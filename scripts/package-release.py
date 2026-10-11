@@ -73,6 +73,11 @@ def main():
         "rpc_schema": 6,
         "real_account_validation": False,
     }
+    installer, count = re.subn(r'(?m)^DEFAULT_VERSION = "[^"]+"$',
+                              f'DEFAULT_VERSION = "{args.version}"',
+                              (ROOT / "scripts/install.py").read_text(), count=1)
+    if count != 1:
+        raise ValueError("cannot set the bundled installer release version")
     members = {
         "codex-window-refresh.so": (library.read_bytes(), 0o644),
         "window-refresh": (cli.read_bytes(), 0o755),
@@ -83,6 +88,7 @@ def main():
         "NOTICE": ((ROOT / "cmd/plugin/NOTICE").read_bytes(), 0o644),
         "LICENSE.upstream": ((ROOT / "third_party/cliproxyapi-reference/LICENSE").read_bytes(), 0o644),
         "BUILD-INFO.json": ((json.dumps(info, ensure_ascii=False, indent=2) + "\n").encode(), 0o644),
+        "install.py": (installer.encode(), 0o755),
     }
     output = pathlib.Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)

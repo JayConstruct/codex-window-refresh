@@ -4,6 +4,30 @@
 
 安装包在 Debian 12 环境构建；CPU 架构、glibc 与 CPA 运行环境必须匹配。Docker 部署以容器内的架构和 libc 为准。Alpine/musl 镜像不能使用这些 glibc 安装包。
 
+## 自动安装（直接运行 / systemd）
+
+自动安装脚本支持 Debian 12/13 的直接运行与 systemd，Docker 使用下面的手动挂载流程。以 CPA 程序 `/root/cliproxyapi/cli-proxy-api` 为例：
+
+```sh
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl python3 python3-yaml
+curl -fL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.py -o /tmp/codex-window-refresh-install.py
+sudo python3 /tmp/codex-window-refresh-install.py --cpa-dir /root/cliproxyapi --dry-run
+sudo python3 /tmp/codex-window-refresh-install.py --cpa-dir /root/cliproxyapi
+```
+
+脚本从运行中的 CPA 进程检测用户、工作目录和 `-config` 参数；没有运行进程时须提供 `--user`。存在自定义主配置时使用 `--config /absolute/path/config.yaml`。已有相对插件目录但进程停止时，使用 `--working-dir` 指明 CPA 工作目录。不能唯一确定的路径会停止，不猜测。
+
+systemd 部署应在预览与安装命令中均添加 `--service 实际服务名`。脚本核对服务程序与用户，并添加仅用于本插件的 `EnvironmentFile` override。首次交互安装输入实际可用模型及现有管理密钥，密钥输入不显示。安装完成询问是否重启；也可显式使用 `--restart`。直接运行模式保留原启动方式，提示设置环境变量后手动重启。
+
+`--dry-run` 不下载、不写入、不重启。正常安装先从固定 Release 下载对应架构并校验 SHA-256，再检查 ELF、glibc 与策略。新策略默认关闭自动请求；安装会开启 CPA 主配置中的 `plugins.enabled`，因此其他已配置为启用的插件也会随宿主加载。其他插件配置保留，`plugins` 节的注释可能重新排版，原配置先备份。策略、窗口状态在升级时保留。
+
+非交互安装需显式提供 `--yes --model 可用模型 --key-file /root/管理密钥文件`，密钥文件由 root 拥有且权限为 `0600`。不接受命令行中的原始密钥。生成的 `window-refresh.env` 同样由 root 拥有、权限 `0600`，按 systemd EnvironmentFile 语法保存，不能直接用 shell `source` 执行。新安装包也包含 `install.py`；首个 rc.1 包不含脚本，请用上述地址下载。
+
+升级时重复执行同一安装命令，用 `--version vX.Y.Z-rc.N` 指定新的测试版，不覆盖旧策略、状态。`--uninstall` 仅卸载本脚本安装的插件与本插件 override，保留策略、状态、密钥环境文件和备份；也需使用原来的服务与路径参数。备份位于 CPA 目录的 `window-refresh-install/`，权限 `0700`，每次操作的 `index.json` 记录原路径、权限和拥有者。文件写入失败会恢复已替换的文件；服务启动失败时保留备份和安装结果供排查，不声称已成功加载。
+
+需要离线安装可传 `--package /path/package.tar.gz --checksums /path/SHA256SUMS`。自动安装依赖 Python 3 与 `python3-yaml`，不依赖 Go 或 C 编译器。含 YAML 锚点、重复键或符号链接目标的配置需先整理或使用手动安装方式。
+
 ## 1. 下载与校验
 
 执行 `uname -m`：`x86_64` 使用 `amd64`，`aarch64` 使用 `arm64`。以下为 x86_64 示例；ARM 服务器将文件名中的 `amd64` 换成 `arm64`。
