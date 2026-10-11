@@ -46,4 +46,4 @@ make native-smoke
 
 首版实际生成并发为 1。没有上游窗口状态的正向证据时不会唤醒；零使用率和未来 reset 时间本身不足以确认窗口未启动。官方宿主目前也没有前台请求与后台唤醒之间的原子互斥接口，插件只能查询并观察后尽量避开。完整图形化管理页、配置写入和分布式执行尚未实现。
 
-发布流程由 `.github/workflows/prerelease.yml` 管理。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；全部通过才发布 Pre-release，不覆盖已存在版本。需要手动重试时从 Actions 运行该工作流。
+发布流程由 `.github/workflows/prerelease.yml` 管理。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；修改工作流也会触发检查。全部通过才发布 Pre-release，不覆盖已存在版本。需要手动重试时从 Actions 运行该工作流。

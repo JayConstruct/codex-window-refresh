@@ -3,7 +3,7 @@ name: Build and publish prerelease
 on:
   push:
     branches: [main]
-    paths: [release/version.txt]
+    paths: [release/version.txt, .github/workflows/prerelease.yml]
   workflow_dispatch:
 
 permissions:
@@ -68,6 +68,7 @@ jobs:
       - name: Package disabled policy and installation guide
         run: |
           export PATH="/usr/local/go/bin:$PATH"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 scripts/package-release.py --version "$VERSION"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
