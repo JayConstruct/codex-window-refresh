@@ -24,3 +24,6 @@ private-state/
 /third_party/cliproxyapi-reference/*
 !/third_party/cliproxyapi-reference/MANIFEST.md
 !/third_party/cliproxyapi-reference/LICENSE
+
+__pycache__/
+*.pyc

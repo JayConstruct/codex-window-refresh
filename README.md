@@ -2,6 +2,8 @@
 
 CLIProxyAPI 的 Codex 账号窗口唤醒插件，插件 ID 为 `codex-window-refresh`。
 
+服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
+
 当前已实现 **Linux 原生插件原型**：后台协调器、持久化状态、额度查询桥、指定账号执行、活动观测及已认证管理 API。动态库已通过本地 C 假宿主加载验证；尚未在真实 CPA 宿主或生产账号上联调。
 
 设计规则：本地窗口到期后随机延迟，精确绑定对应账号；周重置优先且夜间不限人数；普通唤醒根据近期去重用户数补足账号容量；有效 5 小时窗口内不发送；错过时间后合并补发；发送后通过实际额度信息验证新窗口。
@@ -43,3 +45,5 @@ make native-smoke
 `make plugin` 生成 `bin/codex-window-refresh.so`；`bin/window-refresh check /absolute/path/config.yaml` 验证策略文件。示例中的模型占位符必须替换成部署宿主实际可用的模型名；初次联调建议将 `enabled` 设为 `false`。宿主配置见 [插件说明](docs/plugin.md)。
 
 首版实际生成并发为 1。没有上游窗口状态的正向证据时不会唤醒；零使用率和未来 reset 时间本身不足以确认窗口未启动。官方宿主目前也没有前台请求与后台唤醒之间的原子互斥接口，插件只能查询并观察后尽量避开。完整图形化管理页、配置写入和分布式执行尚未实现。
+
+发布流程由 `.github/workflows/prerelease.yml` 管理。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；全部通过才发布 Pre-release，不覆盖已存在版本。需要手动重试时从 Actions 运行该工作流。
