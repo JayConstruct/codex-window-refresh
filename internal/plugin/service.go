@@ -26,7 +26,8 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0"
+const Version = "0.1.0-rc.2"
+const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
 const ResourcePrefix = "/v0/resource/plugins/" + ID
@@ -386,7 +387,7 @@ func registration() any {
 	for _, field := range []struct{ name, description string }{{"config_file", "Absolute path to the validated scheduler YAML or JSON file."}, {"state_dir", "Absolute path to private durable state directory (0700)."}, {"management_url", "Optional local CPA management base URL for quota observations."}, {"management_key_env", "Environment variable containing the management key; never the key itself."}} {
 		fields = append(fields, map[string]string{"Name": field.name, "Type": "string", "Description": field.description})
 	}
-	return map[string]any{"schema_version": SchemaVersion, "metadata": map[string]any{"Name": ID, "Version": Version, "Author": "codex-window-refresh contributors", "ConfigFields": fields}, "capabilities": map[string]bool{"request_interceptor": true, "request_lifecycle_plugin": true, "management_api": true}}
+	return map[string]any{"schema_version": SchemaVersion, "metadata": map[string]any{"Name": ID, "Version": Version, "Author": "codex-window-refresh contributors", "GitHubRepository": Repository, "ConfigFields": fields}, "capabilities": map[string]bool{"request_interceptor": true, "request_lifecycle_plugin": true, "management_api": true}}
 }
 func managementRegistration() any {
 	routes := []map[string]string{}

@@ -28,18 +28,18 @@ systemd 部署应在预览与安装命令中均添加 `--service 实际服务名
 
 升级时重新下载脚本并重复执行同一安装命令，默认更新到最新已发布版本；也可用 `--version vX.Y.Z-rc.N` 或 `--version vX.Y.Z` 固定版本，不覆盖旧策略、状态。新安装包内附脚本也默认选择 latest。`--uninstall` 不查询版本，仅卸载本脚本安装的插件与本插件 override，保留策略、状态、密钥环境文件和备份；也需使用原来的服务与路径参数。备份位于 CPA 目录的 `window-refresh-install/`，权限 `0700`，每次操作的 `index.json` 记录原路径、权限和拥有者。文件写入失败会恢复已替换的文件；服务启动失败时保留备份和安装结果供排查，不声称已成功加载。
 
-离线安装须同时传入固定版本，例如 `--version v0.1.0-rc.1 --package /path/package.tar.gz --checksums /path/SHA256SUMS`，不查询 GitHub。自动安装依赖 Python 3 与 `python3-yaml`，不依赖 Go 或 C 编译器。含 YAML 锚点、重复键或符号链接目标的配置需先整理或使用手动安装方式。
+离线安装须同时传入固定版本，例如 `--version v0.1.0-rc.2 --package /path/package.tar.gz --checksums /path/SHA256SUMS`，不查询 GitHub。自动安装依赖 Python 3 与 `python3-yaml`，不依赖 Go 或 C 编译器。含 YAML 锚点、重复键或符号链接目标的配置需先整理或使用手动安装方式。
 
 ## 1. 下载与校验
 
 执行 `uname -m`：`x86_64` 使用 `amd64`，`aarch64` 使用 `arm64`。以下为 x86_64 示例；ARM 服务器将文件名中的 `amd64` 换成 `arm64`。
 
 ```sh
-curl -fLO https://github.com/JayConstruct/codex-window-refresh/releases/download/v0.1.0-rc.1/codex-window-refresh_v0.1.0-rc.1_linux_amd64.tar.gz
-curl -fLO https://github.com/JayConstruct/codex-window-refresh/releases/download/v0.1.0-rc.1/SHA256SUMS
-grep '  codex-window-refresh_v0.1.0-rc.1_linux_amd64.tar.gz$' SHA256SUMS | sha256sum -c -
-tar -xzf codex-window-refresh_v0.1.0-rc.1_linux_amd64.tar.gz
-cd codex-window-refresh_v0.1.0-rc.1_linux_amd64
+curl -fLO https://github.com/JayConstruct/codex-window-refresh/releases/download/v0.1.0-rc.2/codex-window-refresh_v0.1.0-rc.2_linux_amd64.tar.gz
+curl -fLO https://github.com/JayConstruct/codex-window-refresh/releases/download/v0.1.0-rc.2/SHA256SUMS
+grep '  codex-window-refresh_v0.1.0-rc.2_linux_amd64.tar.gz$' SHA256SUMS | sha256sum -c -
+tar -xzf codex-window-refresh_v0.1.0-rc.2_linux_amd64.tar.gz
+cd codex-window-refresh_v0.1.0-rc.2_linux_amd64
 ```
 
 包内 `BUILD-INFO.json` 记录源码提交、架构、工具链与实际依赖的 glibc 符号版本。首次安装无需服务器安装 Go 或 C 编译器。

@@ -127,11 +127,15 @@ func TestLifecycleRegistrationAndWrapperIsolation(t *testing.T) {
 	registrationRaw := rpcResult(t, s.Handle(context.Background(), "plugin.reconfigure", lifecyclePayload(t, "config_file: /tmp/policy.yaml\nstate_dir: /tmp/scheduler-state\n", 6)))
 	var r struct {
 		SchemaVersion int `json:"schema_version"`
-		Metadata      struct{ Name, Version string }
+		Metadata      struct{ Name, Version, Author, GitHubRepository string }
 		Capabilities  map[string]bool `json:"capabilities"`
 	}
 	if json.Unmarshal(registrationRaw, &r) != nil || r.SchemaVersion != 6 || r.Metadata.Name != ID || !r.Capabilities["request_lifecycle_plugin"] {
 		t.Fatal("registration schema mismatched")
+	}
+	// CPA validPlugin rejects registrations missing any of these metadata fields.
+	if r.Metadata.Version != Version || r.Metadata.Author == "" || r.Metadata.GitHubRepository != Repository {
+		t.Fatal("metadata required by the CPA loader is incomplete")
 	}
 	for _, wrapper := range []string{"config_file: /tmp/policy.yaml\nstate_dir: /tmp/scheduler-state\nreset_rules: {}\n", "config_file: relative.yaml\nstate_dir: /tmp/scheduler-state\n", "config_file: /tmp/policy.yaml\nstate_dir: /tmp/scheduler-state\nmanagement_key: SECRET\n", "config_file: /tmp/policy.yaml\nstate_dir: /tmp/changed-state\n"} {
 		raw := s.Handle(context.Background(), "plugin.reconfigure", lifecyclePayload(t, wrapper, 6))
