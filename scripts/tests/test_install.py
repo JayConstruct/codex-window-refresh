@@ -272,6 +272,45 @@ class InstallIntegrationTests(unittest.TestCase):
         self.assertFalse(self.plan['plugin_dir'].exists())
         self.assertFalse(self.plan['env'].exists())
 
+    def test_first_install_detects_common_model_and_upgrade_preserves_policy(self):
+        self.args.model = None
+        with mock.patch.object(installer, 'discover_codex_model', return_value=('fixture-codex-mini', 2)) as detect:
+            self.install()
+        detect.assert_called_once_with(self.plan['url'], 'fixture-management-secret')
+        policy = self.plan['policy'].read_bytes()
+        self.assertEqual(yaml.safe_load(policy)['execution']['model'], 'fixture-codex-mini')
+        self.assertFalse(yaml.safe_load(policy)['enabled'])
+        self.plan = installer.infer(self.args)
+        with mock.patch.object(installer, 'discover_codex_model') as detect:
+            self.install()
+        detect.assert_not_called()
+        self.assertEqual(self.plan['policy'].read_bytes(), policy)
+
+    def test_explicit_model_skips_discovery(self):
+        with mock.patch.object(installer, 'discover_codex_model') as detect:
+            self.install()
+        detect.assert_not_called()
+
+    def test_detection_failure_in_noninteractive_install_writes_nothing(self):
+        self.args.model = None
+        with mock.patch.object(installer, 'discover_codex_model', side_effect=installer.InstallError('fixture-discovery-unavailable')):
+            with self.assertRaises(installer.InstallError), contextlib.redirect_stdout(io.StringIO()):
+                installer.install(self.args, self.plan, self.arch)
+        self.assertEqual(self.config.read_text(), self.original)
+        self.assertFalse(self.plan['env'].exists())
+        self.assertFalse(self.plan['policy'].exists())
+        self.assertFalse(self.plan['record'].exists())
+
+    def test_detection_failure_falls_back_to_interactive_model_entry(self):
+        self.args.model = None
+        self.args.yes = False
+        with mock.patch.object(installer, 'discover_codex_model', side_effect=installer.InstallError('fixture-discovery-unavailable')), \
+                mock.patch.object(installer.sys.stdin, 'isatty', return_value=True), \
+                mock.patch('builtins.input', side_effect=['fixture-manual-model', 'yes']) as ask:
+            self.install()
+        self.assertEqual(yaml.safe_load(self.plan['policy'].read_text())['execution']['model'], 'fixture-manual-model')
+        self.assertEqual(ask.call_count, 2)
+
     def test_live_config_change_is_not_overwritten(self):
         self.config.write_text(self.original + 'routing: {strategy: fill-first}\n')
         with self.assertRaises(installer.InstallError):

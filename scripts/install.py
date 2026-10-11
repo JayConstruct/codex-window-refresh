@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 
@@ -518,6 +519,108 @@ def environment_content(key, name):
     return f'{name}="{escaped}"\n'.encode()
 
 
+def management_credentials(args, plan):
+    if args.key_file:
+        key = private_file(args.key_file).read_text().rstrip("\r\n")
+        content = environment_content(key, plan["env_name"])
+        if plan["env"].exists():
+            private_file(plan["env"])
+        return key, content
+    if plan["env"].exists():
+        private_file(plan["env"])
+        saved = plan["env"].read_text()
+        match = re.fullmatch(re.escape(plan["env_name"]) + r'="((?:[^"\n\\]|\\["\\])+)"\n?', saved)
+        require(match, "现有环境文件不是安装器管理的格式；请用 --key-file 明确更新。")
+        # Decode only escapes emitted by environment_content. Never evaluate
+        # shell expressions or expand variables from the private environment file.
+        key = re.sub(r'\\(["\\])', lambda m: m[1], match[1])
+        environment_content(key, plan["env_name"])
+        return key, None
+    require(not args.yes and sys.stdin.isatty(),
+            "首次安装请提供 root 拥有、0600 权限的 --key-file，或使用交互输入。")
+    key = getpass.getpass("输入现有 CPA 管理密钥（不显示）：")
+    return key, environment_content(key, plan["env_name"])
+
+
+class NoManagementRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Authorization must never follow an HTTP redirect, even to the same host.
+        raise InstallError("管理接口发生重定向，请检查 --management-url。")
+
+
+def model_discovery_base(url):
+    bridge_url(url)
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path.rstrip("/")
+    require(path in {"", "/v0/management", "/v0/management/api-call"},
+            "该管理路径不支持自动识别模型，请用 --model 指定。")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/v0/management", "", ""))
+
+
+def management_json(base, route, key, timeout):
+    require(route == "/auth-files" or route.startswith("/auth-files/models?name="),
+            "模型查询路径无效。")
+    request = urllib.request.Request(base + route,
+                                     headers={"Authorization": "Bearer " + key, "Accept": "application/json"})
+    opener = urllib.request.build_opener(NoManagementRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            require(response.url == request.full_url, "管理接口地址已改变，请检查 --management-url。")
+            raw = response.read((4 << 20) + 1)
+            require(len(raw) <= 4 << 20, "模型查询响应过大，请用 --model 指定。")
+        value = json.loads(raw)
+    except (OSError, ValueError):
+        raise InstallError("无法读取 CPA 模型目录，请检查 CPA 是否运行、管理密钥和管理地址。") from None
+    require(isinstance(value, dict), "CPA 模型目录格式不受支持，请用 --model 指定。")
+    return value
+
+
+def discover_codex_model(url, key):
+    base = model_discovery_base(url)
+    # Registry reads only; do not execute a model request to test availability.
+    deadline = time.monotonic() + 30
+
+    def read(route):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "自动识别模型超时，请用 --model 指定。")
+        return management_json(base, route, key, min(5, remaining))
+
+    entries = read("/auth-files").get("files")
+    require(isinstance(entries, list) and all(isinstance(e, dict) for e in entries),
+            "CPA 账号目录格式不受支持，请用 --model 指定。")
+    accounts = []
+    for entry in entries:
+        provider = entry.get("provider") or entry.get("type")
+        if provider != "codex" or entry.get("disabled") is True or entry.get("status") == "disabled":
+            continue
+        # Include temporarily unavailable credentials: they can rejoin the pool.
+        require(entry.get("disabled") is False,
+                "CPA 账号启用状态不明确，请用 --model 指定。")
+        name = entry.get("id") or entry.get("name")
+        require(isinstance(name, str) and name and len(name.encode()) <= 4096,
+                "CPA 账号标识不明确，请用 --model 指定。")
+        require(name not in accounts, "CPA 账号目录包含重复标识，请用 --model 指定。")
+        accounts.append(name)
+    require(accounts, "没有已启用的 Codex 账号，请先在 CPA 登录账号，或用 --model 指定。")
+    require(len(accounts) <= 64, "Codex 账号超过自动识别查询限制，请用 --model 指定。")
+    common = None
+    for name in accounts:
+        models = read("/auth-files/models?" + urllib.parse.urlencode({"name": name})).get("models")
+        require(isinstance(models, list) and all(isinstance(m, dict) for m in models),
+                "CPA 模型目录格式不受支持，请用 --model 指定。")
+        ids = {m["id"] for m in models if isinstance(m.get("id"), str)
+               and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/():-]{0,255}", m["id"])
+               and "REPLACE_WITH" not in m["id"].upper()}
+        require(ids, "有 Codex 账号没有可用的模型目录，请用 --model 指定。")
+        common = ids if common is None else common & ids
+        require(common, "Codex 账号之间没有共同模型，请用 --model 指定并检查账号配置。")
+    # Prefer a registered mini variant for a short wake-up, then Codex names;
+    # deterministic order avoids guessing a model version that CPA never listed.
+    model = min(common, key=lambda value: (not re.search(r"(^|[-_/])mini($|[-_/])", value.lower()),
+                                           "codex" not in value.lower(), value.lower(), value))
+    return model, len(accounts)
+
+
 def prompt(question, yes):
     if yes:
         return True
@@ -542,16 +645,25 @@ def install(args, plan, architecture):
         unpacked.mkdir()
         verify_archive(archive, checksums, filename, unpacked, args.version, architecture)
         policy = plan["policy"]
+        credentials_loaded = False
         if policy.exists():
             require(policy.is_file(), "现有策略不是普通文件。")
             policy_bytes = policy.read_bytes()
             candidate = temp / ("policy" + policy.suffix)
         else:
             model = args.model
-            if not model and not args.yes:
-                require(sys.stdin.isatty(), "首次安装请提供 --model。")
-                model = input("CPA 实际支持的 Codex 模型名：").strip()
-            require(model, "首次安装请提供 --model，脚本不会猜测可用模型。")
+            if not model:
+                key, key_bytes = management_credentials(args, plan)
+                credentials_loaded = True
+                print("从 CPA 已启用的 Codex 账号读取模型目录……")
+                try:
+                    model, count = discover_codex_model(plan["url"], key)
+                    print(f"自动选择模型：{model}（{count} 个已启用 Codex 账号的共同模型；未发送测试请求）")
+                except InstallError as error:
+                    print(str(error))
+                    require(not args.yes and sys.stdin.isatty(), "自动识别失败，请用 --model 指定实际支持的模型。")
+                    model = input("CPA 实际支持的 Codex 模型名（手动填写）：").strip()
+            require(model, "模型名不能为空，请用 --model 指定。")
             data, _ = load_yaml((unpacked / "config.example.yaml").read_text())
             data["enabled"] = False
             data["execution"]["model"] = model
@@ -559,19 +671,8 @@ def install(args, plan, architecture):
             candidate = temp / "policy.yaml"
         candidate.write_bytes(policy_bytes)
         run(str(unpacked / "window-refresh"), "check", str(candidate))
-        key_bytes = None
-        if args.key_file:
-            key = private_file(args.key_file).read_text().rstrip("\r\n")
-            key_bytes = environment_content(key, plan["env_name"])
-            if plan["env"].exists():
-                private_file(plan["env"])
-        elif plan["env"].exists():
-            private_file(plan["env"])
-            require(re.fullmatch(re.escape(plan["env_name"]) + r'="(?:[^"\n\\]|\\.)+"\n?', plan["env"].read_text()),
-                    "现有环境文件不是安装器管理的格式；请用 --key-file 明确更新。")
-        else:
-            require(not args.yes and sys.stdin.isatty(), "首次安装请提供 root 拥有、0600 权限的 --key-file，或使用交互输入。")
-            key_bytes = environment_content(getpass.getpass("输入现有 CPA 管理密钥（不显示）："), plan["env_name"])
+        if not credentials_loaded:
+            key, key_bytes = management_credentials(args, plan)
         plugins = copy.deepcopy(plan["plugins"])
         plugins["enabled"] = True
         plugins["dir"] = str(plan["plugin_dir"])
@@ -715,14 +816,14 @@ def main():
     parser.add_argument("--user", help="CPA 运行用户；优先检测运行进程或指定服务")
     parser.add_argument("--service", help="实际 systemd 服务名，不自动猜测")
     parser.add_argument("--management-url", help="管理入口；默认检测端口并使用本机 HTTP")
-    parser.add_argument("--model", help="首次安装使用的可用 Codex 模型名")
+    parser.add_argument("--model", help="首次安装指定 Codex 模型；省略时自动读取已启用 Codex 账号的共同模型")
     parser.add_argument("--version", default=DEFAULT_VERSION,
                         help="默认 latest：最新已发布正式版或 rc 测试版；也可指定 vX.Y.Z 或 vX.Y.Z-rc.N")
     parser.add_argument("--key-file", help="仅 root 可读的纯文本管理密钥文件；不通过命令行传密钥")
     parser.add_argument("--package", help="离线安装包")
     parser.add_argument("--checksums", help="离线 SHA256SUMS 文件")
     parser.add_argument("--dry-run", action="store_true", help="仅检查和显示路径，不下载或修改文件")
-    parser.add_argument("--yes", action="store_true", help="非交互安装，首次安装需 --model 和 --key-file")
+    parser.add_argument("--yes", action="store_true", help="非交互安装，首次安装需 --key-file；自动识别失败须 --model")
     parser.add_argument("--restart", action="store_true", help="安装后重启明确指定的 systemd 服务")
     parser.add_argument("--uninstall", action="store_true", help="卸载本脚本安装的插件，保留策略和状态")
     args = parser.parse_args()
