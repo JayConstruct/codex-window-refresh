@@ -4,7 +4,7 @@ CLIProxyAPI 的 Codex 账号窗口唤醒插件，插件 ID 为 `codex-window-ref
 
 服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
 
-直接运行或 systemd 部署可使用 [自动安装脚本](scripts/install.py)：`sudo python3 install.py --cpa-dir /root/cliproxyapi`。默认安装最新已发布版本（包含 rc 测试版），支持预览、备份、升级与卸载；首次安装输入管理密钥后自动识别 Codex 模型，无法识别时提示手动填写。可用 `--model` 指定模型、`--version` 固定版本。先安装 `python3-yaml`，完整命令和服务参数见安装指南。
+直接运行或 systemd 部署可使用 [自动安装脚本](scripts/install.py)：`sudo python3 install.py --cpa-dir /root/cliproxyapi`。默认安装最新已发布版本（包含 rc 测试版），支持预览、备份、升级与卸载；首次安装输入管理密钥后自动识别 Codex 模型，无法识别时提示手动填写。可核实识别运行中的 CPA 系统服务，交互安装结束询问是否重启；未知启动方式提示手动重启。可用 `--model` 指定模型、`--version` 固定版本。先安装 `python3-yaml`，完整命令和服务参数见安装指南。
 
 当前已实现 **Linux 原生插件原型**：后台协调器、持久化状态、额度查询桥、指定账号执行、活动观测及已认证管理 API。动态库已通过本地 C 假宿主加载验证；尚未在真实 CPA 宿主或生产账号上联调。
 

@@ -306,10 +306,53 @@ class InstallIntegrationTests(unittest.TestCase):
         self.args.yes = False
         with mock.patch.object(installer, 'discover_codex_model', side_effect=installer.InstallError('fixture-discovery-unavailable')), \
                 mock.patch.object(installer.sys.stdin, 'isatty', return_value=True), \
-                mock.patch('builtins.input', side_effect=['fixture-manual-model', 'yes']) as ask:
+                mock.patch('builtins.input', side_effect=['fixture-manual-model', 'yes', 'no']) as ask:
             self.install()
         self.assertEqual(yaml.safe_load(self.plan['policy'].read_text())['execution']['model'], 'fixture-manual-model')
-        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(ask.call_count, 3)
+
+    def test_detected_system_service_uses_restart_prompt_and_attaches_existing_direct_install(self):
+        self.install()
+        self.assertIsNone(json.loads((self.plan['record'] / 'installed.json').read_text())['dropin'])
+        process = {'pid': 123, 'uid': os.geteuid(), 'cwd': self.cpa, 'args': [str(self.cpa / 'cli-proxy-api')]}
+        service = {'name': 'fixture-cpa.service', 'User': self.args.user, 'MainPID': '123',
+                   'WorkingDirectory': str(self.cpa), 'ExecStart': str(self.cpa / 'cli-proxy-api')}
+        with mock.patch.object(installer, 'detect_processes', return_value=[process]), \
+                mock.patch.object(installer, 'detect_service', return_value=service):
+            self.plan = installer.infer(self.args)
+        self.assertTrue(self.plan['service_auto'])
+        # Keep the complete install transaction inside the disposable fixture.
+        self.plan['dropin'] = self.root / 'systemd/fixture-cpa.service.d/60-window-refresh.conf'
+        actual = installer.run
+        calls = []
+
+        def execute(*args):
+            if args[0] == 'systemctl':
+                calls.append(args)
+                return 'active'
+            return actual(*args)
+
+        policy = self.plan['policy'].read_bytes()
+        self.args.yes = False
+        with mock.patch.object(installer, 'run', side_effect=execute), \
+                mock.patch.object(installer.sys.stdin, 'isatty', return_value=True), \
+                mock.patch('builtins.input', side_effect=['yes', 'yes']):
+            self.install()
+        self.assertIn(('systemctl', 'restart', 'fixture-cpa.service'), calls)
+        self.assertEqual(self.plan['policy'].read_bytes(), policy)
+        self.assertEqual(json.loads((self.plan['record'] / 'installed.json').read_text())['dropin'], str(self.plan['dropin']))
+
+    def test_uninstall_old_direct_install_after_service_is_detected_leaves_unowned_override(self):
+        self.install()
+        self.plan = installer.infer(self.args)
+        self.plan['service'] = {'name': 'fixture-cpa.service'}
+        self.plan['service_auto'] = True
+        self.plan['dropin'] = self.root / 'unowned.conf'
+        self.plan['dropin'].write_text('unowned')
+        self.args.uninstall = True
+        with mock.patch.object(installer, 'run', return_value='active'), contextlib.redirect_stdout(io.StringIO()):
+            installer.uninstall(self.args, self.plan)
+        self.assertEqual(self.plan['dropin'].read_text(), 'unowned')
 
     def test_live_config_change_is_not_overwritten(self):
         self.config.write_text(self.original + 'routing: {strategy: fill-first}\n')
