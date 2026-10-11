@@ -39,7 +39,7 @@
 
 原 `GET /config` 继续返回当前运行配置；`GET /config-editor` 返回磁盘策略与 `revision`，`POST /config` 接收 `{ "config": { ... }, "revision": "..." }`。数据和修改接口均位于 CPA 已认证的 `/v0/management/codex-window-refresh/` 下；公开资源只包含静态页面资产。
 
-提交到 `main` 的源代码不会自动替换已发布的 `v0.1.0-rc.1` 安装包。使用安装脚本升级时需选择包含面板的新 Release；也可从新源代码构建 `.so` 后按安装说明替换并重启 CPA。
+提交到 `main` 的源代码不会自动替换已发布的 `v0.1.0-rc.1` 安装包。安装脚本默认选择最新已发布版本；包含面板的新 Release 发布后，重新运行安装脚本即可升级。也可从新源代码构建 `.so` 后按安装说明替换并重启 CPA。
 
 ## 开发验证
 

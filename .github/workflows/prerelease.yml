@@ -3,7 +3,7 @@ name: Build and publish prerelease
 on:
   push:
     branches: [main]
-    paths: [release/version.txt, .github/workflows/prerelease.yml]
+    paths: [release/version.txt, .github/workflows/prerelease.yml, 'scripts/**']
   workflow_dispatch:
 
 permissions:

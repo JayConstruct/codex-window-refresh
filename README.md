@@ -4,7 +4,7 @@ CLIProxyAPI 的 Codex 账号窗口唤醒插件，插件 ID 为 `codex-window-ref
 
 服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
 
-直接运行或 systemd 部署可使用 [自动安装脚本](scripts/install.py)：`sudo python3 install.py --cpa-dir /root/cliproxyapi`。支持预览、备份、升级与卸载；首次安装输入实际模型及管理密钥。先安装 `python3-yaml`，完整命令和服务参数见安装指南。
+直接运行或 systemd 部署可使用 [自动安装脚本](scripts/install.py)：`sudo python3 install.py --cpa-dir /root/cliproxyapi`。默认安装最新已发布版本（包含 rc 测试版），支持预览、备份、升级与卸载；首次安装输入实际模型及管理密钥。可用 `--version` 固定版本。先安装 `python3-yaml`，完整命令和服务参数见安装指南。
 
 当前已实现 **Linux 原生插件原型**：后台协调器、持久化状态、额度查询桥、指定账号执行、活动观测及已认证管理 API。动态库已通过本地 C 假宿主加载验证；尚未在真实 CPA 宿主或生产账号上联调。
 
@@ -53,4 +53,4 @@ make panel-check
 
 首版实际生成并发为 1。没有上游窗口状态的正向证据时不会唤醒；零使用率和未来 reset 时间本身不足以确认窗口未启动。官方宿主目前也没有前台请求与后台唤醒之间的原子互斥接口，插件只能查询并观察后尽量避开。分布式执行尚未实现。
 
-发布流程由 `.github/workflows/prerelease.yml` 管理。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；修改工作流也会触发检查。全部通过才发布 Pre-release，已发布版本只做构建检查而不覆盖下载文件。需要手动重试时从 Actions 运行该工作流。
+发布流程由 `.github/workflows/prerelease.yml` 管理。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；修改工作流、脚本或脚本测试也会触发检查。全部通过才发布 Pre-release，已发布版本只做构建检查而不覆盖下载文件。需要手动重试时从 Actions 运行该工作流。

@@ -73,11 +73,7 @@ def main():
         "rpc_schema": 6,
         "real_account_validation": False,
     }
-    installer, count = re.subn(r'(?m)^DEFAULT_VERSION = "[^"]+"$',
-                              f'DEFAULT_VERSION = "{args.version}"',
-                              (ROOT / "scripts/install.py").read_text(), count=1)
-    if count != 1:
-        raise ValueError("cannot set the bundled installer release version")
+    installer = (ROOT / "scripts/install.py").read_text()
     members = {
         "codex-window-refresh.so": (library.read_bytes(), 0o644),
         "window-refresh": (cli.read_bytes(), 0o755),

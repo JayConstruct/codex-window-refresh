@@ -31,8 +31,10 @@ except ImportError:
 
 
 PLUGIN = "codex-window-refresh"
-DEFAULT_VERSION = "v0.1.0-rc.1"
+DEFAULT_VERSION = "latest"
 REPOSITORY = "https://github.com/JayConstruct/codex-window-refresh"
+RELEASE_API = "https://api.github.com/repos/JayConstruct/codex-window-refresh/releases"
+VERSION_PATTERN = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-rc\.([1-9]\d*))?")
 ASSET_FILES = {
     "codex-window-refresh.so", "window-refresh", "config.example.yaml",
     "INSTALL.md", "PLUGIN.md", "RUNTIME.md", "NOTICE", "LICENSE.upstream",
@@ -314,6 +316,65 @@ def download(url, destination, limit):
             size += len(chunk)
             require(size <= limit, "下载文件超过安装限制。")
             output.write(chunk)
+
+
+def version_key(version):
+    match = VERSION_PATTERN.fullmatch(version) if isinstance(version, str) else None
+    if not match:
+        return None
+    major, minor, patch, candidate = match.groups()
+    return (int(major), int(minor), int(patch), candidate is None, int(candidate or 0))
+
+
+def release_page(page):
+    request = urllib.request.Request(
+        f"{RELEASE_API}?per_page=100&page={page}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": f"{PLUGIN}-installer",
+                 "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as result:
+            address = urllib.parse.urlsplit(result.url)
+            require(address.scheme == "https" and address.hostname == "api.github.com"
+                    and not address.username and not address.password,
+                    "版本查询返回非预期地址；可用 --version 指定版本。")
+            raw = result.read((2 << 20) + 1)
+            require(len(raw) <= 2 << 20, "版本查询响应过大；可用 --version 指定版本。")
+        releases = json.loads(raw)
+    except (OSError, ValueError):
+        raise InstallError("无法查询 GitHub 发布版本（网络或 API 限流）；请稍后重试，或用 --version 指定版本。") from None
+    require(isinstance(releases, list) and len(releases) <= 100
+            and all(isinstance(item, dict) for item in releases),
+            "GitHub 版本响应无效；可用 --version 指定版本。")
+    return releases
+
+
+def latest_version(architecture):
+    # The /latest endpoint excludes prereleases. Compare supported version tags
+    # numerically instead of trusting publication order or GitHub's Latest badge.
+    candidates = []
+    for page in range(1, 6):
+        releases = release_page(page)
+        for item in releases:
+            key = version_key(item.get("tag_name"))
+            if item.get("draft") is False and item.get("published_at") and key is not None:
+                candidates.append((key, item))
+        if len(releases) < 100:
+            break
+    else:
+        raise InstallError("发布记录超过自动查询限制；请用 --version 指定版本。")
+    require(candidates, "没有可安装的已发布正式版或 rc 测试版。")
+    _, release = max(candidates, key=lambda entry: entry[0])
+    version = release["tag_name"]
+    assets = release.get("assets")
+    require(isinstance(assets, list) and all(isinstance(asset, dict) for asset in assets),
+            "最新发布版本的安装包信息无效。")
+    for name, limit in [(f"{PLUGIN}_{version}_linux_{architecture}.tar.gz", 64 << 20),
+                        ("SHA256SUMS", 65536)]:
+        matches = [asset for asset in assets if asset.get("name") == name]
+        require(len(matches) == 1 and matches[0].get("state") == "uploaded"
+                and type(matches[0].get("size")) is int and 0 < matches[0]["size"] <= limit,
+                f"最新版本 {version} 缺少有效的 {name}；请稍后重试或用 --version 指定版本。")
+    return version
 
 
 def verify_archive(archive, checksum_file, filename, output, version, architecture):
@@ -655,7 +716,8 @@ def main():
     parser.add_argument("--service", help="实际 systemd 服务名，不自动猜测")
     parser.add_argument("--management-url", help="管理入口；默认检测端口并使用本机 HTTP")
     parser.add_argument("--model", help="首次安装使用的可用 Codex 模型名")
-    parser.add_argument("--version", default=DEFAULT_VERSION, help="固定的 Release candidate 版本")
+    parser.add_argument("--version", default=DEFAULT_VERSION,
+                        help="默认 latest：最新已发布正式版或 rc 测试版；也可指定 vX.Y.Z 或 vX.Y.Z-rc.N")
     parser.add_argument("--key-file", help="仅 root 可读的纯文本管理密钥文件；不通过命令行传密钥")
     parser.add_argument("--package", help="离线安装包")
     parser.add_argument("--checksums", help="离线 SHA256SUMS 文件")
@@ -672,11 +734,16 @@ def main():
     require(re.search(r'^ID=["\x27]?debian["\x27]?$', release, re.M)
             and re.search(r'^VERSION_ID=["\x27]?(12|13)["\x27]?$', release, re.M),
             "当前自动安装仅支持 Debian 12/13；其他系统请按 docs/install.md 手动安装。")
-    require(re.fullmatch(r"v\d+\.\d+\.\d+-rc\.[1-9]\d*", args.version), "版本须为固定 rc 版本。")
+    require(args.version == "latest" or version_key(args.version) is not None,
+            "版本须为 latest、vX.Y.Z 或 vX.Y.Z-rc.N。")
+    require(args.uninstall or not args.package or args.version != "latest",
+            "离线安装须使用 --version 指定安装包的准确版本。")
     require(not args.restart or args.service, "--restart 需要 --service。")
     plan = infer(args)
     verify_elf(plan["binary"], architecture)
-    print(f"操作：{'卸载' if args.uninstall else '安装/升级'} {args.version} / linux_{architecture}")
+    target = "最新发布版本（含 rc 测试版，执行时查询）" if args.version == "latest" else args.version
+    print(f"操作：{'卸载' if args.uninstall else '安装/升级'} / linux_{architecture}"
+          + ("" if args.uninstall else f" / {target}"))
     for key in ["binary", "config", "plugin_dir", "policy", "state", "env"]:
         print(f"{key}: {plan[key]}")
     print(f"CPA 用户：{plan['user']}；systemd 服务：{plan['service']['name'] if plan['service'] else '未指定'}")
@@ -685,6 +752,9 @@ def main():
     if args.dry_run:
         print("仅预览，未下载、写入或重启。")
         return
+    if not args.uninstall and args.version == "latest":
+        args.version = latest_version(architecture)
+        print(f"本次安装版本：{args.version}（已固定，下载期间不再切换版本）")
     lock_path = safe_path(plan["directory"] / ".window-refresh-install.lock")
     with os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "r+") as lock:
         require(os.fstat(lock.fileno()).st_uid == 0, "安装锁必须由 root 拥有。")
