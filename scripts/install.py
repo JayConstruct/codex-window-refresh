@@ -4,10 +4,12 @@
 import argparse
 import copy
 import datetime
+import errno
 import fcntl
 import getpass
 import grp
 import hashlib
+import ipaddress
 import json
 import os
 import pathlib
@@ -15,6 +17,8 @@ import platform
 import pwd
 import re
 import shutil
+import socket
+import ssl
 import stat
 import struct
 import subprocess
@@ -22,6 +26,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -45,6 +50,12 @@ ASSET_FILES = {
 
 class InstallError(Exception):
     pass
+
+
+class ManagementQueryError(InstallError):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 def require(condition, message):
@@ -131,7 +142,9 @@ def bridge_url(value):
             and not parsed.password and not parsed.query and not parsed.fragment,
             "管理地址须为无用户名、查询参数和片段的 HTTP(S) URL。")
     require(parsed.path.rstrip("/") in {"", "/v0/management", "/v0/management/api-call",
-                                       "/v8/management/requests/api-call"}, "管理地址的路径不受插件支持。")
+                                       "/v8/management", "/v8/management/requests/api-call"}, "管理地址的路径不受插件支持。")
+    if parsed.path.rstrip("/") == "/v8/management":
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/v8/management/requests/api-call", "", ""))
     return value.rstrip("/")
 
 
@@ -538,7 +551,7 @@ def management_credentials(args, plan):
         return key, None
     require(not args.yes and sys.stdin.isatty(),
             "首次安装请提供 root 拥有、0600 权限的 --key-file，或使用交互输入。")
-    key = getpass.getpass("输入现有 CPA 管理密钥（不显示）：")
+    key = getpass.getpass("输入 CPA 网页面板管理密钥（原始密钥，非 API Key / bcrypt 哈希，不显示）：")
     return key, environment_content(key, plan["env_name"])
 
 
@@ -549,28 +562,64 @@ class NoManagementRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def model_discovery_base(url):
-    bridge_url(url)
-    parsed = urllib.parse.urlsplit(url)
+    parsed = urllib.parse.urlsplit(bridge_url(url))
     path = parsed.path.rstrip("/")
-    require(path in {"", "/v0/management", "/v0/management/api-call"},
-            "该管理路径不支持自动识别模型，请用 --model 指定。")
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/v0/management", "", ""))
+    prefix = "/v8/management" if path.startswith("/v8/") else "/v0/management"
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, prefix, "", ""))
+
+
+def loopback_host(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def management_json(base, route, key, timeout):
-    require(route == "/auth-files" or route.startswith("/auth-files/models?name="),
+    require(route in {"/auth-files", "/credentials"} or
+            route.startswith(("/auth-files/models?name=", "/credentials/models?name=")),
             "模型查询路径无效。")
     request = urllib.request.Request(base + route,
                                      headers={"Authorization": "Bearer " + key, "Accept": "application/json"})
-    opener = urllib.request.build_opener(NoManagementRedirect())
+    handlers = [NoManagementRedirect()]
+    if loopback_host(urllib.parse.urlsplit(base).hostname):
+        # Local management credentials must not pass through environment proxies.
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
+    endpoint = base + route.split("?", 1)[0]
     try:
         with opener.open(request, timeout=timeout) as response:
             require(response.url == request.full_url, "管理接口地址已改变，请检查 --management-url。")
             raw = response.read((4 << 20) + 1)
             require(len(raw) <= 4 << 20, "模型查询响应过大，请用 --model 指定。")
         value = json.loads(raw)
-    except (OSError, ValueError):
-        raise InstallError("无法读取 CPA 模型目录，请检查 CPA 是否运行、管理密钥和管理地址。") from None
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        reason = {
+            401: "管理认证失败；请使用登录 CPA 网页面板的原始管理密钥，不是模型 API Key 或配置文件中的 bcrypt 哈希。",
+            403: "管理访问被拒绝；检查远程访问限制、管理密钥配置及失败次数过多导致的 IP 封禁。",
+            404: "管理接口不存在或未启用；检查地址、管理密钥配置及 CPA 版本。仅支持 v8 的入口可用 --management-url 指定 /v8/management。",
+            429: "管理接口限流，请稍后重试。",
+        }.get(status, "管理接口返回异常，请检查 CPA 日志及反向代理。")
+        raise ManagementQueryError(f"CPA 模型目录查询失败：HTTP {status}；{reason} 查询地址：{endpoint}", status) from None
+    except (urllib.error.URLError, OSError) as error:
+        cause = error.reason if isinstance(error, urllib.error.URLError) else error
+        if isinstance(cause, ssl.SSLError):
+            reason = "TLS 连接或证书验证失败；检查 HTTP/HTTPS 配置及受信任证书。"
+        elif isinstance(cause, (TimeoutError, socket.timeout)):
+            reason = "连接或读取超时；检查 CPA 是否运行及管理端口。"
+        elif isinstance(cause, socket.gaierror):
+            reason = "管理主机名无法解析；检查管理地址。"
+        elif getattr(cause, "errno", None) == errno.ECONNREFUSED:
+            reason = "连接被拒绝；检查 CPA 是否运行、监听地址及端口，可用 --management-url 指定。"
+        else:
+            reason = "网络连接失败；检查 CPA 监听地址、端口、防火墙及代理。"
+        raise ManagementQueryError(f"CPA 模型目录查询失败：{reason} 查询地址：{endpoint}") from None
+    except ValueError:
+        raise ManagementQueryError(f"CPA 模型目录响应不是有效 JSON；检查是否连接到网页或反向代理的错误页。查询地址：{endpoint}") from None
     require(isinstance(value, dict), "CPA 模型目录格式不受支持，请用 --model 指定。")
     return value
 
@@ -585,7 +634,8 @@ def discover_codex_model(url, key):
         require(remaining > 0, "自动识别模型超时，请用 --model 指定。")
         return management_json(base, route, key, min(5, remaining))
 
-    entries = read("/auth-files").get("files")
+    account_route = "/credentials" if base.endswith("/v8/management") else "/auth-files"
+    entries = read(account_route).get("files")
     require(isinstance(entries, list) and all(isinstance(e, dict) for e in entries),
             "CPA 账号目录格式不受支持，请用 --model 指定。")
     accounts = []
@@ -605,7 +655,7 @@ def discover_codex_model(url, key):
     require(len(accounts) <= 64, "Codex 账号超过自动识别查询限制，请用 --model 指定。")
     common = None
     for name in accounts:
-        models = read("/auth-files/models?" + urllib.parse.urlencode({"name": name})).get("models")
+        models = read(account_route + "/models?" + urllib.parse.urlencode({"name": name})).get("models")
         require(isinstance(models, list) and all(isinstance(m, dict) for m in models),
                 "CPA 模型目录格式不受支持，请用 --model 指定。")
         ids = {m["id"] for m in models if isinstance(m.get("id"), str)
@@ -614,10 +664,19 @@ def discover_codex_model(url, key):
         require(ids, "有 Codex 账号没有可用的模型目录，请用 --model 指定。")
         common = ids if common is None else common & ids
         require(common, "Codex 账号之间没有共同模型，请用 --model 指定并检查账号配置。")
-    # Prefer a registered mini variant for a short wake-up, then Codex names;
-    # deterministic order avoids guessing a model version that CPA never listed.
-    model = min(common, key=lambda value: (not re.search(r"(^|[-_/])mini($|[-_/])", value.lower()),
-                                           "codex" not in value.lower(), value.lower(), value))
+    # Approval review models are registered by CPA but are not general wake-ups.
+    common = {value for value in common if not re.search(r"(^|[-_/])auto[-_]review($|[-_/(])", value.lower())}
+    require(common, "共同目录仅包含特殊审核模型，不适合自动唤醒；请用 --model 指定普通生成模型。")
+
+    def preference(value):
+        lowered = value.lower()
+        for rank, variant in enumerate(["mini", "nano", "luna"]):
+            if re.search(r"(^|[-_/])" + variant + r"($|[-_/(])", lowered):
+                return rank, lowered, value
+        return (3 if "codex" in lowered else 4), lowered, value
+
+    # Only select a reported model; never guess an upstream model version.
+    model = min(common, key=preference)
     return model, len(accounts)
 
 
@@ -823,6 +882,7 @@ def main():
     parser.add_argument("--package", help="离线安装包")
     parser.add_argument("--checksums", help="离线 SHA256SUMS 文件")
     parser.add_argument("--dry-run", action="store_true", help="仅检查和显示路径，不下载或修改文件")
+    parser.add_argument("--check-model", action="store_true", help="只查询 CPA 模型并诊断管理连接；不下载、写入安装文件或重启")
     parser.add_argument("--yes", action="store_true", help="非交互安装，首次安装需 --key-file；自动识别失败须 --model")
     parser.add_argument("--restart", action="store_true", help="安装后重启明确指定的 systemd 服务")
     parser.add_argument("--uninstall", action="store_true", help="卸载本脚本安装的插件，保留策略和状态")
@@ -840,18 +900,28 @@ def main():
     require(args.uninstall or not args.package or args.version != "latest",
             "离线安装须使用 --version 指定安装包的准确版本。")
     require(not args.restart or args.service, "--restart 需要 --service。")
+    require(not args.check_model or not (args.dry_run or args.uninstall or args.restart),
+            "--check-model 不能与 --dry-run、--uninstall 或 --restart 同时使用。")
     plan = infer(args)
     verify_elf(plan["binary"], architecture)
     target = "最新发布版本（含 rc 测试版，执行时查询）" if args.version == "latest" else args.version
-    print(f"操作：{'卸载' if args.uninstall else '安装/升级'} / linux_{architecture}"
-          + ("" if args.uninstall else f" / {target}"))
+    operation = "模型诊断" if args.check_model else "卸载" if args.uninstall else "安装/升级"
+    print(f"操作：{operation} / linux_{architecture}"
+          + ("" if args.uninstall or args.check_model else f" / {target}"))
     for key in ["binary", "config", "plugin_dir", "policy", "state", "env"]:
         print(f"{key}: {plan[key]}")
     print(f"CPA 用户：{plan['user']}；systemd 服务：{plan['service']['name'] if plan['service'] else '未指定'}")
     print(f"管理入口：{plan['url']}；密钥将只保存到 root 拥有的 0600 环境文件。")
-    print("安装时开启宿主 plugins.enabled；首次策略保持关闭。plugins 节的注释可能重新排版，原配置会备份。")
+    if not args.check_model:
+        print("安装时开启宿主 plugins.enabled；首次策略保持关闭。plugins 节的注释可能重新排版，原配置会备份。")
     if args.dry_run:
         print("仅预览，未下载、写入或重启。")
+        return
+    if args.check_model:
+        key, _ = management_credentials(args, plan)
+        model, count = discover_codex_model(plan["url"], key)
+        print(f"自动选择模型：{model}（{count} 个已启用 Codex 账号的共同模型；未发送测试请求）")
+        print("模型查询完成，未下载、写入安装文件或重启。")
         return
     if not args.uninstall and args.version == "latest":
         args.version = latest_version(architecture)

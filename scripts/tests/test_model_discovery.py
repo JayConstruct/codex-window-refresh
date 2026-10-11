@@ -1,9 +1,13 @@
 import argparse
+import errno
 import importlib.util
 import json
 import pathlib
+import socket
+import ssl
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
 from unittest import mock
 
@@ -48,6 +52,19 @@ class ModelDiscoveryTests(unittest.TestCase):
         with mock.patch.object(installer, "management_json", side_effect=[{"files": [account("a")]}, models("custom-alias")]):
             self.assertEqual(installer.discover_codex_model("https://cpa.example.com", "secret"), ("custom-alias", 1))
 
+    def test_approval_review_models_are_excluded_and_lightweight_registered_models_preferred(self):
+        cases = [(["codex-auto-review", "gpt-5.5", "gpt-5.6-luna", "gpt-6-sol"], "gpt-5.6-luna"),
+                 (["codex-auto-review", "gpt-6-sol"], "gpt-6-sol"),
+                 (["team/codex-auto-review(high)", "custom-model"], "custom-model"),
+                 (["codex-auto-review-mini", "gpt-nano", "gpt-luna"], "gpt-nano"),
+                 (["codex-auto-review", "codex-mini", "gpt-nano", "gpt-luna"], "codex-mini")]
+        for candidates, expected in cases:
+            with self.subTest(candidates=candidates), mock.patch.object(installer, "management_json", side_effect=[{"files": [account("a")]}, models(*candidates)]):
+                self.assertEqual(installer.discover_codex_model("http://localhost:8317", "secret"), (expected, 1))
+        with mock.patch.object(installer, "management_json", side_effect=[{"files": [account("a")]}, models("codex-auto-review")]):
+            with self.assertRaises(installer.InstallError) as error: installer.discover_codex_model("http://localhost:8317", "secret")
+        self.assertIn("特殊审核模型", str(error.exception))
+
     def test_no_accounts_empty_models_no_common_models_and_limits_fail_closed(self):
         fixtures = [
             [{"files": []}],
@@ -72,7 +89,7 @@ class ModelDiscoveryTests(unittest.TestCase):
         self.assertEqual(read.call_count, 1)
 
     def test_management_paths_and_redirects_rejected_before_sending_key(self):
-        for url in ["https://user:secret@cpa.example.com", "https://cpa.example.com/?secret=x", "https://cpa.example.com/v8/management/requests/api-call"]:
+        for url in ["https://user:secret@cpa.example.com", "https://cpa.example.com/?secret=x", "https://cpa.example.com/not-management"]:
             with mock.patch.object(installer, "management_json") as read:
                 with self.assertRaises(installer.InstallError): installer.discover_codex_model(url, "secret")
             read.assert_not_called()
@@ -101,6 +118,63 @@ class ModelDiscoveryTests(unittest.TestCase):
         with mock.patch.object(installer.urllib.request, "build_opener", return_value=opener):
             with self.assertRaises(installer.InstallError) as error: installer.management_json("http://localhost:8317/v0/management", "/auth-files", "fixture-secret", 5)
         self.assertNotIn("fixture-private-context", str(error.exception))
+
+    def test_v8_model_query_uses_credential_routes_and_bridge_compatible_address(self):
+        for suffix in ["/v8/management", "/v8/management/", "/v8/management/requests/api-call"]:
+            url = "https://cpa.example.com" + suffix
+            with mock.patch.object(installer, "management_json", side_effect=[{"files": [account("a")]}, models("codex-mini")]) as read:
+                self.assertEqual(installer.discover_codex_model(url, "secret"), ("codex-mini", 1))
+            self.assertEqual([call.args[1] for call in read.call_args_list], ["/credentials", "/credentials/models?name=a"])
+            self.assertEqual(installer.bridge_url(url), "https://cpa.example.com/v8/management/requests/api-call")
+
+    def test_local_management_bypasses_environment_proxies_and_remote_preserves_them(self):
+        reply = mock.MagicMock()
+        reply.__enter__.return_value = reply
+        reply.read.return_value = b'{"files": []}'
+        opener = mock.Mock(); opener.open.return_value = reply
+        for host, bypass in [("127.0.0.1", True), ("127.0.0.2", True), ("localhost", True), ("[::1]", True), ("cpa.example.com", False)]:
+            base = "http://" + host + ":8317/v0/management"
+            reply.url = base + "/auth-files"
+            with mock.patch.object(installer.urllib.request, "build_opener", return_value=opener) as build:
+                installer.management_json(base, "/auth-files", "secret", 5)
+            proxies = [handler for handler in build.call_args.args if isinstance(handler, installer.urllib.request.ProxyHandler)]
+            self.assertEqual(len(proxies), int(bypass))
+            if bypass: self.assertEqual(proxies[0].proxies, {})
+
+    def test_status_diagnostics_are_specific_redacted_and_never_retry_authentication(self):
+        for status, message in [(401, "管理认证失败"), (403, "管理访问被拒绝"), (404, "管理接口不存在"), (429, "限流"), (502, "异常")]:
+            opener = mock.Mock()
+            opener.open.side_effect = urllib.error.HTTPError("http://localhost/private-account", status, "fixture-private-context", {}, None)
+            with mock.patch.object(installer.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaises(installer.ManagementQueryError) as error:
+                    installer.discover_codex_model("http://localhost:8317", "fixture-secret")
+            self.assertEqual(opener.open.call_count, 1)
+            self.assertEqual(error.exception.status, status)
+            self.assertIn(message, str(error.exception))
+            self.assertIn("/v0/management/auth-files", str(error.exception))
+            for private in ["fixture-secret", "fixture-private-context", "private-account"]:
+                self.assertNotIn(private, str(error.exception))
+
+    def test_transport_diagnostics_distinguish_refused_timeout_dns_tls_and_bad_json(self):
+        failures = [(OSError(errno.ECONNREFUSED, "private"), "连接被拒绝"),
+                    (socket.timeout("private"), "超时"), (socket.gaierror(-2, "private"), "无法解析"),
+                    (ssl.SSLCertVerificationError("private"), "证书验证失败")]
+        for cause, message in failures:
+            opener = mock.Mock(); opener.open.side_effect = urllib.error.URLError(cause)
+            with mock.patch.object(installer.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaises(installer.ManagementQueryError) as error:
+                    installer.management_json("http://localhost:8317/v0/management", "/auth-files/models?name=private-account", "fixture-secret", 5)
+            self.assertIn(message, str(error.exception))
+            for private in ["private-account", "fixture-secret", "private"]: self.assertNotIn(private, str(error.exception))
+        reply = mock.MagicMock(); reply.__enter__.return_value = reply
+        reply.url = "http://localhost:8317/v0/management/auth-files"
+        reply.read.return_value = b"<html>fixture-private-page</html>"
+        opener = mock.Mock(); opener.open.return_value = reply
+        with mock.patch.object(installer.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaises(installer.ManagementQueryError) as error:
+                installer.management_json("http://localhost:8317/v0/management", "/auth-files", "fixture-secret", 5)
+        self.assertIn("不是有效 JSON", str(error.exception))
+        self.assertNotIn("fixture-private-page", str(error.exception))
 
     def test_saved_key_decodes_literal_quotes_backslashes_and_shell_characters(self):
         with tempfile.TemporaryDirectory() as directory:

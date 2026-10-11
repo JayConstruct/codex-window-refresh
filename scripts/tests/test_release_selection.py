@@ -137,6 +137,32 @@ class ReleaseSelectionTests(unittest.TestCase):
             with self.assertRaises(installer.InstallError): installer.main()
         query.assert_not_called(); infer.assert_not_called()
 
+    def test_model_diagnostic_skips_release_package_installer_lock_and_file_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            plan = {name: root / name for name in ["binary", "config", "plugin_dir", "policy", "state", "env"]}
+            plan.update(directory=root, user="root", service=None, url="http://127.0.0.1:8317/v0/management")
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(sys, "argv", ["install.py", "--check-model"]))
+                stack.enter_context(mock.patch.object(installer.os, "geteuid", return_value=0))
+                stack.enter_context(mock.patch.object(installer.platform, "system", return_value="Linux"))
+                stack.enter_context(mock.patch.object(installer.platform, "machine", return_value="x86_64"))
+                stack.enter_context(mock.patch.object(pathlib.Path, "read_text", return_value='ID=debian\nVERSION_ID="12"\n'))
+                stack.enter_context(mock.patch.object(installer, "infer", return_value=plan))
+                stack.enter_context(mock.patch.object(installer, "verify_elf"))
+                stack.enter_context(mock.patch.object(installer, "management_credentials", return_value=("fixture-secret", None)))
+                detect = stack.enter_context(mock.patch.object(installer, "discover_codex_model", return_value=("fixture-mini", 2)))
+                install = stack.enter_context(mock.patch.object(installer, "install"))
+                query = stack.enter_context(mock.patch.object(installer, "latest_version"))
+                write = stack.enter_context(mock.patch.object(installer.os, "open", side_effect=AssertionError("no installer lock or file writes")))
+                output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                installer.main()
+                detect.assert_called_once_with(plan["url"], "fixture-secret")
+                install.assert_not_called(); query.assert_not_called(); write.assert_not_called()
+                self.assertIn("模型诊断", output.getvalue())
+                self.assertNotIn("fixture-secret", output.getvalue())
+            self.assertEqual(list(root.iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()
