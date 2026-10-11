@@ -1,0 +1,69 @@
+# 调度策略示例；CPA 插件包装配置另见 docs/plugin.md。
+# execution.model 必须按部署环境填写；占位值会被配置验证拒绝。
+schema_version: 1
+enabled: true
+timezone: Asia/Shanghai
+
+reset_rules:
+  five_hour:
+    enabled: true
+    random_delay: {min: 0s, max: 10m}
+  weekly:
+    enabled: true
+    random_delay: {min: 0s, max: 10m}
+    # 已确定的行为：周任务夜间执行，且不受近期用户数限制。
+    # 两项目前只接受 true，并不是可关闭的功能开关。
+    bypass_activity_limit: true
+    bypass_allowed_hours: true
+
+activity:
+  lookback: 30m
+  accounts_per_user: 1.0
+  max_accounts: 10
+  # 使用宿主认证后生成的 caller_scope；一般是 principal/key 口径，非自然人数。
+  identity_source: host_caller_scope
+
+ordinary_rules:
+  # 同一时区下的每日半开区间 [start, end)，可配置多个不重叠时段。
+  # 跨午夜示例："22:00-02:00"；全天写 "00:00-24:00"。
+  allowed_hours: ["08:00-23:00"]
+  allow_outside_hours_when_users_active: true
+
+daily_rules:
+  - id: morning
+    enabled: true
+    # 默认按池容量准备账号，并非每个账号每天发一次请求。
+    random_time_range: "09:00-09:10"
+    minimum_ready_accounts: 1
+    # 固定 true：错过后保留最近有效目标，不回放历日请求。
+    catch_up: true
+
+execution:
+  quota_read_timeout: 15s
+  request_timeout: 1m
+  model: "REPLACE_WITH_SUPPORTED_MODEL"
+  prompt: "Reply OK."
+  max_concurrency: 1
+  min_dispatch_spacing: 5s
+  # 0s 要求本次生成前完成主动查询；不得转换为正数缓存期限替代。
+  quota_max_age_before_send: 30s
+  verify_delays: [5s, 30s, 2m]
+  # 到期仅释放容量预约；超时/不确定任务仍禁止重复生成。
+  verification_capacity_hold: 15m
+  # 固定 true；补发仍经过窗口、时段、人数和账号可用性检查。
+  catch_up: true
+
+# 宿主稳定账号 ID -> 局部覆盖。空对象表示完全继承池配置。
+# 不在这里填写账号 token、用户 API key 或账号凭据。
+account_overrides: {}
+
+# 账号覆盖示例（应替换为宿主实际提供的稳定 ID 后再启用）：
+# account_overrides:
+#   account-id-from-host:
+#     paused: false
+#     five_hour_enabled: true
+#     weekly_enabled: true
+#     five_hour_random_delay: {min: 2m, max: 10m}
+#     weekly_random_delay: {min: 0s, max: 5m}
+#     allowed_hours: ["08:00-23:00"]
+#     allow_outside_hours_when_users_active: true

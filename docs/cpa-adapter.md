@@ -1,0 +1,84 @@
+# CPA JSON 回调适配器
+
+`internal/cpa` 使用本地核对的官方 v8 源码提交 `3de4e24` 的 JSON 契约，不依赖官方 SDK 的 Go 模块。原生 ABI 注册由 `internal/plugin` 和 `cmd/plugin` 完成。本适配器的测试使用假回调与内存 HTTP transport；实现期间未读取真实账号文件、查询真实额度或发送真实生成请求。
+
+## 回调接口
+
+```go
+type Callback interface {
+    Call(context.Context, string, any, any) error
+}
+
+host := cpa.NewHost(callback, quotaReader)
+```
+
+`Host` 实现核心 `core.Host`，另提供 `SetBaseline(core.CoreState)` 与 `ActivityAccounts()`。适配器只消费以下官方回调：
+
+| 回调 | 用途 | 关键 JSON 字段 |
+| --- | --- | --- |
+| `host.auth.list` | 列举 Codex 宿主账号 | `files[].id/auth_index/provider` |
+| `host.auth.get_runtime` | 核对精确账号绑定与可用状态 | 请求 `auth_index`；响应 `auth.id/auth_index/provider/disabled/unavailable` |
+| `host.auth.get` | 临时核对真实上游身份 | 请求 `auth_index`；响应 `json.account_id/type` |
+| `host.model.execute_stream` | 发送精确账号生成 | `auth_id`, `forced_provider`, `entry_protocol`, `exit_protocol`, `stream`, base64 `body` |
+| `host.model.stream_read` | 消费模型输出 | 请求 `stream_id`；响应 base64 `payload`, `error`, `done` |
+| `host.model.stream_close` | 显式释放模型流 | 请求 `stream_id` |
+
+官方对应定义在 `sdk/pluginapi/types.go`、`internal/pluginhost/auth_callbacks.go`、`internal/pluginhost/host_model_stream_callbacks.go`。`host.stream.close` 用于另一类 executor 输出流，不能代替模型流关闭。原生 dynamic callback 的 host context 已携带插件身份，后台工作不借用已结束的请求 callback scope。模型流取消时，适配器发出独立 stream_close 取消宿主上游，再等待取消 watcher 结束后返回，避免卸载后遗留调用。原生同步 C 回调无法被 Go deadline 强行中断；若宿主回调本身完全不返回，关闭过程仍需安全等待。
+
+## 精确账号与代际
+
+生成使用宿主稳定 `id` 作为 `auth_id`，同时锁定 `forced_provider=codex`；管理额度查询使用同一绑定的 `auth_index`。发现、查询前后、生成前都会核对 runtime 信息与实际 `account_id`。
+
+代际是 `SHA256("codex-account-v1" + 分隔符 + 宿主 ID + 分隔符 + 实际 account_id)`。不使用 token、email、文件时间、`updated_at` 或 OAuth 刷新时间。OAuth 正常续期不会丢失窗口；同一宿主 ID 换成另一真实上游账号会阻止旧任务生成。
+
+`host.auth.get` 返回的凭据 JSON 只在调用栈里用于解码 allowlist 字段，随后清理原始字节。账号 token 不进入状态、配置、日志或错误。缺少 `account_id`、runtime-only 账号或无法核对绑定时返回 `account_identity_unavailable`，不会用名称或 email 猜测。宿主无法证明同一上游账号删除后重新添加的独立凭据生命周期；首版代际明确采用上游账号身份口径。
+
+目前宿主没有与前台生成联合原子锁定的接口，`ForegroundGuard=false`。生成前核对无法彻底消除核对之后、真实宿主执行之前的账号修改或前台请求竞态。
+
+## 显式额度桥接
+
+`QuotaReader.Read(ctx, AuthBinding)` 可注入受信实现。默认 `BridgeReader` 只通过 CPA 管理 API 做 token substitution，不在插件里拼接真实账号 token。
+
+- `ManagementURL` 指定 CPA 服务基址、`/v0/management` 或完整 `/v0/management/api-call`；完整 `/v8/management/requests/api-call` 也支持。
+- `ManagementKeyEnv` 指定管理密钥的环境变量名；实际密钥通过环境读取，不放进插件规则文件。
+- 管理请求为 POST `api-call`，正文的 `auth_index` 精确匹配目标账号，upstream GET 固定为 `https://chatgpt.com/backend-api/wham/usage`。
+- upstream 请求头使用 `Authorization: Bearer $TOKEN$` 和核对过的 `Chatgpt-Account-Id`；CPA 负责替换和续期 token。
+- 管理响应必须是 HTTP 200，其包装字段 `status_code` 也必须为 200；最多读取 2 MiB。禁用重定向，不向其他位置转送管理凭据。
+
+管理 URL 与密钥未配置时，`QuotaAdapterReady=false`；查询返回 `quota_management_bridge_missing`。查询失败只返回稳定分类 `quota_management_bridge_failed`，不将响应正文、token 或密钥附加进错误。
+
+官方管理 API schema 来源为 `internal/api/handlers/management/api_tools.go`。默认桥接不是 CPA 的原生 `host.quota` callback，不会把拟议能力当作现成接口。
+
+## 额度证据
+
+解析 `rate_limit.primary_window/secondary_window`，以及官方 quota event 的 `rate_limits.primary/secondary`、`rateLimit` 与 camelCase 字段。5 小时与周字段按 `limit_window_seconds=18000/604800` 或 `window_minutes=300/10080` 识别，不能仅按 primary/secondary 的位置判断。主池以外的附加额度不代替普通 Codex 窗口。
+
+`used_percent` 必须为 0 到 100 的有限数；保留 `remaining=100-used_percent`，单位 `percent`。优先 `reset_at`，否则使用 `reset_after_seconds`/`reset_after`。没有有效持续时间、用量或重置证据时保持未知或报告未识别，不填伪造倒计时。
+
+同字段的 snake_case、camelCase 和 legacy 别名同时存在时必须一致；主次窗口与顶层 rate-limit 对象的重复表示只接受归一化后等值的内容。持续时间的秒数与分钟数也必须一致，不能任选一个来产生可发送结论。相对倒计时按对应窗口限制为 5 小时或 7 天加 60 秒，与绝对截止时间的上界一致。
+
+同时提供绝对截止时间与相对倒计时时，允许 60 秒的采样、整数舍入和网络延迟差异，但不会用这个容差放行到期：绝对时间已经到期而相对倒计时仍为正时，整个观测报告未识别；请求传输时刚好跨过边界也可能触发这个保守判断，后续查询再确认。相对倒计时为零时允许绝对时间处于过去，因为上游可能把过期倒计时钳制为零。明确非法的 `reset_at <= 0` 不回退到相对时间猜测。
+
+- 明确 past reset boundary 分类为 `expired`。
+- 未来 reset boundary 且非零用量分类为 `active`。
+- 零用量与未来 reset boundary 分类为 `unknown`。如果是主动查询，且同账号、同代际的现有 active 证据和 baseline 都具有完全相同的未来截止时间，则只保留该已证实的 active 周期，不声明新周期。即使本地旧 baseline 到期，也不能据此声称上游新字段是未激活占位。
+- 当前解析器不凭零用量生成 `inactive`。如果实际上游在空闲时只提供未来移动占位，任务会等待进一步可证明的证据。增加特定上游的未激活特征需要独立核对与测试。
+
+生成 response headers 的 `X-Codex-Primary/Secondary-*` 和 `codex.rate_limits` SSE 帧也会转换为独立额度观测。来自响应头的旧证据不会因为后续帧到达而自动刷新时间；生成缺少额度信息时仍由运行时安排主动查询。HTTP 200、`[DONE]` 或只有文本 delta 不代表生成完整完成；必须完整消费模型流并收到 `response.completed`，没有 stream 错误才返回 `SendCompleted`。流打开或读取失败会返回 `SendUnknown`，避免错误地声称请求未送达。
+
+## 用户活动
+
+`ParseActivity(method, payload, accounts)` 只接收原生宿主认证回调 payload。官方 lifecycle 外层字段为 PascalCase `RequestID/Metadata/CompletedAt`，Metadata 子字段为 `caller_scope/source/selected_auth_id`。请求正文里伪造的同名字段不参与统计。
+
+- `request.intercept_before`：只有宿主 `caller_scope` 存在才发出 started 事件。
+- `request.intercept_after`：按宿主 `selected_auth_id` 关联已核对的账号与代际；没有该字段则不能靠模型名猜账号。
+- `request.complete`：按 RequestID 结束原有活动绑定；允许 completion 的 Metadata 不完整。
+- `source=plugin_host_model_callback`：整个生命周期排除，不把插件生成计入真实用户活动。
+
+开始/结束幂等、重试更换账号与 in-flight 去重由核心 reducer 按 RequestID 处理。当前适配器只实现 `host_caller_scope` 口径；其他严格身份来源应在原生入口能力校验时拒绝，不能声称 caller_scope 是独立自然人。
+
+`PassThrough(method,payload)` 保留普通请求的原 Headers 与原 Body，返回无终止的响应。活动观测不改写正常用户请求。
+
+## 已验证
+
+配置与代际测试覆盖 OAuth 刷新、真实账号替换、精确 `auth_id`、模型格式映射、终端 completion、分片 SSE、异常流显式关闭、管理密钥缺失、token substitution、主次窗口互换、零用量占位、活动排除和正常请求内容原样返回。额度一致性测试覆盖矛盾别名、矛盾重置时间、各窗口的倒计时上界、等值别名及采样延迟，确保畸形响应不会提供到期或 permission 证据。

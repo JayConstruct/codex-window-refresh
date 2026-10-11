@@ -1,0 +1,26 @@
+*.so
+*.dylib
+*.dll
+*.exe
+bin/
+dist/
+runtime-state/
+private-state/
+
+# Local policy and environment files; publish the example configuration only.
+/config.yaml
+/config.yml
+/config.json
+.env
+.env.*
+!.env.example
+
+# Workspace-provided metadata is not part of the plugin source.
+.agents/
+.aws/
+.codex/
+
+# Keep upstream research snapshots local; publish provenance and license only.
+/third_party/cliproxyapi-reference/*
+!/third_party/cliproxyapi-reference/MANIFEST.md
+!/third_party/cliproxyapi-reference/LICENSE

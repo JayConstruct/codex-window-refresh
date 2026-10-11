@@ -1,0 +1,527 @@
+// Package plugin implements the CPA JSON-RPC lifecycle and authenticated
+// management surface. It owns no C pointers; the native entry is in cmd/plugin.
+package plugin
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"codex-window-refresh/internal/config"
+	"codex-window-refresh/internal/core"
+	"codex-window-refresh/internal/cpa"
+	"codex-window-refresh/internal/storage"
+	"gopkg.in/yaml.v3"
+)
+
+const ID = "codex-window-refresh"
+const Version = "0.1.0"
+const SchemaVersion = 6
+const ManagementPrefix = "/v0/management/" + ID
+const ResourcePrefix = "/v0/resource/plugins/" + ID
+
+type Engine interface {
+	Run(context.Context) error
+	Snapshot() core.CoreState
+	UpdateConfig(config.Config) error
+	EnqueueActivity(core.ActivityEvent)
+	EnqueueObservation(core.QuotaObservation)
+	Notify()
+}
+type DiagnosticEngine interface {
+	Diagnostics() (core.HostCapabilities, string, int)
+}
+
+// SchedulerDiagnosticEngine provides aggregate scheduling decisions only. The
+// optional interface keeps other Engine implementations compatible; values must
+// not contain activity identities, request metadata, or credentials.
+type SchedulerDiagnosticEngine interface {
+	SchedulerDiagnostics() any
+}
+type Host interface {
+	core.Host
+	ActivityAccounts() map[core.AccountID]core.HostAccount
+}
+type DurableStore interface {
+	core.Store
+	Close() error
+}
+type Options struct {
+	EngineFactory   func(config.Config, core.Host, core.Store, core.Clock, core.Random) (Engine, error)
+	HostFactory     func(cpa.Callback, WrapperConfig) (Host, error)
+	OpenStore       func(string) (DurableStore, error)
+	LoadConfig      func(string) (config.Config, error)
+	ShutdownTimeout time.Duration
+}
+
+// WrapperConfig contains plumbing only. All scheduling policy is read from the
+// separate validated business config; credentials remain in an environment var.
+type WrapperConfig struct {
+	// CPA injects these host-owned loader controls into ConfigYAML. They do not
+	// belong to business policy and do not change plumbing identity.
+	HostEnabled      *bool  `yaml:"enabled" json:"-"`
+	HostPriority     *int   `yaml:"priority" json:"-"`
+	ConfigFile       string `yaml:"config_file" json:"config_file"`
+	StateDir         string `yaml:"state_dir" json:"state_dir"`
+	ManagementURL    string `yaml:"management_url" json:"management_url,omitempty"`
+	ManagementKeyEnv string `yaml:"management_key_env" json:"management_key_env,omitempty"`
+}
+
+func (w WrapperConfig) hostEnabled() bool { return w.HostEnabled == nil || *w.HostEnabled }
+func (w WrapperConfig) effective(cfg config.Config) config.Config {
+	cfg.Enabled = cfg.Enabled && w.hostEnabled()
+	return cfg
+}
+func (w WrapperConfig) samePlumbing(other WrapperConfig) bool {
+	return w.ConfigFile == other.ConfigFile && w.StateDir == other.StateDir && w.ManagementURL == other.ManagementURL && w.ManagementKeyEnv == other.ManagementKeyEnv
+}
+
+type Service struct {
+	lifecycle sync.Mutex
+	mu        sync.RWMutex
+	callback  cpa.Callback
+	options   Options
+	wrapper   WrapperConfig
+	cfg       config.Config
+	engine    Engine
+	host      Host
+	store     DurableStore
+	cancel    context.CancelFunc
+	done      chan struct{}
+	stopping  bool
+	lastError string
+}
+
+func New(callback cpa.Callback, options Options) *Service {
+	if options.OpenStore == nil {
+		options.OpenStore = func(path string) (DurableStore, error) { return storage.Open(path) }
+	}
+	if options.LoadConfig == nil {
+		options.LoadConfig = config.Load
+	}
+	if options.HostFactory == nil {
+		options.HostFactory = func(cb cpa.Callback, w WrapperConfig) (Host, error) {
+			return cpa.NewHost(cb, &cpa.BridgeReader{ManagementURL: w.ManagementURL, ManagementKeyEnv: w.ManagementKeyEnv, Getenv: os.Getenv, Client: &http.Client{Timeout: 30 * time.Second}}), nil
+		}
+	}
+	if options.ShutdownTimeout <= 0 {
+		options.ShutdownTimeout = 5 * time.Second
+	}
+	return &Service{callback: callback, options: options}
+}
+
+type rpcEnvelope struct {
+	OK     bool      `json:"ok"`
+	Result any       `json:"result,omitempty"`
+	Error  *rpcError `json:"error,omitempty"`
+}
+type rpcError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+func ErrorResponse(code, message string) []byte {
+	raw, _ := json.Marshal(rpcEnvelope{Error: &rpcError{Code: code, Message: message}})
+	return raw
+}
+func (s *Service) Handle(ctx context.Context, method string, payload []byte) (raw []byte) {
+	defer func() {
+		if recover() != nil {
+			raw = ErrorResponse("plugin_panic", "plugin operation failed")
+		}
+	}()
+	result, err := s.handle(ctx, method, payload)
+	if err != nil {
+		return ErrorResponse("plugin_error", err.Error())
+	}
+	raw, err = json.Marshal(rpcEnvelope{OK: true, Result: result})
+	if err != nil {
+		return ErrorResponse("encoding_error", "response encoding failed")
+	}
+	return raw
+}
+func (s *Service) handle(ctx context.Context, method string, payload []byte) (any, error) {
+	switch method {
+	case "plugin.register", "plugin.reconfigure":
+		if err := s.configure(payload); err != nil {
+			return nil, err
+		}
+		return registration(), nil
+	case "plugin.quiesce", "plugin.shutdown":
+		if err := s.Shutdown(ctx); err != nil {
+			return nil, err
+		}
+		return struct{}{}, nil
+	case "management.register":
+		return managementRegistration(), nil
+	case "management.handle":
+		return s.management(ctx, payload)
+	case "request.intercept_before", "request.intercept_after", "request.complete":
+		// Observational hooks fail open for invalid optional activity metadata.
+		pass, err := cpa.PassThrough(method, payload)
+		if err != nil {
+			return nil, errors.New("invalid request lifecycle payload")
+		}
+		s.mu.RLock()
+		engine, host, stopping := s.engine, s.host, s.stopping
+		s.mu.RUnlock()
+		if engine != nil && host != nil && !stopping {
+			events, err := cpa.ParseActivity(method, payload, host.ActivityAccounts())
+			if err == nil {
+				for _, event := range events {
+					engine.EnqueueActivity(event)
+				}
+			}
+		}
+		return pass, nil
+	default:
+		return nil, errors.New("unknown method")
+	}
+}
+func parseWrapper(payload []byte) (WrapperConfig, error) {
+	var lifecycle struct {
+		ConfigYAML    []byte `json:"config_yaml"`
+		SchemaVersion uint32 `json:"schema_version"`
+	}
+	if err := json.Unmarshal(payload, &lifecycle); err != nil {
+		return WrapperConfig{}, errors.New("invalid lifecycle request")
+	}
+	if lifecycle.SchemaVersion < SchemaVersion {
+		return WrapperConfig{}, fmt.Errorf("host schema version must be at least %d", SchemaVersion)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(lifecycle.ConfigYAML))
+	dec.KnownFields(true)
+	var wrapper WrapperConfig
+	if err := dec.Decode(&wrapper); err != nil {
+		return WrapperConfig{}, errors.New("invalid wrapper configuration")
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return WrapperConfig{}, errors.New("wrapper configuration must contain one document")
+	}
+	// YAML decoding must not coerce quoted host booleans/integers or nulls.
+	var document yaml.Node
+	if err := yaml.Unmarshal(lifecycle.ConfigYAML, &document); err != nil || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		return WrapperConfig{}, errors.New("invalid wrapper configuration")
+	}
+	mapping := document.Content[0]
+	for i := 0; i < len(mapping.Content); i += 2 {
+		key, value := mapping.Content[i], mapping.Content[i+1]
+		if key.Value == "enabled" && (value.Kind != yaml.ScalarNode || value.Tag != "!!bool") {
+			return WrapperConfig{}, errors.New("host enabled must be a boolean")
+		}
+		if key.Value == "priority" && (value.Kind != yaml.ScalarNode || value.Tag != "!!int") {
+			return WrapperConfig{}, errors.New("host priority must be an integer")
+		}
+	}
+	if wrapper.ConfigFile == "" || wrapper.StateDir == "" || !filepath.IsAbs(wrapper.ConfigFile) || !filepath.IsAbs(wrapper.StateDir) {
+		return WrapperConfig{}, errors.New("config_file and state_dir must be absolute paths")
+	}
+	if (wrapper.ManagementURL == "") != (wrapper.ManagementKeyEnv == "") {
+		return WrapperConfig{}, errors.New("management_url and management_key_env must be set together")
+	}
+	return wrapper, nil
+}
+func (s *Service) configure(payload []byte) error {
+	wrapper, err := parseWrapper(payload)
+	if err != nil {
+		return err
+	}
+	cfg, err := s.options.LoadConfig(wrapper.ConfigFile)
+	if err != nil {
+		return errors.New("business configuration failed to load or validate")
+	}
+	if err := cfg.Validate(); err != nil {
+		return errors.New("business configuration failed to validate")
+	}
+	if cfg.Activity.IdentitySource != "host_caller_scope" {
+		return errors.New("identity_source_not_supported_by_cpa_adapter")
+	}
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	s.mu.RLock()
+	existing, previous, stopping := s.engine, s.wrapper, s.stopping
+	s.mu.RUnlock()
+	if stopping {
+		return errors.New("plugin is stopping; process restart required")
+	}
+	if existing != nil {
+		if !wrapper.samePlumbing(previous) {
+			return errors.New("wrapper plumbing changes require process restart")
+		}
+		if err := existing.UpdateConfig(wrapper.effective(cfg)); err != nil {
+			return errors.New("configuration update failed")
+		}
+		s.mu.Lock()
+		s.cfg = cfg
+		s.wrapper = wrapper
+		s.mu.Unlock()
+		return nil
+	}
+	if s.options.EngineFactory == nil {
+		return errors.New("scheduler factory unavailable")
+	}
+	host, err := s.options.HostFactory(s.callback, wrapper)
+	if err != nil {
+		return errors.New("host adapter initialization failed")
+	}
+	store, err := s.options.OpenStore(wrapper.StateDir)
+	if err != nil {
+		return errors.New("state store initialization failed")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = store.Close()
+		}
+	}()
+	engine, err := s.options.EngineFactory(wrapper.effective(cfg), host, store, realClock{}, secureRandom{})
+	if err != nil {
+		return errors.New("scheduler initialization failed")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.wrapper = wrapper
+	s.cfg = cfg
+	s.engine = engine
+	s.host = host
+	s.store = store
+	s.cancel = cancel
+	s.done = done
+	s.mu.Unlock()
+	committed = true
+	go func() {
+		defer close(done)
+		defer func() {
+			if recover() != nil {
+				s.mu.Lock()
+				s.lastError = "scheduler stopped due to a panic"
+				s.mu.Unlock()
+			}
+		}()
+		err := engine.Run(ctx)
+		s.mu.Lock()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			s.lastError = "scheduler stopped due to an error"
+		}
+		s.mu.Unlock()
+	}()
+	return nil
+}
+
+// Shutdown is bounded. On timeout the store remains owned and new lifecycle
+// activity is refused. Native shutdown must subsequently call WaitForShutdown
+// before its host frees the callback context or unloads the dynamic library.
+func (s *Service) Shutdown(ctx context.Context) error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	s.mu.Lock()
+	s.stopping = true
+	cancel, done, store := s.cancel, s.done, s.store
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		timer := time.NewTimer(s.options.ShutdownTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return errors.New("shutdown interrupted; process restart required")
+		case <-timer.C:
+			return errors.New("shutdown waiting for host callback; process restart required")
+		}
+	}
+	if store != nil {
+		if err := store.Close(); err != nil {
+			return errors.New("state store close failed")
+		}
+	}
+	s.mu.Lock()
+	s.store = nil
+	s.cancel = nil
+	s.done = nil
+	s.mu.Unlock()
+	return nil
+}
+
+// WaitForShutdown drains callbacks without a deadline. Native shutdown has no
+// error return and cannot safely permit unloading when a C callback is still
+// running. A nonreturning host callback therefore delays native shutdown.
+func (s *Service) WaitForShutdown() {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	s.mu.RLock()
+	done, store := s.done, s.store
+	s.mu.RUnlock()
+	if done != nil {
+		<-done
+	}
+	if store != nil {
+		_ = store.Close()
+	}
+	s.mu.Lock()
+	s.store = nil
+	s.cancel = nil
+	s.done = nil
+	s.mu.Unlock()
+}
+
+func registration() any {
+	fields := []map[string]string{}
+	for _, field := range []struct{ name, description string }{{"config_file", "Absolute path to the validated scheduler YAML or JSON file."}, {"state_dir", "Absolute path to private durable state directory (0700)."}, {"management_url", "Optional local CPA management base URL for quota observations."}, {"management_key_env", "Environment variable containing the management key; never the key itself."}} {
+		fields = append(fields, map[string]string{"Name": field.name, "Type": "string", "Description": field.description})
+	}
+	return map[string]any{"schema_version": SchemaVersion, "metadata": map[string]any{"Name": ID, "Version": Version, "Author": "codex-window-refresh contributors", "ConfigFields": fields}, "capabilities": map[string]bool{"request_interceptor": true, "request_lifecycle_plugin": true, "management_api": true}}
+}
+func managementRegistration() any {
+	routes := []map[string]string{}
+	for _, p := range []string{"/summary", "/accounts", "/config", "/capabilities"} {
+		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
+	}
+	for _, p := range []string{"/reload", "/recheck"} {
+		routes = append(routes, map[string]string{"Method": "POST", "Path": ManagementPrefix + p})
+	}
+	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Scheduler information and authenticated management endpoints."}}}
+}
+
+type managementRequest struct {
+	Method, Path string
+	Headers      http.Header
+	Body         []byte
+}
+type managementResponse struct {
+	StatusCode int
+	Headers    http.Header
+	Body       []byte
+}
+
+func response(status int, value any) managementResponse {
+	body, _ := json.Marshal(value)
+	return managementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {"application/json; charset=utf-8"}, "Cache-Control": {"no-store"}}, Body: body}
+}
+func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
+	_ = ctx
+	var req managementRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return nil, errors.New("invalid management payload")
+	}
+	// Resource routes are unauthenticated in CPA. They contain static information
+	// only; account state and policy are exposed solely under authenticated Routes.
+	if req.Method == "GET" && req.Path == ResourcePrefix+"/status" {
+		return managementResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Content-Security-Policy": {"default-src 'none'; style-src 'unsafe-inline'"}}, Body: []byte(statusHTML)}, nil
+	}
+	if !strings.HasPrefix(req.Path, ManagementPrefix+"/") {
+		return response(404, map[string]string{"error": "not found"}), nil
+	}
+	path := strings.TrimPrefix(req.Path, ManagementPrefix)
+	s.mu.RLock()
+	engine, wrapper, cfg, done, stopping, lastError := s.engine, s.wrapper, s.cfg, s.done, s.stopping, s.lastError
+	s.mu.RUnlock()
+	if engine == nil {
+		return response(503, map[string]string{"error": "scheduler not initialized"}), nil
+	}
+	switch req.Method + " " + path {
+	case "GET /summary":
+		state := engine.Snapshot()
+		running := done != nil && !stopping
+		if done != nil {
+			select {
+			case <-done:
+				running = false
+			default:
+			}
+		}
+		concurrency := 1
+		if debug, ok := engine.(DiagnosticEngine); ok {
+			_, errorCode, effective := debug.Diagnostics()
+			if errorCode != "" {
+				lastError = errorCode
+			}
+			concurrency = effective
+		}
+		summary := map[string]any{"enabled": wrapper.effective(cfg).Enabled, "business_enabled": cfg.Enabled, "host_enabled": wrapper.hostEnabled(), "running": running, "revision": state.Revision, "accounts": len(state.Accounts), "reservations": len(state.Reservations), "last_error": lastError, "effective_concurrency": concurrency}
+		if debug, ok := engine.(SchedulerDiagnosticEngine); ok {
+			summary["scheduler"] = debug.SchedulerDiagnostics()
+		}
+		return response(200, summary), nil
+	case "GET /accounts":
+		return response(200, engine.Snapshot().Accounts), nil
+	case "GET /config":
+		return response(200, cfg), nil
+	case "GET /capabilities":
+		capabilities := core.HostCapabilities{}
+		if debug, ok := engine.(DiagnosticEngine); ok {
+			capabilities, _, _ = debug.Diagnostics()
+		}
+		return response(200, capabilities), nil
+	case "POST /reload":
+		if stopping {
+			return response(409, map[string]string{"error": "scheduler stopping"}), nil
+		}
+		s.lifecycle.Lock()
+		defer s.lifecycle.Unlock()
+		s.mu.RLock()
+		stopping = s.stopping
+		wrapper = s.wrapper
+		s.mu.RUnlock()
+		if stopping {
+			return response(409, map[string]string{"error": "scheduler stopping"}), nil
+		}
+		updated, err := s.options.LoadConfig(wrapper.ConfigFile)
+		if err != nil || updated.Validate() != nil {
+			return response(400, map[string]string{"error": "business configuration failed to load or validate"}), nil
+		}
+		if updated.Activity.IdentitySource != "host_caller_scope" {
+			return response(400, map[string]string{"error": "identity_source_not_supported_by_cpa_adapter"}), nil
+		}
+		if err := engine.UpdateConfig(wrapper.effective(updated)); err != nil {
+			return response(409, map[string]string{"error": "configuration update failed"}), nil
+		}
+		s.mu.Lock()
+		s.cfg = updated
+		s.mu.Unlock()
+		return response(200, map[string]bool{"reloaded": true}), nil
+	case "POST /recheck":
+		if stopping {
+			return response(409, map[string]string{"error": "scheduler stopping"}), nil
+		}
+		engine.Notify()
+		return response(202, map[string]string{"status": "scheduled"}), nil
+	default:
+		return response(404, map[string]string{"error": "not found"}), nil
+	}
+}
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
+type secureRandom struct{}
+
+func (secureRandom) Duration(min, max time.Duration) (time.Duration, error) {
+	if min < 0 || max < min {
+		return 0, errors.New("invalid delay")
+	}
+	span := new(big.Int).SetInt64(int64(max - min))
+	span.Add(span, big.NewInt(1))
+	v, err := rand.Int(rand.Reader, span)
+	if err != nil {
+		return 0, err
+	}
+	return min + time.Duration(v.Int64()), nil
+}
+
+const statusHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Codex Window Refresh</title><style>body{font:16px system-ui;max-width:760px;margin:64px auto;padding:24px;line-height:1.6}code{background:#eee;padding:3px}</style><h1>Codex Window Refresh</h1><p>插件按本地额度窗口、近期用户活动和时间规则安排账号唤醒。</p><p>运行状态、账号和配置通过 CPA 已认证的管理 API 查询：</p><ul><li><code>GET /v0/management/codex-window-refresh/summary</code></li><li><code>GET /v0/management/codex-window-refresh/accounts</code></li><li><code>GET /v0/management/codex-window-refresh/config</code></li><li><code>GET /v0/management/codex-window-refresh/capabilities</code></li><li><code>POST /v0/management/codex-window-refresh/reload</code> 重新读取规则文件</li><li><code>POST /v0/management/codex-window-refresh/recheck</code> 重新检查规则</li></ul><p>此公开说明页面不显示账号或运行数据。</p></html>`
