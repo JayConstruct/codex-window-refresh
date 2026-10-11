@@ -34,6 +34,7 @@ const ResourcePrefix = "/v0/resource/plugins/" + ID
 type Engine interface {
 	Run(context.Context) error
 	Snapshot() core.CoreState
+	// UpdateConfig must leave the previous configuration intact on error.
 	UpdateConfig(config.Config) error
 	EnqueueActivity(core.ActivityEvent)
 	EnqueueObservation(core.QuotaObservation)
@@ -101,6 +102,7 @@ type Service struct {
 	done      chan struct{}
 	stopping  bool
 	lastError string
+	policyOps *policyFileOps
 }
 
 func New(callback cpa.Callback, options Options) *Service {
@@ -237,6 +239,8 @@ func (s *Service) configure(payload []byte) error {
 	if err != nil {
 		return err
 	}
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	cfg, err := s.options.LoadConfig(wrapper.ConfigFile)
 	if err != nil {
 		return errors.New("business configuration failed to load or validate")
@@ -247,8 +251,6 @@ func (s *Service) configure(payload []byte) error {
 	if cfg.Activity.IdentitySource != "host_caller_scope" {
 		return errors.New("identity_source_not_supported_by_cpa_adapter")
 	}
-	s.lifecycle.Lock()
-	defer s.lifecycle.Unlock()
 	s.mu.RLock()
 	existing, previous, stopping := s.engine, s.wrapper, s.stopping
 	s.mu.RUnlock()
@@ -388,13 +390,13 @@ func registration() any {
 }
 func managementRegistration() any {
 	routes := []map[string]string{}
-	for _, p := range []string{"/summary", "/accounts", "/config", "/capabilities"} {
+	for _, p := range []string{"/summary", "/accounts", "/config", "/config-editor", "/capabilities"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
-	for _, p := range []string{"/reload", "/recheck"} {
+	for _, p := range []string{"/reload", "/recheck", "/config"} {
 		routes = append(routes, map[string]string{"Method": "POST", "Path": ManagementPrefix + p})
 	}
-	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Scheduler information and authenticated management endpoints."}}}
+	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Authenticated scheduler panel."}, {"Path": "/panel.js"}, {"Path": "/panel.css"}}}
 }
 
 type managementRequest struct {
@@ -413,15 +415,16 @@ func response(status int, value any) managementResponse {
 	return managementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {"application/json; charset=utf-8"}, "Cache-Control": {"no-store"}}, Body: body}
 }
 func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
-	_ = ctx
 	var req managementRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return nil, errors.New("invalid management payload")
 	}
-	// Resource routes are unauthenticated in CPA. They contain static information
-	// only; account state and policy are exposed solely under authenticated Routes.
-	if req.Method == "GET" && req.Path == ResourcePrefix+"/status" {
-		return managementResponse{StatusCode: 200, Headers: http.Header{"Content-Type": {"text/html; charset=utf-8"}, "Content-Security-Policy": {"default-src 'none'; style-src 'unsafe-inline'"}}, Body: []byte(statusHTML)}, nil
+	// CPA resources are public static assets. All account and policy data stays
+	// under CPA-authenticated management routes.
+	if req.Method == "GET" {
+		if resource, ok := panelResource(req.Path); ok {
+			return resource, nil
+		}
 	}
 	if !strings.HasPrefix(req.Path, ManagementPrefix+"/") {
 		return response(404, map[string]string{"error": "not found"}), nil
@@ -461,6 +464,10 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		return response(200, engine.Snapshot().Accounts), nil
 	case "GET /config":
 		return response(200, cfg), nil
+	case "GET /config-editor":
+		return s.readPolicyEditor(), nil
+	case "POST /config":
+		return s.savePolicyEditor(ctx, req.Body), nil
 	case "GET /capabilities":
 		capabilities := core.HostCapabilities{}
 		if debug, ok := engine.(DiagnosticEngine); ok {
@@ -523,5 +530,3 @@ func (secureRandom) Duration(min, max time.Duration) (time.Duration, error) {
 	}
 	return min + time.Duration(v.Int64()), nil
 }
-
-const statusHTML = `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Codex Window Refresh</title><style>body{font:16px system-ui;max-width:760px;margin:64px auto;padding:24px;line-height:1.6}code{background:#eee;padding:3px}</style><h1>Codex Window Refresh</h1><p>插件按本地额度窗口、近期用户活动和时间规则安排账号唤醒。</p><p>运行状态、账号和配置通过 CPA 已认证的管理 API 查询：</p><ul><li><code>GET /v0/management/codex-window-refresh/summary</code></li><li><code>GET /v0/management/codex-window-refresh/accounts</code></li><li><code>GET /v0/management/codex-window-refresh/config</code></li><li><code>GET /v0/management/codex-window-refresh/capabilities</code></li><li><code>POST /v0/management/codex-window-refresh/reload</code> 重新读取规则文件</li><li><code>POST /v0/management/codex-window-refresh/recheck</code> 重新检查规则</li></ul><p>此公开说明页面不显示账号或运行数据。</p></html>`

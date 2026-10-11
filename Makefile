@@ -2,7 +2,7 @@ GOCACHE ?= /tmp/codex-window-refresh-go-cache
 export GOCACHE
 export GOTOOLCHAIN := local
 
-.PHONY: check test vet race build plugin native-smoke installer-check
+.PHONY: check test vet race build plugin native-smoke installer-check panel-check
 
 check: test vet
 
@@ -28,3 +28,6 @@ native-smoke: plugin
 
 installer-check: build
 	python3 -m unittest discover -s scripts/tests -v
+
+panel-check:
+	node --test scripts/tests/panel.test.cjs

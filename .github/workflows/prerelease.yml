@@ -59,12 +59,12 @@ jobs:
       - name: Install native test dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends gcc libc6-dev binutils make python3 python3-yaml
+          apt-get install -y --no-install-recommends gcc libc6-dev binutils make python3 python3-yaml nodejs
       - name: Test, load, and build native binaries
         run: |
           export PATH="/usr/local/go/bin:$PATH"
           test "$(go env GOARCH)" = "$EXPECTED_ARCH"
-          make check race native-smoke build installer-check
+          make check race native-smoke build installer-check panel-check
       - name: Package disabled policy and installation guide
         run: |
           export PATH="/usr/local/go/bin:$PATH"

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Codex Window Refresh · 模块面板</title>
+  <link rel="stylesheet" href="./panel.css">
+  <script defer src="./panel.js"></script>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar"><a class="brand" href="./status"><span class="brand-mark" aria-hidden="true">↻</span><span>Codex Window Refresh<small>额度窗口调度</small></span></a><div class="connection"><span id="connection-status" class="badge neutral">未连接</span><button id="disconnect" class="quiet" disabled>断开</button></div></header>
+  <main>
+    <section id="login-section" class="card login-card">
+      <div><span class="eyebrow">CPA 管理认证</span><h1>让刷新按你的节奏发生</h1><p>查看已确认的额度窗口、检查账号调度，并调整刷新规则。</p></div>
+      <form id="login-form" class="login-form"><label for="management-key">管理密钥</label><div class="input-action"><input id="management-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 CPA management secret-key" required><button id="connect" class="primary" type="submit">连接面板</button></div><p class="hint">密钥仅保存在当前页面内存；刷新页面或断开连接后清除。请求只发送到当前 CPA 地址。</p></form>
+    </section>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <div id="workspace" hidden>
+      <nav class="tabbar" aria-label="面板视图"><button class="tab active" data-tab="overview" aria-selected="true">运行概览</button><button class="tab" data-tab="accounts" aria-selected="false">账号与任务</button><button class="tab" data-tab="rules" aria-selected="false">刷新规则</button><button class="tab" data-tab="capabilities" aria-selected="false">宿主能力</button></nav>
+      <section id="tab-overview" class="view">
+        <div class="section-head"><div><span class="eyebrow">调度状态</span><h1>当前运行概览</h1></div><div class="toolbar"><span id="updated-at" class="hint">等待快照</span><button id="refresh" class="quiet">刷新视图</button></div></div>
+        <div id="metrics" class="metrics"></div>
+        <div class="two-columns"><section class="card"><h2>规则与时间</h2><dl id="schedule-info" class="details"></dl><p class="hint">周重置可绕过人数与普通时段限制。已有 5 小时窗口内不发送；实际执行仍以最新额度证据为准。</p></section><section class="card"><h2>阻塞与诊断</h2><div id="hold-counts"></div><p id="last-error" class="hint"></p></section></div>
+        <section class="card action-card"><div><h2>调度操作</h2><p>重新检查会通知调度器评估现有规则；重新读取会应用服务器规则文件。启用的规则可能随后发送真实请求。</p></div><div class="toolbar"><button id="recheck" class="quiet">重新检查规则</button><button id="reload" class="quiet">重新读取规则文件</button></div></section>
+        <p class="footnote">页面每 15 秒读取已有状态快照，隐藏页面时暂停。运行规则在连接或操作时读取；外部修改后请手动刷新视图。刷新视图不会直接查询上游额度或发送模型请求。近期用户按 CPA 的 caller_scope 去重，共用 API key 的调用可能属于同一范围，并不等于自然人数。</p>
+      </section>
+      <section id="tab-accounts" class="view" hidden>
+        <div class="section-head"><div><span class="eyebrow">账号池</span><h1>账号与合并任务</h1></div><span id="account-count" class="hint"></span></div>
+        <div class="filters"><label class="search-label">搜索账号<input id="account-search" type="search" placeholder="按账号 ID 搜索" autocomplete="off"></label><label>状态筛选<select id="account-filter"><option value="all">全部账号</option><option value="active">5 小时窗口内</option><option value="pending">有未完成任务</option><option value="paused">已暂停</option><option value="unknown">额度未知</option></select></label></div>
+        <div id="account-list" class="account-list"></div><p class="footnote">倒计时来自上游已确认的 ResetAt，不会推算新的 5 小时窗口。暂停按钮只修改规则草稿，点击“保存并应用”后生效。</p>
+      </section>
+      <section id="tab-rules" class="view" hidden>
+        <div class="section-head"><div><span class="eyebrow">规则配置</span><h1>安排刷新时间与规模</h1></div><span id="draft-status" class="badge neutral">已与服务器同步</span></div>
+        <section class="card"><div class="card-heading"><h2>常用设置</h2><span class="hint">未改动的高级字段会完整保留</span></div>
+          <div class="form-grid" id="settings-form">
+            <label class="check-field"><input id="rule-enabled" type="checkbox" data-field="enabled">启用自动刷新</label>
+            <label>时区<input id="rule-timezone" data-field="timezone" placeholder="Asia/Shanghai"></label>
+            <label>近期活动回溯<input id="rule-lookback" data-field="activity.lookback" placeholder="30m"><small>整数 + s / m / h / d</small></label>
+            <label>每个用户范围的账号比例<input id="rule-ratio" type="number" min="0" step="0.1" data-field="activity.accounts_per_user"></label>
+            <label>普通刷新最多账号数<input id="rule-max" type="number" min="0" step="1" data-field="activity.max_accounts"></label>
+            <label>普通允许时段<input id="rule-hours" data-field="ordinary_rules.allowed_hours" placeholder="08:00-23:00, 00:00-01:00"><small>多个时段用逗号分隔；空列表不允许普通时段刷新</small></label>
+            <label class="check-field"><input id="rule-night" type="checkbox" data-field="ordinary_rules.allow_outside_hours_when_users_active">时段外有近期用户活动时允许普通刷新</label>
+            <label class="check-field"><input id="rule-catchup" type="checkbox" data-field="execution.catch_up">错过窗口后补发</label>
+            <label class="check-field"><input id="rule-five-enabled" type="checkbox" data-field="reset_rules.five_hour.enabled">5 小时窗口重置后唤醒</label>
+            <label class="check-field"><input id="rule-week-enabled" type="checkbox" data-field="reset_rules.weekly.enabled">周窗口重置后唤醒</label>
+            <label>5 小时随机延迟最小值<input id="rule-five-min" data-field="reset_rules.five_hour.random_delay.min" placeholder="0s"></label>
+            <label>5 小时随机延迟最大值<input id="rule-five-max" data-field="reset_rules.five_hour.random_delay.max" placeholder="10m"></label>
+            <label>周重置随机延迟最小值<input id="rule-week-min" data-field="reset_rules.weekly.random_delay.min" placeholder="0s"></label>
+            <label>周重置随机延迟最大值<input id="rule-week-max" data-field="reset_rules.weekly.random_delay.max" placeholder="10m"></label>
+            <label class="check-field"><input id="rule-week-users" type="checkbox" disabled data-fixed="true" data-field="reset_rules.weekly.bypass_activity_limit">周任务固定不受人数限制</label>
+            <label class="check-field"><input id="rule-week-hours" type="checkbox" disabled data-fixed="true" data-field="reset_rules.weekly.bypass_allowed_hours">周任务固定在普通时段外也执行</label>
+            <label>请求模型<input id="rule-model" data-field="execution.model" placeholder="填写对应账号可用的模型名"></label>
+            <label>请求内容<input id="rule-prompt" data-field="execution.prompt" placeholder="Reply OK."></label>
+          </div>
+        </section>
+        <section class="card"><div class="card-heading"><div><h2>每日时间规则</h2><p class="hint">为账号池设置最低就绪数；与重置任务合并执行。</p></div><button id="daily-add" class="quiet">添加每日规则</button></div><div id="daily-rules"></div></section>
+        <section class="card"><div class="card-heading"><div><h2>高级 JSON 编辑器</h2><p class="hint">支持完整规则及账号覆盖设置。JSON 修改后先应用到草稿，再保存到服务器。</p></div></div><label class="sr-only" for="config-json">完整规则 JSON</label><textarea id="config-json" class="code-editor" spellcheck="false" rows="15"></textarea><div class="toolbar"><button id="json-apply" class="quiet">将 JSON 应用到草稿</button><button id="json-format" class="quiet">格式化 JSON</button></div><p id="json-message" class="hint"></p></section>
+        <div class="save-bar"><p id="save-help">保存会写入服务器规则文件并立即应用。启用刷新后可能发送真实请求。</p><div class="toolbar"><button id="draft-restore" class="quiet">恢复服务器规则</button><button id="config-save" class="primary">保存并应用</button></div></div>
+      </section>
+      <section id="tab-capabilities" class="view" hidden><div class="section-head"><div><span class="eyebrow">CPA 接口</span><h1>宿主能力</h1></div></div><section class="card"><dl id="capabilities-list" class="details"></dl><p class="hint">能力由当前 CPA 实例及额度适配器报告。前台保护不可用时，额度检查与实际发送之间仍可能遇到前台请求竞争。</p></section></section>
+    </div>
+  </main>
+  <footer>Codex Window Refresh <span>本地窗口 · 随机延迟 · 合并执行</span></footer>
+</div>
+</body>
+</html>

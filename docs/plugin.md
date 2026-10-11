@@ -41,11 +41,13 @@ plugins:
 | GET `/v0/management/codex-window-refresh/summary` | 实际 enabled（宿主与业务开关同时开启）、独立 business_enabled/host_enabled、运行状态、状态版本、账号数、预约数、错误、实际并发能力和调度汇总 |
 | GET `/v0/management/codex-window-refresh/accounts` | 本地账号窗口、任务和证据；不含原始凭据 |
 | GET `/v0/management/codex-window-refresh/config` | 当前生效的规则配置 |
+| GET `/v0/management/codex-window-refresh/config-editor` | 磁盘策略与内容版本，用于并发编辑检查 |
+| POST `/v0/management/codex-window-refresh/config` | 严格验证并原子保存策略、热应用；内容版本冲突返回 409 |
 | GET `/v0/management/codex-window-refresh/capabilities` | 运行时已核对的宿主能力 |
 | POST `/v0/management/codex-window-refresh/reload` | 读取外部配置、验证后更新 |
 | POST `/v0/management/codex-window-refresh/recheck` | 通知协调器重新检查；不能绕过窗口、用户名额、时间段或送达抑制规则 |
 
-CPA 的 ResourceRoute 不做管理认证。因此菜单资源 `/v0/resource/plugins/codex-window-refresh/status` 只返回静态说明 HTML，绝不放账号、用户、配置、额度或运行状态，也不接受变更操作。JSON 管理响应采用 schema 6 原始响应语义；Body 按官方 RPC 的 `[]byte` 序列化传输。
+CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/codex-window-refresh/status` 与 `/panel.js`、`/panel.css` 只返回静态面板资产，HTML 不嵌入账号、配置、额度或运行状态。页面输入管理密钥后通过同源的已认证管理 API 查询与编辑，密钥仅保存在页面内存。资源使用限制同源脚本、样式与连接的 CSP。使用与保存行为详见 [网页面板](panel.md)。JSON 管理响应采用 schema 6 原始响应语义；Body 按官方 RPC 的 `[]byte` 序列化传输。
 
 `/summary` 的 `scheduler` 字段用于实测时解释为何尚未唤醒账号：包含汇总发布时间 `observed_at`、近期身份数量 `recent_users`、身份来源 `identity_source`、容量 `capacity`（目标、活跃、预约和缺口）、阻止发送的账号数量 `hold_counts`、额度未知账号数 `quota_unknown_accounts`、前台请求占用账号数 `foreground_busy_accounts` 和下一次账号清单检查时间 `next_inventory_at`。人数按宿主认证的 caller scope 去重；共用 scope 的多个自然人只计一个身份。指标只包含汇总，不返回活动身份、请求 ID 或原始请求。
 
