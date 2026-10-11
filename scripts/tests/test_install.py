@@ -354,6 +354,78 @@ class InstallIntegrationTests(unittest.TestCase):
             installer.uninstall(self.args, self.plan)
         self.assertEqual(self.plan['dropin'].read_text(), 'unowned')
 
+    def test_user_service_install_upgrade_and_uninstall_preserve_private_environment(self):
+        account = pwd.getpwuid(os.geteuid())
+        home = self.root / 'user-home'
+        home.mkdir()
+        replacement = pwd.struct_passwd((account.pw_name, account.pw_passwd, account.pw_uid,
+                                        account.pw_gid, account.pw_gecos, str(home), account.pw_shell))
+        service = {'name': 'fixture-cpa.service', 'scope': 'user', 'manager_user': account.pw_name,
+                   'User': account.pw_name, 'unit_dir': str(home / '.config/systemd/user'),
+                   'WorkingDirectory': str(self.cpa), 'ExecStart': str(self.cpa / 'cli-proxy-api')}
+        self.plan['service'] = service
+        self.plan['dropin'] = home / '.config/systemd/user/fixture-cpa.service.d/60-window-refresh.conf'
+        # Force a separate user copy even when the test runner itself is root.
+        self.plan['service_env'] = self.plan['dropin'].parent / '60-window-refresh.env'
+        self.args.restart = True
+        with mock.patch.object(installer.pwd, 'getpwuid', return_value=replacement), \
+                mock.patch.object(installer, 'service_run', return_value='active') as calls:
+            self.install()
+        calls.assert_has_calls([mock.call(service, 'daemon-reload'), mock.call(service, 'restart', service['name']),
+                                mock.call(service, 'is-active', service['name'])])
+        env = self.plan['service_env']
+        self.assertEqual(env.read_bytes(), self.plan['env'].read_bytes())
+        self.assertEqual(env.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(env.stat().st_uid, os.geteuid())
+        self.assertIn(str(env), self.plan['dropin'].read_text())
+        self.assertEqual(json.loads((self.plan['record'] / 'installed.json').read_text())['service_scope'], 'user')
+        self.key.write_text('fixture-updated-management-secret\n')
+        self.plan['text'] = self.config.read_text()
+        self.plan['plugins'] = yaml.safe_load(self.plan['text'])['plugins']
+        with mock.patch.object(installer.pwd, 'getpwuid', return_value=replacement), \
+                mock.patch.object(installer, 'service_run', return_value='active'):
+            self.install()
+        self.assertEqual(env.read_bytes(), self.plan['env'].read_bytes())
+        self.plan['text'] = self.config.read_text()
+        self.plan['plugins'] = yaml.safe_load(self.plan['text'])['plugins']
+        self.args.uninstall = True
+        with mock.patch.object(installer, 'service_run', return_value='active'), contextlib.redirect_stdout(io.StringIO()):
+            installer.uninstall(self.args, self.plan)
+        self.assertFalse(self.plan['dropin'].exists())
+        self.assertTrue(env.exists())
+        self.assertTrue(self.plan['policy'].exists())
+
+    def test_user_service_reload_failure_rolls_back_private_copy_and_override(self):
+        account = pwd.getpwuid(os.geteuid())
+        home = self.root / 'user-home'
+        home.mkdir()
+        replacement = pwd.struct_passwd((account.pw_name, account.pw_passwd, account.pw_uid,
+                                        account.pw_gid, account.pw_gecos, str(home), account.pw_shell))
+        self.plan['service'] = {'name': 'fixture-cpa.service', 'scope': 'user', 'manager_user': account.pw_name}
+        self.plan['dropin'] = home / '.config/systemd/user/fixture-cpa.service.d/60-window-refresh.conf'
+        self.plan['service_env'] = self.plan['dropin'].parent / '60-window-refresh.env'
+        with mock.patch.object(installer.pwd, 'getpwuid', return_value=replacement), \
+                mock.patch.object(installer, 'service_run', side_effect=installer.InstallError('fixture-reload-failure')):
+            with self.assertRaises(installer.InstallError): self.install()
+        self.assertEqual(self.config.read_text(), self.original)
+        self.assertFalse(self.plan['dropin'].exists())
+        self.assertFalse(self.plan['service_env'].exists())
+        self.assertFalse(self.plan['env'].exists())
+
+    def test_explicit_user_service_infers_user_unit_directory_and_private_environment(self):
+        home = self.root / 'user-home'
+        service = {'name': 'fixture-cpa.service', 'scope': 'user', 'manager_user': self.args.user,
+                   'User': self.args.user, 'unit_dir': str(home / '.config/systemd/user'),
+                   'WorkingDirectory': str(self.cpa), 'ExecStart': str(self.cpa / 'cli-proxy-api')}
+        self.args.user_service = True
+        self.args.service = 'fixture-cpa.service'
+        with mock.patch.object(installer, 'service_info', return_value=service) as read:
+            plan = installer.infer(self.args)
+        read.assert_called_once_with(self.args.service, self.args.user)
+        self.assertEqual(plan['dropin'], home / '.config/systemd/user/fixture-cpa.service.d/60-window-refresh.conf')
+        self.assertEqual(plan['service_env'], plan['env'] if os.geteuid() == 0 else plan['dropin'].parent / '60-window-refresh.env')
+        self.assertFalse(plan['service_auto'])
+
     def test_live_config_change_is_not_overwritten(self):
         self.config.write_text(self.original + 'routing: {strategy: fill-first}\n')
         with self.assertRaises(installer.InstallError):

@@ -16,6 +16,7 @@ import pathlib
 import platform
 import pwd
 import re
+import shlex
 import shutil
 import socket
 import ssl
@@ -185,16 +186,54 @@ def cli_config(args, cwd):
     return None
 
 
-def service_info(name):
+def service_command(service, *args):
+    if service.get("scope", "system") != "user":
+        return ("systemctl", *args)
+    user = pwd.getpwnam(service["manager_user"])
+    runtime = safe_path(pathlib.Path("/run/user") / str(user.pw_uid))
+    require(runtime.is_dir(), "用户 systemd 运行目录不存在；请先启动该用户的服务管理器。")
+    info = runtime.stat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == user.pw_uid,
+            "用户 systemd 运行目录不存在或拥有者不匹配；请先启动该用户的服务管理器。")
+    bus = runtime / "bus"
+    require(bus.exists(), "用户 systemd 会话总线未运行；请先启动该用户的服务管理器。")
+    info = bus.lstat()
+    require(stat.S_ISSOCK(info.st_mode) and info.st_uid == user.pw_uid,
+            "用户 systemd 会话总线未运行或拥有者不匹配。")
+    return ("runuser", "-u", user.pw_name, "--", "env",
+            "-u", "DBUS_SYSTEM_BUS_ADDRESS", "XDG_RUNTIME_DIR=" + str(runtime),
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=" + str(bus), "systemctl", "--user", *args)
+
+
+def service_run(service, *args):
+    return run(*service_command(service, *args))
+
+
+def service_info(name, manager_user=None):
     if not name:
         return None
     require(re.fullmatch(r"[A-Za-z0-9_.@-]+(?:\.service)?", name) and not name.startswith("-"),
             "无效的 systemd 服务名称。")
     name = name if name.endswith(".service") else name + ".service"
-    raw = run("systemctl", "show", name, "--property=LoadState,User,Group,WorkingDirectory,ExecStart,MainPID")
-    info = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+    info = {"scope": "user" if manager_user is not None else "system"}
+    if manager_user is not None:
+        info["manager_user"] = manager_user
+    raw = service_run(info, "show", name, "--property=LoadState,User,Group,WorkingDirectory,ExecStart,MainPID")
+    info.update(dict(line.split("=", 1) for line in raw.splitlines() if "=" in line))
     require(info.get("LoadState") == "loaded", "指定的 systemd 服务不存在或尚未加载。")
     info["name"] = name
+    if manager_user is not None:
+        user = pwd.getpwnam(manager_user)
+        require(not info.get("User") or info["User"] in {user.pw_name, str(user.pw_uid)},
+                "用户服务的运行用户与所属用户不一致。")
+        info["User"] = user.pw_name
+        paths = service_run(info, "show", "--property=UnitPath")
+        paths = next((line.removeprefix("UnitPath=") for line in paths.splitlines() if line.startswith("UnitPath=")), "")
+        home = safe_path(user.pw_dir)
+        candidates = [safe_path(path) for path in paths.split() if path.endswith("/systemd/user")
+                      and pathlib.Path(path).is_absolute() and pathlib.Path(path).is_relative_to(home)]
+        require(candidates, "无法核实用户服务配置目录；请检查用户 systemd UnitPath。")
+        info["unit_dir"] = str(candidates[0])
     return info
 
 
@@ -207,18 +246,29 @@ def detect_service(process, binary):
         names = set()
         for line in groups.splitlines():
             parts = line.split(":", 2)
-            if len(parts) != 3 or not parts[2].startswith("/system.slice/"):
+            if len(parts) != 3:
                 continue
-            for part in parts[2].split("/"):
+            path = parts[2]
+            if path.startswith("/system.slice/"):
+                service_parts = path.split("/")
+                manager_user = None
+            else:
+                match = re.fullmatch(r"/user\.slice/user-(\d+)\.slice/user@(\d+)\.service/(.+)", path)
+                if not match or match[1] != match[2] or int(match[1]) != process.get("uid"):
+                    continue
+                manager_user = pwd.getpwuid(int(match[1])).pw_name
+                service_parts = match[3].split("/")
+            for part in service_parts:
                 if re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", part) and not part.startswith("-"):
-                    names.add(part)
+                    names.add((part, manager_user))
         if len(names) != 1:
             return None
-        info = service_info(names.pop())
+        name, manager_user = names.pop()
+        info = service_info(name, manager_user) if manager_user is not None else service_info(name)
         if info.get("MainPID") != str(pid) or str(binary) not in info.get("ExecStart", ""):
             return None
         return info
-    except (OSError, InstallError):
+    except (OSError, KeyError, InstallError):
         # Missing systemd or an ambiguous supervisor leaves the original mode.
         return None
 
@@ -237,7 +287,11 @@ def infer(args):
     binary = binaries[0].resolve()
     processes = detect_processes(binary)
     require(len(processes) <= 1, "发现多个 CPA 实例，请分别安装到独立目录。")
-    service = service_info(args.service)
+    manager_user = None
+    if getattr(args, "user_service", False):
+        manager_user = args.user or (pwd.getpwuid(processes[0]["uid"]).pw_name if processes else None)
+        require(manager_user, "CPA 未运行时指定用户服务需要 --user 所属用户名。")
+    service = service_info(args.service, manager_user) if manager_user is not None else service_info(args.service)
     service_auto = False
     if service is None and processes:
         service = detect_service(processes[0], binary)
@@ -340,10 +394,12 @@ def infer(args):
     record = safe_path(directory / "window-refresh-install")
     dropin = None
     if service:
-        dropin = safe_path(pathlib.Path("/etc/systemd/system") / (service["name"] + ".d") / "60-window-refresh.conf")
+        unit_dir = pathlib.Path(service["unit_dir"]) if service.get("scope") == "user" else pathlib.Path("/etc/systemd/system")
+        dropin = safe_path(unit_dir / (service["name"] + ".d") / "60-window-refresh.conf")
+    service_env = dropin.parent / "60-window-refresh.env" if service and service.get("scope") == "user" and account.pw_uid != 0 else env
     return {"directory": directory, "binary": binary, "config": config, "text": text, "data": data,
             "plugins": plugins, "wrapper": wrapper, "plugin_dir": plugin_dir, "policy": policy,
-            "state": state, "env": env, "record": record, "dropin": dropin, "service": service, "service_auto": service_auto,
+            "state": state, "env": env, "service_env": service_env, "record": record, "dropin": dropin, "service": service, "service_auto": service_auto,
             "uid": account.pw_uid, "gid": gid, "user": user, "url": url, "env_name": env_name}
 
 
@@ -538,6 +594,20 @@ def directory(path, mode, uid, gid, strict=False):
     path.mkdir(parents=True, mode=mode)
     os.chown(path, uid, gid)
     path.chmod(mode)
+
+
+def user_service_directory(path, uid, gid):
+    path = safe_path(path)
+    home = safe_path(pwd.getpwuid(uid).pw_dir)
+    require(path.is_relative_to(home) and home.is_dir(), "用户服务配置目录须位于已存在的用户主目录中。")
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for current in reversed(missing):
+        directory(current, 0o700, uid, gid)
+    readable_by(path, uid, gid)
 
 
 def readable_by(path, uid, gid):
@@ -761,6 +831,11 @@ def install(args, plan, architecture):
         run(str(unpacked / "window-refresh"), "check", str(candidate))
         if not credentials_loaded:
             key, key_bytes = management_credentials(args, plan)
+        service_env = plan.get("service_env", plan["env"])
+        if service_env != plan["env"] and service_env.exists():
+            info = safe_path(service_env).stat()
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == plan["uid"] and info.st_mode & 0o077 == 0,
+                    "现有用户服务密钥文件须由 CPA 用户拥有，且权限为 0600。")
         plugins = copy.deepcopy(plan["plugins"])
         plugins["enabled"] = True
         plugins["dir"] = str(plan["plugin_dir"])
@@ -802,9 +877,16 @@ def install(args, plan, architecture):
             if key_bytes is not None:
                 transaction.write(plan["env"], key_bytes, 0o600)
             if plan["dropin"]:
-                directory(plan["dropin"].parent, 0o755, 0, 0)
-                body = f'# Managed by codex-window-refresh installer\n[Service]\nEnvironmentFile="{plan["env"]}"\n'
-                transaction.write(plan["dropin"], body.encode(), 0o644)
+                if plan["service"].get("scope") == "user":
+                    user_service_directory(plan["dropin"].parent, plan["uid"], plan["gid"])
+                    if service_env != plan["env"]:
+                        transaction.write(service_env, environment_content(key, plan["env_name"]), 0o600, plan["uid"], plan["gid"])
+                    owner, group = plan["uid"], plan["gid"]
+                else:
+                    directory(plan["dropin"].parent, 0o755, 0, 0)
+                    owner, group = 0, 0
+                body = f'# Managed by codex-window-refresh installer\n[Service]\nEnvironmentFile="{service_env}"\n'
+                transaction.write(plan["dropin"], body.encode(), 0o644, owner, group)
             info = plan["config"].stat()
             transaction.write(plan["config"], merged, stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
             hashes = {str(lib): hashlib.sha256(lib.read_bytes()).hexdigest(),
@@ -814,15 +896,17 @@ def install(args, plan, architecture):
             record = {"version": args.version, "config": str(plan["config"]), "library": str(lib),
                       "checker": str(checker), "dropin": str(plan["dropin"]) if plan["dropin"] else None,
                       "service": plan["service"]["name"] if plan["service"] else None,
+                      "service_scope": plan["service"].get("scope", "system") if plan["service"] else None,
+                      "service_env": str(service_env) if plan["service"] else None,
                       "backup": str(backup), "installed_hashes": hashes}
             transaction.write(plan["record"] / "installed.json", json.dumps(record, indent=2).encode(), 0o600)
             if plan["service"]:
-                run("systemctl", "daemon-reload")
+                service_run(plan["service"], "daemon-reload")
         except BaseException:
             transaction.rollback()
             if plan["service"]:
                 try:
-                    run("systemctl", "daemon-reload")
+                    service_run(plan["service"], "daemon-reload")
                 except InstallError:
                     pass
             raise
@@ -841,12 +925,13 @@ def finish(args, plan):
     print("需要重启 CPA 才能加载本次插件变更；重启后请刷新管理网页。")
     if plan["service"]:
         service = plan["service"]["name"]
-        if args.restart or (not args.yes and sys.stdin.isatty() and prompt(f"现在重启 CPA 服务 {service}？（会短暂中断正在处理的请求）", False)):
-            run("systemctl", "restart", service)
-            require(run("systemctl", "is-active", service) == "active", "CPA 重启后未处于 active 状态，请检查服务日志。")
+        kind = "用户级 " if plan["service"].get("scope") == "user" else ""
+        if args.restart or (not args.yes and sys.stdin.isatty() and prompt(f"现在重启 CPA 服务 {kind}{service}？（会短暂中断正在处理的请求）", False)):
+            service_run(plan["service"], "restart", service)
+            require(service_run(plan["service"], "is-active", service) == "active", "CPA 重启后未处于 active 状态，请检查服务日志。")
             print("CPA 服务已重启。请刷新管理网页，并通过管理认证检查插件 /summary 和 /capabilities。")
         else:
-            print(f"尚未重启服务；生效命令：systemctl restart {service}")
+            print("尚未重启服务；生效命令：" + shlex.join(service_command(plan["service"], "restart", service)))
     else:
         require(not args.restart, "--restart 仅支持明确指定或已核实识别的 systemd 服务。")
         if not args.yes and sys.stdin.isatty():
@@ -893,12 +978,12 @@ def uninstall(args, plan):
                 transaction.remove(path)
         transaction.remove(manifest)
         if plan["service"]:
-            run("systemctl", "daemon-reload")
+            service_run(plan["service"], "daemon-reload")
     except BaseException:
         transaction.rollback()
         if plan["service"]:
             try:
-                run("systemctl", "daemon-reload")
+                service_run(plan["service"], "daemon-reload")
             except InstallError:
                 pass
         raise
@@ -913,7 +998,8 @@ def main():
     parser.add_argument("--plugin-dir", help="插件目录；保留已有 plugins.dir")
     parser.add_argument("--working-dir", help="CPA 工作目录；运行中或 systemd 服务优先自动检测")
     parser.add_argument("--user", help="CPA 运行用户；优先检测运行进程或指定服务")
-    parser.add_argument("--service", help="实际 systemd 服务名；省略时只识别运行进程所属且 MainPID 匹配的系统服务")
+    parser.add_argument("--service", help="实际 systemd 服务名；省略时识别运行进程所属且 MainPID 匹配的系统或用户服务")
+    parser.add_argument("--user-service", action="store_true", help="显式指定 --service 为用户服务；所属用户用 --user 指定或从运行进程识别")
     parser.add_argument("--management-url", help="管理入口；默认检测端口并使用本机 HTTP")
     parser.add_argument("--model", help="首次安装指定 Codex 模型；省略时自动读取已启用 Codex 账号的共同模型")
     parser.add_argument("--version", default=DEFAULT_VERSION,
@@ -941,6 +1027,7 @@ def main():
             "离线安装须使用 --version 指定安装包的准确版本。")
     require(not args.check_model or not (args.dry_run or args.uninstall or args.restart),
             "--check-model 不能与 --dry-run、--uninstall 或 --restart 同时使用。")
+    require(not args.user_service or args.service, "--user-service 需要同时指定 --service。")
     plan = infer(args)
     require(not args.restart or plan["service"], "--restart 需要 --service，或能核实识别的 systemd 服务。")
     verify_elf(plan["binary"], architecture)
@@ -950,10 +1037,14 @@ def main():
           + ("" if args.uninstall or args.check_model else f" / {target}"))
     for key in ["binary", "config", "plugin_dir", "policy", "state", "env"]:
         print(f"{key}: {plan[key]}")
-    print(f"CPA 用户：{plan['user']}；systemd 服务：{plan['service']['name'] if plan['service'] else '未指定'}")
+    scope = "用户级" if plan["service"] and plan["service"].get("scope") == "user" else "系统级"
+    print(f"CPA 用户：{plan['user']}；systemd 服务：{plan['service']['name'] if plan['service'] else '未指定'}"
+          + (f"（{scope}）" if plan["service"] else ""))
     if plan.get("service_auto"):
-        print("已核实识别 CPA 所属系统服务；交互安装结束时将询问是否重启。")
-    print(f"管理入口：{plan['url']}；密钥将只保存到 root 拥有的 0600 环境文件。")
+        print("已核实识别 CPA 所属 systemd 服务；交互安装结束时将询问是否重启。")
+    print(f"管理入口：{plan['url']}；管理密钥保存到私有 0600 环境文件。")
+    if plan.get("service_env", plan["env"]) != plan["env"]:
+        print(f"用户服务环境文件：{plan['service_env']}（CPA 用户拥有，权限 0600）")
     if not args.check_model:
         print("安装时开启宿主 plugins.enabled；首次策略保持关闭。plugins 节的注释可能重新排版，原配置会备份。")
     if args.dry_run:

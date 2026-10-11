@@ -16,9 +16,17 @@ sudo python3 /tmp/codex-window-refresh-install.py --cpa-dir /root/cliproxyapi --
 sudo python3 /tmp/codex-window-refresh-install.py --cpa-dir /root/cliproxyapi
 ```
 
-脚本从运行中的 CPA 进程检测用户、工作目录和 `-config` 参数；同时尝试从进程的系统 cgroup 识别所属 systemd 服务，只有唯一服务且其 `MainPID` 与 CPA 进程匹配、启动程序包含 CPA 二进制时才采用。用户服务、容器、其他进程作为主进程的监督服务或无法核实的情况不自动采用。没有运行进程时须提供 `--user` 或 `--service`。存在自定义主配置时使用 `--config /absolute/path/config.yaml`。已有相对插件目录但进程停止时，使用 `--working-dir` 指明 CPA 工作目录。不能唯一确定的路径会停止，不猜测。
+脚本从运行中的 CPA 进程检测用户、工作目录和 `-config` 参数；同时从进程 cgroup 识别所属系统级或用户级 systemd 服务，只有唯一服务且其 `MainPID` 与 CPA 进程匹配、启动程序包含 CPA 二进制时才采用。用户服务还核对 cgroup 中的 UID 与进程用户，并通过该用户的会话总线查询，支持 root 的用户服务；不会把 `user@UID.service` 用户管理器当作 CPA 服务。容器、其他进程作为主进程的监督服务或无法核实的情况不自动采用。没有运行进程时须提供 `--user` 或 `--service`。存在自定义主配置时使用 `--config /absolute/path/config.yaml`。已有相对插件目录但进程停止时，使用 `--working-dir` 指明 CPA 工作目录。不能唯一确定的路径会停止，不猜测。
 
 systemd 部署可以省略 `--service` 使用已核实的自动识别结果；未识别到时，在预览与安装命令中均添加 `--service 实际服务名`。脚本核对服务程序与用户，并添加仅用于本插件的 `EnvironmentFile` override。首次交互安装先输入现有管理密钥，密钥输入不显示；随后自动识别 Codex 模型。安装完成询问 `现在重启 CPA 服务 …？ [y/N]`，默认稍后重启；确认后执行服务重启并检查 active 状态。未确认服务的直接运行模式也询问是否现在手动重启，选择现在时给出另一终端操作与环境变量提示，不代替用户停止或重建未知启动方式的进程。随后刷新 CPA 管理网页以显示插件菜单。
+
+明确指定用户服务时添加 `--user-service`，并用 `--user` 指定所属用户（运行中的 CPA 可自动检测）。例如 root 的用户服务：
+
+```sh
+sudo python3 /tmp/codex-window-refresh-install.py --cpa-dir /root/cliproxyapi --user-service --service 实际服务名 --user root
+```
+
+用户服务的 daemon-reload、restart、is-active 均以所属用户执行 `systemctl --user`，通过 `/run/user/UID/bus` 连接；该用户的服务管理器和会话总线须已运行。override 写入用户管理器报告的 `UnitPath` 中、位于其主目录下的首个持久配置目录（通常 `~/.config/systemd/user/服务名.service.d/`），不写入系统服务目录。非 root 用户服务另外需要用户拥有、权限 `0600` 的 `60-window-refresh.env`，放在该 override 目录内；root 的用户服务可读取原有 root 私有环境文件。用户目录缺失时仅在已有主目录下创建，拥有者保持为服务用户。原 CPA 目录中的 root 私有环境文件也保留，用于升级时复用管理密钥。卸载保留两处密钥文件，移除本插件的 override；写入或用户 daemon-reload 失败时回滚文件。用户主目录以外的自定义 UnitPath 不自动写入。
 
 `--yes` 跳过交互询问，默认不重启；需要安装后自动重启时使用 `--yes --restart`，前提是指定了 `--service` 或已核实识别服务。`--dry-run` 与 `--check-model` 不询问重启。先前未关联服务的安装可在升级时关联核实的服务并添加环境文件 override，保留策略及窗口状态；已关联服务不允许迁移到其他服务。服务 active 只确认进程运行，仍需检查插件加载日志和管理接口，不保证插件已成功注册。
 
@@ -36,7 +44,7 @@ sudo python3 /tmp/codex-window-refresh-install.py --cpa-dir /root/cliproxyapi --
 
 `--dry-run` 不查询版本或模型、不下载、不写入、不重启；默认只显示将在执行安装时解析最新版本。新策略默认关闭自动请求；安装会开启 CPA 主配置中的 `plugins.enabled`，因此其他已配置为启用的插件也会随宿主加载。其他插件配置保留，`plugins` 节的注释可能重新排版，原配置先备份。策略、窗口状态在升级时保留。
 
-首次非交互安装需提供 `--yes --key-file /root/管理密钥文件`，密钥文件由 root 拥有且权限为 `0600`；可自动识别模型，也可添加 `--model 可用模型`。自动识别失败会在写入安装文件前停止，补充 `--model` 后重试。不接受命令行中的原始密钥。生成的 `window-refresh.env` 同样由 root 拥有、权限 `0600`，按 systemd EnvironmentFile 语法保存，不能直接用 shell `source` 执行。请使用上述地址下载最新脚本；已发布 rc.2 包内的旧脚本仍需手动填写模型。
+首次非交互安装需提供 `--yes --key-file /root/管理密钥文件`，密钥文件由 root 拥有且权限为 `0600`；可自动识别模型，也可添加 `--model 可用模型`。自动识别失败会在写入安装文件前停止，补充 `--model` 后重试。不接受命令行中的原始密钥。生成的 `window-refresh.env` 同样由 root 拥有、权限 `0600`；非 root 用户服务另存一份用户私有副本。两者都按 systemd EnvironmentFile 语法保存，不能直接用 shell `source` 执行。请使用上述地址下载最新脚本；已发布 rc.2 包内的旧脚本仍需手动填写模型。
 
 升级时重新下载脚本并重复执行同一安装命令，默认更新到最新已发布版本；也可用 `--version vX.Y.Z-rc.N` 或 `--version vX.Y.Z` 固定版本，不覆盖旧策略、状态。新安装包内附脚本也默认选择 latest。`--uninstall` 不查询版本，仅卸载本脚本安装的插件与本插件 override，保留策略、状态、密钥环境文件和备份；也需使用原来的服务与路径参数。备份位于 CPA 目录的 `window-refresh-install/`，权限 `0700`，每次操作的 `index.json` 记录原路径、权限和拥有者。文件写入失败会恢复已替换的文件；服务启动失败时保留备份和安装结果供排查，不声称已成功加载。
 

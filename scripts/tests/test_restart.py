@@ -3,6 +3,9 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import pwd
+import stat
+import types
 import unittest
 from unittest import mock
 
@@ -14,6 +17,81 @@ SPEC.loader.exec_module(installer)
 
 
 class RestartTests(unittest.TestCase):
+    def test_user_service_detection_checks_cgroup_owner_and_ignores_user_manager_unit(self):
+        binary = pathlib.Path('/fixture/cli-proxy-api')
+        process = {'pid': 123, 'uid': 1000}
+        valid = {'MainPID': '123', 'ExecStart': str(binary), 'name': 'fixture-cpa.service', 'scope': 'user'}
+        group = '0::/user.slice/user-1000.slice/user@1000.service/app.slice/fixture-cpa.service'
+        with mock.patch.object(pathlib.Path, 'read_text', return_value=group), \
+                mock.patch.object(installer.pwd, 'getpwuid', return_value=types.SimpleNamespace(pw_name='fixture-user')), \
+                mock.patch.object(installer, 'service_info', return_value=valid) as read:
+            self.assertEqual(installer.detect_service(process, binary), valid)
+        read.assert_called_once_with('fixture-cpa.service', 'fixture-user')
+        for group in ['0::/user.slice/user-1001.slice/user@1001.service/app.slice/fixture-cpa.service',
+                      '0::/user.slice/user-1000.slice/user@1001.service/app.slice/fixture-cpa.service',
+                      '0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope',
+                      '0::/user.slice/user-1000.slice/user@1000.service/app.slice/a.service/b.service']:
+            with mock.patch.object(pathlib.Path, 'read_text', return_value=group), \
+                    mock.patch.object(installer.pwd, 'getpwuid', return_value=types.SimpleNamespace(pw_name='fixture-user')), \
+                    mock.patch.object(installer, 'service_info') as read:
+                self.assertIsNone(installer.detect_service(process, binary))
+            read.assert_not_called()
+
+    def test_user_service_command_uses_own_bus_and_never_system_manager(self):
+        account = types.SimpleNamespace(pw_uid=1000, pw_name='fixture-user')
+        directory = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1000)
+        bus = types.SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600, st_uid=1000)
+        service = {'scope': 'user', 'manager_user': 'fixture-user'}
+        with mock.patch.object(installer.pwd, 'getpwnam', return_value=account), \
+                mock.patch.object(installer, 'safe_path', side_effect=pathlib.Path), \
+                mock.patch.object(pathlib.Path, 'stat', return_value=directory), \
+                mock.patch.object(pathlib.Path, 'lstat', return_value=bus), \
+                mock.patch.object(installer, 'run', return_value='active') as run:
+            installer.service_run(service, 'restart', 'fixture-cpa.service')
+        command = run.call_args.args
+        self.assertEqual(command[:5], ('runuser', '-u', 'fixture-user', '--', 'env'))
+        self.assertIn('XDG_RUNTIME_DIR=/run/user/1000', command)
+        self.assertIn('DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus', command)
+        self.assertEqual(command[-4:], ('systemctl', '--user', 'restart', 'fixture-cpa.service'))
+        for invalid in [types.SimpleNamespace(st_mode=stat.S_IFSOCK, st_uid=1001),
+                        types.SimpleNamespace(st_mode=stat.S_IFLNK, st_uid=1000),
+                        types.SimpleNamespace(st_mode=stat.S_IFREG, st_uid=1000)]:
+            with mock.patch.object(installer.pwd, 'getpwnam', return_value=account), \
+                    mock.patch.object(installer, 'safe_path', side_effect=pathlib.Path), \
+                    mock.patch.object(pathlib.Path, 'stat', return_value=directory), \
+                    mock.patch.object(pathlib.Path, 'lstat', return_value=invalid), \
+                    mock.patch.object(installer, 'run') as run:
+                with self.assertRaises(installer.InstallError): installer.service_run(service, 'daemon-reload')
+            run.assert_not_called()
+
+    def test_user_service_info_reads_manager_unit_path_and_fills_effective_user(self):
+        account = types.SimpleNamespace(pw_uid=1000, pw_name='fixture-user', pw_dir='/fixture/home')
+        properties = 'LoadState=loaded\nUser=\nMainPID=123\nExecStart=/fixture/cli-proxy-api\n'
+        for paths in ['UnitPath=/fixture/home/.config/systemd/user /etc/systemd/user',
+                      'UnitPath=/fixture/home/custom-config/systemd/user /fixture/home/.local/share/systemd/user']:
+            with mock.patch.object(installer.pwd, 'getpwnam', return_value=account), \
+                    mock.patch.object(installer, 'service_run', side_effect=[properties, paths]):
+                info = installer.service_info('fixture-cpa', 'fixture-user')
+            self.assertEqual(info['User'], 'fixture-user')
+            self.assertEqual(info['scope'], 'user')
+            self.assertEqual(info['manager_user'], 'fixture-user')
+            self.assertEqual(info['unit_dir'], paths.split('=', 1)[1].split()[0])
+        with mock.patch.object(installer.pwd, 'getpwnam', return_value=account), \
+                mock.patch.object(installer, 'service_run', side_effect=[properties, 'UnitPath=/etc/systemd/user /usr/lib/systemd/user']):
+            with self.assertRaises(installer.InstallError): installer.service_info('fixture-cpa', 'fixture-user')
+
+    def test_user_service_restart_prompt_controls_only_user_manager(self):
+        args = argparse.Namespace(yes=False, restart=False, uninstall=False)
+        service = {'name': 'fixture-cpa.service', 'scope': 'user', 'manager_user': 'fixture-user'}
+        with mock.patch.object(installer.sys.stdin, 'isatty', return_value=True), \
+                mock.patch('builtins.input', return_value='yes') as ask, \
+                mock.patch.object(installer, 'service_run', return_value='active') as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            installer.finish(args, {'service': service})
+        self.assertIn('用户级', ask.call_args.args[0])
+        self.assertEqual(run.call_args_list, [mock.call(service, 'restart', 'fixture-cpa.service'),
+                                             mock.call(service, 'is-active', 'fixture-cpa.service')])
+
     def test_system_service_detection_requires_unique_system_cgroup_and_main_pid(self):
         binary = pathlib.Path('/fixture/cli-proxy-api')
         process = {'pid': 123}
