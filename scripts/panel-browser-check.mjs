@@ -126,6 +126,9 @@ try {
   catch (error) { console.error(await evaluate('document.getElementById("notice").textContent'), errors, caughtExceptions); throw error; }
   assert.equal(posts.length, 0, 'Read-only login must not dispatch operations');
   assert.equal(await evaluate('localStorage.length'), 0, 'Manual login persisted the key');
+  assert.equal(await evaluate('document.getElementById("mode-title").textContent'), '仅查看与查询额度', 'Applied mode did not explain model behavior');
+  assert.equal(await evaluate('document.getElementById("query-automatic").closest(".view").id'), 'tab-query', 'Query controls are mixed with wake rules');
+  assert.equal(await evaluate('document.getElementById("save-bar").hidden'), true, 'Clean draft displayed a pending save bar');
   // Seed only the mock host's saved credentials; exercise the real startup path.
   for (const legacy of [false, true]) {
     for (const encoded of [false, true]) {
@@ -159,11 +162,16 @@ try {
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), 'Accounts did not render');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'), 0, 'Account IDs must render as text');
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("正常请求响应")'), true, 'Quota source was not displayed');
+  assert.equal(await evaluate('Array.from(document.querySelectorAll(".account-disclosure")).every(item=>!item.open)'),true,'Account diagnostics were not collapsed');
+  await evaluate('document.querySelector(".account-disclosure").open=true');
+  await waitFor(()=>evaluate('document.querySelector(".account-disclosure").open'),'Account details did not open');
   accounts['fixture-account'].FiveHour.Remaining.Value = 72;
   const pollStarted = Date.now();
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("72%")'), 'Passive quota did not appear on automatic panel polling');
   assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
+  assert.equal(await evaluate('document.querySelector(".account-disclosure").open'),true,'Polling collapsed open account diagnostics');
   assert.equal(posts.length, 0, 'Snapshot polling dispatched operations');
+  await evaluate('document.querySelector(".account-disclosure").open=false; document.querySelector("[data-tab=overview]").click()');
   await waitFor(() => evaluate('!document.getElementById("quota-query").disabled'), 'Manual query was not enabled');
   await evaluate('document.getElementById("quota-query").click()');
   await waitFor(() => evaluate('document.getElementById("quota-query-status").textContent.includes("查询结束")'), 'Manual query progress did not display');
@@ -171,6 +179,13 @@ try {
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("71%") && document.getElementById("account-list").textContent.includes("主动查询")'),true,'Manual quota did not update panel');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 960, deviceScaleFactor: 1, mobile: false });
   let capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp, 'panel-overview-desktop.png'), Buffer.from(capture.data, 'base64'));
+  await evaluate('document.querySelector("[data-open-tab=query]").click()');
+  assert.equal(await evaluate('!document.getElementById("tab-query").hidden'),true,'Query shortcut failed');
+  await evaluate('document.getElementById("nav-query").dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowRight",bubbles:true}))');
+  assert.equal(await evaluate('document.activeElement.id'), 'nav-rules', 'Keyboard tab navigation failed');
+  await evaluate('document.querySelector("[data-tab=accounts]").click()');
+  capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp, 'panel-desktop.png'), Buffer.from(capture.data, 'base64'));
   await evaluate(`{ document.querySelector('[data-tab="rules"]').click(); const ratio=document.getElementById('rule-ratio'); ratio.value='1.5'; ratio.dispatchEvent(new Event('input',{bubbles:true})); ratio.dispatchEvent(new Event('change',{bubbles:true})); }`);
   await evaluate(`document.getElementById('config-save').click()`);
@@ -183,6 +198,9 @@ try {
   await waitFor(() => posts.filter(p => p.path === 'config').length === 2, 'Conflict save was not sent');
   await waitFor(() => evaluate('document.getElementById("notice").textContent.includes("其他操作修改") || document.getElementById("notice").textContent.includes("冲突")'), 'Conflict did not display');
   assert.equal(await evaluate('document.getElementById("rule-ratio").value'), '2', 'Conflict discarded draft');
+  await evaluate('document.querySelector("[data-tab=query]").click()');
+  assert.equal(await evaluate('document.getElementById("save-bar").hidden'),false,'Cross-tab edits lost the shared save bar');
+  assert.equal(await evaluate('document.getElementById("rule-ratio").value'),'2','Navigation discarded wake draft');
   conflict = false;
   await evaluate(`{document.getElementById('query-automatic').checked=false; document.getElementById('query-automatic').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('query-manual').checked=false; document.getElementById('query-manual').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click();}`);
   await waitFor(()=>config.quota_query.automatic===false && config.quota_query.manual===false,'Query switches did not persist');
@@ -190,8 +208,22 @@ try {
   assert.equal(config.enabled,false,'Changing query settings enabled model wake');
   assert.equal(config.execution.model,'fixture-model','Query settings changed execution model');
   assert.ok(posts.every(p=>['config','quota-query'].includes(p.path)),'Query controls called a model/scheduler operation');
+  await waitFor(()=>evaluate('document.getElementById("save-bar").hidden'),'Successful save did not clear pending changes');
+  capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp,'panel-query-desktop.png'),Buffer.from(capture.data,'base64'));
+  await evaluate('document.querySelector("[data-tab=rules]").click()');
+  capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp,'panel-rules-desktop.png'),Buffer.from(capture.data,'base64'));
   await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
-  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Mobile viewport has horizontal overflow');
+  for (const tab of ['overview','accounts','query','rules','capabilities']) {
+    await evaluate(`document.querySelector('[data-tab="${tab}"]').click()`);
+    assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Mobile viewport has horizontal overflow: '+tab);
+    capture = await cdp('Page.captureScreenshot');
+    await writeFile(join(temp,`panel-${tab}-mobile.png`),Buffer.from(capture.data,'base64'));
+  }
+  await evaluate('document.querySelector("[data-tab=capabilities]").click(); document.getElementById("advanced-editor").open=true');
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'),'Expanded mobile JSON editor overflowed');
+  await evaluate('document.querySelector("[data-tab=accounts]").click()');
   capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp, 'panel-mobile.png'), Buffer.from(capture.data, 'base64'));
   unauthorized = true;
@@ -209,7 +241,7 @@ try {
   await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
   await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Manual fallback did not connect');
   assert.deepEqual(errors, [], 'Browser or fixture errors');
-  console.log(`Browser smoke passed: CPA login, quota sources/5-second polling, manual quota query, independent saved query switches, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
+  console.log(`Browser smoke passed: CPA login, query/wake separation, mode summary, shared drafts/save bar, persistent account disclosures, keyboard tabs, quota sources/polling, manual query, five mobile views, JSON editor, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }

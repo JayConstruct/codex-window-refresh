@@ -179,6 +179,7 @@
   if (!root.document) return;
   const document = root.document, $ = id => document.getElementById(id);
   const editor = createEditor();
+  const expandedAccounts = new Set();
   let summary = null, runningConfig = null, accounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
   const session = createSession(root.fetch.bind(root), clearView, undefined, apiBase(root.location));
   function el(tag, text, className) {
@@ -192,6 +193,7 @@
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null; pollBusy = false; actionBusy = false;
     summary = null; runningConfig = null; accounts = {}; capabilities = {}; editor.clear(); diskMatchesRunning = true;
+    expandedAccounts.clear();
     $('workspace').hidden = true; $('login-section').hidden = false; $('management-key').value = ''; $('config-json').value = '';
     $('connection-status').textContent = '未连接'; $('connection-status').className = 'badge neutral'; $('disconnect').disabled = true;
     for (const id of ['metrics', 'schedule-info', 'hold-counts', 'account-list', 'daily-rules', 'capabilities-list']) $(id).replaceChildren();
@@ -199,6 +201,7 @@
     $('account-search').value = ''; $('account-filter').value = 'all'; $('last-error').textContent = ''; $('updated-at').textContent = ''; $('json-message').textContent = '';
     for (const id of ['refresh', 'connect', 'recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = false;
     $('quota-query').disabled = true; $('quota-query-status').textContent = '';
+    $('save-bar').hidden = true; $('mode-title').textContent = '正在读取运行模式'; $('mode-description').textContent = ''; $('mode-badge').textContent = '';
     $('config-save').disabled = true; $('account-count').textContent = '';
     $('draft-status').textContent = '已与服务器同步'; $('draft-status').className = 'badge neutral'; notice('');
   }
@@ -235,15 +238,17 @@
   function renderOverview() {
     if (!summary) return;
     const s = summary.scheduler || {}, cap = s.capacity || {}, cfg = runningConfig;
-    const cards = [
-      ['模型唤醒', summary.running ? (summary.enabled ? '已启用' : '已关闭') : '未运行', '宿主 ' + (summary.host_enabled ? '已启用' : '未启用') + ' · 额度采集独立运行'],
-      ['近期用户范围', s.recent_users ?? '未知', '去重 caller_scope · ' + (cfg?.activity?.lookback || '回溯时间未知')],
-      ['普通目标 / 已就绪', (cap.target ?? '—') + ' / ' + (cap.active ?? '—'), '人数目标 ' + (cap.user_target ?? '—') + ' · 预留 ' + (cap.reserved ?? '—') + ' · 缺口 ' + (cap.missing ?? '—')],
-      ['账号池', summary.accounts ?? '未知', '额度未知 ' + (s.quota_unknown_accounts ?? '—') + ' · 前台忙碌 ' + (s.foreground_busy_accounts ?? '—')]
-    ];
+    const pool = Object.values(accounts || {});
+    const known = pool.filter(a => Number.isFinite(a.FiveHour?.Remaining?.Value) && Number.isFinite(a.Weekly?.Remaining?.Value)).length;
+    const active = pool.filter(a => a.FiveHour?.State === 'active' && (resetTime(a.FiveHour.ResetAt) || 0) > Date.now()).length;
+    const cards = [['账号总数', summary.accounts ?? pool.length, 'CPA 中发现的 Codex 账号'], ['有额度数据', known, '5 小时与周额度都有数值'], ['5 小时窗口内', active, '窗口尚未到重置时间'], ['额度待确认', s.quota_unknown_accounts ?? '—', '窗口或请求权限仍未知']];
+    $('mode-banner').classList.toggle('wake-enabled', summary.enabled === true);
+    $('mode-title').textContent = !summary.running ? '后台未运行' : summary.enabled ? '模型唤醒已开启' : '仅查看与查询额度';
+    $('mode-description').textContent = !summary.running ? '当前显示已保存的数据；请在“诊断与高级”检查后台状态。' : summary.enabled ? '后台会按已保存的规则发送模型请求。额度查询由独立开关控制。' : '不会创建新的模型唤醒请求。用户响应被动更新，额度接口按查询设置运行。';
+    $('mode-badge').textContent = '已应用配置';
     $('metrics').replaceChildren();
     for (const [label, value, hint] of cards) { const card = el('div', undefined, 'metric'); card.append(el('div', label, 'metric-label'), el('div', value, 'metric-value'), el('div', hint, 'metric-detail')); $('metrics').append(card); }
-    details($('schedule-info'), [['规则时区', cfg?.timezone], ['普通允许时段', Array.isArray(cfg?.ordinary_rules?.allowed_hours) ? cfg.ordinary_rules.allowed_hours.join('、') || '无' : '未知'], ['时段外活动例外', cfg?.ordinary_rules?.allow_outside_hours_when_users_active ? '近期有用户活动时允许' : '关闭'], ['周任务限制', cfg ? (cfg.reset_rules?.weekly?.bypass_activity_limit ? '不受人数限制' : '受人数限制') + ' · ' + (cfg.reset_rules?.weekly?.bypass_allowed_hours ? '可在夜间执行' : '按普通时段') : '未知'], ['有效并发', summary.effective_concurrency], ['下一次账号清单检查', date(s.next_inventory_at)], ['服务器快照时间', date(s.observed_at)]]);
+    details($('schedule-info'), [['近期用户范围', s.recent_users ?? '未知'], ['普通目标 / 已就绪', (cap.target ?? '—') + ' / ' + (cap.active ?? '—')], ['预留 / 缺口', (cap.reserved ?? '—') + ' / ' + (cap.missing ?? '—')], ['规则时区', cfg?.timezone], ['普通允许时段', Array.isArray(cfg?.ordinary_rules?.allowed_hours) ? cfg.ordinary_rules.allowed_hours.join('、') || '无' : '未知'], ['周任务限制', cfg ? '不受人数与普通时段限制' : '未知'], ['有效并发', summary.effective_concurrency], ['下一次账号清单检查', date(s.next_inventory_at)], ['后台快照时间', date(s.observed_at)]]);
     $('hold-counts').replaceChildren();
     const counts = Object.entries(s.hold_counts || {}).sort((a, b) => b[1] - a[1]);
     if (!counts.length) $('hold-counts').append(el('p', '当前没有报告的阻塞原因。', 'hint'));
@@ -255,9 +260,13 @@
     const query = runningConfig?.quota_query || {}, job = summary?.scheduler?.quota_query || {};
     const running = job.phase === 'queued' || job.phase === 'running';
     const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
-    const progress = job.phase ? (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + ' · 失败 ' + (job.failed || 0) + ' · 跳过 ' + (job.skipped || 0) + ' / 总计 ' + (job.total || 0) : '尚未手动查询';
-    $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · ' + progress;
-    $('quota-query').disabled = !session.connected() || actionBusy || !summary?.running || query.manual !== true || capabilities.QuotaAdapterReady !== true || running;
+    const progress = job.phase ? (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' : '尚未执行手动查询';
+    let reason = '';
+    if (!summary?.running) reason = '后台未运行';
+    else if (capabilities.QuotaAdapterReady !== true) reason = '额度查询接口未就绪，请查看诊断';
+    else if (query.manual !== true) reason = '手动查询已关闭，可在“额度查询”中开启';
+    $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · ' + (reason || progress);
+    $('quota-query').disabled = !session.connected() || actionBusy || !!reason || running;
   }
   function renderCapabilities() {
     const labels = {StableAccountIdentity: '稳定账号身份', ExactAccountExecution: '指定账号发送', QuotaAdapterReady: '额度适配器就绪', ActivityIdentityAtStart: '请求开始时识别用户范围', ActivityIdentityAtCompletion: '请求完成时识别用户范围', ForegroundGuard: '前台请求与调度互斥保护'};
@@ -270,7 +279,12 @@
     const remaining = evidence.Remaining;
     const text = remaining && Number.isFinite(remaining.Value) ? (Math.round(remaining.Value * 100) / 100) + (remaining.Unit === 'percent' ? '%' : ' ' + (remaining.Unit || '单位未知')) : '未知';
     const source = {cpa_response_headers: '正常请求响应', cpa_websocket_quota: 'WebSocket 请求响应', cpa_wham_usage: '主动查询', cpa_execution_quota: '模块唤醒响应'}[evidence.Source] || '额度观测';
-    cell.append(el('div', text, 'remaining'), el('div', source + ' · 确认于 ' + date(evidence.ConfirmedAt), 'window-time'), el('div', '重置 ' + date(evidence.ResetAt), 'window-time'));
+    cell.append(el('div', text, 'remaining'), el('div', '剩余额度', 'window-label'));
+    if (remaining && remaining.Unit === 'percent' && Number.isFinite(remaining.Value)) {
+      const meter = el('progress'); meter.max = 100; meter.value = Math.max(0, Math.min(100, remaining.Value)); meter.setAttribute('aria-label', title + '剩余 ' + text); cell.append(meter);
+    }
+    const kind = evidence.Source === 'cpa_execution_quota' ? 'wake' : evidence.Source === 'cpa_wham_usage' ? 'query' : 'passive';
+    cell.append(el('div', source, 'quota-source ' + kind), el('div', '观测 ' + date(evidence.ConfirmedAt), 'window-time'), el('div', '重置 ' + date(evidence.ResetAt), 'window-time'));
     const timer = el('div', countdown(evidence.ResetAt), 'countdown'); timer.dataset.reset = evidence.ResetAt || ''; cell.append(timer);
     return cell;
   }
@@ -293,27 +307,32 @@
     for (const [id, a] of visible) {
       const paused = cfg?.account_overrides && Object.hasOwn(cfg.account_overrides, id) && cfg.account_overrides[id]?.paused === true;
       const card = el('article', undefined, 'card account-card'), header = el('div', undefined, 'account-head'), name = el('div');
-      name.append(el('div', id, 'account-id'), el('div', '普通参与 ' + (a.OrdinaryParticipant ? '是' : '否') + ' · 周任务 ' + (a.WeeklyEnabled ? '启用' : '关闭'), 'account-meta'));
+      name.append(el('div', id, 'account-id'));
       const runningPaused = runningConfig?.account_overrides && Object.hasOwn(runningConfig.account_overrides, id) && runningConfig.account_overrides[id]?.paused === true;
       const pauseChanged = paused !== Boolean(runningPaused);
-      const accountStatus = pauseChanged ? (paused ? '草稿暂停' : '草稿恢复') : paused ? '已暂停' : a.Enabled ? '可用' : '已禁用';
+      const accountStatus = pauseChanged ? (paused ? '待保存：暂停唤醒' : '待保存：恢复唤醒') : paused ? '唤醒已暂停' : a.Enabled ? '账号已启用' : '账号已禁用';
       header.append(name, badge(accountStatus, paused || pauseChanged || !a.Enabled ? 'warning' : '')); card.append(header);
       const windows = el('div', undefined, 'window-grid'); windows.append(windowCell('5 小时额度', a.FiveHour), windowCell('周额度', a.Weekly)); card.append(windows);
-      const task = a.Task, taskInfo = el('dl', undefined, 'details task-info');
+      const task = a.Task, taskInfo = el('dl', undefined, 'details task-info'), disclosure = el('details', undefined, 'account-disclosure');
+      disclosure.open = expandedAccounts.has(id);
+      disclosure.addEventListener('toggle', () => { if (disclosure.isConnected) { if (disclosure.open) expandedAccounts.add(id); else expandedAccounts.delete(id); } });
+      disclosure.append(el('summary', '唤醒任务与诊断' + (task ? ' · ' + (states[task.State] || task.State) : ' · 无任务')));
       const pendingReasons = task?.Intents?.filter(i => i.Status === 'pending').map(i => (reasons[i.Reason] || i.Reason) + (i.RuleID ? ' / ' + i.RuleID : '')) || [];
       const due = task?.Intents?.filter(i => i.Status === 'pending').map(i => resetTime(i.RandomizedDueAt)).filter(t => t !== null) || [];
-      details(taskInfo, [['任务状态', task ? states[task.State] || task.State : '无任务'], ['合并原因', [...new Set(pendingReasons)].join('、') || '无'], ['阻塞原因', task?.HoldReason ? holds[task.HoldReason] || task.HoldReason : '无'], ['随机执行到期', due.length ? date(new Date(Math.min(...due)).toISOString()) : '无'], ['下一次检查', resetTime(task?.NextCheckAt) !== null ? date(task.NextCheckAt) : '未安排'], ['下一次窗口核实', resetTime(task?.NextVerificationAt) !== null ? date(task.NextVerificationAt) : '未安排'], ['失败退避到', resetTime(a.BackoffUntil) !== null ? date(a.BackoffUntil) : '无'], ['请求权限', a.Permission === 'allowed' ? '允许' : a.Permission === 'blocked' ? '额度阻止' : '未知']]); card.append(taskInfo);
+      details(taskInfo, [['任务状态', task ? states[task.State] || task.State : '无任务'], ['触发原因', [...new Set(pendingReasons)].join('、') || '无'], ['阻塞原因', task?.HoldReason ? holds[task.HoldReason] || task.HoldReason : '无'], ['随机延迟结束', due.length ? date(new Date(Math.min(...due)).toISOString()) : '无'], ['下一次检查', resetTime(task?.NextCheckAt) !== null ? date(task.NextCheckAt) : '未安排'], ['下一次窗口核实', resetTime(task?.NextVerificationAt) !== null ? date(task.NextVerificationAt) : '未安排'], ['失败退避到', resetTime(a.BackoffUntil) !== null ? date(a.BackoffUntil) : '无'], ['请求权限', a.Permission === 'allowed' ? '允许' : a.Permission === 'blocked' ? '额度阻止' : '未知'], ['普通唤醒参与', a.OrdinaryParticipant ? '是' : '否'], ['周任务参与', a.WeeklyEnabled ? '是' : '否']]); disclosure.append(taskInfo);
       const footer = el('div', undefined, 'account-footer'); footer.append(el('span', '最近真实请求 ' + date(a.LastRealRequestAt), 'hint'));
-      const pause = el('button', paused ? '在草稿中恢复' : '在草稿中暂停', 'quiet'); pause.type = 'button'; pause.disabled = actionBusy || editor.rawDirty();
+      const pause = el('button', paused ? '恢复唤醒（草稿）' : '暂停唤醒（草稿）', 'quiet'); pause.type = 'button'; pause.disabled = actionBusy || editor.rawDirty();
       pause.addEventListener('click', () => { try { editor.pause(id, !paused); draftChanged(); renderAccounts(); notice('已更新账号规则草稿；保存并应用后生效。'); } catch (error) { report(error); } });
-      footer.append(pause); card.append(footer); $('account-list').append(card);
+      footer.append(pause); disclosure.append(footer); card.append(disclosure); $('account-list').append(card);
     }
   }
   function updateDraftBadge() {
     const dirty = editor.dirty();
     $('draft-status').textContent = dirty ? '有未保存的草稿' : '已与服务器同步'; $('draft-status').className = 'badge' + (dirty ? ' warning' : ' neutral');
+    $('save-bar').hidden = !dirty && diskMatchesRunning && !actionBusy;
     $('config-save').disabled = actionBusy || (!dirty && diskMatchesRunning) || editor.rawDirty();
     $('save-help').textContent = !diskMatchesRunning ? '服务器规则文件与当前运行策略不同。保存将应用草稿；开启模型唤醒时可能发送模型请求。' : '保存会写入服务器规则文件并立即应用。额度查询不生成内容；开启模型唤醒时可能发送模型请求。';
+    $('wake-draft-hint').textContent = editor.value()?.enabled ? '草稿：模型唤醒已开启。保存后按下方规则发送模型请求。' : '草稿：模型唤醒已关闭。保存后仅查看额度，查询由独立设置控制。';
   }
   function draftChanged() { $('config-json').value = JSON.stringify(editor.value(), null, 2); $('json-message').textContent = ''; updateDraftBadge(); renderOverview(); }
   function fieldValue(cfg, path) { let v = cfg; for (const part of path.split('.')) v = v?.[part]; return v; }
@@ -352,8 +371,8 @@
   function busy(value) {
     actionBusy = value;
     for (const id of ['recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = value;
-    for (const field of document.querySelectorAll('#tab-rules input, #tab-rules textarea, #daily-rules button')) field.disabled = value || field.dataset.fixed === 'true';
-    updateDraftBadge(); renderAccounts();
+    for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button')) field.disabled = value || field.dataset.fixed === 'true';
+    updateDraftBadge(); renderAccounts(); renderQuotaQuery();
   }
   async function readSnapshots() {
     const generation = session.generation();
@@ -421,10 +440,27 @@
     void connectPanel($('management-key').value, false);
   });
   $('disconnect').addEventListener('click', () => { if (editor.dirty() && !root.confirm('断开将清除未保存的规则草稿。继续断开？')) return; session.disconnect(); });
-  document.querySelectorAll('[data-tab]').forEach(button => button.addEventListener('click', () => {
-    document.querySelectorAll('[data-tab]').forEach(tab => { const selected = tab === button; tab.classList.toggle('active', selected); tab.setAttribute('aria-selected', String(selected)); });
-    for (const view of document.querySelectorAll('.view')) view.hidden = view.id !== 'tab-' + button.dataset.tab;
-  }));
+  function activateTab(name, focus) {
+    const button = Array.from(document.querySelectorAll('[data-tab]')).find(tab => tab.dataset.tab === name);
+    if (!button) return;
+    document.querySelectorAll('[data-tab]').forEach(tab => { const selected = tab === button; tab.classList.toggle('active', selected); tab.setAttribute('aria-selected', String(selected)); tab.tabIndex = selected ? 0 : -1; });
+    for (const view of document.querySelectorAll('.view')) view.hidden = view.id !== 'tab-' + name;
+    if (focus) button.focus();
+  }
+  document.querySelectorAll('[data-tab]').forEach(button => {
+    button.addEventListener('click', () => activateTab(button.dataset.tab));
+    button.addEventListener('keydown', event => {
+      const tabs = Array.from(document.querySelectorAll('[data-tab]')), index = tabs.indexOf(button);
+      let next;
+      if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+      else if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = tabs.length - 1;
+      else return;
+      event.preventDefault(); activateTab(tabs[next].dataset.tab, true);
+    });
+  });
+  document.querySelectorAll('[data-open-tab]').forEach(button => button.addEventListener('click', () => activateTab(button.dataset.openTab, true)));
   for (const input of document.querySelectorAll('[data-field]')) input.addEventListener('change', () => {
     try {
       if (editor.rawDirty()) throw new PanelError('unapplied_json');

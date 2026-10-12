@@ -4,67 +4,73 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Codex Window Refresh · 模块面板</title>
+  <title>Codex Window Refresh · 额度与唤醒</title>
   <link rel="stylesheet" href="./panel.css">
   <script defer src="./panel.js"></script>
 </head>
 <body>
 <div class="shell">
-  <header class="topbar"><a class="brand" href="./status"><span class="brand-mark" aria-hidden="true">↻</span><span>Codex Window Refresh<small>额度窗口调度</small></span></a><div class="connection"><span id="connection-status" class="badge neutral">未连接</span><button id="disconnect" class="quiet" disabled>断开</button></div></header>
+  <header class="topbar"><a class="brand" href="./status"><span class="brand-mark" aria-hidden="true">↻</span><span>Codex Window Refresh<small>账号额度与模型唤醒</small></span></a><div class="connection"><span id="connection-status" class="badge neutral">未连接</span><button id="disconnect" class="quiet" disabled>断开</button></div></header>
   <main>
     <section id="login-section" class="card login-card">
-      <div><span class="eyebrow">CPA 管理认证</span><h1>让刷新按你的节奏发生</h1><p>查看已确认的额度窗口、检查账号调度，并调整刷新规则。</p></div>
-      <form id="login-form" class="login-form"><label for="management-key">管理密钥</label><div class="input-action"><input id="management-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 CPA management secret-key" required><button id="connect" class="primary" type="submit">连接面板</button></div><p class="hint">优先复用同源 CPA 管理中心已保存的登录凭据；无法复用时请手动连接。手动输入的密钥仅保存在当前页面内存，请求只发送到当前 CPA 地址。</p></form>
+      <div><span class="eyebrow">连接 CPA</span><h1>查看额度，按需唤醒</h1><p>查看账号剩余额度，独立设置额度查询与模型唤醒。</p></div>
+      <form id="login-form" class="login-form"><label for="management-key">CPA 管理密钥</label><div class="input-action"><input id="management-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 CPA 管理密钥" required><button id="connect" class="primary" type="submit">连接面板</button></div><p class="hint">优先复用同源 CPA 已保存的登录状态；无法复用时手动连接。手动输入的密钥仅保存在当前页面内存。</p></form>
     </section>
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
     <div id="workspace" hidden>
-      <nav class="tabbar" aria-label="面板视图"><button class="tab active" data-tab="overview" aria-selected="true">运行概览</button><button class="tab" data-tab="accounts" aria-selected="false">账号与任务</button><button class="tab" data-tab="rules" aria-selected="false">刷新规则</button><button class="tab" data-tab="capabilities" aria-selected="false">宿主能力</button></nav>
-      <section id="tab-overview" class="view">
-        <div class="section-head"><div><span class="eyebrow">调度状态</span><h1>当前运行概览</h1></div><div class="toolbar"><span id="updated-at" class="hint">等待快照</span><button id="refresh" class="quiet">刷新视图</button></div></div>
+      <section id="mode-banner" class="mode-banner" aria-label="已应用的运行模式"><div><span class="eyebrow">当前生效</span><h2 id="mode-title">正在读取运行模式</h2><p id="mode-description"></p></div><span id="mode-badge" class="badge neutral"></span></section>
+      <nav class="tabbar" role="tablist" aria-label="面板视图">
+        <button id="nav-overview" class="tab active" role="tab" data-tab="overview" aria-selected="true" aria-controls="tab-overview">总览</button>
+        <button id="nav-accounts" class="tab" role="tab" data-tab="accounts" aria-selected="false" aria-controls="tab-accounts" tabindex="-1">账号额度</button>
+        <button id="nav-query" class="tab" role="tab" data-tab="query" aria-selected="false" aria-controls="tab-query" tabindex="-1">额度查询</button>
+        <button id="nav-rules" class="tab" role="tab" data-tab="rules" aria-selected="false" aria-controls="tab-rules" tabindex="-1">模型唤醒</button>
+        <button id="nav-capabilities" class="tab" role="tab" data-tab="capabilities" aria-selected="false" aria-controls="tab-capabilities" tabindex="-1">诊断与高级</button>
+      </nav>
+      <section id="tab-overview" class="view" role="tabpanel" aria-labelledby="nav-overview">
+        <div class="section-head"><div><span class="eyebrow">账号池</span><h1>额度总览</h1><p>先了解账号状态，再选择是否查询或唤醒。</p></div><div class="toolbar"><span id="updated-at" class="hint">等待快照</span><button id="refresh" class="quiet">更新页面数据</button></div></div>
         <div id="metrics" class="metrics"></div>
-        <section class="card action-card"><div><h2>额度查询</h2><p>只调用额度接口，不发送模型请求。被动采集始终保留；定期和手动查询开关在“刷新规则”中设置。</p><p id="quota-query-status" class="hint"></p></div><button id="quota-query" class="quiet" disabled>立即查询额度</button></section>
-        <div class="two-columns"><section class="card"><h2>规则与时间</h2><dl id="schedule-info" class="details"></dl><p class="hint">周重置可绕过人数与普通时段限制。已有 5 小时窗口内不发送；实际执行仍以最新额度证据为准。</p></section><section class="card"><h2>阻塞与诊断</h2><div id="hold-counts"></div><p id="last-error" class="hint"></p></section></div>
-        <section class="card action-card"><div><h2>调度操作</h2><p>重新检查会通知调度器评估现有规则；重新读取会应用服务器规则文件。启用的规则可能随后发送真实请求。</p></div><div class="toolbar"><button id="recheck" class="quiet">重新检查规则</button><button id="reload" class="quiet">重新读取规则文件</button></div></section>
-        <p class="footnote">页面每 5 秒读取已有状态快照，隐藏页面时暂停。额度优先使用正常请求返回的信息，后台查询补充缺失证据。运行规则在连接或操作时读取；外部修改后请手动刷新视图。刷新视图不会直接查询上游额度或发送模型请求。近期用户按 CPA 的 caller_scope 去重，共用 API key 的调用可能属于同一范围，并不等于自然人数。</p>
+        <section class="card query-action"><div class="card-heading"><div><span class="badge">额度接口 · 不发送模型请求</span><h2>获取最新额度</h2><p>页面每 5 秒读取后台已有数据；立即查询会向上游额度接口发起查询。</p></div><button id="quota-query" class="primary" disabled>立即查询额度</button></div><p id="quota-query-status" class="query-progress" role="status" aria-live="polite"></p><div class="card-links"><button class="text-button" data-open-tab="query">设置自动 / 手动查询 →</button><button class="text-button" data-open-tab="accounts">查看每个账号的额度 →</button></div></section>
+        <div class="two-columns">
+          <section class="card"><h2>额度数据从哪里来？</h2><dl class="source-guide"><div><dt><span class="source-dot passive"></span>用户请求响应</dt><dd>被动读取用户请求返回的额度，无需额外查询。</dd></div><div><dt><span class="source-dot query"></span>主动查询</dt><dd>只访问额度接口，可自动或手动执行，不生成内容。</dd></div><div><dt><span class="source-dot wake"></span>模块唤醒响应</dt><dd>来自模块发送的模型请求，由“模型唤醒”单独控制。</dd></div></dl></section>
+          <section class="card"><h2>只想查看额度？</h2><ol class="plain-steps"><li>在“模型唤醒”中关闭总开关。</li><li>在“额度查询”中选择定期或手动查询。</li><li>保存并应用；用户响应的被动采集仍会继续。</li></ol><button class="text-button" data-open-tab="rules">检查模型唤醒设置 →</button></section>
+        </div>
+        <p class="footnote">“未知”表示尚无可靠的窗口证据。页面展示后台最近一次观测，更新时间不等于上游实时状态。</p>
       </section>
-      <section id="tab-accounts" class="view" hidden>
-        <div class="section-head"><div><span class="eyebrow">账号池</span><h1>账号与合并任务</h1></div><span id="account-count" class="hint"></span></div>
-        <div class="filters"><label class="search-label">搜索账号<input id="account-search" type="search" placeholder="按账号 ID 搜索" autocomplete="off"></label><label>状态筛选<select id="account-filter"><option value="all">全部账号</option><option value="active">5 小时窗口内</option><option value="pending">有未完成任务</option><option value="paused">已暂停</option><option value="unknown">额度未知</option></select></label></div>
-        <div id="account-list" class="account-list"></div><p class="footnote">倒计时来自上游已确认的 ResetAt，不会推算新的 5 小时窗口。暂停按钮只修改规则草稿，点击“保存并应用”后生效。</p>
+      <section id="tab-accounts" class="view" role="tabpanel" aria-labelledby="nav-accounts" hidden>
+        <div class="section-head"><div><span class="eyebrow">查看额度</span><h1>账号额度</h1><p>先看剩余额度和重置时间；需要排查时再展开唤醒任务。</p></div><span id="account-count" class="hint"></span></div>
+        <div class="filters"><label class="search-label">搜索账号<input id="account-search" type="search" placeholder="输入账号 ID" autocomplete="off"></label><label>筛选状态<select id="account-filter"><option value="all">全部账号</option><option value="active">5 小时窗口内</option><option value="pending">有待处理任务</option><option value="paused">已暂停模型唤醒</option><option value="unknown">额度待确认</option></select></label></div>
+        <div id="account-list" class="account-list"></div><p class="footnote">倒计时使用上游报告的重置时间。暂停或恢复只修改唤醒草稿，保存后生效；不会停止用户请求的被动额度采集。</p>
       </section>
-      <section id="tab-rules" class="view" hidden>
-        <div class="section-head"><div><span class="eyebrow">规则配置</span><h1>安排刷新时间与规模</h1></div><span id="draft-status" class="badge neutral">已与服务器同步</span></div>
-        <section class="card"><div class="card-heading"><h2>常用设置</h2><span class="hint">未改动的高级字段会完整保留</span></div>
-          <div class="form-grid" id="settings-form">
-            <label class="check-field"><input id="rule-enabled" type="checkbox" data-field="enabled">启用模型唤醒（会发送模型请求）</label>
-            <label>时区<input id="rule-timezone" data-field="timezone" placeholder="Asia/Shanghai"></label>
-            <label>近期活动回溯<input id="rule-lookback" data-field="activity.lookback" placeholder="30m"><small>整数 + s / m / h / d</small></label>
-            <label>每个用户范围的账号比例<input id="rule-ratio" type="number" min="0" step="0.1" data-field="activity.accounts_per_user"></label>
-            <label>普通刷新最多账号数<input id="rule-max" type="number" min="0" step="1" data-field="activity.max_accounts"></label>
-            <label>普通允许时段<input id="rule-hours" data-field="ordinary_rules.allowed_hours" placeholder="08:00-23:00, 00:00-01:00"><small>多个时段用逗号分隔；空列表不允许普通时段刷新</small></label>
-            <label class="check-field"><input id="rule-night" type="checkbox" data-field="ordinary_rules.allow_outside_hours_when_users_active">时段外有近期用户活动时允许普通刷新</label>
-            <label class="check-field"><input id="rule-catchup" type="checkbox" data-field="execution.catch_up">错过窗口后补发</label>
-            <label class="check-field"><input id="rule-five-enabled" type="checkbox" data-field="reset_rules.five_hour.enabled">5 小时窗口重置后唤醒</label>
-            <label class="check-field"><input id="rule-week-enabled" type="checkbox" data-field="reset_rules.weekly.enabled">周窗口重置后唤醒</label>
-            <label>5 小时随机延迟最小值<input id="rule-five-min" data-field="reset_rules.five_hour.random_delay.min" placeholder="0s"></label>
-            <label>5 小时随机延迟最大值<input id="rule-five-max" data-field="reset_rules.five_hour.random_delay.max" placeholder="10m"></label>
-            <label>周重置随机延迟最小值<input id="rule-week-min" data-field="reset_rules.weekly.random_delay.min" placeholder="0s"></label>
-            <label>周重置随机延迟最大值<input id="rule-week-max" data-field="reset_rules.weekly.random_delay.max" placeholder="10m"></label>
-            <label class="check-field"><input id="rule-week-users" type="checkbox" disabled data-fixed="true" data-field="reset_rules.weekly.bypass_activity_limit">周任务固定不受人数限制</label>
-            <label class="check-field"><input id="rule-week-hours" type="checkbox" disabled data-fixed="true" data-field="reset_rules.weekly.bypass_allowed_hours">周任务固定在普通时段外也执行</label>
-            <label>请求模型<input id="rule-model" data-field="execution.model" placeholder="填写对应账号可用的模型名"></label>
-            <label>请求内容<input id="rule-prompt" data-field="execution.prompt" placeholder="Reply OK."></label>
-          </div>
+      <section id="tab-query" class="view" role="tabpanel" aria-labelledby="nav-query" hidden>
+        <div class="section-head"><div><span class="eyebrow">只读取额度</span><h1>额度查询</h1><p>这些设置只控制额度接口查询，不会开启模型唤醒。</p></div><span class="badge">不发送模型请求</span></div>
+        <section class="card"><div class="card-heading"><div><h2>自动与手动查询</h2><p>更改先保存在草稿中，点击下方“保存并应用”后生效。</p></div></div><div class="setting-list">
+          <label class="setting-toggle"><span><strong>定期查询额度</strong><small>后台自动补充额度数据；近期有完整用户响应额度时，可减少重复查询。</small></span><input id="query-automatic" type="checkbox" data-field="quota_query.automatic"></label>
+          <label class="interval-field">定期查询间隔<input id="query-interval" data-field="quota_query.interval" placeholder="30s"><small>例如 30s、2m 或 1h；允许 30 秒到 1 小时。</small></label>
+          <label class="setting-toggle"><span><strong>允许手动查询</strong><small>开启后可在“总览”点击“立即查询额度”，并查看成功和失败数量。</small></span><input id="query-manual" type="checkbox" data-field="quota_query.manual"></label>
+        </div></section>
+        <section class="card compact-note"><h2>关闭查询开关后会怎样？</h2><p>用户请求返回的被动额度仍会更新。若独立开启了模型唤醒，发送前的额度核对和已发送操作的验证仍会执行。</p><button class="text-button" data-open-tab="overview">返回总览，查询最新额度 →</button></section>
+      </section>
+      <section id="tab-rules" class="view" role="tabpanel" aria-labelledby="nav-rules" hidden>
+        <div class="section-head"><div><span class="eyebrow">会发送模型请求</span><h1>模型唤醒</h1><p>按规则向指定账号发送模型请求，用于唤醒额度窗口。</p></div><span class="badge warning">与额度查询独立</span></div>
+        <section class="card wake-control"><label class="setting-toggle"><span><strong>启用模型唤醒</strong><small>开启后可能发送真实模型请求。只查看额度时保持关闭。</small></span><input id="rule-enabled" type="checkbox" data-field="enabled"></label><p id="wake-draft-hint" class="hint">下方规则只有在总开关开启后才会用于发送新请求。</p></section>
+        <section class="card"><div class="card-heading"><div><span class="eyebrow">01 · 发送内容</span><h2>使用哪个模型？</h2></div></div><div class="form-grid"><label>模型名称<input id="rule-model" data-field="execution.model" placeholder="对应账号可用的模型名"></label><label>唤醒消息<input id="rule-prompt" data-field="execution.prompt" placeholder="Reply OK."></label></div></section>
+        <section class="card"><div class="card-heading"><div><span class="eyebrow">02 · 所需容量</span><h2>需要准备多少账号？</h2><p>根据近期用户数量补足账号，不会对每个账号固定发送。</p></div></div><div class="form-grid"><label>近期活动回溯<input id="rule-lookback" data-field="activity.lookback" placeholder="30m"><small>例如 30m；共享 API key 的多人可能算一个用户范围。</small></label><label>每个用户范围需要的账号数<input id="rule-ratio" type="number" min="0" step="0.1" data-field="activity.accounts_per_user"></label><label>普通唤醒账号数上限<input id="rule-max" type="number" min="0" step="1" data-field="activity.max_accounts"></label></div></section>
+        <section class="card"><div class="card-heading"><div><span class="eyebrow">03 · 触发时间</span><h2>何时唤醒账号？</h2><p>有效的 5 小时窗口内不重复发送；到期后再按规则判断。</p></div></div><div class="form-grid"><label>规则时区<input id="rule-timezone" data-field="timezone" placeholder="Asia/Shanghai"></label><label>普通唤醒允许时段<input id="rule-hours" data-field="ordinary_rules.allowed_hours" placeholder="08:00-23:00"><small>多个时段用逗号分隔；留空则不允许普通时段唤醒。</small></label><label class="check-field"><input id="rule-night" type="checkbox" data-field="ordinary_rules.allow_outside_hours_when_users_active">有近期用户时允许在时段外唤醒</label><label class="check-field"><input id="rule-catchup" type="checkbox" data-field="execution.catch_up">错过窗口后补发</label></div>
+          <div class="rule-pair"><div class="rule-block"><label class="check-field"><input id="rule-five-enabled" type="checkbox" data-field="reset_rules.five_hour.enabled">5 小时窗口到期后唤醒</label><div class="form-grid"><label>随机延迟最短<input id="rule-five-min" data-field="reset_rules.five_hour.random_delay.min" placeholder="0s"></label><label>随机延迟最长<input id="rule-five-max" data-field="reset_rules.five_hour.random_delay.max" placeholder="10m"></label></div></div><div class="rule-block"><label class="check-field"><input id="rule-week-enabled" type="checkbox" data-field="reset_rules.weekly.enabled">周窗口到期后唤醒</label><div class="form-grid"><label>随机延迟最短<input id="rule-week-min" data-field="reset_rules.weekly.random_delay.min" placeholder="0s"></label><label>随机延迟最长<input id="rule-week-max" data-field="reset_rules.weekly.random_delay.max" placeholder="10m"></label></div><p class="hint">周任务固定不受人数限制，可在普通时段外执行。</p><label class="sr-only"><input id="rule-week-users" type="checkbox" disabled data-fixed="true" data-field="reset_rules.weekly.bypass_activity_limit">周任务不受人数限制</label><label class="sr-only"><input id="rule-week-hours" type="checkbox" disabled data-fixed="true" data-field="reset_rules.weekly.bypass_allowed_hours">周任务可在普通时段外执行</label></div></div>
         </section>
-        <section class="card"><div class="card-heading"><div><h2>额度查询设置</h2><p class="hint">只查询额度，不生成内容。只查看额度时，请关闭上方“启用模型唤醒”。更改后点击“保存并应用”。</p></div></div><div class="form-grid"><label class="check-field"><input id="query-automatic" type="checkbox" data-field="quota_query.automatic">定期查询额度</label><label class="check-field"><input id="query-manual" type="checkbox" data-field="quota_query.manual">允许手动查询额度</label><label>查询间隔<input id="query-interval" data-field="quota_query.interval" placeholder="30s"><small>30s 到 1h；近期有完整被动额度时可减少重复查询</small></label></div><p class="hint">关闭定期查询后仍采集正常请求额度。已启用的模型唤醒仍会执行发送前额度核对，未完成的唤醒操作仍会验证。</p></section>
-        <section class="card"><div class="card-heading"><div><h2>每日时间规则</h2><p class="hint">为账号池设置最低就绪数；与重置任务合并执行。</p></div><button id="daily-add" class="quiet">添加每日规则</button></div><div id="daily-rules"></div></section>
-        <section class="card"><div class="card-heading"><div><h2>高级 JSON 编辑器</h2><p class="hint">支持完整规则及账号覆盖设置。JSON 修改后先应用到草稿，再保存到服务器。</p></div></div><label class="sr-only" for="config-json">完整规则 JSON</label><textarea id="config-json" class="code-editor" spellcheck="false" rows="15"></textarea><div class="toolbar"><button id="json-apply" class="quiet">将 JSON 应用到草稿</button><button id="json-format" class="quiet">格式化 JSON</button></div><p id="json-message" class="hint"></p></section>
-        <div class="save-bar"><p id="save-help">保存会写入服务器规则文件并立即应用。开启模型唤醒时可能发送模型请求。</p><div class="toolbar"><button id="draft-restore" class="quiet">恢复服务器规则</button><button id="config-save" class="primary">保存并应用</button></div></div>
+        <section class="card"><div class="card-heading"><div><span class="eyebrow">04 · 每日目标</span><h2>在固定时间准备账号</h2><p>可选。设置每日最低就绪账号数，与到期任务合并执行。</p></div><button id="daily-add" class="quiet">添加每日规则</button></div><div id="daily-rules"></div></section>
       </section>
-      <section id="tab-capabilities" class="view" hidden><div class="section-head"><div><span class="eyebrow">CPA 接口</span><h1>宿主能力</h1></div></div><section class="card"><dl id="capabilities-list" class="details"></dl><p class="hint">能力由当前 CPA 实例及额度适配器报告。前台保护不可用时，额度检查与实际发送之间仍可能遇到前台请求竞争。</p></section></section>
+      <section id="tab-capabilities" class="view" role="tabpanel" aria-labelledby="nav-capabilities" hidden>
+        <div class="section-head"><div><span class="eyebrow">排查与维护</span><h1>诊断与高级</h1><p>查看调度原因、接口能力，或编辑完整配置。</p></div></div>
+        <div class="two-columns"><section class="card"><h2>为什么没有唤醒？</h2><div id="hold-counts"></div><p id="last-error" class="hint"></p></section><section class="card"><h2>当前规则与调度</h2><dl id="schedule-info" class="details"></dl></section></div>
+        <details class="card disclosure"><summary>CPA 接口能力</summary><div class="disclosure-body"><dl id="capabilities-list" class="details"></dl><p class="hint">这些能力用于诊断。前台互斥保护不可用时，最终额度核对和实际发送之间仍可能发生请求竞争。</p></div></details>
+        <details class="card disclosure"><summary>手动调度与文件操作</summary><div class="disclosure-body"><p>只用于维护。模型唤醒已开启时，这些操作可能使规则继续发送模型请求。</p><div class="maintenance-actions"><div><h3>重新检查现有规则</h3><p>让后台尽快评估已有规则，不绕过窗口与名额限制。</p><button id="recheck" class="quiet">重新检查规则</button></div><div><h3>应用服务器配置文件</h3><p>服务器上手工修改配置后使用；会重新读取并应用文件。</p><button id="reload" class="quiet">重新读取规则文件</button></div></div></div></details>
+        <details id="advanced-editor" class="card disclosure"><summary>完整配置 JSON</summary><div class="disclosure-body"><p>包含全部规则和账号覆盖设置。修改后先“应用到草稿”，再“保存并应用”。</p><label class="sr-only" for="config-json">完整规则 JSON</label><textarea id="config-json" class="code-editor" spellcheck="false" rows="15"></textarea><div class="toolbar"><button id="json-apply" class="quiet">应用到草稿</button><button id="json-format" class="quiet">格式化 JSON</button></div><p id="json-message" class="hint"></p></div></details>
+      </section>
+      <div id="save-bar" class="save-bar" hidden><div><span id="draft-status" class="badge warning">有未保存的更改</span><p id="save-help">所有页面的配置修改会一起保存。</p></div><div class="toolbar"><button id="draft-restore" class="quiet">放弃草稿，重新读取</button><button id="config-save" class="primary">保存并应用</button></div></div>
     </div>
   </main>
-  <footer>Codex Window Refresh <span>本地窗口 · 随机延迟 · 合并执行</span></footer>
+  <footer>Codex Window Refresh <span>额度查询与模型唤醒独立控制</span></footer>
 </div>
 </body>
 </html>
