@@ -64,6 +64,11 @@ type Engine struct {
 	inventory       []core.HostAccount
 	inventoryFailed bool
 	nextInventory   time.Time
+	manualRequested bool              // guarded by queueMu
+	manualActive    bool              // guarded by queueMu; includes queued and running jobs
+	manualQuery     ManualQueryStatus // guarded by mu, published with snapshots
+	manualIDs       []core.AccountID
+	manualIndex     int
 }
 
 func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, random core.Random) (*Engine, error) {
@@ -176,7 +181,7 @@ func (e *Engine) drain() {
 				a.FiveHour.ConfirmedAt.Equal(v.ReceivedAt) && a.Weekly.ConfirmedAt.Equal(v.ReceivedAt) &&
 				a.FiveHour.ResetAt.After(e.clock.Now()) && a.Weekly.ResetAt.After(e.clock.Now()) &&
 				(a.Task == nil || a.Task.OperationID == "") {
-				e.nextRead[v.AccountID] = maxTime(e.nextRead[v.AccountID], v.ReceivedAt.Add(30*time.Second))
+				e.nextRead[v.AccountID] = maxTime(e.nextRead[v.AccountID], v.ReceivedAt.Add(e.cfg.QuotaQuery.Interval.Value()))
 			}
 		}
 	}
@@ -264,7 +269,7 @@ func (e *Engine) observe(ctx context.Context, id core.AccountID) error {
 	}
 	cancel()
 	e.drain()
-	e.nextRead[id] = e.clock.Now().Add(30 * time.Second)
+	e.nextRead[id] = e.clock.Now().Add(e.cfg.QuotaQuery.Interval.Value())
 	if err != nil {
 		e.lastError = "quota_read_failed"
 		e.readFailed(id)
@@ -314,6 +319,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		return err
 	}
 	before, _ := json.Marshal(e.state)
+	e.startManualQuery()
 	e.lastError = ""
 	if len(e.readFailures) > 0 {
 		e.lastError = "quota_read_failed"
@@ -367,6 +373,12 @@ func (e *Engine) Step(ctx context.Context) error {
 	}
 	e.drain()
 	core.ReleaseExpiredReservations(&e.state, now)
+	// A manual sweep uses an exclusively read-only path. Do not create model
+	// intents or dispatch even when wake rules are enabled and already due.
+	if e.manualQuery.Phase == "queued" || e.manualQuery.Phase == "running" {
+		e.stepManualQuery(ctx)
+		return e.commitChanged(ctx, before)
+	}
 	if err = e.generate(now); err != nil {
 		return err
 	}
@@ -394,7 +406,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		a := e.state.Accounts[id]
 		verifying := a.Task != nil && a.Task.OperationID != "" && !now.Before(a.Task.NextVerificationAt)
 		pendingOperation := a.Task != nil && a.Task.OperationID != ""
-		if caps.QuotaAdapterReady && (a.Enabled || pendingOperation) && (verifying || (!pendingOperation && !now.Before(e.nextRead[id]))) && reads < 4 && !now.Before(e.nextPreflight[id]) {
+		if caps.QuotaAdapterReady && (a.Enabled || pendingOperation) && (verifying || (e.cfg.QuotaQuery.Automatic && !pendingOperation && !now.Before(e.nextRead[id]))) && reads < 4 && !now.Before(e.nextPreflight[id]) {
 			reads++
 			_ = e.observe(ctx, id)
 			a = e.state.Accounts[id]

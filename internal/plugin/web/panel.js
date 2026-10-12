@@ -13,7 +13,7 @@
     if (url.origin !== location.origin || !url.pathname.endsWith(API)) throw new PanelError('invalid_endpoint');
     return url.pathname;
   }
-  const paths = new Set(['/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck']);
+  const paths = new Set(['/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query']);
   class PanelError extends Error {
     constructor(code, status) { super(code); this.name = 'PanelError'; this.code = code; this.status = status || 0; }
   }
@@ -114,6 +114,7 @@
       && Array.isArray(value.ordinary_rules.allowed_hours) && value.ordinary_rules.allowed_hours.every(x => typeof x === 'string')
       && validObject(value.reset_rules) && validObject(value.reset_rules.five_hour) && validObject(value.reset_rules.weekly)
       && validObject(value.reset_rules.five_hour.random_delay) && validObject(value.reset_rules.weekly.random_delay)
+      && (value.quota_query === undefined || (validObject(value.quota_query) && typeof value.quota_query.automatic === 'boolean' && typeof value.quota_query.manual === 'boolean' && typeof value.quota_query.interval === 'string'))
       && Array.isArray(value.daily_rules) && value.daily_rules.every(validObject) && validObject(value.account_overrides)
       && Object.values(value.account_overrides).every(validObject);
   }
@@ -197,6 +198,7 @@
     for (const input of document.querySelectorAll('[data-field]')) { if (input.type === 'checkbox') input.checked = false; else input.value = ''; input.disabled = input.dataset.fixed === 'true'; }
     $('account-search').value = ''; $('account-filter').value = 'all'; $('last-error').textContent = ''; $('updated-at').textContent = ''; $('json-message').textContent = '';
     for (const id of ['refresh', 'connect', 'recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = false;
+    $('quota-query').disabled = true; $('quota-query-status').textContent = '';
     $('config-save').disabled = true; $('account-count').textContent = '';
     $('draft-status').textContent = '已与服务器同步'; $('draft-status').className = 'badge neutral'; notice('');
   }
@@ -227,14 +229,14 @@
     container.replaceChildren();
     for (const [label, value] of entries) { const row = el('div'); row.append(el('dt', label), el('dd', value ?? '未知')); container.append(row); }
   }
-  const holds = {plugin_disabled: '自动刷新未启用', account_inventory_unavailable: '账号清单暂不可用', account_disabled: '账号已禁用或暂停', delivery_evidence_pending: '已发送，等待确认', quota_adapter_unavailable: '额度适配器不可用', foreground_busy: '账号正在处理前台请求', backoff: '失败退避中', active_five_hour: '5 小时窗口内', quota_exhausted: '额度耗尽', quota_unknown: '额度证据未知', not_due: '尚未到执行时间', outside_hours: '不在允许时段', target_satisfied: '人数比例容量已满足', credential_changed: '账号凭据已变化', weekly_reset_unconfirmed: '周重置尚未确认', weekly_reset_conflict: '周与短窗口证据冲突', no_concurrency_slot: '等待执行空位'};
+  const holds = {plugin_disabled: '模型唤醒未启用', account_inventory_unavailable: '账号清单暂不可用', account_disabled: '账号已禁用或暂停', delivery_evidence_pending: '已发送，等待确认', quota_adapter_unavailable: '额度适配器不可用', foreground_busy: '账号正在处理前台请求', backoff: '失败退避中', active_five_hour: '5 小时窗口内', quota_exhausted: '额度耗尽', quota_unknown: '额度证据未知', not_due: '尚未到执行时间', outside_hours: '不在允许时段', target_satisfied: '人数比例容量已满足', credential_changed: '账号凭据已变化', weekly_reset_unconfirmed: '周重置尚未确认', weekly_reset_conflict: '周与短窗口证据冲突', no_concurrency_slot: '等待执行空位'};
   const states = {unknown: '未知', inactive: '未启动', active: '窗口内', expired: '已到期', pending: '待处理', waiting: '等待', reserved: '已预留', dispatch_intent: '准备发送', verifying: '核实窗口', awaiting_evidence: '等待证据', satisfied: '已满足', suspended: '已暂停'};
   const reasons = {five_hour_reset: '5 小时重置', weekly_reset: '周重置', daily_schedule: '每日时间规则'};
   function renderOverview() {
     if (!summary) return;
     const s = summary.scheduler || {}, cap = s.capacity || {}, cfg = runningConfig;
     const cards = [
-      ['运行状态', summary.running ? (summary.enabled ? '运行中' : '已停用') : '未运行', '宿主 ' + (summary.host_enabled ? '已启用' : '未启用') + ' · 规则 ' + (summary.business_enabled ? '已启用' : '未启用')],
+      ['模型唤醒', summary.running ? (summary.enabled ? '已启用' : '已关闭') : '未运行', '宿主 ' + (summary.host_enabled ? '已启用' : '未启用') + ' · 额度采集独立运行'],
       ['近期用户范围', s.recent_users ?? '未知', '去重 caller_scope · ' + (cfg?.activity?.lookback || '回溯时间未知')],
       ['普通目标 / 已就绪', (cap.target ?? '—') + ' / ' + (cap.active ?? '—'), '人数目标 ' + (cap.user_target ?? '—') + ' · 预留 ' + (cap.reserved ?? '—') + ' · 缺口 ' + (cap.missing ?? '—')],
       ['账号池', summary.accounts ?? '未知', '额度未知 ' + (s.quota_unknown_accounts ?? '—') + ' · 前台忙碌 ' + (s.foreground_busy_accounts ?? '—')]
@@ -247,6 +249,15 @@
     if (!counts.length) $('hold-counts').append(el('p', '当前没有报告的阻塞原因。', 'hint'));
     for (const [reason, count] of counts) { const row = el('div', undefined, 'hold-row'); row.append(el('span', holds[reason] || reason), badge(count, 'neutral')); $('hold-counts').append(row); }
     $('last-error').textContent = summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误';
+    renderQuotaQuery();
+  }
+  function renderQuotaQuery() {
+    const query = runningConfig?.quota_query || {}, job = summary?.scheduler?.quota_query || {};
+    const running = job.phase === 'queued' || job.phase === 'running';
+    const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
+    const progress = job.phase ? (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + ' · 失败 ' + (job.failed || 0) + ' · 跳过 ' + (job.skipped || 0) + ' / 总计 ' + (job.total || 0) : '尚未手动查询';
+    $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · ' + progress;
+    $('quota-query').disabled = !session.connected() || actionBusy || !summary?.running || query.manual !== true || capabilities.QuotaAdapterReady !== true || running;
   }
   function renderCapabilities() {
     const labels = {StableAccountIdentity: '稳定账号身份', ExactAccountExecution: '指定账号发送', QuotaAdapterReady: '额度适配器就绪', ActivityIdentityAtStart: '请求开始时识别用户范围', ActivityIdentityAtCompletion: '请求完成时识别用户范围', ForegroundGuard: '前台请求与调度互斥保护'};
@@ -302,7 +313,7 @@
     const dirty = editor.dirty();
     $('draft-status').textContent = dirty ? '有未保存的草稿' : '已与服务器同步'; $('draft-status').className = 'badge' + (dirty ? ' warning' : ' neutral');
     $('config-save').disabled = actionBusy || (!dirty && diskMatchesRunning) || editor.rawDirty();
-    $('save-help').textContent = !diskMatchesRunning ? '服务器规则文件与当前运行策略不同。保存将应用草稿；启用刷新后可能发送真实请求。' : '保存会写入服务器规则文件并立即应用。启用刷新后可能发送真实请求。';
+    $('save-help').textContent = !diskMatchesRunning ? '服务器规则文件与当前运行策略不同。保存将应用草稿；开启模型唤醒时可能发送模型请求。' : '保存会写入服务器规则文件并立即应用。额度查询不生成内容；开启模型唤醒时可能发送模型请求。';
   }
   function draftChanged() { $('config-json').value = JSON.stringify(editor.value(), null, 2); $('json-message').textContent = ''; updateDraftBadge(); renderOverview(); }
   function fieldValue(cfg, path) { let v = cfg; for (const part of path.split('.')) v = v?.[part]; return v; }
@@ -434,7 +445,7 @@
   $('config-save').addEventListener('click', async () => {
     if (!session.connected() || actionBusy || editor.rawDirty() || (!editor.dirty() && diskMatchesRunning)) return;
     const config = editor.value();
-    if (!root.confirm(config.enabled ? '保存并启用这些规则？调度器可能按规则向对应账号发送真实模型请求。' : '保存并应用规则？自动刷新将关闭；已发出的请求仍可能完成。')) return;
+    if (!root.confirm(config.enabled ? '保存并应用这些规则？模型唤醒已开启，调度器可能发送真实模型请求。' : '保存并应用规则？模型唤醒保持关闭，额度查询按独立设置运行；已发出的请求仍可能完成。')) return;
     const generation = session.generation(), version = editor.version(); busy(true);
     try { const envelope = await session.request('/config', 'POST', {config, revision: editor.revision()}); if (generation !== session.generation()) return; editor.saved(envelope, version); diskMatchesRunning = envelope.disk_matches_running !== false; renderForm(); renderAccounts(); notice('规则已保存并应用。'); await readRunningConfig(); await readSnapshots(); }
     catch (error) { report(error); }
@@ -457,6 +468,17 @@
     finally { if (generation === session.generation()) busy(false); }
   });
   $('refresh').addEventListener('click', () => refreshSnapshots(true));
+  $('quota-query').addEventListener('click', async () => {
+    if ($('quota-query').disabled || actionBusy || !session.connected()) return;
+    const generation = session.generation(); busy(true); renderQuotaQuery();
+    try {
+      const result = await session.request('/quota-query', 'POST');
+      if (generation !== session.generation()) return;
+      notice(result.status === 'already_queued' ? '已有额度查询任务，正在等待结果。' : '已安排额度查询，仅调用额度接口，不发送模型请求。');
+      await readSnapshots();
+    } catch (error) { report(error); }
+    finally { if (generation === session.generation()) { busy(false); renderQuotaQuery(); } }
+  });
   $('account-search').addEventListener('input', renderAccounts); $('account-filter').addEventListener('change', renderAccounts);
   document.addEventListener('visibilitychange', () => { if (document.hidden) { if (pollTimer) root.clearTimeout(pollTimer); pollTimer = null; } else if (session.connected()) refreshSnapshots(false); });
   root.addEventListener('beforeunload', event => { if (editor.dirty()) { event.preventDefault(); event.returnValue = ''; } });

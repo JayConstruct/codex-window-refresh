@@ -208,7 +208,7 @@ func TestManagementSeparatesPublicResourceFromAuthenticatedData(t *testing.T) {
 		Resources []struct{ Path string }
 	}
 	_ = json.Unmarshal(result, &routes)
-	if len(routes.Routes) != 8 || len(routes.Resources) != 3 {
+	if len(routes.Routes) != 9 || len(routes.Resources) != 3 {
 		t.Fatal("management registration incomplete")
 	}
 	for _, route := range routes.Routes {

@@ -17,7 +17,10 @@
 | 字段 | 类型、默认值 | 范围与语义 |
 | --- | --- | --- |
 | `schema_version` | integer，`1` | 只接受 `1`；未知版本拒绝加载 |
-| `enabled` | boolean，`true` | 关闭后不创建或发送新任务；已发送操作继续验证；待执行任务保留 |
+| `enabled` | boolean，`true` | 模型唤醒总开关；关闭后不创建或发送新任务，已有操作继续验证；额度查询和被动采集独立控制 |
+| `quota_query.automatic` | boolean，`true` | 是否进行普通定期额度查询；不发送模型请求，关闭仍保留被动额度、独立启用的唤醒前核对和已有操作验证 |
+| `quota_query.manual` | boolean，`true` | 是否允许管理面板/管理 API 排队一次仅查询额度的任务；关闭取消任务剩余查询 |
+| `quota_query.interval` | duration，`30s` | 普通定期查询间隔，允许 30 秒到 1 小时；完整被动额度也按此间隔推迟重复轮询 |
 | `timezone` | string，`Asia/Shanghai` | 可加载的 IANA 时区；拒绝未识别名称，不能默默退回服务器时区 |
 | `reset_rules.five_hour.enabled` | boolean，`true` | 创建普通到期任务；关闭不影响周联合任务和每日目标选取到期账号 |
 | `reset_rules.five_hour.random_delay.min/max` | duration，`0s/10m` | `0 ≤ min ≤ max ≤ 24h`；事件到期后只抽一次 |

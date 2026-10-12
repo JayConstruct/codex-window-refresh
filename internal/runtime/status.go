@@ -15,14 +15,15 @@ type publishedStatus struct {
 	scheduler SchedulingSummary
 }
 type SchedulingSummary struct {
-	ObservedAt             time.Time      `json:"observed_at"`
-	RecentUsers            int            `json:"recent_users"`
-	IdentitySource         string         `json:"identity_source"`
-	Capacity               core.Capacity  `json:"capacity"`
-	HoldCounts             map[string]int `json:"hold_counts"`
-	QuotaUnknownAccounts   int            `json:"quota_unknown_accounts"`
-	ForegroundBusyAccounts int            `json:"foreground_busy_accounts"`
-	NextInventoryAt        time.Time      `json:"next_inventory_at"`
+	ObservedAt             time.Time         `json:"observed_at"`
+	RecentUsers            int               `json:"recent_users"`
+	IdentitySource         string            `json:"identity_source"`
+	Capacity               core.Capacity     `json:"capacity"`
+	HoldCounts             map[string]int    `json:"hold_counts"`
+	QuotaUnknownAccounts   int               `json:"quota_unknown_accounts"`
+	ForegroundBusyAccounts int               `json:"foreground_busy_accounts"`
+	NextInventoryAt        time.Time         `json:"next_inventory_at"`
+	QuotaQuery             ManualQueryStatus `json:"quota_query"`
 }
 
 func (e *Engine) publish(committed bool) {
@@ -35,6 +36,7 @@ func (e *Engine) publish(committed bool) {
 	}
 	now := e.clock.Now()
 	summary := SchedulingSummary{ObservedAt: now, RecentUsers: core.ActiveUserCount(state, now, e.cfg.Activity.Lookback.Value()), IdentitySource: e.cfg.Activity.IdentitySource, Capacity: capacityFor(e.cfg, state, now, ""), HoldCounts: map[string]int{}, NextInventoryAt: e.nextInventory}
+	summary.QuotaQuery = e.manualQuery
 	busyAccounts := map[core.AccountID]bool{}
 	for _, r := range state.Requests {
 		if !r.Completed && r.AccountID != "" && state.Accounts[r.AccountID].Generation == r.Generation {

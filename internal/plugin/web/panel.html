@@ -22,6 +22,7 @@
       <section id="tab-overview" class="view">
         <div class="section-head"><div><span class="eyebrow">调度状态</span><h1>当前运行概览</h1></div><div class="toolbar"><span id="updated-at" class="hint">等待快照</span><button id="refresh" class="quiet">刷新视图</button></div></div>
         <div id="metrics" class="metrics"></div>
+        <section class="card action-card"><div><h2>额度查询</h2><p>只调用额度接口，不发送模型请求。被动采集始终保留；定期和手动查询开关在“刷新规则”中设置。</p><p id="quota-query-status" class="hint"></p></div><button id="quota-query" class="quiet" disabled>立即查询额度</button></section>
         <div class="two-columns"><section class="card"><h2>规则与时间</h2><dl id="schedule-info" class="details"></dl><p class="hint">周重置可绕过人数与普通时段限制。已有 5 小时窗口内不发送；实际执行仍以最新额度证据为准。</p></section><section class="card"><h2>阻塞与诊断</h2><div id="hold-counts"></div><p id="last-error" class="hint"></p></section></div>
         <section class="card action-card"><div><h2>调度操作</h2><p>重新检查会通知调度器评估现有规则；重新读取会应用服务器规则文件。启用的规则可能随后发送真实请求。</p></div><div class="toolbar"><button id="recheck" class="quiet">重新检查规则</button><button id="reload" class="quiet">重新读取规则文件</button></div></section>
         <p class="footnote">页面每 5 秒读取已有状态快照，隐藏页面时暂停。额度优先使用正常请求返回的信息，后台查询补充缺失证据。运行规则在连接或操作时读取；外部修改后请手动刷新视图。刷新视图不会直接查询上游额度或发送模型请求。近期用户按 CPA 的 caller_scope 去重，共用 API key 的调用可能属于同一范围，并不等于自然人数。</p>
@@ -35,7 +36,7 @@
         <div class="section-head"><div><span class="eyebrow">规则配置</span><h1>安排刷新时间与规模</h1></div><span id="draft-status" class="badge neutral">已与服务器同步</span></div>
         <section class="card"><div class="card-heading"><h2>常用设置</h2><span class="hint">未改动的高级字段会完整保留</span></div>
           <div class="form-grid" id="settings-form">
-            <label class="check-field"><input id="rule-enabled" type="checkbox" data-field="enabled">启用自动刷新</label>
+            <label class="check-field"><input id="rule-enabled" type="checkbox" data-field="enabled">启用模型唤醒（会发送模型请求）</label>
             <label>时区<input id="rule-timezone" data-field="timezone" placeholder="Asia/Shanghai"></label>
             <label>近期活动回溯<input id="rule-lookback" data-field="activity.lookback" placeholder="30m"><small>整数 + s / m / h / d</small></label>
             <label>每个用户范围的账号比例<input id="rule-ratio" type="number" min="0" step="0.1" data-field="activity.accounts_per_user"></label>
@@ -55,9 +56,10 @@
             <label>请求内容<input id="rule-prompt" data-field="execution.prompt" placeholder="Reply OK."></label>
           </div>
         </section>
+        <section class="card"><div class="card-heading"><div><h2>额度查询设置</h2><p class="hint">只查询额度，不生成内容。只查看额度时，请关闭上方“启用模型唤醒”。更改后点击“保存并应用”。</p></div></div><div class="form-grid"><label class="check-field"><input id="query-automatic" type="checkbox" data-field="quota_query.automatic">定期查询额度</label><label class="check-field"><input id="query-manual" type="checkbox" data-field="quota_query.manual">允许手动查询额度</label><label>查询间隔<input id="query-interval" data-field="quota_query.interval" placeholder="30s"><small>30s 到 1h；近期有完整被动额度时可减少重复查询</small></label></div><p class="hint">关闭定期查询后仍采集正常请求额度。已启用的模型唤醒仍会执行发送前额度核对，未完成的唤醒操作仍会验证。</p></section>
         <section class="card"><div class="card-heading"><div><h2>每日时间规则</h2><p class="hint">为账号池设置最低就绪数；与重置任务合并执行。</p></div><button id="daily-add" class="quiet">添加每日规则</button></div><div id="daily-rules"></div></section>
         <section class="card"><div class="card-heading"><div><h2>高级 JSON 编辑器</h2><p class="hint">支持完整规则及账号覆盖设置。JSON 修改后先应用到草稿，再保存到服务器。</p></div></div><label class="sr-only" for="config-json">完整规则 JSON</label><textarea id="config-json" class="code-editor" spellcheck="false" rows="15"></textarea><div class="toolbar"><button id="json-apply" class="quiet">将 JSON 应用到草稿</button><button id="json-format" class="quiet">格式化 JSON</button></div><p id="json-message" class="hint"></p></section>
-        <div class="save-bar"><p id="save-help">保存会写入服务器规则文件并立即应用。启用刷新后可能发送真实请求。</p><div class="toolbar"><button id="draft-restore" class="quiet">恢复服务器规则</button><button id="config-save" class="primary">保存并应用</button></div></div>
+        <div class="save-bar"><p id="save-help">保存会写入服务器规则文件并立即应用。开启模型唤醒时可能发送模型请求。</p><div class="toolbar"><button id="draft-restore" class="quiet">恢复服务器规则</button><button id="config-save" class="primary">保存并应用</button></div></div>
       </section>
       <section id="tab-capabilities" class="view" hidden><div class="section-head"><div><span class="eyebrow">CPA 接口</span><h1>宿主能力</h1></div></div><section class="card"><dl id="capabilities-list" class="details"></dl><p class="hint">能力由当前 CPA 实例及额度适配器报告。前台保护不可用时，额度检查与实际发送之间仍可能遇到前台请求竞争。</p></section></section>
     </div>

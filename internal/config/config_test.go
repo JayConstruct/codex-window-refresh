@@ -23,6 +23,9 @@ func valid(t *testing.T, data, format string) Config {
 }
 func TestParseDefaultsAndForceFreshObservation(t *testing.T) {
 	c := valid(t, `{"execution":{"model":"supported","quota_max_age_before_send":"0s"},"daily_rules":[{"id":"morning","random_time_range":"09:00-09:10"}]}`, "json")
+	if !c.QuotaQuery.Automatic || !c.QuotaQuery.Manual || c.QuotaQuery.Interval.Value() != 30*time.Second {
+		t.Fatal("old configs did not inherit compatible query settings")
+	}
 	if c.Activity.IdentitySource != "host_caller_scope" || c.Activity.Lookback.Value() != 30*time.Minute || c.Execution.VerificationCapacityHold.Value() != 15*time.Minute {
 		t.Fatalf("defaults lost: %+v", c)
 	}
@@ -39,6 +42,17 @@ func TestParseDefaultsAndForceFreshObservation(t *testing.T) {
 	c.Execution.QuotaMaxAgeBeforeSend = Duration(5 * time.Second)
 	if c.Runtime().ForceObserveBeforeDispatch || c.Runtime().EvidenceMaxAge != 5*time.Second {
 		t.Fatal("positive freshness mapping changed")
+	}
+}
+func TestQuerySettingsParseIndependentlyAndRejectInvalidTypes(t *testing.T) {
+	c := valid(t, `{"enabled":false,"execution":{"model":"supported"},"quota_query":{"automatic":true,"manual":false,"interval":"2m"}}`, "json")
+	if c.Enabled || !c.QuotaQuery.Automatic || c.QuotaQuery.Manual || c.QuotaQuery.Interval.Value() != 2*time.Minute {
+		t.Fatal("independent query config lost")
+	}
+	for _, settings := range []string{`{"automatic":"false"}`, `{"manual":null}`, `{"interval":"29s"}`, `{"interval":"3601s"}`, `{"interval":30}`, `{"automatic":false,"automatic":true}`, `{"model":"unsupported"}`} {
+		if _, err := Parse([]byte(`{"execution":{"model":"supported"},"quota_query":`+settings+`}`), "json"); err == nil {
+			t.Fatalf("invalid query config accepted: %s", settings)
+		}
 	}
 }
 func TestYAMLStrongScalarTypesAndDuplicateRejection(t *testing.T) {

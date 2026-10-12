@@ -26,7 +26,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.4"
+const Version = "0.1.0-rc.5"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -409,7 +409,7 @@ func managementRegistration() any {
 	for _, p := range []string{"/summary", "/accounts", "/config", "/config-editor", "/capabilities"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
-	for _, p := range []string{"/reload", "/recheck", "/config"} {
+	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query"} {
 		routes = append(routes, map[string]string{"Method": "POST", "Path": ManagementPrefix + p})
 	}
 	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Authenticated scheduler panel."}, {"Path": "/panel.js"}, {"Path": "/panel.css"}}}
@@ -484,6 +484,37 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		return s.readPolicyEditor(), nil
 	case "POST /config":
 		return s.savePolicyEditor(ctx, req.Body), nil
+	case "POST /quota-query":
+		if stopping || done == nil {
+			return response(409, map[string]string{"error": "scheduler_not_running"}), nil
+		}
+		select {
+		case <-done:
+			return response(409, map[string]string{"error": "scheduler_not_running"}), nil
+		default:
+		}
+		if !cfg.QuotaQuery.Manual {
+			return response(409, map[string]string{"error": "manual_quota_query_disabled"}), nil
+		}
+		// This endpoint accepts no model, prompt, or scheduler mutation payload.
+		if len(bytes.TrimSpace(req.Body)) > 0 && string(bytes.TrimSpace(req.Body)) != "{}" {
+			return response(400, map[string]string{"error": "quota_query_has_no_parameters"}), nil
+		}
+		query, ok := engine.(interface{ RequestQuotaQuery() bool })
+		if !ok {
+			return response(501, map[string]string{"error": "quota_query_unavailable"}), nil
+		}
+		if debug, ok := engine.(DiagnosticEngine); ok {
+			caps, _, _ := debug.Diagnostics()
+			if !caps.QuotaAdapterReady {
+				return response(503, map[string]string{"error": "quota_bridge_unavailable"}), nil
+			}
+		}
+		status := "already_queued"
+		if query.RequestQuotaQuery() {
+			status = "queued"
+		}
+		return response(202, map[string]string{"status": status}), nil
 	case "GET /capabilities":
 		capabilities := core.HostCapabilities{}
 		if debug, ok := engine.(DiagnosticEngine); ok {

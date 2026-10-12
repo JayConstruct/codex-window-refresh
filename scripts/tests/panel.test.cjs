@@ -108,6 +108,13 @@ test('form edits preserve advanced fields, overrides and original input objects'
   assert.equal(original.activity.accounts_per_user, 1); assert.equal(original.account_overrides.existing.paused, undefined);
   const copy = editor.value(); copy.execution.model = 'mutated'; assert.equal(editor.value().execution.model, 'test');
 });
+test('quota controls preserve model wake settings and use only the quota endpoint', async()=>{
+  const initial={...policy(),quota_query:{automatic:true,manual:true,interval:'30s'}},editor=createEditor();editor.load({config:initial,revision:'r1'},true);
+  editor.update('quota_query.automatic',false);editor.update('quota_query.manual',false);editor.update('quota_query.interval','120s');
+  assert.equal(editor.value().enabled,false);assert.deepEqual(editor.value().execution,initial.execution);
+  const calls=[],session=createSession(async(url,options)=>{calls.push([url,options]);return response({status:'queued'},202)});session.setKey('test-key');
+  await session.request('/quota-query','POST');assert.equal(calls.length,1);assert.equal(calls[0][0],'/v0/management/codex-window-refresh/quota-query');assert.equal(calls[0][1].body,undefined);session.disconnect();
+});
 test('account IDs are literal keys and cannot alter object prototypes', () => {
   const editor = createEditor(); editor.load({config: policy(), revision: 'r1'}, true); editor.pause('__proto__', true); editor.pause('constructor', true);
   const overrides = editor.value().account_overrides;

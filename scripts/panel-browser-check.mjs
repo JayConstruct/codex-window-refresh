@@ -18,6 +18,7 @@ const reads = [];
 let unauthorized = false, conflict = false, revision = 'a'.repeat(64);
 let config = {
   schema_version: 1, enabled: false, timezone: 'Asia/Shanghai',
+  quota_query: {automatic: true, manual: true, interval: '30s'},
   reset_rules: { five_hour: { enabled: true, random_delay: { min: '0s', max: '600s' } }, weekly: { enabled: true, random_delay: { min: '0s', max: '600s' }, bypass_activity_limit: true, bypass_allowed_hours: true } },
   activity: { lookback: '1800s', accounts_per_user: 1, max_accounts: 10, identity_source: 'host_caller_scope' },
   ordinary_rules: { allowed_hours: ['08:00-23:00'], allow_outside_hours_when_users_active: true },
@@ -67,6 +68,14 @@ try {
       if (req.method === 'POST') {
         let body = ''; for await (const chunk of req) body += chunk;
         posts.push({ path, body });
+        if (path === 'quota-query') {
+          if (!config.quota_query.manual) {json(res,409,{error:'manual_quota_query_disabled'});return;}
+          assert.equal(body, '', 'Query endpoint must not receive a model or prompt');
+          summary.scheduler.quota_query = {phase:'completed',total:2,completed:2,failed:0,skipped:0};
+          accounts['fixture-account'].FiveHour.Remaining.Value = 71;
+          accounts['fixture-account'].FiveHour.Source = 'cpa_wham_usage';
+          json(res,202,{status:'queued'});return;
+        }
         if (path === 'config') {
           const edit = JSON.parse(body);
           if (conflict || edit.revision !== revision) { json(res, 409, { error: 'policy changed; reload the editor before saving' }); return; }
@@ -155,6 +164,11 @@ try {
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("72%")'), 'Passive quota did not appear on automatic panel polling');
   assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
   assert.equal(posts.length, 0, 'Snapshot polling dispatched operations');
+  await waitFor(() => evaluate('!document.getElementById("quota-query").disabled'), 'Manual query was not enabled');
+  await evaluate('document.getElementById("quota-query").click()');
+  await waitFor(() => evaluate('document.getElementById("quota-query-status").textContent.includes("查询结束")'), 'Manual query progress did not display');
+  assert.equal(posts.filter(p=>p.path==='quota-query').length,1,'Manual query duplicated');
+  assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("71%") && document.getElementById("account-list").textContent.includes("主动查询")'),true,'Manual quota did not update panel');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 960, deviceScaleFactor: 1, mobile: false });
   let capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp, 'panel-desktop.png'), Buffer.from(capture.data, 'base64'));
@@ -169,6 +183,13 @@ try {
   await waitFor(() => posts.filter(p => p.path === 'config').length === 2, 'Conflict save was not sent');
   await waitFor(() => evaluate('document.getElementById("notice").textContent.includes("其他操作修改") || document.getElementById("notice").textContent.includes("冲突")'), 'Conflict did not display');
   assert.equal(await evaluate('document.getElementById("rule-ratio").value'), '2', 'Conflict discarded draft');
+  conflict = false;
+  await evaluate(`{document.getElementById('query-automatic').checked=false; document.getElementById('query-automatic').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('query-manual').checked=false; document.getElementById('query-manual').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click();}`);
+  await waitFor(()=>config.quota_query.automatic===false && config.quota_query.manual===false,'Query switches did not persist');
+  await waitFor(()=>evaluate('document.getElementById("quota-query").disabled && document.getElementById("quota-query-status").textContent.includes("定期查询：关闭")'),'Saved manual/automatic switches did not apply');
+  assert.equal(config.enabled,false,'Changing query settings enabled model wake');
+  assert.equal(config.execution.model,'fixture-model','Query settings changed execution model');
+  assert.ok(posts.every(p=>['config','quota-query'].includes(p.path)),'Query controls called a model/scheduler operation');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Mobile viewport has horizontal overflow');
   capture = await cdp('Page.captureScreenshot');
@@ -188,7 +209,7 @@ try {
   await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
   await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Manual fallback did not connect');
   assert.deepEqual(errors, [], 'Browser or fixture errors');
-  console.log(`Browser smoke passed: manual login, CPA credential formats, reload/reopen, menu iframe, single rejected probe, fallback, quota source/5-second polling, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
+  console.log(`Browser smoke passed: CPA login, quota sources/5-second polling, manual quota query, independent saved query switches, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }

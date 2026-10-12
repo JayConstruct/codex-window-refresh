@@ -2,6 +2,12 @@
 # execution.model 必须按部署环境填写；占位值会被配置验证拒绝。
 schema_version: 1
 enabled: true
+
+# 只调用额度接口，不发送模型请求；与 enabled（模型唤醒）独立。
+quota_query:
+  automatic: true
+  manual: true
+  interval: 30s # 定期查询间隔，允许 30s 到 1h
 timezone: Asia/Shanghai
 
 reset_rules:

@@ -77,6 +77,7 @@ func (c Config) Validate() error {
 		add("reset_rules.weekly.bypass_allowed_hours", "WEEKLY_EXEMPTION_REQUIRED", "must be true")
 	}
 	duration("activity.lookback", c.Activity.Lookback, time.Minute, 24*time.Hour)
+	duration("quota_query.interval", c.QuotaQuery.Interval, 30*time.Second, time.Hour)
 	ratio := c.Activity.AccountsPerUser
 	if math.IsNaN(ratio) || math.IsInf(ratio, 0) {
 		add("activity.accounts_per_user", "NON_FINITE_NUMBER", "must be a finite number")
