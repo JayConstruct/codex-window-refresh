@@ -6,7 +6,7 @@
 GOCACHE=/tmp/codex-window-refresh-go-cache CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-shared -o /tmp/codex-window-refresh.so ./cmd/plugin
 ```
 
-该命令生成 `.so` 与 C 头文件。将动态库放入配置的 `plugins.dir`，文件名使用 `codex-window-refresh.so` 或 `codex-window-refresh-v0.1.0.so`；官方宿主从文件名识别稳定 ID 与可选版本。不要增加 `lib` 前缀，否则会成为另一个插件 ID。 首版支持手动放置动态库；插件商店附加的 `store` 元数据尚未接入严格包装解析，不能直接按商店安装方式配置。需要支持原生插件的同架构 Linux CPA 宿主。管理注册名称为 `codex-window-refresh`，版本 `0.1.0-rc.7`；声明 `request_interceptor`、`request_lifecycle_plugin`、`response_interceptor`、`response_stream_interceptor`、`websocket_response_observer` 和 `management_api`。该插件不替换正常账号路由。
+该命令生成 `.so` 与 C 头文件。将动态库放入配置的 `plugins.dir`，文件名使用 `codex-window-refresh.so` 或 `codex-window-refresh-v0.1.0.so`；官方宿主从文件名识别稳定 ID 与可选版本。不要增加 `lib` 前缀，否则会成为另一个插件 ID。 首版支持手动放置动态库；插件商店附加的 `store` 元数据尚未接入严格包装解析，不能直接按商店安装方式配置。需要支持原生插件的同架构 Linux CPA 宿主。管理注册名称为 `codex-window-refresh`，版本 `0.1.0-rc.8`；声明 `request_interceptor`、`request_lifecycle_plugin`、`response_interceptor`、`response_stream_interceptor`、`websocket_response_observer` 和 `management_api`。该插件不替换正常账号路由。
 
 ## 宿主配置和策略文件
 
@@ -43,7 +43,7 @@ plugins:
 | GET `/v0/management/codex-window-refresh/config` | 当前生效的规则配置 |
 | GET `/v0/management/codex-window-refresh/config-editor` | 磁盘策略与内容版本，用于并发编辑检查 |
 | POST `/v0/management/codex-window-refresh/config` | 严格验证并原子保存策略、热应用；内容版本冲突返回 409 |
-| GET `/v0/management/codex-window-refresh/capabilities` | 运行时已核对的宿主能力 |
+| GET `/v0/management/codex-window-refresh/capabilities` | 运行时宿主能力及 quota_bridge 本地配置诊断；不测试上游连通性，不返回管理密钥或地址 |
 | POST `/v0/management/codex-window-refresh/reload` | 读取外部配置、验证后更新 |
 | POST `/v0/management/codex-window-refresh/recheck` | 通知协调器重新检查；不能绕过窗口、用户名额、时间段或送达抑制规则 |
 | POST `/v0/management/codex-window-refresh/quota-query` | 无请求体或 `{}` 时批量查询；可选 `{ "account_id": "账号 ID" }` 仅查询该账号。需要允许手动查询及额度桥就绪，返回 202 和 queued/already_queued；不同目标忙碌时返回 409，未知账号返回 404；不创建唤醒任务或派发模型，进度位于摘要 scheduler.quota_query |

@@ -98,23 +98,32 @@ func (b *BridgeReader) Read(ctx context.Context, a AuthBinding) ([]byte, error) 
 
 // Available checks explicit bridge configuration without contacting CPA.
 func (b *BridgeReader) Available() bool {
-	if b == nil || b.ManagementKeyEnv == "" {
-		return false
+	return b.ConfigurationStatus() == "configured"
+}
+
+// ConfigurationStatus is a local check, not a network or authentication probe.
+// It returns fixed codes and never includes the key or configured URL.
+func (b *BridgeReader) ConfigurationStatus() string {
+	if b == nil || b.ManagementURL == "" {
+		return "missing_management_url"
+	}
+	if b.ManagementKeyEnv == "" {
+		return "missing_management_key_env"
 	}
 	lookup := b.Getenv
 	if lookup == nil {
 		lookup = os.Getenv
 	}
 	if lookup(b.ManagementKeyEnv) == "" {
-		return false
+		return "missing_management_key"
 	}
 	endpoint, err := url.Parse(b.ManagementURL)
 	if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
-		return false
+		return "invalid_management_url"
 	}
 	switch strings.TrimSuffix(endpoint.Path, "/") {
 	case "", "/", "/v0/management", "/v0/management/api-call", "/v8/management/requests/api-call":
-		return true
+		return "configured"
 	}
-	return false
+	return "invalid_management_url"
 }

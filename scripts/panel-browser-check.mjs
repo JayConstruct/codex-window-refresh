@@ -32,6 +32,7 @@ const accounts = {
   '<img src=x onerror=alert(1)>': { ID: '<img src=x onerror=alert(1)>', Enabled: true, Permission: 'unknown', FiveHour: { State: 'unknown' }, Weekly: { State: 'unknown' }, Task: { State: 'waiting', HoldReason: 'quota_unknown', Intents: [{ Reason: 'weekly_reset', Status: 'pending', RandomizedDueAt: reset }] } },
 };
 const summary = { enabled: false, business_enabled: false, host_enabled: true, running: true, accounts: 2, reservations: 0, revision: 42, effective_concurrency: 1, last_error: '', scheduler: { observed_at: now, recent_users: 2, capacity: { target: 2, active: 1, reserved: 0, missing: 1, participants: 2, user_target: 2 }, hold_counts: { quota_unknown: 1 }, identity_source: 'host_caller_scope', quota_unknown_accounts: 1, foreground_busy_accounts: 0, next_inventory_at: reset } };
+const capabilities = { StableAccountIdentity: true, ExactAccountExecution: true, QuotaAdapterReady: false, ActivityIdentityAtStart: true, ActivityIdentityAtCompletion: true, ForegroundGuard: false, quota_bridge: {status:'missing_management_key',management_key_env:'CPA_MANAGEMENT_KEY'} };
 function json(res, status, value) { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); }
 const errors = [];
 async function waitFor(check, message, timeout = 12000) {
@@ -99,7 +100,7 @@ try {
         }
         json(res, path === 'recheck' ? 202 : 200, { status: 'scheduled' }); return;
       }
-      const values = { summary, accounts, config, capabilities: { StableAccountIdentity: true, ExactAccountExecution: true, QuotaAdapterReady: true, ActivityIdentityAtStart: true, ActivityIdentityAtCompletion: true, ForegroundGuard: false }, 'config-editor': { config, revision, disk_matches_running: true } };
+      const values = { summary, accounts, config, capabilities, 'config-editor': { config, revision, disk_matches_running: true } };
       json(res, 200, values[path] ?? {});
     } catch (err) { errors.push(String(err)); json(res, 500, { error: 'fixture error' }); }
   });
@@ -144,6 +145,10 @@ try {
   assert.equal(await evaluate('document.getElementById("mode-title").textContent'), '仅查看与查询额度', 'Applied mode did not explain model behavior');
   assert.equal(await evaluate('document.getElementById("query-automatic").closest(".view").id'), 'tab-query', 'Query controls are mixed with wake rules');
   assert.equal(await evaluate('document.getElementById("save-bar").hidden'), true, 'Clean draft displayed a pending save bar');
+  assert.equal(await evaluate('document.getElementById("quota-query").disabled'),true,'Unready quota bridge allowed a query');
+  assert.equal(await evaluate('document.getElementById("bridge-status").textContent.includes("CPA 进程未读取到") && document.getElementById("bridge-help").textContent.includes("CPA_MANAGEMENT_KEY")'),true,'Missing backend key diagnosis was not actionable');
+  capabilities.QuotaAdapterReady = true; capabilities.quota_bridge.status = 'configured';
+  await waitFor(()=>evaluate('!document.getElementById("quota-query").disabled && document.getElementById("bridge-status").textContent.includes("已就绪")'),'Startup readiness remained stale after automatic polling');
   // Seed only the mock host's saved credentials; exercise the real startup path.
   for (const legacy of [false, true]) {
     for (const encoded of [false, true]) {
@@ -271,7 +276,7 @@ try {
   await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
   await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Manual fallback did not connect');
   assert.deepEqual(errors, [], 'Browser or fixture errors');
-  console.log(`Browser smoke passed: CPA login, query/wake separation, mode summary, shared drafts/save bar, persistent account disclosures, keyboard tabs, quota sources/polling, manual and single-account queries, five mobile views, JSON editor, 401 cleanup. Screenshots: ${temp}`);
+  console.log(`Browser smoke passed: CPA login, live bridge readiness/diagnosis, query/wake separation, mode summary, shared drafts/save bar, persistent account disclosures, keyboard tabs, quota sources/polling, manual and single-account queries, five mobile views, JSON editor, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }

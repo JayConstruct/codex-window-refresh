@@ -45,7 +45,7 @@ host := cpa.NewHost(callback, quotaReader)
 - upstream 请求头使用 `Authorization: Bearer $TOKEN$` 和核对过的 `Chatgpt-Account-Id`；CPA 负责替换和续期 token。
 - 管理响应必须是 HTTP 200，其包装字段 `status_code` 也必须为 200；最多读取 2 MiB。禁用重定向，不向其他位置转送管理凭据。
 
-管理 URL 与密钥未配置时，`QuotaAdapterReady=false`；查询返回 `quota_management_bridge_missing`。查询失败只返回稳定分类 `quota_management_bridge_failed`，不将响应正文、token 或密钥附加进错误。
+管理 URL 与密钥未配置时，`QuotaAdapterReady=false`；查询返回 `quota_management_bridge_missing`。管理能力响应另含 `quota_bridge.status`，区分 `missing_management_url`、`missing_management_key_env`、`missing_management_key`、`invalid_management_url` 和 `configured`，仅检查本地配置，不发送请求或验证认证。诊断可包含环境变量名，不包含管理 URL、密钥值或 token。查询失败只返回稳定分类 `quota_management_bridge_failed`，不将响应正文、token 或密钥附加进错误。
 
 官方管理 API schema 来源为 `internal/api/handlers/management/api_tools.go`。默认桥接不是 CPA 的原生 `host.quota` callback，不会把拟议能力当作现成接口。
 

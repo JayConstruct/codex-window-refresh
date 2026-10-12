@@ -26,11 +26,16 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.7"
+const Version = "0.1.0-rc.8"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
 const ResourcePrefix = "/v0/resource/plugins/" + ID
+
+type quotaBridgeDiagnostic struct {
+	Status           string `json:"status"`
+	ManagementKeyEnv string `json:"management_key_env,omitempty"`
+}
 
 type Engine interface {
 	Run(context.Context) error
@@ -540,7 +545,11 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		if debug, ok := engine.(DiagnosticEngine); ok {
 			capabilities, _, _ = debug.Diagnostics()
 		}
-		return response(200, capabilities), nil
+		bridge := &cpa.BridgeReader{ManagementURL: wrapper.ManagementURL, ManagementKeyEnv: wrapper.ManagementKeyEnv}
+		return response(200, struct {
+			core.HostCapabilities
+			QuotaBridge quotaBridgeDiagnostic `json:"quota_bridge"`
+		}{capabilities, quotaBridgeDiagnostic{bridge.ConfigurationStatus(), wrapper.ManagementKeyEnv}}), nil
 	case "POST /reload":
 		if stopping {
 			return response(409, map[string]string{"error": "scheduler stopping"}), nil

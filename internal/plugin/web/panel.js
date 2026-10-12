@@ -201,6 +201,7 @@
     for (const id of ['metrics', 'schedule-info', 'hold-counts', 'account-list', 'daily-rules', 'capabilities-list']) $(id).replaceChildren();
     for (const input of document.querySelectorAll('[data-field]')) { if (input.type === 'checkbox') input.checked = false; else input.value = ''; input.disabled = input.dataset.fixed === 'true'; }
     $('account-search').value = ''; $('account-filter').value = 'all'; $('last-error').textContent = ''; $('updated-at').textContent = ''; $('json-message').textContent = '';
+    $('bridge-status').textContent = ''; $('bridge-help').textContent = '';
     for (const id of ['refresh', 'connect', 'recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = false;
     $('quota-query').disabled = true; $('quota-query-status').textContent = '';
     $('save-bar').hidden = true; $('mode-title').textContent = '正在读取运行模式'; $('mode-description').textContent = ''; $('mode-badge').textContent = '';
@@ -269,7 +270,7 @@
   }
   function quotaQueryReason() {
     if (!summary?.running) return '后台未运行';
-    if (capabilities.QuotaAdapterReady !== true) return '额度查询接口未就绪，请查看诊断';
+    if (capabilities.QuotaAdapterReady !== true) return bridgeDescription() + '，请查看诊断';
     if (runningConfig?.quota_query?.manual !== true) return '手动查询已关闭，可在“额度查询”中开启';
     return '';
   }
@@ -284,7 +285,20 @@
   }
   function renderCapabilities() {
     const labels = {StableAccountIdentity: '稳定账号身份', ExactAccountExecution: '指定账号发送', QuotaAdapterReady: '额度适配器就绪', ActivityIdentityAtStart: '请求开始时识别用户范围', ActivityIdentityAtCompletion: '请求完成时识别用户范围', ForegroundGuard: '前台请求与调度互斥保护'};
-    details($('capabilities-list'), Object.entries(labels).map(([key, label]) => [label, capabilities[key] === true ? '支持' : capabilities[key] === false ? '不支持' : '未知']));
+    details($('capabilities-list'), Object.entries(labels).map(([key, label]) => [label, capabilities[key] === true ? (key === 'QuotaAdapterReady' ? '已就绪' : '支持') : capabilities[key] === false ? (key === 'QuotaAdapterReady' ? '未就绪' : '不支持') : '未知']));
+    $('bridge-status').textContent = capabilities.QuotaAdapterReady === true ? '后台额度查询配置已就绪' : bridgeDescription();
+    const env = capabilities.quota_bridge?.management_key_env || 'management_key_env 指定的变量';
+    const help = {
+      missing_management_url: '在 CPA 主配置的 plugins.configs.codex-window-refresh 中设置 management_url 和 management_key_env，然后重启 CPA。',
+      missing_management_key_env: '在 CPA 主配置的 plugins.configs.codex-window-refresh 中设置 management_key_env（环境变量名），然后重启 CPA。',
+      missing_management_key: '将现有 CPA 管理密钥设置到 CPA 进程的 ' + env + ' 环境变量，然后重启 CPA。systemd 需配置 EnvironmentFile；Docker 需将变量传入容器。',
+      invalid_management_url: '检查 CPA 主配置中的 management_url。支持 http(s) 服务基址、/v0/management、/v0/management/api-call 或完整 /v8/management/requests/api-call；修改后重启 CPA。',
+      configured: '管理地址及密钥环境变量已配置。接口能力每 5 秒更新；查询失败时再检查管理密钥、地址及上游连接。'
+    };
+    $('bridge-help').textContent = help[capabilities.quota_bridge?.status] || '接口能力每 5 秒更新。若持续未就绪，请检查后台管理地址和密钥环境变量，并查看 CPA 日志。';
+  }
+  function bridgeDescription() {
+    return {missing_management_url: '未配置后台管理接口地址', missing_management_key_env: '未配置管理密钥环境变量名', missing_management_key: 'CPA 进程未读取到管理密钥环境变量', invalid_management_url: '后台管理接口地址配置无效', configured: '额度查询配置已具备，等待后台确认'}[capabilities.quota_bridge?.status] || '额度查询接口未就绪';
   }
   function windowCell(title, evidence) {
     evidence = evidence || {};
@@ -402,10 +416,10 @@
   }
   async function readSnapshots() {
     const generation = session.generation();
-    const [nextSummary, nextAccounts] = await Promise.all([session.request('/summary'), session.request('/accounts')]);
+    const [nextSummary, nextAccounts, nextCapabilities] = await Promise.all([session.request('/summary'), session.request('/accounts'), session.request('/capabilities')]);
     if (generation !== session.generation()) return;
-    if (!validObject(nextSummary) || !validObject(nextAccounts)) throw new PanelError('invalid_response');
-    summary = nextSummary; accounts = nextAccounts; renderOverview(); renderAccounts(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
+    if (![nextSummary, nextAccounts, nextCapabilities].every(validObject)) throw new PanelError('invalid_response');
+    summary = nextSummary; accounts = nextAccounts; capabilities = nextCapabilities; renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
   }
   function schedulePoll() {
     if (pollTimer) root.clearTimeout(pollTimer);
