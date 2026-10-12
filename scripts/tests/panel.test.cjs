@@ -1,12 +1,55 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {createSession, createEditor, resetTime, countdown, apiBase} = require('../../internal/plugin/web/panel.js');
+const {createSession, createEditor, resetTime, countdown, apiBase, readPanelKey} = require('../../internal/plugin/web/panel.js');
 const response = (value, status = 200, type = 'application/json') => ({ok: status >= 200 && status < 300, status, headers: {get: () => type}, json: async () => value});
 function policy() {
   return {schema_version: 1, enabled: false, timezone: 'Asia/Shanghai', activity: {lookback: '1800s', accounts_per_user: 1, max_accounts: 10, identity_source: 'host_caller_scope'}, ordinary_rules: {allowed_hours: ['08:00-23:00'], allow_outside_hours_when_users_active: true}, reset_rules: {five_hour: {enabled: true, random_delay: {min: '0s', max: '600s'}}, weekly: {enabled: true, random_delay: {min: '0s', max: '600s'}, bypass_activity_limit: true, bypass_allowed_hours: true}}, daily_rules: [], execution: {model: 'test', prompt: 'Reply OK.', request_timeout: '60s', verification_capacity_hold: '900s', verify_delays: ['5s', '30s', '120s']}, account_overrides: {existing: {weekly_enabled: false, allowed_hours: ['09:00-18:00']}}};
 }
 function deferred() { let resolve, reject; const promise = new Promise((ok, fail) => {resolve = ok; reject = fail;}); return {promise, resolve, reject}; }
+function panelContext(entries = {}, origin = 'https://cpa.test') {
+  return {localStorage: {getItem: name => entries[name] ?? null}, location: new URL(origin), navigator: {userAgent: 'fixture browser'}, TextEncoder, TextDecoder, atob};
+}
+function obfuscated(value, context) {
+  const data = new TextEncoder().encode(JSON.stringify(value));
+  const mask = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + context.location.host + '|' + context.navigator.userAgent);
+  return 'enc::v1::' + Buffer.from(data.map((byte, i) => byte ^ mask[i % mask.length])).toString('base64');
+}
+test('CPA saved auth state and legacy keys are reused without modifying storage', () => {
+  for (const encoded of [false, true]) {
+    for (const legacy of [false, true]) {
+      const context = panelContext();
+      const entries = legacy ? {managementKey: '  管理-key  ', apiBase: 'https://cpa.test'}
+        : {'cli-proxy-auth': {state: {managementKey: '  管理-key  ', apiBase: 'https://cpa.test', rememberPassword: true}, version: 0}};
+      for (const name of Object.keys(entries)) entries[name] = encoded ? obfuscated(entries[name], context) : JSON.stringify(entries[name]);
+      const reads = [];
+      context.localStorage = {getItem: name => {reads.push(name); return entries[name] ?? null;}};
+      assert.equal(readPanelKey(context, apiBase({origin: context.location.origin, pathname: '/v0/resource/plugins/codex-window-refresh/status'})), '管理-key');
+      assert.ok(reads.every(name => ['cli-proxy-auth', 'managementKey', 'apiBase', 'apiUrl'].includes(name)));
+    }
+  }
+  assert.equal(readPanelKey(panelContext({managementKey: 'legacy-raw-key'}), '/v0/management/codex-window-refresh'), 'legacy-raw-key');
+});
+test('saved credentials for another server or proxy prefix are never reused', () => {
+  const base = '/cpa/v0/management/codex-window-refresh';
+  for (const apiBase of ['https://other.test/cpa', 'http://cpa.test/cpa', 'https://cpa.test/other', 'https://cpa.test', 'https://user@cpa.test/cpa', 'https://cpa.test/cpa?x=1', 'https://cpa.test/cpa#x', 'invalid']) {
+    const entries = {'cli-proxy-auth': JSON.stringify({state: {managementKey: 'secret', apiBase}})};
+    assert.equal(readPanelKey(panelContext(entries), base), '', apiBase);
+    assert.equal(readPanelKey(panelContext({managementKey: 'secret', apiUrl: JSON.stringify(apiBase)}), base), '', apiBase);
+  }
+  assert.equal(readPanelKey(panelContext({'cli-proxy-auth': JSON.stringify({state: {managementKey: 'secret', apiBase: 'https://cpa.test/cpa/'}})}), base), 'secret');
+});
+test('missing, blocked, malformed or damaged CPA storage leaves manual login available', () => {
+  const base = '/v0/management/codex-window-refresh';
+  for (const entry of [null, '{}', '{bad', 'null', '[]', 'enc::v1::bad!', 'enc::v1::AAAA', JSON.stringify({state: {managementKey: '\nsecret'}}), JSON.stringify({state: {managementKey: 123}})]) {
+    assert.equal(readPanelKey(panelContext({'cli-proxy-auth': entry}), base), '');
+  }
+  const context = panelContext();
+  Object.defineProperty(context, 'localStorage', {get: () => {throw new Error('storage denied');}});
+  assert.equal(readPanelKey(context, base), '');
+  const mismatched = panelContext({managementKey: obfuscated('secret'.repeat(20), panelContext())}, 'https://cpa.test:8443');
+  assert.equal(readPanelKey(mismatched, base), '');
+});
 test('authenticated requests use the fixed same-origin API and omit cookies and redirects', async () => {
   const calls = [], session = createSession(async (url, options) => {calls.push([url, options]); return response({ok: true});});
   session.setKey('private-test-key');

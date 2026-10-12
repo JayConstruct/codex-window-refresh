@@ -14,6 +14,7 @@ const key = 'local-browser-test-only';
 const temp = await mkdtemp(join(tmpdir(), 'window-refresh-panel-browser-'));
 let browser, server, ws;
 const posts = [];
+const reads = [];
 let unauthorized = false, conflict = false, revision = 'a'.repeat(64);
 let config = {
   schema_version: 1, enabled: false, timezone: 'Asia/Shanghai',
@@ -48,6 +49,10 @@ try {
   assert.ok(executable, 'Set CHROME_BIN to a Chromium executable');
   server = createServer(async (req, res) => {
     try {
+      if (req.url === '/management.html') {
+        res.writeHead(200, {'Content-Type': 'text/html'});
+        res.end('<!doctype html><iframe src="' + base + 'status"></iframe>'); return;
+      }
       if (req.url.startsWith(base)) {
         const name = req.url.slice(base.length), files = { status: 'panel.html', 'panel.js': 'panel.js', 'panel.css': 'panel.css' };
         if (!files[name]) { res.writeHead(404); res.end(); return; }
@@ -56,6 +61,7 @@ try {
         res.end(await readFile(join(root, 'internal/plugin/web', files[name]))); return;
       }
       if (!req.url.startsWith(api)) { res.writeHead(404); res.end(); return; }
+      if (req.method === 'GET') reads.push(req.url);
       if (unauthorized || req.headers.authorization !== `Bearer ${key}`) { json(res, 401, { error: 'unauthorized' }); return; }
       const path = req.url.slice(api.length);
       if (req.method === 'POST') {
@@ -103,6 +109,36 @@ try {
   try { await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Login did not succeed'); }
   catch (error) { console.error(await evaluate('document.getElementById("notice").textContent'), errors, caughtExceptions); throw error; }
   assert.equal(posts.length, 0, 'Read-only login must not dispatch operations');
+  assert.equal(await evaluate('localStorage.length'), 0, 'Manual login persisted the key');
+  // Seed only the mock host's saved credentials; exercise the real startup path.
+  for (const legacy of [false, true]) {
+    for (const encoded of [false, true]) {
+      const saved = await evaluate(`(() => {
+        localStorage.clear();
+        const name = ${JSON.stringify(legacy ? 'managementKey' : 'cli-proxy-auth')};
+        const value = ${legacy ? JSON.stringify(key) : `{state: {managementKey: ${JSON.stringify(key)}, apiBase: location.origin}, version: 0}`};
+        let raw = JSON.stringify(value);
+        if (${encoded}) {
+          const bytes = new TextEncoder().encode(raw);
+          const mask = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + location.host + '|' + navigator.userAgent);
+          raw = 'enc::v1::' + btoa(Array.from(bytes, (byte, i) => String.fromCharCode(byte ^ mask[i % mask.length])).join(''));
+        }
+        localStorage.setItem(name, raw); return raw;
+      })()`);
+      const beforeReload = reads.length;
+      await cdp('Page.reload');
+      await waitFor(async () => reads.length >= beforeReload + 5 && await evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Saved CPA credentials did not auto-connect');
+      assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(legacy ? 'managementKey' : 'cli-proxy-auth')})`), saved, 'Auto-connect modified host storage');
+      assert.equal(await evaluate('document.getElementById("management-key").value'), '', 'Auto-connect exposed key in form');
+      await evaluate('document.getElementById("disconnect").click()');
+      assert.equal(await evaluate('document.getElementById("workspace").hidden'), true, 'Disconnect did not stay disconnected');
+    }
+  }
+  await cdp('Page.navigate', {url: new URL('/management.html', url).href});
+  await waitFor(() => evaluate('!!document.querySelector("iframe")?.contentDocument?.getElementById("workspace") && !document.querySelector("iframe").contentDocument.getElementById("workspace").hidden'), 'CPA menu iframe did not auto-connect');
+  await cdp('Page.navigate', {url});
+  await waitFor(() => evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Reopening did not auto-connect');
+  assert.equal(posts.length, 0, 'Auto-connect dispatched operations');
   await evaluate(`document.querySelector('[data-tab="accounts"]').click()`);
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), 'Accounts did not render');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'), 0, 'Account IDs must render as text');
@@ -130,8 +166,16 @@ try {
   assert.equal(await evaluate('document.getElementById("management-key").value'), '', '401 retained key input');
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), false, '401 retained account data');
   assert.equal(await evaluate('document.getElementById("config-json").value'), '', '401 retained editor content');
+  const beforeRejectedLogin = reads.length;
+  await cdp('Page.reload');
+  await waitFor(async () => reads.length > beforeRejectedLogin && await evaluate('document.readyState === "complete" && !!document.getElementById("login-section") && !document.getElementById("login-section").hidden && document.getElementById("notice").textContent.includes("认证失败")'), 'Rejected saved key did not return to manual login');
+  assert.equal(reads.length - beforeRejectedLogin, 1, 'Rejected saved key retried or dispatched parallel reads');
+  assert.equal(await evaluate('localStorage.length'), 1, 'Failed auto-connect changed host login');
+  unauthorized = false;
+  await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
+  await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Manual fallback did not connect');
   assert.deepEqual(errors, [], 'Browser or fixture errors');
-  console.log(`Browser smoke passed: authentication, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
+  console.log(`Browser smoke passed: manual login, CPA credential formats, reload/reopen, menu iframe, single rejected probe, fallback, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
   if (browser) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }

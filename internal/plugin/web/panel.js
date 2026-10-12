@@ -1,5 +1,5 @@
-/* Public assets are inert until the operator supplies a CPA management key.
- * No storage, external endpoint, HTML injection, or automatic write is used. */
+/* Public assets reuse the same-origin CPA panel's saved management key.
+ * Storage is read-only; requests use fixed local endpoints and never auto-write. */
 (function (root) {
   'use strict';
   const API = '/v0/management/codex-window-refresh';
@@ -19,6 +19,46 @@
   }
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function validObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+  // CPAMC/CPAMP use cli-proxy-auth or the legacy managementKey entry, either
+  // plain JSON or reversible enc::v1:: obfuscation. Read only these known keys.
+  // Format reference: router-for-me/Cli-Proxy-API-Management-Center,
+  // src/utils/encryption.ts and src/stores/useAuthStore.ts.
+  function panelStoredValue(context, name) {
+    try {
+      let value = context.localStorage.getItem(name);
+      if (value === null) return null;
+      if (value.startsWith('enc::v1::')) {
+        const bytes = Uint8Array.from(context.atob(value.slice(9)), c => c.charCodeAt(0));
+        const mask = new context.TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + context.location.host + '|' + context.navigator.userAgent);
+        for (let i = 0; i < bytes.length; i++) bytes[i] ^= mask[i % mask.length];
+        value = new context.TextDecoder('utf-8', {fatal: true}).decode(bytes);
+        // Obfuscated values are JSON; damaged values must never become a key.
+        return JSON.parse(value);
+      }
+      try { return JSON.parse(value); } catch (_) { return value; }
+    } catch (_) { return null; }
+  }
+  function readPanelKey(context, base) {
+    function candidate(key, address) {
+      if (typeof key !== 'string' || !key.trim() || /[\x00-\x1f\x7f]/.test(key)) return '';
+      if (address !== null && address !== undefined && address !== '') {
+        if (typeof address !== 'string') return '';
+        try {
+          const url = new URL(address);
+          const prefix = base.slice(0, -API.length).replace(/\/$/, '');
+          if (url.origin !== context.location.origin || url.username || url.password || url.search || url.hash
+            || url.pathname.replace(/\/$/, '') !== prefix) return '';
+        } catch (_) { return ''; }
+      }
+      return key.trim();
+    }
+    const stored = panelStoredValue(context, 'cli-proxy-auth');
+    const state = validObject(stored) && validObject(stored.state) ? stored.state : null;
+    const key = state ? candidate(state.managementKey, state.apiBase) : '';
+    if (key) return key;
+    return candidate(panelStoredValue(context, 'managementKey'),
+      panelStoredValue(context, 'apiBase') || panelStoredValue(context, 'apiUrl'));
+  }
   function createSession(fetcher, disconnected, timers, base) {
     base = base || API;
     timers = timers || {setTimeout: (...args) => root.setTimeout(...args), clearTimeout: (...args) => root.clearTimeout(...args)};
@@ -133,7 +173,7 @@
     const days = Math.floor(seconds / 86400), hours = Math.floor(seconds % 86400 / 3600), minutes = Math.floor(seconds % 3600 / 60), s = seconds % 60;
     return (days ? days + ' 天 ' : '') + String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
-  const exported = {PanelError, createSession, createEditor, resetTime, countdown, apiBase};
+  const exported = {PanelError, createSession, createEditor, resetTime, countdown, apiBase, readPanelKey};
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
   if (!root.document) return;
   const document = root.document, $ = id => document.getElementById(id);
@@ -333,13 +373,16 @@
     if (generation !== session.generation()) return;
     editor.load(envelope, true); diskMatchesRunning = envelope.disk_matches_running !== false; renderForm(); renderAccounts();
   }
-  $('login-form').addEventListener('submit', async event => {
-    event.preventDefault();
-    const key = $('management-key').value;
+  async function connectPanel(key, automatic) {
     $('management-key').value = '';
     let generation;
     try { generation = session.setKey(key); } catch (error) { report(error); return; }
     $('connect').disabled = true;
+    $('management-key').disabled = true;
+    if (automatic) {
+      $('login-section').hidden = true;
+      $('connection-status').textContent = '正在连接';
+    }
     try {
       // CPA counts failed authentication per request. Probe once before parallel reads.
       const nextSummary = await session.request('/summary');
@@ -355,7 +398,15 @@
     } catch (error) {
       if (generation === session.generation()) session.disconnect();
       report(error);
-    } finally { if (generation === session.generation() || !session.connected()) $('connect').disabled = false; }
+    } finally {
+      if (generation === session.generation() || !session.connected()) {
+        $('connect').disabled = false; $('management-key').disabled = false;
+      }
+    }
+  }
+  $('login-form').addEventListener('submit', event => {
+    event.preventDefault();
+    void connectPanel($('management-key').value, false);
   });
   $('disconnect').addEventListener('click', () => { if (editor.dirty() && !root.confirm('断开将清除未保存的规则草稿。继续断开？')) return; session.disconnect(); });
   document.querySelectorAll('[data-tab]').forEach(button => button.addEventListener('click', () => {
@@ -410,4 +461,8 @@
   root.addEventListener('beforeunload', event => { if (editor.dirty()) { event.preventDefault(); event.returnValue = ''; } });
   root.addEventListener('pagehide', () => session.disconnect());
   root.setInterval(() => { if (!session.connected() || document.hidden) return; for (const item of document.querySelectorAll('[data-reset]')) item.textContent = countdown(item.dataset.reset); }, 1000);
+  (function autoConnect() {
+    const key = readPanelKey(root, apiBase(root.location));
+    if (key) void connectPanel(key, true);
+  })();
 })(typeof globalThis !== 'undefined' ? globalThis : this);

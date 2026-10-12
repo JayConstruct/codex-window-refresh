@@ -14,7 +14,7 @@
   <main>
     <section id="login-section" class="card login-card">
       <div><span class="eyebrow">CPA 管理认证</span><h1>让刷新按你的节奏发生</h1><p>查看已确认的额度窗口、检查账号调度，并调整刷新规则。</p></div>
-      <form id="login-form" class="login-form"><label for="management-key">管理密钥</label><div class="input-action"><input id="management-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 CPA management secret-key" required><button id="connect" class="primary" type="submit">连接面板</button></div><p class="hint">密钥仅保存在当前页面内存；刷新页面或断开连接后清除。请求只发送到当前 CPA 地址。</p></form>
+      <form id="login-form" class="login-form"><label for="management-key">管理密钥</label><div class="input-action"><input id="management-key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 CPA management secret-key" required><button id="connect" class="primary" type="submit">连接面板</button></div><p class="hint">优先复用同源 CPA 管理中心已保存的登录凭据；无法复用时请手动连接。手动输入的密钥仅保存在当前页面内存，请求只发送到当前 CPA 地址。</p></form>
     </section>
     <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
     <div id="workspace" hidden>
