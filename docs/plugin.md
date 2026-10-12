@@ -6,7 +6,7 @@
 GOCACHE=/tmp/codex-window-refresh-go-cache CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-shared -o /tmp/codex-window-refresh.so ./cmd/plugin
 ```
 
-该命令生成 `.so` 与 C 头文件。将动态库放入配置的 `plugins.dir`，文件名使用 `codex-window-refresh.so` 或 `codex-window-refresh-v0.1.0.so`；官方宿主从文件名识别稳定 ID 与可选版本。不要增加 `lib` 前缀，否则会成为另一个插件 ID。 首版支持手动放置动态库；插件商店附加的 `store` 元数据尚未接入严格包装解析，不能直接按商店安装方式配置。需要支持原生插件的同架构 Linux CPA 宿主。管理注册名称为 `codex-window-refresh`，版本 `0.1.0-rc.2`；声明 `request_interceptor`、`request_lifecycle_plugin`、`management_api` 三项能力。该插件不替换正常账号路由。
+该命令生成 `.so` 与 C 头文件。将动态库放入配置的 `plugins.dir`，文件名使用 `codex-window-refresh.so` 或 `codex-window-refresh-v0.1.0.so`；官方宿主从文件名识别稳定 ID 与可选版本。不要增加 `lib` 前缀，否则会成为另一个插件 ID。 首版支持手动放置动态库；插件商店附加的 `store` 元数据尚未接入严格包装解析，不能直接按商店安装方式配置。需要支持原生插件的同架构 Linux CPA 宿主。管理注册名称为 `codex-window-refresh`，版本 `0.1.0-rc.4`；声明 `request_interceptor`、`request_lifecycle_plugin`、`response_interceptor`、`response_stream_interceptor`、`websocket_response_observer` 和 `management_api`。该插件不替换正常账号路由。
 
 ## 宿主配置和策略文件
 
@@ -47,7 +47,7 @@ plugins:
 | POST `/v0/management/codex-window-refresh/reload` | 读取外部配置、验证后更新 |
 | POST `/v0/management/codex-window-refresh/recheck` | 通知协调器重新检查；不能绕过窗口、用户名额、时间段或送达抑制规则 |
 
-CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/codex-window-refresh/status` 与 `/panel.js`、`/panel.css` 只返回静态面板资产，HTML 不嵌入账号、配置、额度或运行状态。页面输入管理密钥后通过同源的已认证管理 API 查询与编辑，密钥仅保存在页面内存。资源使用限制同源脚本、样式与连接的 CSP。使用与保存行为详见 [网页面板](panel.md)。JSON 管理响应采用 schema 6 原始响应语义；Body 按官方 RPC 的 `[]byte` 序列化传输。
+CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/codex-window-refresh/status` 与 `/panel.js`、`/panel.css` 只返回静态面板资产，HTML 不嵌入账号、配置、额度或运行状态。页面优先复用同源 CPA 已保存的管理凭据，无法复用时手动输入密钥，再通过已认证管理 API 查询与编辑；模块不持久化手动输入的密钥。资源使用限制同源脚本、样式与连接的 CSP。使用与保存行为详见 [网页面板](panel.md)。JSON 管理响应采用 schema 6 原始响应语义；Body 按官方 RPC 的 `[]byte` 序列化传输。
 
 `/summary` 的 `scheduler` 字段用于实测时解释为何尚未唤醒账号：包含汇总发布时间 `observed_at`、近期身份数量 `recent_users`、身份来源 `identity_source`、容量 `capacity`（目标、活跃、预约和缺口）、阻止发送的账号数量 `hold_counts`、额度未知账号数 `quota_unknown_accounts`、前台请求占用账号数 `foreground_busy_accounts` 和下一次账号清单检查时间 `next_inventory_at`。人数按宿主认证的 caller scope 去重；共用 scope 的多个自然人只计一个身份。指标只包含汇总，不返回活动身份、请求 ID 或原始请求。
 
@@ -55,7 +55,7 @@ CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/co
 
 ## 观测回调和生命周期
 
-`request.intercept_before`、`request.intercept_after`、`request.complete` 仅提交宿主认证活动事件。前两个回调原样回传 Headers 与 Body，不拒绝请求、不改写请求。插件自身流量由 CPA 适配器排除；不可信或缺失的可选身份字段不会变成人数。队列由同一运行时协调器处理。
+`request.intercept_before`、`request.intercept_after`、`request.complete` 提交宿主认证活动事件，并维护有界的请求账号绑定。前两个回调原样回传 Headers 与 Body，不拒绝请求、不改写请求。`response.intercept_after`、`response.intercept_stream_chunk`、`websocket.response_event` 只解析绑定账号的额度并返回空修改对象，不改变任何响应内容。插件自身流量由 CPA 适配器排除；不可信或缺失的可选身份字段不会变成人数。队列由同一运行时协调器处理；详见 [额度适配器](cpa-adapter.md#正常请求返回的额度)。
 
 初始化复制完整 host API 结构，不保存宿主传入的临时结构指针。每次 host callback 同步读取完整响应、验证长度与 Envelope，再按宿主提供的 free_buffer 释放；失败响应的已分配缓冲区也释放。入口验证 ABI、空指针及 64 MiB 缓冲上限；RPC 和后台运行的 Go panic 归类为错误，不能穿过 C ABI。
 

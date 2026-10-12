@@ -66,6 +66,16 @@ host := cpa.NewHost(callback, quotaReader)
 
 生成 response headers 的 `X-Codex-Primary/Secondary-*` 和 `codex.rate_limits` SSE 帧也会转换为独立额度观测。来自响应头的旧证据不会因为后续帧到达而自动刷新时间；生成缺少额度信息时仍由运行时安排主动查询。HTTP 200、`[DONE]` 或只有文本 delta 不代表生成完整完成；必须完整消费模型流并收到 `response.completed`，没有 stream 错误才返回 `SendCompleted`。流打开或读取失败会返回 `SendUnknown`，避免错误地声称请求未送达。
 
+## 正常请求返回的额度
+
+原生 schema 6 注册 `response_interceptor`、`response_stream_interceptor` 和 `websocket_response_observer`。对应 RPC 为 `response.intercept_after`、`response.intercept_stream_chunk`、`websocket.response_event`；名称由官方 `sdk/pluginabi/types.go` 和 `internal/pluginhost/rpc_client.go` 核对。HTTP 使用 `ResponseHeaders` 中的 `X-Codex-Primary/Secondary-*`；流式只读取 `ChunkIndex=-1` 的 header-init，不把后续正文 chunk 重复携带的旧头当作新观测。WebSocket 使用上游原始 `Payload` 的 `codex.rate_limits`，也接受 `error.headers` 中的额度字段，兼容小写头名并拒绝矛盾大小写变体。
+
+`request.intercept_after` 捕获 `RequestID → 已核对的 Codex 账号 ID 与凭据代际`。响应可缺少最佳努力的 Metadata，但明确提供的 `selected_auth_id` 必须与绑定一致；WebSocket 的 `Provider=codex`、`AuthID` 和可选 `EventType` 还需与绑定和 payload 一致。重试换号会替换绑定，换到未支持账号时清除旧绑定；刷新宿主清单发现账号代际变化后，旧请求响应不会套用到新账号。宿主仍未提供与账号替换原子同步的凭据代际，当前核对依据已发现的宿主清单，无法声称替换瞬间强一致。
+
+为兼容异步完成通知先于最终响应拦截，完成后的绑定保留 2 分钟；未完成绑定最多保留 10 分钟，总计最多 4096 项，过期或容量淘汰后回退主动查询。只保存请求与账号绑定，不保存提示词、响应正文、凭据、stream history。响应观察回调不做磁盘/网络 I/O，只向协调器提交结构化额度，返回空修改对象 `{}`，原响应头、正文及 stream chunk 原样保留。无额度、绑定未知、畸形或无关数据均忽略，不影响正常请求。客户端正文中的账号或额度字段不参与识别；插件自身生成通过独立执行适配器观察，避免重复收集。
+
+新来源为 `cpa_response_headers`、`cpa_websocket_quota`，观测分类为 `execution_response`。字段仍独立接受，缺失周窗口不会清除已有周额度；旧查询不能覆盖已接收的新响应。完整活跃窗口证据可推迟普通查询，实际唤醒前查询与未完成操作验证仍保留。被动更新不要求管理额度桥可用，但自动唤醒仍要求桥就绪。
+
 ## 用户活动
 
 `ParseActivity(method, payload, accounts)` 只接收原生宿主认证回调 payload。官方 lifecycle 外层字段为 PascalCase `RequestID/Metadata/CompletedAt`，Metadata 子字段为 `caller_scope/source/selected_auth_id`。请求正文里伪造的同名字段不参与统计。

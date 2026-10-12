@@ -27,7 +27,7 @@ let config = {
 };
 const now = new Date().toISOString(), reset = new Date(Date.now() + 3600000).toISOString();
 const accounts = {
-  'fixture-account': { ID: 'fixture-account', Enabled: true, Permission: 'allowed', FiveHour: { State: 'active', ResetAt: reset, ConfirmedAt: now, Remaining: { Value: 73, Unit: 'percent' } }, Weekly: { State: 'unknown', ResetAt: '0001-01-01T00:00:00Z' }, Task: null },
+  'fixture-account': { ID: 'fixture-account', Enabled: true, Permission: 'allowed', FiveHour: { State: 'active', ResetAt: reset, ConfirmedAt: now, Source: 'cpa_response_headers', Remaining: { Value: 73, Unit: 'percent' } }, Weekly: { State: 'unknown', ResetAt: '0001-01-01T00:00:00Z' }, Task: null },
   '<img src=x onerror=alert(1)>': { ID: '<img src=x onerror=alert(1)>', Enabled: true, Permission: 'unknown', FiveHour: { State: 'unknown' }, Weekly: { State: 'unknown' }, Task: { State: 'waiting', HoldReason: 'quota_unknown', Intents: [{ Reason: 'weekly_reset', Status: 'pending', RandomizedDueAt: reset }] } },
 };
 const summary = { enabled: false, business_enabled: false, host_enabled: true, running: true, accounts: 2, reservations: 0, revision: 42, effective_concurrency: 1, last_error: '', scheduler: { observed_at: now, recent_users: 2, capacity: { target: 2, active: 1, reserved: 0, missing: 1, participants: 2, user_target: 2 }, hold_counts: { quota_unknown: 1 }, identity_source: 'host_caller_scope', quota_unknown_accounts: 1, foreground_busy_accounts: 0, next_inventory_at: reset } };
@@ -149,6 +149,12 @@ try {
   await evaluate(`document.querySelector('[data-tab="accounts"]').click()`);
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), 'Accounts did not render');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'), 0, 'Account IDs must render as text');
+  assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("正常请求响应")'), true, 'Quota source was not displayed');
+  accounts['fixture-account'].FiveHour.Remaining.Value = 72;
+  const pollStarted = Date.now();
+  await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("72%")'), 'Passive quota did not appear on automatic panel polling');
+  assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
+  assert.equal(posts.length, 0, 'Snapshot polling dispatched operations');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 960, deviceScaleFactor: 1, mobile: false });
   let capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp, 'panel-desktop.png'), Buffer.from(capture.data, 'base64'));
@@ -182,7 +188,7 @@ try {
   await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
   await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Manual fallback did not connect');
   assert.deepEqual(errors, [], 'Browser or fixture errors');
-  console.log(`Browser smoke passed: manual login, CPA credential formats, reload/reopen, menu iframe, single rejected probe, fallback, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
+  console.log(`Browser smoke passed: manual login, CPA credential formats, reload/reopen, menu iframe, single rejected probe, fallback, quota source/5-second polling, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }

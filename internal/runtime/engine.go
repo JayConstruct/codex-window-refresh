@@ -164,8 +164,29 @@ func (e *Engine) drain() {
 		core.ApplyActivity(&e.state, v)
 	}
 	for _, v := range o {
-		core.ApplyObservation(&e.state, v)
+		if core.ApplyObservation(&e.state, v) {
+			a := e.state.Accounts[v.AccountID]
+			// Only a complete, accepted foreground snapshot can postpone a
+			// background read. Partial/unknown fields, expired boundaries and
+			// in-flight delivery verification retain their existing schedule.
+			if v.Class == core.ObservationExecution && (v.Source == "cpa_response_headers" || v.Source == "cpa_websocket_quota") &&
+				v.FiveHour != nil && v.Weekly != nil && a.Permission == core.PermissionAllowed &&
+				a.FiveHour.Remaining != nil && a.Weekly.Remaining != nil && a.FiveHour.Remaining.Value > 0 && a.Weekly.Remaining.Value > 0 &&
+				a.FiveHour.State == core.WindowActive && a.Weekly.State == core.WindowActive &&
+				a.FiveHour.ConfirmedAt.Equal(v.ReceivedAt) && a.Weekly.ConfirmedAt.Equal(v.ReceivedAt) &&
+				a.FiveHour.ResetAt.After(e.clock.Now()) && a.Weekly.ResetAt.After(e.clock.Now()) &&
+				(a.Task == nil || a.Task.OperationID == "") {
+				e.nextRead[v.AccountID] = maxTime(e.nextRead[v.AccountID], v.ReceivedAt.Add(30*time.Second))
+			}
+		}
 	}
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 func (e *Engine) commit(ctx context.Context) error {
 	// Once a transition exists, cancellation stops network work but must not
@@ -262,6 +283,12 @@ func (e *Engine) observe(ctx context.Context, id core.AccountID) error {
 		return errors.New(e.lastError)
 	}
 	if !core.ApplyObservation(&e.state, o) {
+		// A foreground response received during this query owns the newer
+		// field fences. A superseded query is not a failing quota adapter.
+		current := e.state.Accounts[id]
+		if current.Generation == a.Generation && (current.FiveHour.AcceptedSeq > q.ReadStartedSeq || current.Weekly.AcceptedSeq > q.ReadStartedSeq || current.PermissionAcceptedSeq > q.ReadStartedSeq) {
+			return nil
+		}
 		e.lastError = "quota_evidence_rejected"
 		e.readFailed(id)
 		return errors.New(e.lastError)

@@ -52,11 +52,12 @@ func (*fakeStore) Commit(context.Context, uint64, core.CoreState) (uint64, error
 func (f *fakeStore) Close() error                                                 { f.mu.Lock(); defer f.mu.Unlock(); f.closed = true; return nil }
 
 type fakeEngine struct {
-	mu       sync.Mutex
-	events   []core.ActivityEvent
-	updated  config.Config
-	notified int
-	block    chan struct{}
+	mu           sync.Mutex
+	events       []core.ActivityEvent
+	observations []core.QuotaObservation
+	updated      config.Config
+	notified     int
+	block        chan struct{}
 }
 
 func (f *fakeEngine) Run(ctx context.Context) error {
@@ -80,8 +81,12 @@ func (f *fakeEngine) EnqueueActivity(e core.ActivityEvent) {
 	defer f.mu.Unlock()
 	f.events = append(f.events, e)
 }
-func (*fakeEngine) EnqueueObservation(core.QuotaObservation) {}
-func (f *fakeEngine) Notify()                                { f.mu.Lock(); defer f.mu.Unlock(); f.notified++ }
+func (f *fakeEngine) EnqueueObservation(o core.QuotaObservation) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.observations = append(f.observations, o)
+}
+func (f *fakeEngine) Notify() { f.mu.Lock(); defer f.mu.Unlock(); f.notified++ }
 func (f *fakeEngine) Diagnostics() (core.HostCapabilities, string, int) {
 	return core.HostCapabilities{ExactAccountExecution: true}, "", 1
 }
@@ -132,6 +137,11 @@ func TestLifecycleRegistrationAndWrapperIsolation(t *testing.T) {
 	}
 	if json.Unmarshal(registrationRaw, &r) != nil || r.SchemaVersion != 6 || r.Metadata.Name != ID || !r.Capabilities["request_lifecycle_plugin"] {
 		t.Fatal("registration schema mismatched")
+	}
+	for _, capability := range []string{"response_interceptor", "response_stream_interceptor", "websocket_response_observer"} {
+		if !r.Capabilities[capability] {
+			t.Fatalf("missing quota observation capability: %s", capability)
+		}
 	}
 	// CPA validPlugin rejects registrations missing any of these metadata fields.
 	if r.Metadata.Version != Version || r.Metadata.Author == "" || r.Metadata.GitHubRepository != Repository {

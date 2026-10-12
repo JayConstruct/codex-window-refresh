@@ -49,6 +49,10 @@ int main(int argc,char**argv){
  if(!call(&api,"management.register","{}","/v0/management/codex-window-refresh/summary"))return 10;
  if(!call(&api,"management.handle","{\"Method\":\"GET\",\"Path\":\"/v0/management/codex-window-refresh/summary\"}","\"StatusCode\":200"))return 11;
  if(!call(&api,"request.intercept_before","{\"RequestID\":\"r\",\"Headers\":{\"X-Keep\":[\"preserved\"]},\"Body\":\"e30=\",\"Metadata\":{\"caller_scope\":\"test-scope\"}}","preserved"))return 12;
+ // Response observation returns empty modifications and tolerates missing quota.
+ if(!call(&api,"response.intercept_after","{\"RequestID\":\"r\",\"ResponseHeaders\":{},\"Body\":\"e30=\"}","\"result\":{}"))return 20;
+ if(!call(&api,"response.intercept_stream_chunk","{\"RequestID\":\"r\",\"ChunkIndex\":-1}","\"result\":{}"))return 21;
+ if(!call(&api,"websocket.response_event","{\"RequestID\":\"r\",\"Provider\":\"codex\",\"AuthID\":\"a\"}","\"result\":{}"))return 22;
  buffer out={0};if(api.call(NULL,NULL,0,&out)==0)return 13;api.free_buffer(out.ptr,out.len);
  out=(buffer){0};if(api.call("request.complete",NULL,1,&out)==0)return 14;api.free_buffer(out.ptr,out.len);
  out=(buffer){0};if(api.call("request.complete",NULL,((size_t)64<<20)+1,&out)==0)return 15;api.free_buffer(out.ptr,out.len);

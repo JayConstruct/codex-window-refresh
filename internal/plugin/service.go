@@ -26,7 +26,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.3"
+const Version = "0.1.0-rc.4"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -90,20 +90,21 @@ func (w WrapperConfig) samePlumbing(other WrapperConfig) bool {
 }
 
 type Service struct {
-	lifecycle sync.Mutex
-	mu        sync.RWMutex
-	callback  cpa.Callback
-	options   Options
-	wrapper   WrapperConfig
-	cfg       config.Config
-	engine    Engine
-	host      Host
-	store     DurableStore
-	cancel    context.CancelFunc
-	done      chan struct{}
-	stopping  bool
-	lastError string
-	policyOps *policyFileOps
+	lifecycle     sync.Mutex
+	mu            sync.RWMutex
+	callback      cpa.Callback
+	options       Options
+	wrapper       WrapperConfig
+	cfg           config.Config
+	engine        Engine
+	host          Host
+	store         DurableStore
+	cancel        context.CancelFunc
+	done          chan struct{}
+	stopping      bool
+	lastError     string
+	policyOps     *policyFileOps
+	responseQuota cpa.ResponseQuotaObserver
 }
 
 func New(callback cpa.Callback, options Options) *Service {
@@ -180,7 +181,9 @@ func (s *Service) handle(ctx context.Context, method string, payload []byte) (an
 		engine, host, stopping := s.engine, s.host, s.stopping
 		s.mu.RUnlock()
 		if engine != nil && host != nil && !stopping {
-			events, err := cpa.ParseActivity(method, payload, host.ActivityAccounts())
+			accounts := host.ActivityAccounts()
+			s.responseQuota.Track(method, payload, accounts, time.Now().UTC())
+			events, err := cpa.ParseActivity(method, payload, accounts)
 			if err == nil {
 				for _, event := range events {
 					engine.EnqueueActivity(event)
@@ -188,6 +191,18 @@ func (s *Service) handle(ctx context.Context, method string, payload []byte) (an
 			}
 		}
 		return pass, nil
+	case "response.intercept_after", "response.intercept_stream_chunk", "websocket.response_event":
+		// An empty response is the CPA contract for leaving every header, byte,
+		// and stream chunk untouched. Malformed optional quota fails open.
+		s.mu.RLock()
+		engine, host, stopping := s.engine, s.host, s.stopping
+		s.mu.RUnlock()
+		if engine != nil && host != nil && !stopping {
+			for _, observation := range s.responseQuota.Observe(method, payload, host.ActivityAccounts, time.Now().UTC()) {
+				engine.EnqueueObservation(observation)
+			}
+		}
+		return struct{}{}, nil
 	default:
 		return nil, errors.New("unknown method")
 	}
@@ -387,7 +402,7 @@ func registration() any {
 	for _, field := range []struct{ name, description string }{{"config_file", "Absolute path to the validated scheduler YAML or JSON file."}, {"state_dir", "Absolute path to private durable state directory (0700)."}, {"management_url", "Optional local CPA management base URL for quota observations."}, {"management_key_env", "Environment variable containing the management key; never the key itself."}} {
 		fields = append(fields, map[string]string{"Name": field.name, "Type": "string", "Description": field.description})
 	}
-	return map[string]any{"schema_version": SchemaVersion, "metadata": map[string]any{"Name": ID, "Version": Version, "Author": "codex-window-refresh contributors", "GitHubRepository": Repository, "ConfigFields": fields}, "capabilities": map[string]bool{"request_interceptor": true, "request_lifecycle_plugin": true, "management_api": true}}
+	return map[string]any{"schema_version": SchemaVersion, "metadata": map[string]any{"Name": ID, "Version": Version, "Author": "codex-window-refresh contributors", "GitHubRepository": Repository, "ConfigFields": fields}, "capabilities": map[string]bool{"request_interceptor": true, "request_lifecycle_plugin": true, "response_interceptor": true, "response_stream_interceptor": true, "websocket_response_observer": true, "management_api": true}}
 }
 func managementRegistration() any {
 	routes := []map[string]string{}

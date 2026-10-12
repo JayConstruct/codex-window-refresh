@@ -258,7 +258,8 @@
     heading.append(el('span', title), el('span', states[evidence.State] || evidence.State || '未知')); cell.append(heading);
     const remaining = evidence.Remaining;
     const text = remaining && Number.isFinite(remaining.Value) ? (Math.round(remaining.Value * 100) / 100) + (remaining.Unit === 'percent' ? '%' : ' ' + (remaining.Unit || '单位未知')) : '未知';
-    cell.append(el('div', text, 'remaining'), el('div', '剩余 · 确认于 ' + date(evidence.ConfirmedAt), 'window-time'), el('div', '重置 ' + date(evidence.ResetAt), 'window-time'));
+    const source = {cpa_response_headers: '正常请求响应', cpa_websocket_quota: 'WebSocket 请求响应', cpa_wham_usage: '主动查询', cpa_execution_quota: '模块唤醒响应'}[evidence.Source] || '额度观测';
+    cell.append(el('div', text, 'remaining'), el('div', source + ' · 确认于 ' + date(evidence.ConfirmedAt), 'window-time'), el('div', '重置 ' + date(evidence.ResetAt), 'window-time'));
     const timer = el('div', countdown(evidence.ResetAt), 'countdown'); timer.dataset.reset = evidence.ResetAt || ''; cell.append(timer);
     return cell;
   }
@@ -353,7 +354,7 @@
   function schedulePoll() {
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null;
-    if (session.connected() && !document.hidden) pollTimer = root.setTimeout(() => refreshSnapshots(false), 15000);
+    if (session.connected() && !document.hidden) pollTimer = root.setTimeout(() => refreshSnapshots(false), 5000);
   }
   async function refreshSnapshots(manual) {
     if (!session.connected() || pollBusy || (document.hidden && !manual)) return;

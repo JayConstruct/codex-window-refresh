@@ -24,7 +24,7 @@
         <div id="metrics" class="metrics"></div>
         <div class="two-columns"><section class="card"><h2>规则与时间</h2><dl id="schedule-info" class="details"></dl><p class="hint">周重置可绕过人数与普通时段限制。已有 5 小时窗口内不发送；实际执行仍以最新额度证据为准。</p></section><section class="card"><h2>阻塞与诊断</h2><div id="hold-counts"></div><p id="last-error" class="hint"></p></section></div>
         <section class="card action-card"><div><h2>调度操作</h2><p>重新检查会通知调度器评估现有规则；重新读取会应用服务器规则文件。启用的规则可能随后发送真实请求。</p></div><div class="toolbar"><button id="recheck" class="quiet">重新检查规则</button><button id="reload" class="quiet">重新读取规则文件</button></div></section>
-        <p class="footnote">页面每 15 秒读取已有状态快照，隐藏页面时暂停。运行规则在连接或操作时读取；外部修改后请手动刷新视图。刷新视图不会直接查询上游额度或发送模型请求。近期用户按 CPA 的 caller_scope 去重，共用 API key 的调用可能属于同一范围，并不等于自然人数。</p>
+        <p class="footnote">页面每 5 秒读取已有状态快照，隐藏页面时暂停。额度优先使用正常请求返回的信息，后台查询补充缺失证据。运行规则在连接或操作时读取；外部修改后请手动刷新视图。刷新视图不会直接查询上游额度或发送模型请求。近期用户按 CPA 的 caller_scope 去重，共用 API key 的调用可能属于同一范围，并不等于自然人数。</p>
       </section>
       <section id="tab-accounts" class="view" hidden>
         <div class="section-head"><div><span class="eyebrow">账号池</span><h1>账号与合并任务</h1></div><span id="account-count" class="hint"></span></div>

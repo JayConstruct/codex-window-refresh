@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"codex-window-refresh/internal/core"
@@ -189,6 +190,23 @@ func classifyWindow(w quotaWindow, read core.QuotaRead, at time.Time, class core
 	return kind, evidence, nil
 }
 func quotaHeaders(headers http.Header) []byte {
+	// JSON WebSocket error events can use lower-case names. Normalize only
+	// quota fields, and reject conflicting case variants instead of picking a
+	// nondeterministic value or carrying unrelated sensitive headers onward.
+	normalized := make(http.Header)
+	for name, values := range headers {
+		name = http.CanonicalHeaderKey(name)
+		if name != "X-Codex-Allowed" && name != "X-Codex-Limit-Reached" && !strings.HasPrefix(name, "X-Codex-Primary-") && !strings.HasPrefix(name, "X-Codex-Secondary-") {
+			continue
+		}
+		for _, value := range values {
+			if prior, ok := normalized[name]; ok && prior[0] != value {
+				return nil
+			}
+			normalized.Set(name, value)
+		}
+	}
+	headers = normalized
 	rate := rateLimit{}
 	if v := headers.Get("X-Codex-Allowed"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
