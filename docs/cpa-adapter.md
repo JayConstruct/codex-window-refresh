@@ -18,7 +18,8 @@ host := cpa.NewHost(callback, quotaReader)
 | --- | --- | --- |
 | `host.auth.list` | 列举 Codex 宿主账号 | `files[].id/auth_index/provider` |
 | `host.auth.get_runtime` | 核对精确账号绑定与可用状态 | 请求 `auth_index`；响应 `auth.id/auth_index/provider/disabled/unavailable` |
-| `host.auth.get` | 临时核对真实上游身份 | 请求 `auth_index`；响应 `json.account_id/type` |
+| `host.auth.get` | 核对身份并临时读取查询凭据 | 请求 `auth_index`；响应 `json.account_id/type/access_token/expired/proxy_url` |
+| `host.http.operation.open` / `host.http.do` / `host.http.cancel` | 查询上游额度并取消超时操作 | `operation_id`, GET 固定额度 URL, `headers`；响应 `StatusCode` 和 base64 `Body` |
 | `host.model.execute_stream` | 发送精确账号生成 | `auth_id`, `forced_provider`, `entry_protocol`, `exit_protocol`, `stream`, base64 `body` |
 | `host.model.stream_read` | 消费模型输出 | 请求 `stream_id`；响应 base64 `payload`, `error`, `done` |
 | `host.model.stream_close` | 显式释放模型流 | 请求 `stream_id` |
@@ -35,19 +36,30 @@ host := cpa.NewHost(callback, quotaReader)
 
 目前宿主没有与前台生成联合原子锁定的接口，`ForegroundGuard=false`。生成前核对无法彻底消除核对之后、真实宿主执行之前的账号修改或前台请求竞态。
 
-## 显式额度桥接
+## 默认宿主额度查询
 
-`QuotaReader.Read(ctx, AuthBinding)` 可注入受信实现。默认 `BridgeReader` 只通过 CPA 管理 API 做 token substitution，不在插件里拼接真实账号 token。
+`QuotaReader.Read(ctx, AuthBinding)` 可注入受信实现。默认 `NativeReader` 不需要 CPA 管理地址或管理密钥环境变量；包装配置 `quota_transport` 留空或设为 `host` 即可。旧安装保留的管理桥字段不影响宿主模式。
 
-- `ManagementURL` 指定 CPA 服务基址、`/v0/management` 或完整 `/v0/management/api-call`；完整 `/v8/management/requests/api-call` 也支持。
-- `ManagementKeyEnv` 指定管理密钥的环境变量名；实际密钥通过环境读取，不放进插件规则文件。
-- 管理请求为 POST `api-call`，正文的 `auth_index` 精确匹配目标账号，upstream GET 固定为 `https://chatgpt.com/backend-api/wham/usage`。
-- upstream 请求头使用 `Authorization: Bearer $TOKEN$` 和核对过的 `Chatgpt-Account-Id`；CPA 负责替换和续期 token。
-- 管理响应必须是 HTTP 200，其包装字段 `status_code` 也必须为 200；最多读取 2 MiB。禁用重定向，不向其他位置转送管理凭据。
+每次查询通过 `host.auth.get` 重新读取当前账号凭据，只解码身份、访问 token、有效期及代理字段。再次核对 auth_index、实际 account_id 和代际，然后 GET 固定的 `https://chatgpt.com/backend-api/wham/usage`。查询前后仍由 Host 核对账号状态与身份，不把 token 刷新当成账号更换。
 
-管理 URL 与密钥未配置时，`QuotaAdapterReady=false`；查询返回 `quota_management_bridge_missing`。管理能力响应另含 `quota_bridge.status`，区分 `missing_management_url`、`missing_management_key_env`、`missing_management_key`、`invalid_management_url` 和 `configured`，仅检查本地配置，不发送请求或验证认证。诊断可包含环境变量名，不包含管理 URL、密钥值或 token。查询失败只返回稳定分类 `quota_management_bridge_failed`，不将响应正文、token 或密钥附加进错误。
+- 无账号专用代理时调用 `host.http.do`，沿用宿主全局代理。通过 `host.http.operation.open` 创建操作，超时或取消时使用 `host.http.cancel` 终止。
+- 账号配置 `proxy_url`（兼容 `proxyUrl`）时，使用私有 HTTP transport 支持 HTTP、HTTPS、SOCKS5、SOCKS5H 和显式 direct/none，不继承系统环境代理；禁用重定向与连接复用，响应限制为 2 MiB。
+- 不调用模型执行、登录、`host.auth.save` 或 refresh-token 接口。CPA 保持 OAuth 续期的唯一所有者。凭据文件明确过期或上游返回 401 时报告 `quota_credential_expired`，等待 CPA 更新或用户重新登录后重试；不通过模型请求更新凭据。
+- 物理凭据文件可能暂时落后于宿主内存。插件每次重新读取，但不能承诺文件 token 始终最新；可选择管理桥以复用宿主内存中的 token 解析。
+- token 只用于当前调用，不进入配置、状态、日志或错误。上游、代理和回调异常只发布固定分类，不附带响应正文或凭据。
 
-官方管理 API schema 来源为 `internal/api/handlers/management/api_tools.go`。默认桥接不是 CPA 的原生 `host.quota` callback，不会把拟议能力当作现成接口。
+`QuotaAdapterReady` 在宿主回调配置具备时为 true，并不预先验证网络或每个账号的 token。`quota_bridge.mode=host`、`status=host_callback` 标识此方式。单账号手动任务的 `last_error` 可解释过期凭据、缺少凭据、无效代理和查询失败。
+
+## 可选管理桥
+
+明确设置 `quota_transport: management` 后使用原 `BridgeReader`：
+
+- `management_url` 与 `management_key_env` 必须成对提供。实际管理密钥来自 CPA 进程环境，不放进规则文件。
+- 支持 CPA 服务基址、`/v0/management`、完整 `/v0/management/api-call` 或 `/v8/management/requests/api-call`。
+- POST 管理 `api-call`，正文使用绑定的 auth_index，上游 GET 仍固定为 wham/usage，Authorization 使用 `$TOKEN$`。CPA 解析账号 token，并继承账号/全局代理。
+- 管理与上游状态均须为 200；最多读取 2 MiB，禁止转送管理凭据到重定向地址。
+
+桥缺少地址或环境密钥时才会 `QuotaAdapterReady=false`。`quota_bridge.mode=management`，status 继续区分 `missing_management_url`、`missing_management_key_env`、`missing_management_key`、`invalid_management_url` 与 `configured`。诊断不返回地址或密钥，也不发送网络探测。接口来源见官方 `internal/api/handlers/management/api_tools.go`。
 
 ## 额度证据
 

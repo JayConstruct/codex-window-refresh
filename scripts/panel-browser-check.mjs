@@ -149,6 +149,9 @@ try {
   assert.equal(await evaluate('document.getElementById("bridge-status").textContent.includes("CPA 进程未读取到") && document.getElementById("bridge-help").textContent.includes("CPA_MANAGEMENT_KEY")'),true,'Missing backend key diagnosis was not actionable');
   capabilities.QuotaAdapterReady = true; capabilities.quota_bridge.status = 'configured';
   await waitFor(()=>evaluate('!document.getElementById("quota-query").disabled && document.getElementById("bridge-status").textContent.includes("已就绪")'),'Startup readiness remained stale after automatic polling');
+  capabilities.quota_bridge = {mode:'host',status:'host_callback'};
+  await evaluate('document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('document.getElementById("bridge-help").textContent.includes("不需要配置后台管理地址或管理密钥环境变量") && !document.getElementById("quota-query").disabled'),'Host query diagnosis still required backend management credentials');
   // Seed only the mock host's saved credentials; exercise the real startup path.
   for (const legacy of [false, true]) {
     for (const encoded of [false, true]) {
@@ -203,6 +206,9 @@ try {
   assert.equal(accounts['<img src=x onerror=alert(1)>'].FiveHour.State,'unknown','Selected query changed another account');
   await evaluate(`Array.from(document.querySelectorAll('[data-quota-account]')).find(item=>item.dataset.quotaAccount!=='fixture-account').click()`);
   await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("查询失败，可手动重试")'),'Account query failure was not displayed');
+  summary.scheduler.quota_query.last_error = 'quota_credential_expired';
+  await evaluate('document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("账号凭据已过期")'),'Expired upstream credentials lacked an actionable diagnosis');
   assert.equal(JSON.parse(posts.at(-1).body).account_id,'<img src=x onerror=alert(1)>','Account ID was not passed literally in JSON');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'),0,'Account query introduced unsafe rendering');
   await evaluate('document.querySelector(".account-disclosure").open=false; document.querySelector("[data-tab=overview]").click()');

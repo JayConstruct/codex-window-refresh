@@ -272,9 +272,9 @@ func (e *Engine) observe(ctx context.Context, id core.AccountID) error {
 	e.drain()
 	e.nextRead[id] = e.clock.Now().Add(e.cfg.QuotaQuery.Interval.Value())
 	if err != nil {
-		e.lastError = "quota_read_failed"
+		e.lastError = quotaReadErrorCode(err)
 		e.readFailed(id)
-		return errors.New("quota_read_failed")
+		return errors.New(e.lastError)
 	}
 	if o.AccountID != id || o.Generation != a.Generation {
 		e.lastError = "quota_binding_mismatch"

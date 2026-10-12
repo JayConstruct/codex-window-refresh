@@ -6,7 +6,7 @@
 GOCACHE=/tmp/codex-window-refresh-go-cache CGO_ENABLED=1 go build -buildvcs=false -buildmode=c-shared -o /tmp/codex-window-refresh.so ./cmd/plugin
 ```
 
-该命令生成 `.so` 与 C 头文件。将动态库放入配置的 `plugins.dir`，文件名使用 `codex-window-refresh.so` 或 `codex-window-refresh-v0.1.0.so`；官方宿主从文件名识别稳定 ID 与可选版本。不要增加 `lib` 前缀，否则会成为另一个插件 ID。 首版支持手动放置动态库；插件商店附加的 `store` 元数据尚未接入严格包装解析，不能直接按商店安装方式配置。需要支持原生插件的同架构 Linux CPA 宿主。管理注册名称为 `codex-window-refresh`，版本 `0.1.0-rc.8`；声明 `request_interceptor`、`request_lifecycle_plugin`、`response_interceptor`、`response_stream_interceptor`、`websocket_response_observer` 和 `management_api`。该插件不替换正常账号路由。
+该命令生成 `.so` 与 C 头文件。将动态库放入配置的 `plugins.dir`，文件名使用 `codex-window-refresh.so` 或 `codex-window-refresh-v0.1.0.so`；官方宿主从文件名识别稳定 ID 与可选版本。不要增加 `lib` 前缀，否则会成为另一个插件 ID。 首版支持手动放置动态库；插件商店附加的 `store` 元数据尚未接入严格包装解析，不能直接按商店安装方式配置。需要支持原生插件的同架构 Linux CPA 宿主。管理注册名称为 `codex-window-refresh`，版本 `0.1.0-rc.9`；声明 `request_interceptor`、`request_lifecycle_plugin`、`response_interceptor`、`response_stream_interceptor`、`websocket_response_observer` 和 `management_api`。该插件不替换正常账号路由。
 
 ## 宿主配置和策略文件
 
@@ -22,15 +22,14 @@ plugins:
       priority: 0
       config_file: /absolute/path/config.yaml
       state_dir: /absolute/path/private-state
-      management_url: http://127.0.0.1:8317/v0/management
-      management_key_env: CPA_MANAGEMENT_KEY
+      quota_transport: host # 默认；不需要后台管理密钥
 ```
 
-`management_url` 和 `management_key_env` 成对设置；需要管理桥查询额度时使用。密钥值由运行 CPA 进程的环境提供，不能写入包装 YAML、策略文件或调度状态。桥支持的地址和目标限制以 `internal/cpa/bridge.go` 的验证为准。未知包装字段、旧 RPC schema、混入规则字段、多个 YAML 文档均拒绝注册。测试宿主可省略 `enabled`、`priority`；真实 CPA 会注入两项。宿主 `enabled: false` 会关闭调度生成；`enabled: true` 不会把业务文件中的 `enabled: false` 改为开启。更改宿主优先级或启用开关不属于包装路径迁移，也不要求重启。
+默认 `quota_transport: host`，直接使用宿主账号凭据查询额度，无需管理地址或管理密钥环境变量。旧配置中的管理桥字段可以保留，不影响默认查询。需要兼容桥时明确设置 `quota_transport: management`，并成对设置 `management_url` 和 `management_key_env`。密钥值由运行 CPA 进程的环境提供，不能写入包装 YAML、策略文件或调度状态。桥支持的地址和目标限制以 `internal/cpa/bridge.go` 的验证为准。未知包装字段、旧 RPC schema、混入规则字段、多个 YAML 文档均拒绝注册。测试宿主可省略 `enabled`、`priority`；真实 CPA 会注入两项。宿主 `enabled: false` 会关闭调度生成；`enabled: true` 不会把业务文件中的 `enabled: false` 改为开启。更改宿主优先级或启用开关不属于包装路径迁移，也不要求重启。
 
 策略配置采用项目的 `config.example.yaml`。首版 CPA 适配器只支持 `activity.identity_source: host_caller_scope`，其他预留身份模式在注册和重新加载时明确拒绝。
 
-`plugin.reconfigure` 和 POST `/reload` 重新读取该文件并验证；无效文件不会替换现有配置。修改包装路径、状态目录或管理桥参数需进程重启，避免运行时迁移状态锁或账号绑定。
+`plugin.reconfigure` 和 POST `/reload` 重新读取该文件并验证；无效文件不会替换现有配置。修改包装路径、状态目录、查询方式或管理桥参数需进程重启，避免运行时迁移状态锁或账号绑定。
 
 ## 管理路由
 

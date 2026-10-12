@@ -278,7 +278,7 @@
     const query = runningConfig?.quota_query || {}, job = quotaJob();
     const running = job.phase === 'queued' || job.phase === 'running';
     const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
-    const progress = job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' : '尚未执行手动查询';
+    const progress = job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' + (job.failed && job.last_error ? '；最近失败：' + quotaFailure(job) : '') : '尚未执行手动查询';
     const reason = quotaQueryReason();
     $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · ' + (reason || progress);
     $('quota-query').disabled = !session.connected() || actionBusy || !!reason || running;
@@ -289,16 +289,20 @@
     $('bridge-status').textContent = capabilities.QuotaAdapterReady === true ? '后台额度查询配置已就绪' : bridgeDescription();
     const env = capabilities.quota_bridge?.management_key_env || 'management_key_env 指定的变量';
     const help = {
+      host_callback: '当前使用 CPA 宿主账号凭据查询，不需要配置后台管理地址或管理密钥环境变量。凭据由 CPA 维护；账号专用代理优先，否则沿用 CPA 全局代理。',
       missing_management_url: '在 CPA 主配置的 plugins.configs.codex-window-refresh 中设置 management_url 和 management_key_env，然后重启 CPA。',
       missing_management_key_env: '在 CPA 主配置的 plugins.configs.codex-window-refresh 中设置 management_key_env（环境变量名），然后重启 CPA。',
       missing_management_key: '将现有 CPA 管理密钥设置到 CPA 进程的 ' + env + ' 环境变量，然后重启 CPA。systemd 需给实际服务配置 EnvironmentFile（用户服务用 --user 管理）；Docker 需将变量传入容器。',
       invalid_management_url: '检查 CPA 主配置中的 management_url。支持 http(s) 服务基址、/v0/management、/v0/management/api-call 或完整 /v8/management/requests/api-call；修改后重启 CPA。',
       configured: '管理地址及密钥环境变量已配置。接口能力每 5 秒更新；查询失败时再检查管理密钥、地址及上游连接。'
     };
-    $('bridge-help').textContent = help[capabilities.quota_bridge?.status] || '接口能力每 5 秒更新。若持续未就绪，请检查后台管理地址和密钥环境变量，并查看 CPA 日志。';
+    $('bridge-help').textContent = help[capabilities.quota_bridge?.status] || '接口能力每 5 秒更新。若持续未就绪，请检查查询方式并查看 CPA 日志。';
   }
   function bridgeDescription() {
-    return {missing_management_url: '未配置后台管理接口地址', missing_management_key_env: '未配置管理密钥环境变量名', missing_management_key: 'CPA 进程未读取到管理密钥环境变量', invalid_management_url: '后台管理接口地址配置无效', configured: '额度查询配置已具备，等待后台确认'}[capabilities.quota_bridge?.status] || '额度查询接口未就绪';
+    return {host_callback: '宿主额度查询等待后台确认', missing_management_url: '未配置后台管理接口地址', missing_management_key_env: '未配置管理密钥环境变量名', missing_management_key: 'CPA 进程未读取到管理密钥环境变量', invalid_management_url: '后台管理接口地址配置无效', configured: '额度查询配置已具备，等待后台确认'}[capabilities.quota_bridge?.status] || '额度查询接口未就绪';
+  }
+  function quotaFailure(job) {
+    return {quota_credential_expired: '账号凭据已过期，请先在 CPA 刷新或重新登录账号', quota_credential_missing: '账号缺少有效的访问凭据', quota_proxy_invalid: '账号代理配置无效', quota_host_http_failed: 'CPA HTTP 查询失败，请检查连接或使用兼容管理桥', quota_native_query_failed: '上游额度查询失败，请检查连接与账号状态'}[job.last_error] || '可手动重试';
   }
   function windowCell(title, evidence) {
     evidence = evidence || {};
@@ -350,7 +354,7 @@
       queryButton.title = reason || (querying ? '请等待当前手动查询结束' : '只访问此账号的额度接口，不发送模型请求');
       queryButton.addEventListener('click', () => { if (!queryButton.disabled) void requestQuotaQuery(id); });
       let queryText = reason || '仅查询额度，不发送模型请求';
-      if (selected && job.phase) queryText = ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，可手动重试' : job.skipped ? '未查询：账号已禁用或移除' : '查询完成 · ' + date(job.finished_at));
+      if (selected && job.phase) queryText = ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，' + quotaFailure(job) : job.skipped ? '未查询：账号已禁用或移除' : '查询完成 · ' + date(job.finished_at));
       const queryStatus = el('span', queryText, 'hint'); queryStatus.setAttribute('role', 'status');
       queryRow.append(queryButton, queryStatus); card.append(queryRow);
       const task = a.Task, taskInfo = el('dl', undefined, 'details task-info'), disclosure = el('details', undefined, 'account-disclosure');

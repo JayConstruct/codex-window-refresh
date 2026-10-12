@@ -104,3 +104,14 @@ func (e *Engine) readFailed(id core.AccountID) {
 	e.nextRead[id] = e.clock.Now().Add(delay)
 	e.nextPreflight[id] = e.nextRead[id]
 }
+
+// Only fixed public classifications may reach diagnostics; host errors can
+// contain tokens, proxy credentials, or upstream response bodies.
+func quotaReadErrorCode(err error) string {
+	switch code := err.Error(); code {
+	case "quota_credential_missing", "quota_credential_expired", "quota_proxy_invalid", "quota_host_http_failed", "quota_native_query_failed":
+		return code
+	default:
+		return "quota_read_failed"
+	}
+}

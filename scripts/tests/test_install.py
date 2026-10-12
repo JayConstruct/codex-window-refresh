@@ -159,9 +159,9 @@ class InstallIntegrationTests(unittest.TestCase):
         self.key.chmod(0o600)
         arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}[platform.machine()]
         self.arch = arch
-        name = f'codex-window-refresh_v0.1.0-rc.1_linux_{arch}'
+        name = f'codex-window-refresh_v0.1.0-rc.9_linux_{arch}'
         self.archive = self.root / (name + '.tar.gz')
-        metadata = {'release': 'v0.1.0-rc.1', 'architecture': arch, 'platform': 'linux',
+        metadata = {'release': 'v0.1.0-rc.9', 'architecture': arch, 'platform': 'linux',
                     'host_abi': 1, 'rpc_schema': 6, 'minimum_glibc_symbols': '2.0'}
         machine = 62 if arch == 'amd64' else 183
         files = {'codex-window-refresh.so': elf(machine),
@@ -176,8 +176,8 @@ class InstallIntegrationTests(unittest.TestCase):
         self.checksums = self.root / 'SHA256SUMS'
         self.checksums.write_text(hashlib.sha256(self.archive.read_bytes()).hexdigest() + '  ' + self.archive.name + '\n')
         self.args = argparse.Namespace(cpa_dir=str(self.cpa), config=None, user=pwd.getpwuid(os.geteuid()).pw_name, working_dir=str(self.cpa),
-                                       service=None, plugin_dir=None, management_url=None, model='test-model',
-                                       yes=True, key_file=str(self.key), version='v0.1.0-rc.1',
+                                       service=None, plugin_dir=None, management_url=None, quota_transport='management', model='test-model',
+                                       yes=True, key_file=str(self.key), version='v0.1.0-rc.9',
                                        package=str(self.archive), checksums=str(self.checksums), restart=False, uninstall=False)
         self.plan = installer.infer(self.args)
         # Simulate root ownership operations inside a disposable directory without
@@ -232,6 +232,65 @@ class InstallIntegrationTests(unittest.TestCase):
         self.assertEqual(len(backups), 3)
         backup_files = list(self.plan['record'].glob('*/*config.yaml'))
         self.assertTrue(any(p.read_text() == self.original for p in backup_files))
+
+    def test_default_host_install_does_not_read_or_persist_management_credentials(self):
+        self.args.quota_transport = None
+        self.args.key_file = None
+        self.plan = installer.infer(self.args)
+        self.assertEqual(self.plan['quota_transport'], 'host')
+        with mock.patch.object(installer, 'management_credentials', side_effect=AssertionError('host install must not ask for a key')):
+            self.install()
+        wrapper = yaml.safe_load(self.config.read_text())['plugins']['configs'][installer.PLUGIN]
+        self.assertEqual(wrapper['quota_transport'], 'host')
+        self.assertNotIn('management_url', wrapper)
+        self.assertNotIn('management_key_env', wrapper)
+        self.assertFalse(self.plan['env'].exists())
+
+    def test_older_release_keeps_management_mode_and_rejects_explicit_host(self):
+        self.args.version = 'v0.1.0-rc.8'
+        self.args.quota_transport = None
+        self.plan = installer.infer(self.args)
+        self.assertEqual(self.plan['quota_transport'], 'management')
+        self.args.quota_transport = 'host'
+        with mock.patch.object(installer, 'download') as download, self.assertRaises(installer.InstallError):
+            self.install()
+        download.assert_not_called()
+        self.assertEqual(self.config.read_text(), self.original)
+
+    def test_host_upgrade_preserves_old_key_file_without_reading_it(self):
+        self.install()
+        policy = self.plan['policy'].read_bytes()
+        self.plan['env'].write_text('private legacy content outside installer format\n')
+        self.args.quota_transport = 'host'
+        self.args.key_file = None
+        self.plan = installer.infer(self.args)
+        with mock.patch.object(installer, 'management_credentials', side_effect=AssertionError('host upgrade must not read old key')):
+            self.install()
+        self.assertEqual(self.plan['policy'].read_bytes(), policy)
+        self.assertEqual(self.plan['env'].read_text(), 'private legacy content outside installer format\n')
+        self.assertEqual(yaml.safe_load(self.config.read_text())['plugins']['configs'][installer.PLUGIN]['quota_transport'], 'host')
+
+    def test_host_user_service_override_does_not_load_management_environment(self):
+        self.args.quota_transport = 'host'
+        self.args.key_file = None
+        self.plan = installer.infer(self.args)
+        service = {'name': 'fixture-cpa.service', 'scope': 'user'}
+        self.plan['service'] = service
+        account = pwd.getpwuid(os.geteuid())
+        home = self.root / 'user-home'
+        home.mkdir()
+        replacement = pwd.struct_passwd((account.pw_name, account.pw_passwd, account.pw_uid,
+                                        account.pw_gid, account.pw_gecos, str(home), account.pw_shell))
+        self.plan['dropin'] = home / '.config/systemd/user/fixture-cpa.service.d/60-window-refresh.conf'
+        # A prior managed override may refer to a file that never reached CPA.
+        self.plan['dropin'].parent.mkdir(parents=True)
+        self.plan['dropin'].write_text('[Service]\nEnvironmentFile=/missing/old-quota.env\n')
+        self.args.restart = True
+        with mock.patch.object(installer.pwd, 'getpwuid', return_value=replacement), mock.patch.object(installer, 'service_run', return_value='active'), mock.patch.object(installer, 'management_credentials', side_effect=AssertionError('host user service must not ask for a key')):
+            self.install()
+        self.assertNotIn('EnvironmentFile=', self.plan['dropin'].read_text())
+        self.assertFalse(self.plan['env'].exists())
+        self.assertEqual(json.loads((self.plan['record'] / 'installed.json').read_text())['service_scope'], 'user')
 
     def test_failed_config_write_restores_old_binary_and_all_files(self):
         plugin_dir = self.plan['plugin_dir']

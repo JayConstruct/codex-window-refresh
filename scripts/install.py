@@ -343,7 +343,7 @@ def infer(args):
     require(isinstance(configs, dict), "plugins.configs 必须是映射。")
     wrapper = configs.get(PLUGIN, {})
     require(isinstance(wrapper, dict), "现有插件包装配置必须是映射。")
-    require(not set(wrapper) - {"enabled", "priority", "config_file", "state_dir", "management_url", "management_key_env"},
+    require(not set(wrapper) - {"enabled", "priority", "config_file", "state_dir", "quota_transport", "management_url", "management_key_env"},
             "现有插件含未支持的包装字段，请先按 docs/plugin.md 调整。")
     existing_dir = plugins.get("dir")
     require(existing_dir is None or isinstance(existing_dir, str), "plugins.dir 必须是路径字符串。")
@@ -383,11 +383,16 @@ def infer(args):
     server = data.get("server", {})
     require(isinstance(server, dict), "server 配置须为映射。")
     tls = server.get("tls", data.get("tls", {}))
-    if not args.management_url and not wrapper.get("management_url"):
+    quota_transport = getattr(args, "quota_transport", None) or wrapper.get("quota_transport") or "host"
+    if args.version != "latest" and version_key(args.version) < version_key("v0.1.0-rc.9") and getattr(args, "quota_transport", None) is None:
+        quota_transport = "management"
+    require(quota_transport in {"host", "management"}, "额度查询方式必须是 host 或 management。")
+    needs_management = quota_transport == "management" or getattr(args, "check_model", False) or (not policy.exists() and not args.model)
+    if needs_management and not args.management_url and not wrapper.get("management_url"):
         require(not isinstance(tls, dict) or not tls.get("enable"), "CPA 已启用 TLS，请指定 --management-url。")
     port = server.get("port", data.get("port", 8317))
     require(isinstance(port, int) and 1 <= port <= 65535, "CPA 端口无效。")
-    url = bridge_url(args.management_url or wrapper.get("management_url") or f"http://127.0.0.1:{port}/v0/management")
+    url = bridge_url(args.management_url or (wrapper.get("management_url") if needs_management else None) or f"http://127.0.0.1:{port}/v0/management")
     env_name = wrapper.get("management_key_env", "CPA_MANAGEMENT_KEY")
     require(isinstance(env_name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_name), "密钥环境变量名无效。")
     env = safe_path(directory / "window-refresh.env")
@@ -400,7 +405,7 @@ def infer(args):
     return {"directory": directory, "binary": binary, "config": config, "text": text, "data": data,
             "plugins": plugins, "wrapper": wrapper, "plugin_dir": plugin_dir, "policy": policy,
             "state": state, "env": env, "service_env": service_env, "record": record, "dropin": dropin, "service": service, "service_auto": service_auto,
-            "uid": account.pw_uid, "gid": gid, "user": user, "url": url, "env_name": env_name}
+            "uid": account.pw_uid, "gid": gid, "user": user, "url": url, "env_name": env_name, "quota_transport": quota_transport}
 
 
 def download(url, destination, limit):
@@ -787,6 +792,10 @@ def prompt(question, yes):
 
 
 def install(args, plan, architecture):
+    supports_host = version_key(args.version) >= version_key("v0.1.0-rc.9")
+    if not supports_host:
+        require(getattr(args, "quota_transport", None) != "host", "宿主额度查询需要 v0.1.0-rc.9 或更新版本。")
+        plan = dict(plan, quota_transport="management", url=bridge_url(args.management_url or plan["wrapper"].get("management_url") or plan["url"]))
     filename = f"{PLUGIN}_{args.version}_linux_{architecture}.tar.gz"
     with tempfile.TemporaryDirectory(prefix="window-refresh-install-") as temporary:
         temp = pathlib.Path(temporary)
@@ -829,10 +838,13 @@ def install(args, plan, architecture):
             candidate = temp / "policy.yaml"
         candidate.write_bytes(policy_bytes)
         run(str(unpacked / "window-refresh"), "check", str(candidate))
-        if not credentials_loaded:
+        bridge_mode = plan.get("quota_transport", "host") == "management"
+        if not credentials_loaded and bridge_mode:
             key, key_bytes = management_credentials(args, plan)
+        if not bridge_mode:
+            key_bytes = None # Host queries do not persist discovery credentials.
         service_env = plan.get("service_env", plan["env"])
-        if service_env != plan["env"] and service_env.exists():
+        if bridge_mode and service_env != plan["env"] and service_env.exists():
             info = safe_path(service_env).stat()
             require(stat.S_ISREG(info.st_mode) and info.st_uid == plan["uid"] and info.st_mode & 0o077 == 0,
                     "现有用户服务密钥文件须由 CPA 用户拥有，且权限为 0600。")
@@ -840,8 +852,11 @@ def install(args, plan, architecture):
         plugins["enabled"] = True
         plugins["dir"] = str(plan["plugin_dir"])
         wrapper = dict(plan["wrapper"])
-        wrapper.update({"config_file": str(policy), "state_dir": str(plan["state"]),
-                        "management_url": plan["url"], "management_key_env": plan["env_name"]})
+        wrapper.update({"config_file": str(policy), "state_dir": str(plan["state"]), "quota_transport": plan.get("quota_transport", "host")})
+        if not supports_host:
+            wrapper.pop("quota_transport", None) # Older plugins reject this new field.
+        if bridge_mode:
+            wrapper.update({"management_url": plan["url"], "management_key_env": plan["env_name"]})
         wrapper.setdefault("enabled", True)
         wrapper.setdefault("priority", 0)
         plugins.setdefault("configs", {})[PLUGIN] = wrapper
@@ -879,13 +894,14 @@ def install(args, plan, architecture):
             if plan["dropin"]:
                 if plan["service"].get("scope") == "user":
                     user_service_directory(plan["dropin"].parent, plan["uid"], plan["gid"])
-                    if service_env != plan["env"]:
+                    if bridge_mode and service_env != plan["env"]:
                         transaction.write(service_env, environment_content(key, plan["env_name"]), 0o600, plan["uid"], plan["gid"])
                     owner, group = plan["uid"], plan["gid"]
                 else:
                     directory(plan["dropin"].parent, 0o755, 0, 0)
                     owner, group = 0, 0
-                body = f'# Managed by codex-window-refresh installer\n[Service]\nEnvironmentFile="{service_env}"\n'
+                body = '# Managed by codex-window-refresh installer\n[Service]\n'
+                body += f'EnvironmentFile="{service_env}"\n' if bridge_mode else '# Host quota transport requires no management key environment.\n'
                 transaction.write(plan["dropin"], body.encode(), 0o644, owner, group)
             info = plan["config"].stat()
             transaction.write(plan["config"], merged, stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
@@ -897,7 +913,8 @@ def install(args, plan, architecture):
                       "checker": str(checker), "dropin": str(plan["dropin"]) if plan["dropin"] else None,
                       "service": plan["service"]["name"] if plan["service"] else None,
                       "service_scope": plan["service"].get("scope", "system") if plan["service"] else None,
-                      "service_env": str(service_env) if plan["service"] else None,
+                      "service_env": str(service_env) if plan["service"] and bridge_mode else None,
+                      "quota_transport": plan.get("quota_transport", "host"),
                       "backup": str(backup), "installed_hashes": hashes}
             transaction.write(plan["record"] / "installed.json", json.dumps(record, indent=2).encode(), 0o600)
             if plan["service"]:
@@ -942,9 +959,11 @@ def finish(args, plan):
                 print("已选择稍后手动重启；本次插件变更尚未确认加载。")
         if args.uninstall:
             print("请按原启动方式重启 CPA，使卸载生效。")
-        else:
+        elif plan.get("quota_transport", "host") == "management":
             print(f"请将 {plan['env']} 中的环境变量设置到 CPA 的启动环境，再按原启动方式重启。")
             print("该环境文件按 systemd 语法保存，请勿直接用 shell source 执行。")
+        else:
+            print("默认通过 CPA 宿主查询额度，不需要设置管理密钥环境变量。请按原启动方式重启 CPA。")
 
 
 def uninstall(args, plan):
@@ -1001,6 +1020,7 @@ def main():
     parser.add_argument("--service", help="实际 systemd 服务名；省略时识别运行进程所属且 MainPID 匹配的系统或用户服务")
     parser.add_argument("--user-service", action="store_true", help="显式指定 --service 为用户服务；所属用户用 --user 指定或从运行进程识别")
     parser.add_argument("--management-url", help="管理入口；默认检测端口并使用本机 HTTP")
+    parser.add_argument("--quota-transport", choices=["host", "management"], help="默认 host，无需后台管理密钥；management 为可选兼容桥")
     parser.add_argument("--model", help="首次安装指定 Codex 模型；省略时自动读取已启用 Codex 账号的共同模型")
     parser.add_argument("--version", default=DEFAULT_VERSION,
                         help="默认 latest：最新已发布正式版或 rc 测试版；也可指定 vX.Y.Z 或 vX.Y.Z-rc.N")
@@ -1009,7 +1029,7 @@ def main():
     parser.add_argument("--checksums", help="离线 SHA256SUMS 文件")
     parser.add_argument("--dry-run", action="store_true", help="仅检查和显示路径，不下载或修改文件")
     parser.add_argument("--check-model", action="store_true", help="只查询 CPA 模型并诊断管理连接；不下载、写入安装文件或重启")
-    parser.add_argument("--yes", action="store_true", help="非交互安装，首次安装需 --key-file；自动识别失败须 --model")
+    parser.add_argument("--yes", action="store_true", help="非交互安装；首次自动识别模型或兼容管理桥需 --key-file，指定 --model 的宿主模式无需密钥")
     parser.add_argument("--restart", action="store_true", help="安装后重启明确指定或已核实自动识别的 systemd 服务")
     parser.add_argument("--uninstall", action="store_true", help="卸载本脚本安装的插件，保留策略和状态")
     args = parser.parse_args()

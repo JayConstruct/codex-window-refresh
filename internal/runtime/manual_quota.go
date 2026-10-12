@@ -15,6 +15,7 @@ type ManualQueryStatus struct {
 	Completed  int            `json:"completed"`
 	Failed     int            `json:"failed"`
 	Skipped    int            `json:"skipped"`
+	LastError  string         `json:"last_error,omitempty"`
 	StartedAt  time.Time      `json:"started_at"`
 	FinishedAt time.Time      `json:"finished_at"`
 }
@@ -104,6 +105,7 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 		}
 		if err := e.observe(ctx, id); err != nil {
 			e.manualQuery.Failed++
+			e.manualQuery.LastError = quotaReadErrorCode(err)
 		} else {
 			e.manualQuery.Completed++
 		}

@@ -62,7 +62,7 @@
       </section>
       <section id="tab-capabilities" class="view" role="tabpanel" aria-labelledby="nav-capabilities" hidden>
         <div class="section-head"><div><span class="eyebrow">排查与维护</span><h1>诊断与高级</h1><p>查看调度原因、接口能力，或编辑完整配置。</p></div></div>
-        <section class="card"><h2>额度查询连接</h2><p id="bridge-status"></p><p id="bridge-help" class="hint"></p><p class="hint">网页登录只用于访问面板；后台查询需要 CPA 进程中的管理密钥环境变量。这里检查配置是否具备，不测试上游连通性或认证。</p></section>
+        <section class="card"><h2>额度查询连接</h2><p id="bridge-status"></p><p id="bridge-help" class="hint"></p><p class="hint">默认使用宿主账号凭据查询；只有兼容管理桥需要后台管理密钥环境变量。这里检查查询方式是否就绪，不测试上游连通性或认证。</p></section>
         <div class="two-columns"><section class="card"><h2>为什么没有唤醒？</h2><div id="hold-counts"></div><p id="last-error" class="hint"></p></section><section class="card"><h2>当前规则与调度</h2><dl id="schedule-info" class="details"></dl></section></div>
         <details class="card disclosure"><summary>CPA 接口能力</summary><div class="disclosure-body"><dl id="capabilities-list" class="details"></dl><p class="hint">这些能力用于诊断。前台互斥保护不可用时，最终额度核对和实际发送之间仍可能发生请求竞争。</p></div></details>
         <details class="card disclosure"><summary>手动调度与文件操作</summary><div class="disclosure-body"><p>只用于维护。模型唤醒已开启时，这些操作可能使规则继续发送模型请求。</p><div class="maintenance-actions"><div><h3>重新检查现有规则</h3><p>让后台尽快评估已有规则，不绕过窗口与名额限制。</p><button id="recheck" class="quiet">重新检查规则</button></div><div><h3>应用服务器配置文件</h3><p>服务器上手工修改配置后使用；会重新读取并应用文件。</p><button id="reload" class="quiet">重新读取规则文件</button></div></div></div></details>

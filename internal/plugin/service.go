@@ -26,13 +26,14 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.8"
+const Version = "0.1.0-rc.9"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
 const ResourcePrefix = "/v0/resource/plugins/" + ID
 
 type quotaBridgeDiagnostic struct {
+	Mode             string `json:"mode"`
 	Status           string `json:"status"`
 	ManagementKeyEnv string `json:"management_key_env,omitempty"`
 }
@@ -73,7 +74,7 @@ type Options struct {
 }
 
 // WrapperConfig contains plumbing only. All scheduling policy is read from the
-// separate validated business config; credentials remain in an environment var.
+// separate validated business config; host credentials remain memory-only.
 type WrapperConfig struct {
 	// CPA injects these host-owned loader controls into ConfigYAML. They do not
 	// belong to business policy and do not change plumbing identity.
@@ -81,8 +82,16 @@ type WrapperConfig struct {
 	HostPriority     *int   `yaml:"priority" json:"-"`
 	ConfigFile       string `yaml:"config_file" json:"config_file"`
 	StateDir         string `yaml:"state_dir" json:"state_dir"`
+	QuotaTransport   string `yaml:"quota_transport" json:"quota_transport,omitempty"`
 	ManagementURL    string `yaml:"management_url" json:"management_url,omitempty"`
 	ManagementKeyEnv string `yaml:"management_key_env" json:"management_key_env,omitempty"`
+}
+
+func (w WrapperConfig) quotaTransport() string {
+	if w.QuotaTransport == "" {
+		return "host"
+	}
+	return w.QuotaTransport
 }
 
 func (w WrapperConfig) hostEnabled() bool { return w.HostEnabled == nil || *w.HostEnabled }
@@ -91,7 +100,7 @@ func (w WrapperConfig) effective(cfg config.Config) config.Config {
 	return cfg
 }
 func (w WrapperConfig) samePlumbing(other WrapperConfig) bool {
-	return w.ConfigFile == other.ConfigFile && w.StateDir == other.StateDir && w.ManagementURL == other.ManagementURL && w.ManagementKeyEnv == other.ManagementKeyEnv
+	return w.ConfigFile == other.ConfigFile && w.StateDir == other.StateDir && w.ManagementURL == other.ManagementURL && w.ManagementKeyEnv == other.ManagementKeyEnv && w.quotaTransport() == other.quotaTransport()
 }
 
 type Service struct {
@@ -121,6 +130,9 @@ func New(callback cpa.Callback, options Options) *Service {
 	}
 	if options.HostFactory == nil {
 		options.HostFactory = func(cb cpa.Callback, w WrapperConfig) (Host, error) {
+			if w.quotaTransport() == "host" {
+				return cpa.NewHost(cb, &cpa.NativeReader{Callback: cb}), nil
+			}
 			return cpa.NewHost(cb, &cpa.BridgeReader{ManagementURL: w.ManagementURL, ManagementKeyEnv: w.ManagementKeyEnv, Getenv: os.Getenv, Client: &http.Client{Timeout: 30 * time.Second}}), nil
 		}
 	}
@@ -252,6 +264,12 @@ func parseWrapper(payload []byte) (WrapperConfig, error) {
 	}
 	if (wrapper.ManagementURL == "") != (wrapper.ManagementKeyEnv == "") {
 		return WrapperConfig{}, errors.New("management_url and management_key_env must be set together")
+	}
+	if wrapper.quotaTransport() != "host" && wrapper.quotaTransport() != "management" {
+		return WrapperConfig{}, errors.New("quota_transport must be host or management")
+	}
+	if wrapper.quotaTransport() == "management" && wrapper.ManagementURL == "" {
+		return WrapperConfig{}, errors.New("management transport requires management_url and management_key_env")
 	}
 	return wrapper, nil
 }
@@ -404,7 +422,7 @@ func (s *Service) WaitForShutdown() {
 
 func registration() any {
 	fields := []map[string]string{}
-	for _, field := range []struct{ name, description string }{{"config_file", "Absolute path to the validated scheduler YAML or JSON file."}, {"state_dir", "Absolute path to private durable state directory (0700)."}, {"management_url", "Optional local CPA management base URL for quota observations."}, {"management_key_env", "Environment variable containing the management key; never the key itself."}} {
+	for _, field := range []struct{ name, description string }{{"config_file", "Absolute path to the validated scheduler YAML or JSON file."}, {"state_dir", "Absolute path to private durable state directory (0700)."}, {"quota_transport", "Quota query transport: host (default) or management (optional compatibility bridge)."}, {"management_url", "Local CPA management URL, required only with management transport."}, {"management_key_env", "Management key environment variable name, required only with management transport."}} {
 		fields = append(fields, map[string]string{"Name": field.name, "Type": "string", "Description": field.description})
 	}
 	return map[string]any{"schema_version": SchemaVersion, "metadata": map[string]any{"Name": ID, "Version": Version, "Author": "codex-window-refresh contributors", "GitHubRepository": Repository, "ConfigFields": fields}, "capabilities": map[string]bool{"request_interceptor": true, "request_lifecycle_plugin": true, "response_interceptor": true, "response_stream_interceptor": true, "websocket_response_observer": true, "management_api": true}}
@@ -546,10 +564,16 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 			capabilities, _, _ = debug.Diagnostics()
 		}
 		bridge := &cpa.BridgeReader{ManagementURL: wrapper.ManagementURL, ManagementKeyEnv: wrapper.ManagementKeyEnv}
+		diagnostic := quotaBridgeDiagnostic{Mode: wrapper.quotaTransport()}
+		if diagnostic.Mode == "host" {
+			diagnostic.Status = "host_callback"
+		} else {
+			diagnostic.Status, diagnostic.ManagementKeyEnv = bridge.ConfigurationStatus(), wrapper.ManagementKeyEnv
+		}
 		return response(200, struct {
 			core.HostCapabilities
 			QuotaBridge quotaBridgeDiagnostic `json:"quota_bridge"`
-		}{capabilities, quotaBridgeDiagnostic{bridge.ConfigurationStatus(), wrapper.ManagementKeyEnv}}), nil
+		}{capabilities, diagnostic}), nil
 	case "POST /reload":
 		if stopping {
 			return response(409, map[string]string{"error": "scheduler stopping"}), nil

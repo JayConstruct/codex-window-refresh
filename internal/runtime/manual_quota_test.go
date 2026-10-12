@@ -241,3 +241,25 @@ func TestAccountQuotaQueryFailureAndPermissionCancellation(t *testing.T) {
 		}
 	}
 }
+
+func TestManualQuotaFailurePublishesOnlyFixedCredentialDiagnosis(t *testing.T) {
+	for _, message := range []string{"quota_credential_expired", "failure contains a private-token"} {
+		e, h, _, _ := fixture(t, false, false)
+		e.cfg.Enabled, e.cfg.QuotaQuery.Automatic = false, false
+		e.host = controlledHost{Host: h, read: func(context.Context, core.QuotaRead) (core.QuotaObservation, error) {
+			return core.QuotaObservation{}, errors.New(message)
+		}}
+		e.QueueQuotaQuery("a")
+		if err := e.Step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		expected := "quota_read_failed"
+		if message == "quota_credential_expired" {
+			expected = message
+		}
+		status := e.SchedulerDiagnostics().(SchedulingSummary).QuotaQuery
+		if status.LastError != expected || status.Failed != 1 || len(h.sends) != 0 {
+			t.Fatal("query diagnostics lost its fixed classification or leaked host errors")
+		}
+	}
+}

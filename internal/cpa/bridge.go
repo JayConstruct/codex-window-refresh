@@ -55,7 +55,7 @@ func (b *BridgeReader) Read(ctx context.Context, a AuthBinding) ([]byte, error) 
 		Method    string            `json:"method"`
 		URL       string            `json:"url"`
 		Header    map[string]string `json:"header"`
-	}{a.AuthIndex, http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", map[string]string{"Authorization": "Bearer $TOKEN$", "Chatgpt-Account-Id": a.UpstreamAccountID, "Accept": "application/json"}}
+	}{a.AuthIndex, http.MethodGet, codexUsageURL, map[string]string{"Authorization": "Bearer $TOKEN$", "Chatgpt-Account-Id": a.UpstreamAccountID, "Accept": "application/json"}}
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return nil, ErrBridgeRead

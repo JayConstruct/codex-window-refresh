@@ -129,6 +129,7 @@ func (h *Host) ObserveQuota(ctx context.Context, read core.QuotaRead) (core.Quot
 		return core.QuotaObservation{}, err
 	}
 	raw, err := h.reader.Read(ctx, b)
+	defer clear(raw)
 	if err != nil {
 		return core.QuotaObservation{}, err
 	}
