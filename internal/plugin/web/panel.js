@@ -291,7 +291,7 @@
     const help = {
       missing_management_url: '在 CPA 主配置的 plugins.configs.codex-window-refresh 中设置 management_url 和 management_key_env，然后重启 CPA。',
       missing_management_key_env: '在 CPA 主配置的 plugins.configs.codex-window-refresh 中设置 management_key_env（环境变量名），然后重启 CPA。',
-      missing_management_key: '将现有 CPA 管理密钥设置到 CPA 进程的 ' + env + ' 环境变量，然后重启 CPA。systemd 需配置 EnvironmentFile；Docker 需将变量传入容器。',
+      missing_management_key: '将现有 CPA 管理密钥设置到 CPA 进程的 ' + env + ' 环境变量，然后重启 CPA。systemd 需给实际服务配置 EnvironmentFile（用户服务用 --user 管理）；Docker 需将变量传入容器。',
       invalid_management_url: '检查 CPA 主配置中的 management_url。支持 http(s) 服务基址、/v0/management、/v0/management/api-call 或完整 /v8/management/requests/api-call；修改后重启 CPA。',
       configured: '管理地址及密钥环境变量已配置。接口能力每 5 秒更新；查询失败时再检查管理密钥、地址及上游连接。'
     };
@@ -546,14 +546,16 @@
   $('refresh').addEventListener('click', () => refreshSnapshots(true));
   async function requestQuotaQuery(accountID) {
     if (actionBusy || !session.connected()) return;
-    const generation = session.generation(); busy(true); renderQuotaQuery();
+    const generation = session.generation();
+    pendingQuotaQuery = {target: accountID || '', previousStart: summary?.scheduler?.quota_query?.started_at};
+    busy(true); renderQuotaQuery();
     try {
       const result = await session.request('/quota-query', 'POST', accountID ? {account_id: accountID} : undefined);
       if (generation !== session.generation()) return;
-      pendingQuotaQuery = {target: accountID || '', previousStart: summary?.scheduler?.quota_query?.started_at};
       notice(result.status === 'already_queued' ? '已有相同的额度查询任务，正在等待结果。' : accountID ? '已安排此账号的额度查询，不发送模型请求。' : '已安排全部账号的额度查询，不发送模型请求。');
       await readSnapshots();
     } catch (error) {
+      if (generation === session.generation()) pendingQuotaQuery = null;
       if (['conflict', 'invalid_config', 'http_error'].includes(error.code)) notice('未能安排额度查询。请检查手动查询开关、账号和后台状态；已有查询任务时请等待结束后重试。', 'error');
       else report(error);
     }

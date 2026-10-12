@@ -208,7 +208,7 @@ try {
   await evaluate('document.querySelector(".account-disclosure").open=false; document.querySelector("[data-tab=overview]").click()');
   await waitFor(() => evaluate('!document.getElementById("quota-query").disabled'), 'Manual query was not enabled');
   await evaluate('document.getElementById("quota-query").click()');
-  await waitFor(() => evaluate('document.getElementById("quota-query-status").textContent.includes("查询结束")'), 'Manual query progress did not display');
+  await waitFor(() => evaluate('document.getElementById("quota-query-status").textContent.includes("全部账号 · 查询结束") && document.getElementById("account-list").textContent.includes("71%")'), 'Current batch query result did not display');
   assert.equal(posts.filter(p=>p.path==='quota-query').length,3,'Manual query duplicated');
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("71%") && document.getElementById("account-list").textContent.includes("主动查询")'),true,'Manual quota did not update panel');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 960, deviceScaleFactor: 1, mobile: false });
