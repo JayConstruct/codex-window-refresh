@@ -33,8 +33,8 @@ const accounts = {
 const summary = { enabled: false, business_enabled: false, host_enabled: true, running: true, accounts: 2, reservations: 0, revision: 42, effective_concurrency: 1, last_error: '', scheduler: { observed_at: now, recent_users: 2, capacity: { target: 2, active: 1, reserved: 0, missing: 1, participants: 2, user_target: 2 }, hold_counts: { quota_unknown: 1 }, identity_source: 'host_caller_scope', quota_unknown_accounts: 1, foreground_busy_accounts: 0, next_inventory_at: reset } };
 function json(res, status, value) { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); }
 const errors = [];
-async function waitFor(check, message) {
-  const end = Date.now() + 12000;
+async function waitFor(check, message, timeout = 12000) {
+  const end = Date.now() + timeout;
   while (Date.now() < end) { if (await check()) return; await new Promise(r => setTimeout(r, 50)); }
   throw new Error(message);
 }
@@ -81,10 +81,17 @@ try {
   });
   await new Promise(r => server.listen(0, '127.0.0.1', r));
   const url = `http://127.0.0.1:${server.address().port}${base}status`;
-  browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking', '--remote-debugging-port=0', `--user-data-dir=${temp}`, 'about:blank'], { stdio: 'ignore' });
+  browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', `--user-data-dir=${temp}`, 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+  let browserLog = '';
+  browser.stderr.on('data', chunk => { browserLog = (browserLog + chunk.toString()).slice(-8000); });
   browser.on('error', err => errors.push(String(err)));
   let port;
-  await waitFor(async () => { try { port = (await readFile(join(temp, 'DevToolsActivePort'), 'utf8')).split('\n')[0]; return !!port; } catch { return false; } }, 'Chromium did not start');
+  try {
+    await waitFor(async () => {
+      if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Chromium exited before starting: ' + browserLog);
+      try { port = (await readFile(join(temp, 'DevToolsActivePort'), 'utf8')).split('\n')[0]; return !!port; } catch { return false; }
+    }, 'Chromium did not start', 30000);
+  } catch (error) { console.error(browserLog); throw error; }
   const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
   ws = new WebSocket(targets.find(t => t.type === 'page').webSocketDebuggerUrl);
   await new Promise((r, j) => { ws.addEventListener('open', r, { once: true }); ws.addEventListener('error', j, { once: true }); });
@@ -178,7 +185,7 @@ try {
   console.log(`Browser smoke passed: manual login, CPA credential formats, reload/reopen, menu iframe, single rejected probe, fallback, accounts/XSS, rule persistence, conflict draft, mobile layout, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
-  if (browser) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }
+  if (browser && browser.exitCode === null && browser.signalCode === null) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }
   if (server) await new Promise(r => server.close(r));
   // Keep screenshots for inspection, remove the browser profile and its data.
   for (const name of ['Default', 'Local State', 'DevToolsActivePort', 'ShaderCache', 'GrShaderCache', 'GraphiteDawnCache', 'DawnGraphiteCache', 'DawnWebGPUCache']) {
