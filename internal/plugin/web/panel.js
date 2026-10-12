@@ -180,6 +180,7 @@
   const document = root.document, $ = id => document.getElementById(id);
   const editor = createEditor();
   const expandedAccounts = new Set();
+  let pendingQuotaQuery = null;
   let summary = null, runningConfig = null, accounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
   const session = createSession(root.fetch.bind(root), clearView, undefined, apiBase(root.location));
   function el(tag, text, className) {
@@ -194,6 +195,7 @@
     pollTimer = null; pollBusy = false; actionBusy = false;
     summary = null; runningConfig = null; accounts = {}; capabilities = {}; editor.clear(); diskMatchesRunning = true;
     expandedAccounts.clear();
+    pendingQuotaQuery = null;
     $('workspace').hidden = true; $('login-section').hidden = false; $('management-key').value = ''; $('config-json').value = '';
     $('connection-status').textContent = '未连接'; $('connection-status').className = 'badge neutral'; $('disconnect').disabled = true;
     for (const id of ['metrics', 'schedule-info', 'hold-counts', 'account-list', 'daily-rules', 'capabilities-list']) $(id).replaceChildren();
@@ -256,15 +258,27 @@
     $('last-error').textContent = summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误';
     renderQuotaQuery();
   }
+  function quotaJob() {
+    const job = summary?.scheduler?.quota_query || {};
+    if (pendingQuotaQuery) {
+      if (!summary?.running || ((job.account_id || '') === pendingQuotaQuery.target &&
+          (job.started_at !== pendingQuotaQuery.previousStart || ['queued', 'running'].includes(job.phase)))) pendingQuotaQuery = null;
+      else return {phase: 'queued', account_id: pendingQuotaQuery.target};
+    }
+    return job;
+  }
+  function quotaQueryReason() {
+    if (!summary?.running) return '后台未运行';
+    if (capabilities.QuotaAdapterReady !== true) return '额度查询接口未就绪，请查看诊断';
+    if (runningConfig?.quota_query?.manual !== true) return '手动查询已关闭，可在“额度查询”中开启';
+    return '';
+  }
   function renderQuotaQuery() {
-    const query = runningConfig?.quota_query || {}, job = summary?.scheduler?.quota_query || {};
+    const query = runningConfig?.quota_query || {}, job = quotaJob();
     const running = job.phase === 'queued' || job.phase === 'running';
     const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
-    const progress = job.phase ? (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' : '尚未执行手动查询';
-    let reason = '';
-    if (!summary?.running) reason = '后台未运行';
-    else if (capabilities.QuotaAdapterReady !== true) reason = '额度查询接口未就绪，请查看诊断';
-    else if (query.manual !== true) reason = '手动查询已关闭，可在“额度查询”中开启';
+    const progress = job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' : '尚未执行手动查询';
+    const reason = quotaQueryReason();
     $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · ' + (reason || progress);
     $('quota-query').disabled = !session.connected() || actionBusy || !!reason || running;
   }
@@ -313,6 +327,18 @@
       const accountStatus = pauseChanged ? (paused ? '待保存：暂停唤醒' : '待保存：恢复唤醒') : paused ? '唤醒已暂停' : a.Enabled ? '账号已启用' : '账号已禁用';
       header.append(name, badge(accountStatus, paused || pauseChanged || !a.Enabled ? 'warning' : '')); card.append(header);
       const windows = el('div', undefined, 'window-grid'); windows.append(windowCell('5 小时额度', a.FiveHour), windowCell('周额度', a.Weekly)); card.append(windows);
+      const queryRow = el('div', undefined, 'account-query'), job = quotaJob();
+      const querying = ['queued', 'running'].includes(job.phase), selected = job.account_id === id;
+      const reason = quotaQueryReason() || (!a.Enabled && !runningPaused ? '账号已禁用，无法查询' : '');
+      const queryButton = el('button', querying && selected ? '正在查询…' : '查询此账号额度', 'quiet');
+      queryButton.type = 'button'; queryButton.dataset.quotaAccount = id;
+      queryButton.disabled = !session.connected() || actionBusy || !!reason || querying;
+      queryButton.title = reason || (querying ? '请等待当前手动查询结束' : '只访问此账号的额度接口，不发送模型请求');
+      queryButton.addEventListener('click', () => { if (!queryButton.disabled) void requestQuotaQuery(id); });
+      let queryText = reason || '仅查询额度，不发送模型请求';
+      if (selected && job.phase) queryText = ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，可手动重试' : job.skipped ? '未查询：账号已禁用或移除' : '查询完成 · ' + date(job.finished_at));
+      const queryStatus = el('span', queryText, 'hint'); queryStatus.setAttribute('role', 'status');
+      queryRow.append(queryButton, queryStatus); card.append(queryRow);
       const task = a.Task, taskInfo = el('dl', undefined, 'details task-info'), disclosure = el('details', undefined, 'account-disclosure');
       disclosure.open = expandedAccounts.has(id);
       disclosure.addEventListener('toggle', () => { if (disclosure.isConnected) { if (disclosure.open) expandedAccounts.add(id); else expandedAccounts.delete(id); } });
@@ -504,17 +530,22 @@
     finally { if (generation === session.generation()) busy(false); }
   });
   $('refresh').addEventListener('click', () => refreshSnapshots(true));
-  $('quota-query').addEventListener('click', async () => {
-    if ($('quota-query').disabled || actionBusy || !session.connected()) return;
+  async function requestQuotaQuery(accountID) {
+    if (actionBusy || !session.connected()) return;
     const generation = session.generation(); busy(true); renderQuotaQuery();
     try {
-      const result = await session.request('/quota-query', 'POST');
+      const result = await session.request('/quota-query', 'POST', accountID ? {account_id: accountID} : undefined);
       if (generation !== session.generation()) return;
-      notice(result.status === 'already_queued' ? '已有额度查询任务，正在等待结果。' : '已安排额度查询，仅调用额度接口，不发送模型请求。');
+      pendingQuotaQuery = {target: accountID || '', previousStart: summary?.scheduler?.quota_query?.started_at};
+      notice(result.status === 'already_queued' ? '已有相同的额度查询任务，正在等待结果。' : accountID ? '已安排此账号的额度查询，不发送模型请求。' : '已安排全部账号的额度查询，不发送模型请求。');
       await readSnapshots();
-    } catch (error) { report(error); }
+    } catch (error) {
+      if (['conflict', 'invalid_config', 'http_error'].includes(error.code)) notice('未能安排额度查询。请检查手动查询开关、账号和后台状态；已有查询任务时请等待结束后重试。', 'error');
+      else report(error);
+    }
     finally { if (generation === session.generation()) { busy(false); renderQuotaQuery(); } }
-  });
+  }
+  $('quota-query').addEventListener('click', () => { if (!$('quota-query').disabled) void requestQuotaQuery(); });
   $('account-search').addEventListener('input', renderAccounts); $('account-filter').addEventListener('change', renderAccounts);
   document.addEventListener('visibilitychange', () => { if (document.hidden) { if (pollTimer) root.clearTimeout(pollTimer); pollTimer = null; } else if (session.connected()) refreshSnapshots(false); });
   root.addEventListener('beforeunload', event => { if (editor.dirty()) { event.preventDefault(); event.returnValue = ''; } });

@@ -70,8 +70,23 @@ try {
         posts.push({ path, body });
         if (path === 'quota-query') {
           if (!config.quota_query.manual) {json(res,409,{error:'manual_quota_query_disabled'});return;}
-          assert.equal(body, '', 'Query endpoint must not receive a model or prompt');
-          summary.scheduler.quota_query = {phase:'completed',total:2,completed:2,failed:0,skipped:0};
+          if (body) {
+            const selected = JSON.parse(body);
+            assert.deepEqual(Object.keys(selected), ['account_id'], 'Account query received model input');
+            assert.ok(Object.hasOwn(accounts, selected.account_id), 'Wrong account selected');
+            const accountID = selected.account_id, failed = accountID !== 'fixture-account';
+            // Do not publish immediately: the panel must retain its optimistic
+            // queued state until the runtime's next snapshot catches up.
+            setTimeout(() => {
+              summary.scheduler.quota_query = {account_id:accountID,phase:'completed',total:1,completed:failed?0:1,failed:failed?1:0,skipped:0,started_at:new Date().toISOString(),finished_at:new Date().toISOString()};
+              if (!failed) {
+                accounts[accountID].FiveHour.Remaining.Value = 70;
+                accounts[accountID].FiveHour.Source = 'cpa_wham_usage';
+              }
+            }, 150);
+            json(res,202,{status:'queued',account_id:accountID});return;
+          }
+          summary.scheduler.quota_query = {phase:'completed',total:2,completed:2,failed:0,skipped:0,started_at:new Date().toISOString(),finished_at:new Date().toISOString()};
           accounts['fixture-account'].FiveHour.Remaining.Value = 71;
           accounts['fixture-account'].FiveHour.Source = 'cpa_wham_usage';
           json(res,202,{status:'queued'});return;
@@ -171,11 +186,25 @@ try {
   assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
   assert.equal(await evaluate('document.querySelector(".account-disclosure").open'),true,'Polling collapsed open account diagnostics');
   assert.equal(posts.length, 0, 'Snapshot polling dispatched operations');
+  assert.equal(await evaluate('document.querySelectorAll("[data-quota-account]").length'),2,'Account query buttons missing');
+  assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>!button.closest("details"))'),true,'Account query was hidden in diagnostics');
+  const singleQueryCount = posts.length;
+  await evaluate(`{ const button=Array.from(document.querySelectorAll('[data-quota-account]')).find(item=>item.dataset.quotaAccount==='fixture-account'); button.click(); button.click(); }`);
+  await waitFor(()=>posts.length===singleQueryCount+1,'Account query was not sent');
+  await waitFor(()=>evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>button.disabled)'),'Queued query allowed another target before snapshot');
+  await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("70%") && document.getElementById("account-list").textContent.includes("查询完成")'),'Single-account result did not update');
+  assert.deepEqual(JSON.parse(posts.at(-1).body),{account_id:'fixture-account'},'Account query widened to all accounts');
+  assert.equal(posts.length,singleQueryCount+1,'Double click duplicated the account query');
+  assert.equal(accounts['<img src=x onerror=alert(1)>'].FiveHour.State,'unknown','Selected query changed another account');
+  await evaluate(`Array.from(document.querySelectorAll('[data-quota-account]')).find(item=>item.dataset.quotaAccount!=='fixture-account').click()`);
+  await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("查询失败，可手动重试")'),'Account query failure was not displayed');
+  assert.equal(JSON.parse(posts.at(-1).body).account_id,'<img src=x onerror=alert(1)>','Account ID was not passed literally in JSON');
+  assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'),0,'Account query introduced unsafe rendering');
   await evaluate('document.querySelector(".account-disclosure").open=false; document.querySelector("[data-tab=overview]").click()');
   await waitFor(() => evaluate('!document.getElementById("quota-query").disabled'), 'Manual query was not enabled');
   await evaluate('document.getElementById("quota-query").click()');
   await waitFor(() => evaluate('document.getElementById("quota-query-status").textContent.includes("查询结束")'), 'Manual query progress did not display');
-  assert.equal(posts.filter(p=>p.path==='quota-query').length,1,'Manual query duplicated');
+  assert.equal(posts.filter(p=>p.path==='quota-query').length,3,'Manual query duplicated');
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("71%") && document.getElementById("account-list").textContent.includes("主动查询")'),true,'Manual quota did not update panel');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 960, deviceScaleFactor: 1, mobile: false });
   let capture = await cdp('Page.captureScreenshot');
@@ -205,6 +234,7 @@ try {
   await evaluate(`{document.getElementById('query-automatic').checked=false; document.getElementById('query-automatic').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('query-manual').checked=false; document.getElementById('query-manual').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click();}`);
   await waitFor(()=>config.quota_query.automatic===false && config.quota_query.manual===false,'Query switches did not persist');
   await waitFor(()=>evaluate('document.getElementById("quota-query").disabled && document.getElementById("quota-query-status").textContent.includes("定期查询：关闭")'),'Saved manual/automatic switches did not apply');
+  assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>button.disabled)'),true,'Account query bypassed disabled manual permission');
   assert.equal(config.enabled,false,'Changing query settings enabled model wake');
   assert.equal(config.execution.model,'fixture-model','Query settings changed execution model');
   assert.ok(posts.every(p=>['config','quota-query'].includes(p.path)),'Query controls called a model/scheduler operation');
@@ -241,7 +271,7 @@ try {
   await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
   await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Manual fallback did not connect');
   assert.deepEqual(errors, [], 'Browser or fixture errors');
-  console.log(`Browser smoke passed: CPA login, query/wake separation, mode summary, shared drafts/save bar, persistent account disclosures, keyboard tabs, quota sources/polling, manual query, five mobile views, JSON editor, 401 cleanup. Screenshots: ${temp}`);
+  console.log(`Browser smoke passed: CPA login, query/wake separation, mode summary, shared drafts/save bar, persistent account disclosures, keyboard tabs, quota sources/polling, manual and single-account queries, five mobile views, JSON editor, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }

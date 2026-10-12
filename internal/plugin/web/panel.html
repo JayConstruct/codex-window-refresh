@@ -46,7 +46,7 @@
         <section class="card"><div class="card-heading"><div><h2>自动与手动查询</h2><p>更改先保存在草稿中，点击下方“保存并应用”后生效。</p></div></div><div class="setting-list">
           <label class="setting-toggle"><span><strong>定期查询额度</strong><small>后台自动补充额度数据；近期有完整用户响应额度时，可减少重复查询。</small></span><input id="query-automatic" type="checkbox" data-field="quota_query.automatic"></label>
           <label class="interval-field">定期查询间隔<input id="query-interval" data-field="quota_query.interval" placeholder="30s"><small>例如 30s、2m 或 1h；允许 30 秒到 1 小时。</small></label>
-          <label class="setting-toggle"><span><strong>允许手动查询</strong><small>开启后可在“总览”点击“立即查询额度”，并查看成功和失败数量。</small></span><input id="query-manual" type="checkbox" data-field="quota_query.manual"></label>
+          <label class="setting-toggle"><span><strong>允许手动查询</strong><small>开启后可在“总览”批量查询，也可在账号卡片上单独查询该账号额度。</small></span><input id="query-manual" type="checkbox" data-field="quota_query.manual"></label>
         </div></section>
         <section class="card compact-note"><h2>关闭查询开关后会怎样？</h2><p>用户请求返回的被动额度仍会更新。若独立开启了模型唤醒，发送前的额度核对和已发送操作的验证仍会执行。</p><button class="text-button" data-open-tab="overview">返回总览，查询最新额度 →</button></section>
       </section>

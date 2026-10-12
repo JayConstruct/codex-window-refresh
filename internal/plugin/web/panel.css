@@ -115,6 +115,9 @@ progress::-moz-progress-bar { background: var(--accent); }
 .window-time { font-size: 10px; color: var(--muted); overflow-wrap: anywhere; }
 .countdown { color: var(--ink); font-size: 12px; margin-top: 8px; font-variant-numeric: tabular-nums; }
 .account-disclosure { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+.account-query { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; }
+.account-query button { font-size: 12px; padding: 9px 12px; flex-shrink: 0; }
+.account-query .hint { font-size: 11px; overflow-wrap: anywhere; }
 summary { cursor: pointer; font-weight: 600; }
 .account-disclosure summary { font-size: 12px; color: var(--muted); }
 .task-info { margin-top: 12px; }

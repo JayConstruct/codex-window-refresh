@@ -66,6 +66,7 @@ type Engine struct {
 	nextInventory   time.Time
 	manualRequested bool              // guarded by queueMu
 	manualActive    bool              // guarded by queueMu; includes queued and running jobs
+	manualTarget    core.AccountID    // guarded by queueMu; empty means all enabled accounts
 	manualQuery     ManualQueryStatus // guarded by mu, published with snapshots
 	manualIDs       []core.AccountID
 	manualIndex     int

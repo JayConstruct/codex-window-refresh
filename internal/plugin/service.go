@@ -26,7 +26,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.6"
+const Version = "0.1.0-rc.7"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -496,9 +496,22 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		if !cfg.QuotaQuery.Manual {
 			return response(409, map[string]string{"error": "manual_quota_query_disabled"}), nil
 		}
-		// This endpoint accepts no model, prompt, or scheduler mutation payload.
-		if len(bytes.TrimSpace(req.Body)) > 0 && string(bytes.TrimSpace(req.Body)) != "{}" {
-			return response(400, map[string]string{"error": "quota_query_has_no_parameters"}), nil
+		// Only an optional exact account selector is accepted, never model input.
+		var target core.AccountID
+		if raw := bytes.TrimSpace(req.Body); len(raw) > 0 {
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(raw, &fields) != nil || fields == nil || len(fields) > 1 {
+				return response(400, map[string]string{"error": "invalid_quota_query_parameters"}), nil
+			}
+			if len(fields) == 1 {
+				value, ok := fields["account_id"]
+				if !ok || json.Unmarshal(value, &target) != nil || strings.TrimSpace(string(target)) == "" {
+					return response(400, map[string]string{"error": "invalid_quota_query_parameters"}), nil
+				}
+				if _, exists := engine.Snapshot().Accounts[target]; !exists {
+					return response(404, map[string]string{"error": "account_not_found"}), nil
+				}
+			}
 		}
 		query, ok := engine.(interface{ RequestQuotaQuery() bool })
 		if !ok {
@@ -511,10 +524,17 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 			}
 		}
 		status := "already_queued"
-		if query.RequestQuotaQuery() {
+		if selected, ok := engine.(interface{ QueueQuotaQuery(core.AccountID) string }); ok {
+			status = selected.QueueQuotaQuery(target)
+			if status == "busy" {
+				return response(409, map[string]string{"error": "quota_query_busy"}), nil
+			}
+		} else if target != "" {
+			return response(501, map[string]string{"error": "account_quota_query_unavailable"}), nil
+		} else if query.RequestQuotaQuery() {
 			status = "queued"
 		}
-		return response(202, map[string]string{"status": status}), nil
+		return response(202, map[string]any{"status": status, "account_id": target}), nil
 	case "GET /capabilities":
 		capabilities := core.HostCapabilities{}
 		if debug, ok := engine.(DiagnosticEngine); ok {

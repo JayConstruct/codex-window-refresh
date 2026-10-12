@@ -4,38 +4,53 @@ import (
 	"context"
 	"sort"
 	"time"
+
+	"codex-window-refresh/internal/core"
 )
 
 type ManualQueryStatus struct {
-	Phase      string    `json:"phase"`
-	Total      int       `json:"total"`
-	Completed  int       `json:"completed"`
-	Failed     int       `json:"failed"`
-	Skipped    int       `json:"skipped"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
+	AccountID  core.AccountID `json:"account_id,omitempty"`
+	Phase      string         `json:"phase"`
+	Total      int            `json:"total"`
+	Completed  int            `json:"completed"`
+	Failed     int            `json:"failed"`
+	Skipped    int            `json:"skipped"`
+	StartedAt  time.Time      `json:"started_at"`
+	FinishedAt time.Time      `json:"finished_at"`
 }
 
 // RequestQuotaQuery queues one coalesced query-only sweep. The HTTP callback
 // never performs network I/O or calls the scheduler's model dispatch path.
 func (e *Engine) RequestQuotaQuery() bool {
+	return e.QueueQuotaQuery("") == "queued"
+}
+
+// QueueQuotaQuery selects exactly one account, or a sweep when id is empty.
+// Different targets cannot silently join or widen a running query.
+func (e *Engine) QueueQuotaQuery(id core.AccountID) string {
 	e.queueMu.Lock()
 	if e.manualActive {
+		same := e.manualTarget == id
 		e.queueMu.Unlock()
-		return false
+		if same {
+			return "already_queued"
+		}
+		return "busy"
 	}
 	e.manualRequested, e.manualActive = true, true
+	e.manualTarget = id
 	e.queueMu.Unlock()
 	e.Notify()
-	return true
+	return "queued"
 }
 func (e *Engine) startManualQuery() {
 	e.queueMu.Lock()
 	requested := e.manualRequested
+	target := e.manualTarget
 	e.manualRequested = false
 	e.queueMu.Unlock()
 	if requested {
-		e.manualQuery = ManualQueryStatus{Phase: "queued", StartedAt: e.clock.Now()}
+		e.manualQuery = ManualQueryStatus{AccountID: target, Phase: "queued", StartedAt: e.clock.Now()}
 		e.manualIDs = nil
 		e.manualIndex = 0
 		// Synchronize inventory once for this sweep, including newly added accounts.
@@ -59,9 +74,13 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 		return
 	}
 	if e.manualQuery.Phase == "queued" {
-		for _, a := range e.inventory {
-			if a.Enabled {
-				e.manualIDs = append(e.manualIDs, a.ID)
+		if e.manualQuery.AccountID != "" {
+			e.manualIDs = append(e.manualIDs, e.manualQuery.AccountID)
+		} else {
+			for _, a := range e.inventory {
+				if a.Enabled {
+					e.manualIDs = append(e.manualIDs, a.ID)
+				}
 			}
 		}
 		sort.Slice(e.manualIDs, func(i, j int) bool { return e.manualIDs[i] < e.manualIDs[j] })

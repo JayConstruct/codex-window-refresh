@@ -170,3 +170,74 @@ func TestDisablingManualQueriesCancelsRemainderOfRunningSweep(t *testing.T) {
 		t.Fatal("disabled query continued or dispatched")
 	}
 }
+
+func TestAccountQuotaQueryReadsOnlySelectedPausedAccountWithoutDispatch(t *testing.T) {
+	e, h, _, _ := fixture(t, true, true) // weekly model wake is due
+	e.cfg.QuotaQuery.Automatic = true
+	h.initial = append(h.initial, core.HostAccount{ID: "b", Generation: "other", Enabled: true})
+	paused := true
+	e.cfg.AccountOverrides = map[core.AccountID]config.AccountOverride{"a": {Paused: &paused}}
+	var ids []core.AccountID
+	e.host = controlledHost{Host: h, read: func(ctx context.Context, q core.QuotaRead) (core.QuotaObservation, error) {
+		ids = append(ids, q.AccountID)
+		return h.ObserveQuota(ctx, q)
+	}}
+	if e.QueueQuotaQuery("a") != "queued" || e.QueueQuotaQuery("a") != "already_queued" || e.QueueQuotaQuery("b") != "busy" || e.QueueQuotaQuery("") != "busy" {
+		t.Fatal("selected query duplicated or widened its target")
+	}
+	if h.reads != 0 || len(h.sends) != 0 {
+		t.Fatal("queue callback performed network work")
+	}
+	if err := e.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	job := e.SchedulerDiagnostics().(SchedulingSummary).QuotaQuery
+	if len(ids) != 1 || ids[0] != "a" || len(h.sends) != 0 || job.AccountID != "a" || job.Total != 1 || job.Completed != 1 || job.Phase != "completed" {
+		t.Fatalf("selected query did not stay read-only and bound: ids=%v job=%+v", ids, job)
+	}
+	if e.QueueQuotaQuery("b") != "queued" {
+		t.Fatal("finished query blocked another account")
+	}
+}
+
+func TestAccountQuotaQuerySkipsDisabledOrRemovedAccount(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		e, h, _, _ := fixture(t, false, false)
+		e.cfg.QuotaQuery.Automatic = false
+		if disabled {
+			h.initial[0].Enabled = false
+		} else {
+			h.initial = []core.HostAccount{}
+		}
+		e.QueueQuotaQuery("a")
+		if err := e.Step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if h.reads != 0 || len(h.sends) != 0 || e.manualQuery.Total != 1 || e.manualQuery.Skipped != 1 || e.manualQuery.Phase != "completed" {
+			t.Fatalf("unavailable account caused upstream request: %+v", e.manualQuery)
+		}
+	}
+}
+
+func TestAccountQuotaQueryFailureAndPermissionCancellation(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		e, h, _, _ := fixture(t, false, false)
+		e.cfg.Enabled = false
+		e.cfg.QuotaQuery.Automatic = false
+		reads := 0
+		e.host = controlledHost{Host: h, read: func(context.Context, core.QuotaRead) (core.QuotaObservation, error) {
+			reads++
+			return core.QuotaObservation{}, errors.New("test failure")
+		}}
+		e.QueueQuotaQuery("a")
+		e.cfg.QuotaQuery.Manual = !cancel
+		for i := 0; i < 3; i++ {
+			if err := e.Step(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(h.sends) != 0 || (cancel && (reads != 0 || e.manualQuery.Phase != "cancelled")) || (!cancel && (reads != 1 || e.manualQuery.Failed != 1)) {
+			t.Fatalf("selected query retried, dispatched or ignored cancellation: reads=%d job=%+v", reads, e.manualQuery)
+		}
+	}
+}
