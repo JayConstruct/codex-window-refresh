@@ -119,6 +119,7 @@ func setupService(t *testing.T) (*Service, *fakeEngine, *fakeStore, *fakeCallbac
 	store := &fakeStore{}
 	callback := &fakeCallback{}
 	cfg := config.Defaults()
+	cfg.Enabled = true
 	cfg.Execution.Model = "gpt-5.4"
 	s := New(callback, Options{EngineFactory: func(config.Config, core.Host, core.Store, core.Clock, core.Random) (Engine, error) {
 		return engine, nil
@@ -208,7 +209,7 @@ func TestManagementSeparatesPublicResourceFromAuthenticatedData(t *testing.T) {
 		Resources []struct{ Path string }
 	}
 	_ = json.Unmarshal(result, &routes)
-	if len(routes.Routes) != 10 || len(routes.Resources) != 3 {
+	if len(routes.Routes) != 11 || len(routes.Resources) != 3 {
 		t.Fatal("management registration incomplete")
 	}
 	for _, route := range routes.Routes {

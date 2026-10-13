@@ -65,8 +65,8 @@ func TestAccountQuotaQueryAPISelectsExactAccountAndRejectsOtherPayloads(t *testi
 		}
 	}
 	s.cfg.QuotaQuery.Manual = false
-	if r := call(`{"account_id":"a"}`); r.StatusCode != 409 {
-		t.Fatal("account query bypassed manual permission")
+	if r := call(`{"account_id":"a"}`); r.StatusCode != 202 {
+		t.Fatal("legacy manual setting blocked account query")
 	}
 	s.cfg.QuotaQuery.Manual = true
 	e.ready = false
@@ -101,8 +101,8 @@ func TestQuotaQueryAPIQueuesWithoutSchedulerNotificationOrNetwork(t *testing.T) 
 		t.Fatal("query endpoint notified model scheduler, duplicated work or performed host calls")
 	}
 	s.cfg.QuotaQuery.Manual = false
-	if r := managementCall(t, s, "POST", ManagementPrefix+"/quota-query"); r.StatusCode != 409 {
-		t.Fatal("disabled manual query accepted")
+	if r := managementCall(t, s, "POST", ManagementPrefix+"/quota-query"); r.StatusCode != 202 {
+		t.Fatal("legacy manual setting blocked batch query")
 	}
 	s.cfg.QuotaQuery.Manual = true
 	e.ready = false

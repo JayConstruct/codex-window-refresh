@@ -37,6 +37,7 @@ type AdmissionInput struct {
 	Generation                   CredentialGeneration
 	Task                         MergedTask
 	FiveHour                     WindowEvidence
+	FiveHourBaselineResetAt      time.Time
 	QuotaPermission              Permission
 	QuotaObservedAt              time.Time
 	QuotaMaxAge                  time.Duration
@@ -81,7 +82,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 		return deny(HoldNotDue)
 	}
 	var due []EventID
-	weekly, fiveHour, daily := false, false, false
+	weekly, fiveHour, daily, manual := false, false, false, false
 	seen := make(map[EventID]bool)
 	for _, event := range in.Task.Intents {
 		if event.ID == "" || event.Status != IntentPending || event.RandomizedDueAt.IsZero() || in.Now.Before(event.RandomizedDueAt) || seen[event.ID] {
@@ -94,6 +95,8 @@ func DecideAdmission(in AdmissionInput) Admission {
 			fiveHour = true
 		case ReasonDaily:
 			daily = true
+		case ReasonManual:
+			manual = true
 		default:
 			continue
 		}
@@ -110,6 +113,9 @@ func DecideAdmission(in AdmissionInput) Admission {
 		if weekly && in.Weekly == WeeklyConflict {
 			return deny(HoldWeeklyConflict)
 		}
+		return deny(HoldActiveFiveHour)
+	}
+	if manual && in.FiveHour.State == WindowUnknown && in.Now.Before(in.FiveHourBaselineResetAt) {
 		return deny(HoldActiveFiveHour)
 	}
 	if in.ForegroundBusy {
@@ -133,7 +139,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 	default:
 		return deny(HoldQuotaUnknown)
 	}
-	if in.FiveHour.State != WindowInactive && in.FiveHour.State != WindowExpired {
+	if in.FiveHour.State != WindowInactive && in.FiveHour.State != WindowExpired && !(manual && FullFiveHourPlaceholder(in.FiveHour)) {
 		return deny(HoldQuotaUnknown)
 	}
 	// Expired classifications must have a past reset boundary; an inactive
@@ -141,7 +147,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 	if in.FiveHour.State == WindowExpired && (in.FiveHour.ResetAt.IsZero() || in.Now.Before(in.FiveHour.ResetAt)) {
 		return deny(HoldQuotaUnknown)
 	}
-	if weekly {
+	if weekly && !manual {
 		switch in.Weekly {
 		case WeeklyConfirmed:
 			if in.WeeklyObservedAt.IsZero() || in.WeeklyObservedAt.After(in.Now) || in.Now.Sub(in.WeeklyObservedAt) > in.QuotaMaxAge {
@@ -152,7 +158,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 		default:
 			return deny(HoldWeeklyUnconfirmed)
 		}
-	} else {
+	} else if !manual {
 		outsideAllowed := fiveHour && in.RecentUsers > 0 && in.AllowActiveUsersOutsideHours
 		if !in.WithinAllowedHours && !outsideAllowed {
 			return deny(HoldOutsideHours)
@@ -168,4 +174,12 @@ func DecideAdmission(in AdmissionInput) Admission {
 		return deny(HoldNoConcurrency)
 	}
 	return Admission{Allowed: true, WeeklyPriority: weekly, CoveredEventIDs: due}
+}
+
+func FullFiveHourPlaceholder(window WindowEvidence) bool {
+	if window.Kind != FiveHour || window.State != WindowUnknown || window.Source != "cpa_wham_usage" || window.Remaining == nil || window.Remaining.Unit != "percent" || window.Remaining.Value != 100 || window.ConfirmedAt.IsZero() {
+		return false
+	}
+	duration := window.ResetAt.Sub(window.ConfirmedAt)
+	return duration >= 5*time.Hour-time.Minute && duration <= 5*time.Hour+time.Minute
 }

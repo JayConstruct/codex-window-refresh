@@ -1,8 +1,226 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {createSession, createEditor, resetTime, countdown, apiBase, readPanelKey, quotaFailure} = require('../../internal/plugin/web/panel.js');
+const {readFileSync} = require('node:fs');
+const {runInNewContext} = require('node:vm');
+const {createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure} = require('../../internal/plugin/web/panel.js');
 const response = (value, status = 200, type = 'application/json') => ({ok: status >= 200 && status < 300, status, headers: {get: () => type}, json: async () => value});
+test('only confirmed active windows display a running countdown', () => {
+  const now = Date.parse('2026-10-13T00:00:00Z');
+  const fullWindow = {Kind: 'five_hour', State: 'unknown', Source: 'cpa_wham_usage', ResetAt: '2026-10-13T05:00:00Z', Remaining: {Value: 100, Unit: 'percent'}};
+  assert.match(windowCountdown(fullWindow, now), /尚未确认窗口启动/);
+  assert.match(windowCountdown({...fullWindow, State: 'inactive'}, now), /未启动/);
+  assert.match(windowCountdown({...fullWindow, State: 'expired'}, now), /已到期/);
+  assert.equal(windowCountdown({...fullWindow, State: 'active'}, now), '05:00:00');
+  assert.match(windowCountdown({}, now), /不倒计时/);
+});
+test('manual wake remains independent of automatic settings but requires safety capabilities', async () => {
+  const account = {ID: 'account-a', Enabled: true, FiveHour: {State: 'unknown'}};
+  const config = {...policy(), execution: {...policy().execution, model: 'model'}};
+  const summary = {running: true, host_enabled: true, enabled: false};
+  const capabilities = {StableAccountIdentity: true, ExactAccountExecution: true, QuotaAdapterReady: true};
+  assert.equal(manualWakeReason(account, config, summary, capabilities), '');
+  assert.match(manualWakeReason(account, {...config, execution: {model: ''}}, summary, capabilities), /填写并保存/);
+  assert.match(manualWakeReason(account, config, {...summary, host_enabled: false}, capabilities), /停用/);
+  assert.match(manualWakeReason(account, config, summary, {}), /未就绪/);
+  assert.match(manualWakeReason({...account, Task: {OperationID: 'pending'}}, config, summary, capabilities), /待验证/);
+  assert.match(manualWakeReason({...account, FiveHour: {State: 'active', ResetAt: new Date(Date.now() + 60000).toISOString()}}, config, summary, capabilities), /无需重复/);
+  const calls = [], session = createSession(async (url, options) => {calls.push({url, options}); return response({status: 'queued'}, 202);});
+  session.setKey('test-key');
+  await session.request('/manual-wake', 'POST', {account_id: 'account-a'});
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.body, JSON.stringify({account_id: 'account-a'}));
+  assert.ok(calls[0].url.endsWith('/manual-wake'));
+  session.disconnect();
+});
+function createPanelFixture(fetcher, confirm = () => true) {
+  const elements = new Map(), timers = new Map(), visibility = new Map(), requests = [];
+  let nextTimer = 0;
+  function element() {
+    return {value: '', textContent: '', checked: false, disabled: false, hidden: true, dataset: {}, listeners: new Map(), children: [],
+      classList: {toggle() {}}, append(...items) {this.children.push(...items);}, replaceChildren(...items) {this.children = items;}, setAttribute() {},
+      addEventListener(event, handler) {this.listeners.set(event, handler);}};
+  }
+  function lookup(id) {
+    if (!elements.has(id)) elements.set(id, element());
+    return elements.get(id);
+  }
+  const document = {hidden: false, getElementById: lookup, createElement: element, querySelectorAll: () => [],
+    addEventListener: (event, handler) => visibility.set(event, handler)};
+  const config = {...policy(), quota_query: {automatic: false, manual: false, interval: '30s'}};
+  const data = {summary: {running: true, enabled: false, scheduler: {}}, accounts: {},
+    capabilities: {QuotaAdapterReady: true}, config, 'config-editor': {config, revision: 'r1'}};
+  runInNewContext(readFileSync(require.resolve('../../internal/plugin/web/panel.js'), 'utf8'), {
+    document, URL, AbortController, structuredClone, confirm,
+    location: {origin: 'https://cpa.test', pathname: '/v0/resource/plugins/codex-window-refresh/status'},
+    localStorage: {getItem: () => null}, addEventListener() {}, setInterval() {},
+    setTimeout: (callback, duration) => {const timer = ++nextTimer; timers.set(timer, {callback, duration}); return timer;},
+    clearTimeout: timer => timers.delete(timer),
+    fetch: async (url, options) => {requests.push({url, options}); return fetcher ? fetcher(url, options, data) : response(data[url.split('/').pop()] || {status: 'queued'});}
+  });
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  async function poll() {
+    const [timerID, timer] = [...timers].find(([, value]) => value.duration === 5000);
+    timers.delete(timerID);
+    timer.callback();
+    await settle();
+  }
+  return {lookup, timers, visibility, requests, settle, poll};
+}
+test('account cards require confirmation for exact manual wake and never animate an unstarted window', async () => {
+  let confirmed = false;
+  const confirmations = [], now = new Date().toISOString();
+  const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
+    data.capabilities.StableAccountIdentity = data.capabilities.ExactAccountExecution = true;
+    data.accounts = {'account-a': {ID: 'account-a', Enabled: true, FiveHour: {Kind: 'five_hour', State: 'unknown', ResetAt: new Date(Date.now() + 5*3600000).toISOString(), Remaining: {Value: 100, Unit: 'percent'}, ConfirmedAt: now, Source: 'cpa_wham_usage'}}};
+    return response(data[url.split('/').pop()] || {status: 'queued'}, options.method === 'POST' ? 202 : 200);
+  }, message => {confirmations.push(message); return confirmed;});
+  function descendants(item) {return [item, ...item.children.flatMap(descendants)];}
+  lookup('management-key').value = 'test-key';
+  lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  assert.equal(lookup('workspace').hidden, false);
+  const items = descendants(lookup('account-list'));
+  const wakeButton = items.find(item => item.dataset.wakeAccount === 'account-a');
+  assert.ok(wakeButton);
+  assert.equal(wakeButton.disabled, false);
+  assert.equal(items.some(item => Object.hasOwn(item.dataset, 'reset')), false);
+  assert.ok(items.some(item => item.textContent.includes('不倒计时')));
+  wakeButton.listeners.get('click')();
+  await settle();
+  assert.equal(requests.some(request => request.options.method === 'POST'), false);
+  confirmed = true;
+  wakeButton.listeners.get('click')();
+  await settle();
+  const writes = requests.filter(request => request.options.method === 'POST');
+  assert.equal(writes.length, 1);
+  assert.ok(writes[0].url.endsWith('/manual-wake'));
+  assert.equal(writes[0].options.body, JSON.stringify({account_id: 'account-a'}));
+  assert.match(confirmations[0], /真实模型请求并消耗额度/);
+  lookup('disconnect').listeners.get('click')();
+});
+test('page polling requires opt-in and legacy manual permission does not block queries', async () => {
+  const {lookup, timers, visibility, requests, settle} = createPanelFixture();
+  lookup('management-key').value = 'test-key';
+  lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  assert.equal(lookup('workspace').hidden, false);
+  assert.equal(lookup('quota-query').disabled, false);
+  assert.equal(timers.size, 0);
+  lookup('auto-refresh').checked = true;
+  lookup('auto-refresh').listeners.get('change')();
+  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()][0].duration, 5000);
+  const poll = [...timers.values()][0].callback;
+  lookup('auto-refresh').checked = false;
+  lookup('auto-refresh').listeners.get('change')();
+  assert.equal(timers.size, 0);
+  const before = requests.length;
+  await poll();
+  visibility.get('visibilitychange')();
+  await settle();
+  assert.equal(requests.length, before);
+  lookup('refresh').listeners.get('click')();
+  await settle();
+  assert.ok(requests.length > before);
+  assert.equal(timers.size, 0);
+  lookup('quota-query').listeners.get('click')();
+  await settle();
+  assert.equal(requests.filter(request => request.options.method === 'POST').length, 1);
+  assert.ok(requests.some(request => request.url.endsWith('/quota-query') && request.options.method === 'POST'));
+  lookup('auto-refresh').checked = true;
+  lookup('auto-refresh').listeners.get('change')();
+  lookup('disconnect').listeners.get('click')();
+  assert.equal(lookup('auto-refresh').checked, false);
+  assert.equal(timers.size, 0);
+});
+test('successful snapshot reads hide recovered timeout and network errors', async () => {
+  for (const failure of ['timeout', 'network']) {
+    let failing = false;
+    const {lookup, timers, settle, poll} = createPanelFixture(async (url, options, data) => {
+      if (failing && url.endsWith('/accounts')) {
+        if (failure === 'network') throw new Error('private network failure');
+        return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+      }
+      return response(data[url.split('/').pop()]);
+    });
+    lookup('management-key').value = 'test-key';
+    lookup('login-form').listeners.get('submit')({preventDefault() {}});
+    await settle();
+    lookup('auto-refresh').checked = true;
+    lookup('auto-refresh').listeners.get('change')();
+    failing = true;
+    await poll();
+    if (failure === 'timeout') {
+      [...timers.values()].find(timer => timer.duration === 15000).callback();
+      await settle();
+    }
+    assert.equal(lookup('notice').hidden, false);
+    assert.equal(lookup('notice').className, 'notice error');
+    assert.match(lookup('notice').textContent, failure === 'timeout' ? /读取状态超时/ : /无法读取 CPA/);
+    failing = false;
+    await poll();
+    assert.equal(lookup('notice').hidden, true);
+    assert.equal(lookup('notice').textContent, '');
+    lookup('disconnect').listeners.get('click')();
+  }
+});
+test('snapshot recovery preserves a newer unrelated error', async () => {
+  let mode = '', pendingRead;
+  const {lookup, settle, poll} = createPanelFixture(async (url, options, data) => {
+    if (url.endsWith('/accounts')) {
+      if (mode === 'failed') throw new Error('private network failure');
+      if (mode === 'pending') return new Promise(resolve => {pendingRead = () => resolve(response(data.accounts));});
+    }
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key';
+  lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('auto-refresh').checked = true;
+  lookup('auto-refresh').listeners.get('change')();
+  mode = 'failed';
+  await poll();
+  assert.match(lookup('notice').textContent, /无法读取 CPA/);
+  mode = 'pending';
+  await poll();
+  assert.equal(lookup('notice').hidden, false);
+  assert.match(lookup('notice').textContent, /无法读取 CPA/);
+  lookup('config-json').value = '{invalid-json';
+  lookup('json-format').listeners.get('click')();
+  const validationError = lookup('notice').textContent;
+  assert.match(validationError, /JSON 无法解析/);
+  pendingRead();
+  await settle();
+  assert.equal(lookup('notice').hidden, false);
+  assert.equal(lookup('notice').textContent, validationError);
+  mode = '';
+  await poll();
+  assert.equal(lookup('notice').textContent, validationError);
+  lookup('disconnect').listeners.get('click')();
+});
+test('successful snapshot reads do not hide host connection check timeouts', async () => {
+  const {lookup, timers, settle, poll} = createPanelFixture(async (url, options, data) => {
+    if (url.endsWith('/quota-connection-check')) {
+      return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+    }
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key';
+  lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('auto-refresh').checked = true;
+  lookup('auto-refresh').listeners.get('change')();
+  lookup('quota-connection-check').listeners.get('click')();
+  await settle();
+  [...timers.values()].find(timer => timer.duration === 15000).callback();
+  await settle();
+  assert.match(lookup('notice').textContent, /读取状态超时/);
+  await poll();
+  assert.equal(lookup('notice').hidden, false);
+  assert.match(lookup('notice').textContent, /读取状态超时/);
+  lookup('disconnect').listeners.get('click')();
+});
 test('quota errors show safe stages and distinguish management authentication from upstream rejection', () => {
   const management = quotaFailure({last_error: 'quota_management_auth_failed', diagnostic: {stage: 'management_http', http_status: 403, elapsed_ms: 120}});
   const upstream = quotaFailure({last_error: 'quota_upstream_forbidden', diagnostic: {stage: 'upstream_http', http_status: 403, elapsed_ms: 80}});

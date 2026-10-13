@@ -27,6 +27,7 @@ func (r *dailyTestRandom) Duration(minimum, maximum time.Duration) (time.Duratio
 }
 func dailyTestConfig() config.Config {
 	cfg := config.Defaults()
+	cfg.Enabled = true
 	cfg.DailyRules = []config.DailyRule{{ID: "morning", Enabled: true, RandomTimeRange: "09:00-09:10", MinimumReadyAccounts: 2, CatchUp: true}}
 	return cfg
 }

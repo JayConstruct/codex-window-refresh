@@ -119,22 +119,23 @@ type AccountOverride struct {
 	AllowOutsideHoursWhenUsersActive *bool       `json:"allow_outside_hours_when_users_active,omitempty"`
 }
 type Config struct {
-	SchemaVersion    int                                `json:"schema_version"`
-	Enabled          bool                               `json:"enabled"`
-	Timezone         string                             `json:"timezone"`
-	ResetRules       ResetRules                         `json:"reset_rules"`
-	Activity         Activity                           `json:"activity"`
-	OrdinaryRules    OrdinaryRules                      `json:"ordinary_rules"`
-	DailyRules       []DailyRule                        `json:"daily_rules"`
-	Execution        Execution                          `json:"execution"`
-	QuotaQuery       QuotaQuery                         `json:"quota_query"`
-	AccountOverrides map[core.AccountID]AccountOverride `json:"account_overrides"`
+	ManualWakeDisabled bool                               `json:"-"`
+	SchemaVersion      int                                `json:"schema_version"`
+	Enabled            bool                               `json:"enabled"`
+	Timezone           string                             `json:"timezone"`
+	ResetRules         ResetRules                         `json:"reset_rules"`
+	Activity           Activity                           `json:"activity"`
+	OrdinaryRules      OrdinaryRules                      `json:"ordinary_rules"`
+	DailyRules         []DailyRule                        `json:"daily_rules"`
+	Execution          Execution                          `json:"execution"`
+	QuotaQuery         QuotaQuery                         `json:"quota_query"`
+	AccountOverrides   map[core.AccountID]AccountOverride `json:"account_overrides"`
 }
 
 func Defaults() Config {
 	delay := DelayRange{Min: 0, Max: Duration(10 * time.Minute)}
-	return Config{SchemaVersion: 1, Enabled: true, Timezone: "Asia/Shanghai",
-		QuotaQuery:    QuotaQuery{Automatic: true, Manual: true, Interval: Duration(30 * time.Second)},
+	return Config{SchemaVersion: 1, Enabled: false, Timezone: "Asia/Shanghai",
+		QuotaQuery:    QuotaQuery{Automatic: false, Manual: true, Interval: Duration(30 * time.Second)},
 		ResetRules:    ResetRules{FiveHour: ResetRule{Enabled: true, RandomDelay: delay}, Weekly: WeeklyRule{Enabled: true, RandomDelay: delay, BypassActivityLimit: true, BypassAllowedHours: true}},
 		Activity:      Activity{Lookback: Duration(30 * time.Minute), AccountsPerUser: 1, MaxAccounts: 10, IdentitySource: "host_caller_scope"},
 		OrdinaryRules: OrdinaryRules{AllowedHours: []string{"08:00-23:00"}, AllowOutsideHoursWhenUsersActive: true}, DailyRules: []DailyRule{},

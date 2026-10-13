@@ -111,6 +111,7 @@ const (
 	ReasonFiveHour Reason = "five_hour_reset"
 	ReasonWeekly   Reason = "weekly_reset"
 	ReasonDaily    Reason = "daily_schedule"
+	ReasonManual   Reason = "manual_wake"
 )
 
 type IntentStatus string

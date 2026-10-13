@@ -58,6 +58,7 @@ func Parse(data []byte, format string) (Config, error) {
 	if err := decodeStrict(data, &config); err != nil {
 		return Config{}, err
 	}
+	config.QuotaQuery.Manual = true
 	if err := config.Validate(); err != nil {
 		return Config{}, err
 	}

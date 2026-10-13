@@ -93,6 +93,7 @@ func integrationFixture(t *testing.T, count int, dailyFloor int) (*Engine, *inte
 	t.Helper()
 	clock := &testClock{dailyInstant(t, "2026-10-11T10:00:00+08:00")}
 	cfg := config.Defaults()
+	cfg.Enabled, cfg.QuotaQuery.Automatic = true, true
 	cfg.Execution.Model = "codex-integration-test"
 	cfg.ResetRules.Weekly.Enabled = false
 	cfg.ResetRules.FiveHour.RandomDelay = config.DelayRange{}

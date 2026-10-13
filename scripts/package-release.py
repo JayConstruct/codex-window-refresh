@@ -58,7 +58,7 @@ def main():
     versions = re.findall(r"GLIBC_(\d+)\.(\d+)", symbols)
     glibc = ".".join(map(str, max((int(a), int(b)) for a, b in versions))) if versions else None
     policy = (ROOT / "config.example.yaml").read_text()
-    policy, count = re.subn(r"(?m)^enabled: true$", "enabled: false", policy, count=1)
+    policy, count = re.subn(r"(?m)^enabled: (?:true|false)$", "enabled: false", policy, count=1)
     if count != 1:
         raise ValueError("cannot disable the default release policy")
     info = {

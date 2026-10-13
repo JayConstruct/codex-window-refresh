@@ -1,12 +1,12 @@
 # 调度策略示例；CPA 插件包装配置另见 docs/plugin.md。
 # execution.model 必须按部署环境填写；占位值会被配置验证拒绝。
 schema_version: 1
-enabled: true
+enabled: false
 
 # 只调用额度接口，不发送模型请求；与 enabled（模型唤醒）独立。
 quota_query:
-  automatic: true
-  manual: true
+  automatic: false
+  manual: true # 兼容旧配置；手动查询始终允许，此字段不再控制权限
   interval: 30s # 定期查询间隔，允许 30s 到 1h
 timezone: Asia/Shanghai
 

@@ -6,6 +6,32 @@
 
 ## 自动安装（直接运行 / systemd）
 
+### 一行全自动安装或更新
+
+已有 CPA 的 Debian 12/13 服务器执行同一行即可首次安装或更新：
+
+```sh
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh
+```
+
+root 会话可省略 `sudo`。此命令要求已有 `curl`，缺失时先执行 `sudo apt-get update && sudo apt-get install -y ca-certificates curl`。完整下载成功后才执行脚本，不使用边下载边执行的管道。统一入口自动安装缺少的 `ca-certificates curl python3 python3-yaml`，默认使用 `--version latest --quota-transport host --defer-model --yes --restart`；识别、校验、备份和文件回滚仍由同一个 Python 安装器负责，不复制安装逻辑。旧 `cpa-quota-upgrade.sh` 委托该入口，旧 `cpa-quota-fix.sh` 仅供可选管理桥密钥修复，默认安装不运行它。
+
+首次没有 `--model` 时跳过模型识别，不询问管理密钥，不猜测模型；策略为 `enabled: false`、`execution.model: ""`，自动查询默认关闭，手动查询始终允许。随后在面板填写并保存支持的模型，即可按账号确认手动唤醒；自动查询、自动唤醒需分别手动开启并保存。也可在一行命令末尾加 `--model 实际模型名`，首次写入该模型但仍不自动开启唤醒。已有策略、模型、窗口状态和旧密钥文件在更新时保留，`--defer-model` 不会关闭已开启的模型唤醒。直接使用 Python 安装器且不加此参数时，保留原有交互/模型识别行为。
+
+默认会重启已核实的 systemd 服务，可能短暂中断正在处理的请求。无法唯一识别 CPA 路径、用户、服务或配置时停止并提示补充参数，不盲目重启。非 systemd 直接运行时追加 `--no-restart` 并在完成后按原方式手动重启；Docker 使用手动挂载流程。可在命令末尾追加参数，例如：
+
+```sh
+# 明确指定 root 的 CPA 用户服务
+sudo bash /tmp/codex-window-refresh-install.sh --cpa-dir /root/cliproxyapi --user-service --service cliproxyapi.service --user root
+# 预览路径或推迟重启
+sudo bash /tmp/codex-window-refresh-install.sh --dry-run
+sudo bash /tmp/codex-window-refresh-install.sh --no-restart
+```
+
+`--dry-run` / `--check-model` 不安装系统依赖，依赖缺失时明确停止；远程下载的入口仍需下载 Python 安装器到临时目录，退出时清理，不下载 Release 或写入 CPA 文件。`--check-model` 非交互诊断需要 `--key-file` 或已有可复用的私有密钥文件。`--uninstall` 默认不重启，需要立即重启时显式加 `--restart`。源码目录可直接 `sudo bash scripts/install.sh`，此时使用同目录的 Python 安装器；其他参数透传，固定版本、离线安装与卸载规则不变。
+
+### 交互安装与高级参数
+
 自动安装脚本支持 Debian 12/13 的直接运行与 systemd，Docker 使用下面的手动挂载流程。以 CPA 程序 `/root/cliproxyapi/cli-proxy-api` 为例：
 
 ```sh
@@ -49,6 +75,18 @@ sudo python3 /tmp/codex-window-refresh-install.py --cpa-dir /root/cliproxyapi --
 从 rc.8 及更早版升级时，默认切换宿主查询，保留旧密钥文件并移除安装器自身 override 的环境文件依赖。若此前已明确选择管理桥，使用 `--quota-transport host` 可切换；原有业务规则和模型不变。
 
 升级时重新下载脚本并重复执行同一安装命令，默认更新到最新已发布版本；也可用 `--version vX.Y.Z-rc.N` 或 `--version vX.Y.Z` 固定版本，不覆盖旧策略、状态。新安装包内附脚本也默认选择 latest。`--uninstall` 不查询版本，仅卸载本脚本安装的插件与本插件 override，保留策略、状态、密钥环境文件和备份；也需使用原来的服务与路径参数。备份位于 CPA 目录的 `window-refresh-install/`，权限 `0700`，每次操作的 `index.json` 记录原路径、权限和拥有者。文件写入失败会恢复已替换的文件；服务启动失败时保留备份和安装结果供排查，不声称已成功加载。
+
+对于 `/root/cliproxyapi` 下、由 root 用户级 `cliproxyapi.service` 运行的 CPA，首次安装和更新可在 root 会话执行同一组命令（先安装上述依赖）：
+
+```sh
+curl -fL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.py -o /tmp/codex-window-refresh-install.py &&
+python3 /tmp/codex-window-refresh-install.py \
+  --cpa-dir /root/cliproxyapi \
+  --user-service --service cliproxyapi.service --user root \
+  --version latest --quota-transport host --restart
+```
+
+首次安装按提示识别或填写模型，更新保留原模型与策略；`--restart` 会在安装后立即重启 CPA，建议避开在途请求。需要无交互安装时使用本指南开头的统一入口，或给 Python 安装器增加 `--defer-model --yes`。旧升级脚本副本若仍含 `--version v0.1.0-rc.9`，请改用统一入口，否则仍会安装旧版本。
 
 离线安装须同时传入固定版本，例如 `--version v0.1.0-rc.2 --package /path/package.tar.gz --checksums /path/SHA256SUMS`，不查询 GitHub。自动安装依赖 Python 3 与 `python3-yaml`，不依赖 Go 或 C 编译器。含 YAML 锚点、重复键或符号链接目标的配置需先整理或使用手动安装方式。
 

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -42,35 +41,40 @@ type Status struct {
 	EffectiveConcurrency int
 }
 type Engine struct {
-	published           atomic.Pointer[publishedStatus]
-	mu                  sync.Mutex
-	queueMu             sync.Mutex
-	activity            []core.ActivityEvent
-	observations        []core.QuotaObservation
-	wake                chan struct{}
-	cfg                 config.Config
-	host                core.Host
-	store               core.Store
-	clock               core.Clock
-	random              core.Random
-	state               core.CoreState
-	caps                core.HostCapabilities
-	lastError           string
-	lastQuotaDiagnostic *core.QuotaDiagnostic
-	poisoned            bool
-	nextRead            map[core.AccountID]time.Time
-	nextPreflight       map[core.AccountID]time.Time
-	readFailures        map[core.AccountID]int
-	activityEpoch       map[core.AccountID]uint64
-	inventory           []core.HostAccount
-	inventoryFailed     bool
-	nextInventory       time.Time
-	manualRequested     bool              // guarded by queueMu
-	manualActive        bool              // guarded by queueMu; includes queued and running jobs
-	manualTarget        core.AccountID    // guarded by queueMu; empty means all enabled accounts
-	manualQuery         ManualQueryStatus // guarded by mu, published with snapshots
-	manualIDs           []core.AccountID
-	manualIndex         int
+	published            atomic.Pointer[publishedStatus]
+	mu                   sync.Mutex
+	queueMu              sync.Mutex
+	activity             []core.ActivityEvent
+	observations         []core.QuotaObservation
+	wake                 chan struct{}
+	cfg                  config.Config
+	host                 core.Host
+	store                core.Store
+	clock                core.Clock
+	random               core.Random
+	state                core.CoreState
+	caps                 core.HostCapabilities
+	lastError            string
+	lastQuotaDiagnostic  *core.QuotaDiagnostic
+	poisoned             bool
+	nextRead             map[core.AccountID]time.Time
+	nextPreflight        map[core.AccountID]time.Time
+	readFailures         map[core.AccountID]int
+	activityEpoch        map[core.AccountID]uint64
+	inventory            []core.HostAccount
+	inventoryFailed      bool
+	nextInventory        time.Time
+	manualRequested      bool              // guarded by queueMu
+	manualActive         bool              // guarded by queueMu; includes queued and running jobs
+	manualTarget         core.AccountID    // guarded by queueMu; empty means all enabled accounts
+	manualQuery          ManualQueryStatus // guarded by mu, published with snapshots
+	manualIDs            []core.AccountID
+	manualIndex          int
+	manualWakeRequested  bool
+	manualWakeActive     bool
+	manualWakeTarget     core.AccountID
+	manualWakeGeneration core.CredentialGeneration
+	manualWake           ManualWakeStatus
 }
 
 func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, random core.Random) (*Engine, error) {
@@ -96,6 +100,7 @@ func copyConfig(c config.Config) config.Config {
 	b, _ := json.Marshal(c)
 	var out config.Config
 	_ = json.Unmarshal(b, &out)
+	out.ManualWakeDisabled = c.ManualWakeDisabled
 	return out
 }
 func cloneState(s core.CoreState) core.CoreState {
@@ -325,6 +330,7 @@ func (e *Engine) Step(ctx context.Context) error {
 	}
 	before, _ := json.Marshal(e.state)
 	e.startManualQuery()
+	e.startManualWake()
 	e.lastError = ""
 	if len(e.readFailures) > 0 {
 		e.lastError = "quota_read_failed"
@@ -382,6 +388,12 @@ func (e *Engine) Step(ctx context.Context) error {
 	// intents or dispatch even when wake rules are enabled and already due.
 	if e.manualQuery.Phase == "queued" || e.manualQuery.Phase == "running" {
 		e.stepManualQuery(ctx)
+		return e.commitChanged(ctx, before)
+	}
+	if e.manualWake.Phase == "queued" || e.manualWake.Phase == "running" {
+		if err := e.stepManualWake(ctx); err != nil {
+			return err
+		}
 		return e.commitChanged(ctx, before)
 	}
 	if err = e.generate(now); err != nil {
@@ -538,52 +550,7 @@ func (e *Engine) Step(ctx context.Context) error {
 			}
 			continue
 		}
-		var raw [16]byte
-		if _, err = rand.Read(raw[:]); err != nil {
-			return err
-		}
-		op := core.OperationID(hex.EncodeToString(raw[:]))
-		rid := core.ReservationID(op)
-		e.state.Reservations = append(e.state.Reservations, core.Reservation{ID: rid, AccountID: id, Generation: a.Generation, Weekly: ad.WeeklyPriority, CapacityHoldUntil: now.Add(e.cfg.Runtime().VerificationCapacityHold)})
-		if err = core.MarkDispatch(&e.state, id, op, rid, ad.CoveredEventIDs, now); err != nil {
-			return err
-		}
-		seq := core.NextSequence(&e.state)
-		if err = e.commit(ctx); err != nil {
-			return err
-		}
-		sendCtx, cancel := context.WithTimeout(ctx, e.cfg.Execution.RequestTimeout.Value())
-		result, sendErr := e.host.SendExact(sendCtx, core.ExactRequest{AccountID: id, Generation: a.Generation, OperationID: op, ReadStartedSeq: seq, Model: e.cfg.Execution.Model, Prompt: e.cfg.Execution.Prompt})
-		if sendCtx.Err() != nil && result.Disposition != core.SendDefinitelyNotSent {
-			result.Disposition = core.SendUnknown
-		}
-		cancel()
-		if result.Disposition == "" {
-			result.Disposition = core.SendUnknown
-		}
-		if sendErr != nil {
-			e.lastError = "send_failed"
-		}
-		finished := e.clock.Now()
-		if result.Disposition == core.SendDefinitelyNotSent && result.RetryAfter.IsZero() {
-			result.RetryAfter = finished.Add(time.Minute)
-		}
-		core.ApplySendResult(&e.state, id, op, result, finished)
-		for i := range e.state.Reservations {
-			if e.state.Reservations[i].OperationID == op {
-				e.state.Reservations[i].CapacityHoldUntil = finished.Add(e.cfg.Runtime().VerificationCapacityHold)
-			}
-		}
-		a = e.state.Accounts[id]
-		if a.Task != nil && a.Task.OperationID != "" {
-			a.Task.VerificationStartedAt = finished
-			a.Task.VerificationAttempt = 0
-			a.Task.NextVerificationAt = finished.Add(e.cfg.Runtime().VerifyDelays[0])
-			e.state.Accounts[id] = a
-		}
-		e.drain()
-		e.reconcileDailyCapacity(finished)
-		return e.commit(ctx)
+		return e.dispatch(ctx, id, ad)
 	}
 	return e.commitChanged(ctx, before)
 }

@@ -387,7 +387,7 @@ def infer(args):
     if args.version != "latest" and version_key(args.version) < version_key("v0.1.0-rc.9") and getattr(args, "quota_transport", None) is None:
         quota_transport = "management"
     require(quota_transport in {"host", "management"}, "额度查询方式必须是 host 或 management。")
-    needs_management = quota_transport == "management" or getattr(args, "check_model", False) or (not policy.exists() and not args.model)
+    needs_management = quota_transport == "management" or getattr(args, "check_model", False) or (not policy.exists() and not args.model and not getattr(args, "defer_model", False))
     if needs_management and not args.management_url and not wrapper.get("management_url"):
         require(not isinstance(tls, dict) or not tls.get("enable"), "CPA 已启用 TLS，请指定 --management-url。")
     port = server.get("port", data.get("port", 8317))
@@ -819,7 +819,7 @@ def install(args, plan, architecture):
             candidate = temp / ("policy" + policy.suffix)
         else:
             model = args.model
-            if not model:
+            if not model and not getattr(args, "defer_model", False):
                 key, key_bytes = management_credentials(args, plan)
                 credentials_loaded = True
                 print("从 CPA 已启用的 Codex 账号读取模型目录……")
@@ -830,10 +830,12 @@ def install(args, plan, architecture):
                     print(str(error))
                     require(not args.yes and sys.stdin.isatty(), "自动识别失败，请用 --model 指定实际支持的模型。")
                     model = input("CPA 实际支持的 Codex 模型名（手动填写）：").strip()
-            require(model, "模型名不能为空，请用 --model 指定。")
+            require(model or getattr(args, "defer_model", False), "模型名不能为空，请用 --model 指定。")
+            if not model:
+                print("首次安装暂不选择模型，仅查询额度；请在面板填写支持的模型后再开启模型唤醒。")
             data, _ = load_yaml((unpacked / "config.example.yaml").read_text())
             data["enabled"] = False
-            data["execution"]["model"] = model
+            data["execution"]["model"] = model or ""
             policy_bytes = yaml.safe_dump(data, allow_unicode=True, sort_keys=False).encode()
             candidate = temp / "policy.yaml"
         candidate.write_bytes(policy_bytes)
@@ -1022,6 +1024,7 @@ def main():
     parser.add_argument("--management-url", help="管理入口；默认检测端口并使用本机 HTTP")
     parser.add_argument("--quota-transport", choices=["host", "management"], help="默认 host，无需后台管理密钥；management 为可选兼容桥")
     parser.add_argument("--model", help="首次安装指定 Codex 模型；省略时自动读取已启用 Codex 账号的共同模型")
+    parser.add_argument("--defer-model", action="store_true", help="首次未指定模型时跳过识别，不要求密钥，仅查询额度；升级保留原策略")
     parser.add_argument("--version", default=DEFAULT_VERSION,
                         help="默认 latest：最新已发布正式版或 rc 测试版；也可指定 vX.Y.Z 或 vX.Y.Z-rc.N")
     parser.add_argument("--key-file", help="仅 root 可读的纯文本管理密钥文件；不通过命令行传密钥")
@@ -1062,7 +1065,10 @@ def main():
           + (f"（{scope}）" if plan["service"] else ""))
     if plan.get("service_auto"):
         print("已核实识别 CPA 所属 systemd 服务；交互安装结束时将询问是否重启。")
-    print(f"管理入口：{plan['url']}；管理密钥保存到私有 0600 环境文件。")
+    if plan.get("quota_transport", "host") == "management":
+        print(f"管理入口：{plan['url']}；管理密钥保存到私有 0600 环境文件。")
+    else:
+        print("宿主额度查询无需管理密钥；模型识别或诊断使用的临时密钥不保存。")
     if plan.get("service_env", plan["env"]) != plan["env"]:
         print(f"用户服务环境文件：{plan['service_env']}（CPA 用户拥有，权限 0600）")
     if not args.check_model:

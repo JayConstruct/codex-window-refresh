@@ -454,7 +454,7 @@ func ReconcileVerification(s *CoreState, id AccountID, now time.Time) bool {
 			satisfied = newWindowForIntent(a.FiveHour, *e, now)
 		case ReasonWeekly:
 			satisfied = newWindowForIntent(a.Weekly, *e, now) && a.FiveHour.State == WindowActive && now.Before(a.FiveHour.ResetAt) && !a.FiveHour.ConfirmedAt.Before(e.OriginalDueAt)
-		case ReasonDaily:
+		case ReasonDaily, ReasonManual:
 			satisfied = a.FiveHour.State == WindowActive && now.Before(a.FiveHour.ResetAt) && !a.FiveHour.ConfirmedAt.Before(e.RandomizedDueAt)
 		}
 		if satisfied {

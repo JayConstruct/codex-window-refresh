@@ -27,12 +27,12 @@
         <button id="nav-capabilities" class="tab" role="tab" data-tab="capabilities" aria-selected="false" aria-controls="tab-capabilities" tabindex="-1">诊断与高级</button>
       </nav>
       <section id="tab-overview" class="view" role="tabpanel" aria-labelledby="nav-overview">
-        <div class="section-head"><div><span class="eyebrow">账号池</span><h1>额度总览</h1><p>先了解账号状态，再选择是否查询或唤醒。</p></div><div class="toolbar"><span id="updated-at" class="hint">等待快照</span><button id="refresh" class="quiet">更新页面数据</button></div></div>
+        <div class="section-head"><div><span class="eyebrow">账号池</span><h1>额度总览</h1><p>先了解账号状态，再选择是否查询或唤醒。</p></div><div class="toolbar"><span id="updated-at" class="hint">等待快照</span><label class="check-field"><input id="auto-refresh" type="checkbox" autocomplete="off">自动刷新页面（每 5 秒）</label><button id="refresh" class="quiet">更新页面数据</button></div></div>
         <div id="metrics" class="metrics"></div>
-        <section class="card query-action"><div class="card-heading"><div><span class="badge">额度接口 · 不发送模型请求</span><h2>获取最新额度</h2><p>页面每 5 秒读取后台已有数据；立即查询会向上游额度接口发起查询。</p></div><button id="quota-query" class="primary" disabled>立即查询额度</button></div><p id="quota-query-status" class="query-progress" role="status" aria-live="polite"></p><div class="card-links"><button class="text-button" data-open-tab="query">设置自动 / 手动查询 →</button><button class="text-button" data-open-tab="accounts">查看每个账号的额度 →</button></div></section>
+        <section class="card query-action"><div class="card-heading"><div><span class="badge">额度接口 · 不发送模型请求</span><h2>获取最新额度</h2><p>手动查询始终允许；自动查询与页面自动刷新默认关闭，需手动开启。立即查询会向上游额度接口发起查询。</p></div><button id="quota-query" class="primary" disabled>立即查询额度</button></div><p id="quota-query-status" class="query-progress" role="status" aria-live="polite"></p><div class="card-links"><button class="text-button" data-open-tab="query">设置自动查询 →</button><button class="text-button" data-open-tab="accounts">查看每个账号的额度 →</button></div></section>
         <div class="two-columns">
           <section class="card"><h2>额度数据从哪里来？</h2><dl class="source-guide"><div><dt><span class="source-dot passive"></span>用户请求响应</dt><dd>被动读取用户请求返回的额度，无需额外查询。</dd></div><div><dt><span class="source-dot query"></span>主动查询</dt><dd>只访问额度接口，可自动或手动执行，不生成内容。</dd></div><div><dt><span class="source-dot wake"></span>模块唤醒响应</dt><dd>来自模块发送的模型请求，由“模型唤醒”单独控制。</dd></div></dl></section>
-          <section class="card"><h2>只想查看额度？</h2><ol class="plain-steps"><li>在“模型唤醒”中关闭总开关。</li><li>在“额度查询”中选择定期或手动查询。</li><li>保存并应用；用户响应的被动采集仍会继续。</li></ol><button class="text-button" data-open-tab="rules">检查模型唤醒设置 →</button></section>
+          <section class="card"><h2>只想查看额度？</h2><ol class="plain-steps"><li>保持“模型唤醒”总开关关闭。</li><li>直接点击“立即查询额度”或账号查询按钮，无需开启查询权限。</li><li>需要定期查询时手动开启并保存；用户响应的被动采集仍会继续。</li></ol><button class="text-button" data-open-tab="rules">检查模型唤醒设置 →</button></section>
         </div>
         <p class="footnote">“未知”表示尚无可靠的窗口证据。页面展示后台最近一次观测，更新时间不等于上游实时状态。</p>
       </section>
@@ -43,17 +43,17 @@
       </section>
       <section id="tab-query" class="view" role="tabpanel" aria-labelledby="nav-query" hidden>
         <div class="section-head"><div><span class="eyebrow">只读取额度</span><h1>额度查询</h1><p>这些设置只控制额度接口查询，不会开启模型唤醒。</p></div><span class="badge">不发送模型请求</span></div>
-        <section class="card"><div class="card-heading"><div><h2>自动与手动查询</h2><p>更改先保存在草稿中，点击下方“保存并应用”后生效。</p></div></div><div class="setting-list">
-          <label class="setting-toggle"><span><strong>定期查询额度</strong><small>后台自动补充额度数据；近期有完整用户响应额度时，可减少重复查询。</small></span><input id="query-automatic" type="checkbox" data-field="quota_query.automatic"></label>
+        <section class="card"><div class="card-heading"><div><h2>自动查询设置</h2><p>手动查询始终允许。自动查询默认关闭，手动开启并点击下方“保存并应用”后生效。</p></div></div><div class="setting-list">
+          <label class="setting-toggle"><span><strong>定期查询额度</strong><small>默认关闭；开启后后台自动补充额度数据，近期有完整用户响应额度时可减少重复查询。</small></span><input id="query-automatic" type="checkbox" data-field="quota_query.automatic"></label>
           <label class="interval-field">定期查询间隔<input id="query-interval" data-field="quota_query.interval" placeholder="30s"><small>例如 30s、2m 或 1h；允许 30 秒到 1 小时。</small></label>
           <label class="interval-field">单账号查询超时<input id="query-timeout" data-field="execution.quota_read_timeout" placeholder="15s"><small>默认 15 秒，允许 1 秒到 5 分钟；代理连接较慢时可适当增加。</small></label>
-          <label class="setting-toggle"><span><strong>允许手动查询</strong><small>开启后可在“总览”批量查询，也可在账号卡片上单独查询该账号额度。</small></span><input id="query-manual" type="checkbox" data-field="quota_query.manual"></label>
+          <p class="hint">手动查询无需开关：可在“总览”批量查询，也可在账号卡片上单独查询该账号额度。</p>
         </div></section>
-        <section class="card compact-note"><h2>关闭查询开关后会怎样？</h2><p>用户请求返回的被动额度仍会更新。若独立开启了模型唤醒，发送前的额度核对和已发送操作的验证仍会执行。</p><button class="text-button" data-open-tab="overview">返回总览，查询最新额度 →</button></section>
+        <section class="card compact-note"><h2>关闭自动查询后会怎样？</h2><p>手动查询始终可用，用户请求返回的被动额度仍会更新。页面自动刷新关闭时，可点击“更新页面数据”查看查询进度与结果。若独立开启了模型唤醒，发送前的额度核对和已发送操作的验证仍会执行。</p><button class="text-button" data-open-tab="overview">返回总览，查询最新额度 →</button></section>
       </section>
       <section id="tab-rules" class="view" role="tabpanel" aria-labelledby="nav-rules" hidden>
         <div class="section-head"><div><span class="eyebrow">会发送模型请求</span><h1>模型唤醒</h1><p>按规则向指定账号发送模型请求，用于唤醒额度窗口。</p></div><span class="badge warning">与额度查询独立</span></div>
-        <section class="card wake-control"><label class="setting-toggle"><span><strong>启用模型唤醒</strong><small>开启后可能发送真实模型请求。只查看额度时保持关闭。</small></span><input id="rule-enabled" type="checkbox" data-field="enabled"></label><p id="wake-draft-hint" class="hint">下方规则只有在总开关开启后才会用于发送新请求。</p></section>
+        <section class="card wake-control"><label class="setting-toggle"><span><strong>启用模型唤醒</strong><small>自动规则默认关闭，需手动开启并保存；开启后可能发送真实模型请求。单账号手动唤醒独立于此开关，需明确确认。</small></span><input id="rule-enabled" type="checkbox" data-field="enabled"></label><p id="wake-draft-hint" class="hint">下方自动规则只有在总开关开启后才会用于发送新请求。</p></section>
         <section class="card"><div class="card-heading"><div><span class="eyebrow">01 · 发送内容</span><h2>使用哪个模型？</h2></div></div><div class="form-grid"><label>模型名称<input id="rule-model" data-field="execution.model" placeholder="对应账号可用的模型名"></label><label>唤醒消息<input id="rule-prompt" data-field="execution.prompt" placeholder="Reply OK."></label></div></section>
         <section class="card"><div class="card-heading"><div><span class="eyebrow">02 · 所需容量</span><h2>需要准备多少账号？</h2><p>根据近期用户数量补足账号，不会对每个账号固定发送。</p></div></div><div class="form-grid"><label>近期活动回溯<input id="rule-lookback" data-field="activity.lookback" placeholder="30m"><small>例如 30m；共享 API key 的多人可能算一个用户范围。</small></label><label>每个用户范围需要的账号数<input id="rule-ratio" type="number" min="0" step="0.1" data-field="activity.accounts_per_user"></label><label>普通唤醒账号数上限<input id="rule-max" type="number" min="0" step="1" data-field="activity.max_accounts"></label></div></section>
         <section class="card"><div class="card-heading"><div><span class="eyebrow">03 · 触发时间</span><h2>何时唤醒账号？</h2><p>有效的 5 小时窗口内不重复发送；到期后再按规则判断。</p></div></div><div class="form-grid"><label>规则时区<input id="rule-timezone" data-field="timezone" placeholder="Asia/Shanghai"></label><label>普通唤醒允许时段<input id="rule-hours" data-field="ordinary_rules.allowed_hours" placeholder="08:00-23:00"><small>多个时段用逗号分隔；留空则不允许普通时段唤醒。</small></label><label class="check-field"><input id="rule-night" type="checkbox" data-field="ordinary_rules.allow_outside_hours_when_users_active">有近期用户时允许在时段外唤醒</label><label class="check-field"><input id="rule-catchup" type="checkbox" data-field="execution.catch_up">错过窗口后补发</label></div>

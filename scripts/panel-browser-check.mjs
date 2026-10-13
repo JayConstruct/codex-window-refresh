@@ -75,7 +75,6 @@ try {
           json(res, 200, {status:'verified'}); return;
         }
         if (path === 'quota-query') {
-          if (!config.quota_query.manual) {json(res,409,{error:'manual_quota_query_disabled'});return;}
           if (body) {
             const selected = JSON.parse(body);
             assert.deepEqual(Object.keys(selected), ['account_id'], 'Account query received model input');
@@ -146,6 +145,12 @@ try {
   try { await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Login did not succeed'); }
   catch (error) { console.error(await evaluate('document.getElementById("notice").textContent'), errors, caughtExceptions); throw error; }
   assert.equal(posts.length, 0, 'Read-only login must not dispatch operations');
+  assert.equal(await evaluate('document.getElementById("auto-refresh").checked'), false, 'Page refresh must require explicit opt-in');
+  assert.equal(await evaluate('document.getElementById("query-manual")'), null, 'Manual queries must not have a permission switch');
+  const initialReads = reads.length;
+  await new Promise(resolve => setTimeout(resolve, 5500));
+  assert.equal(reads.length, initialReads, 'Snapshots refreshed without explicit opt-in');
+  await evaluate('document.getElementById("auto-refresh").click()');
   assert.equal(await evaluate('localStorage.length'), 0, 'Manual login persisted the key');
   assert.equal(await evaluate('document.getElementById("mode-title").textContent'), '仅查看与查询额度', 'Applied mode did not explain model behavior');
   assert.equal(await evaluate('document.getElementById("query-automatic").closest(".view").id'), 'tab-query', 'Query controls are mixed with wake rules');
@@ -186,6 +191,8 @@ try {
   await cdp('Page.navigate', {url});
   await waitFor(() => evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Reopening did not auto-connect');
   assert.equal(posts.length, 0, 'Auto-connect dispatched operations');
+  assert.equal(await evaluate('document.getElementById("auto-refresh").checked'), false, 'Reopening enabled page refresh without opt-in');
+  await evaluate('document.getElementById("auto-refresh").click()');
   await evaluate(`document.querySelector('[data-tab="accounts"]').click()`);
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), 'Accounts did not render');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'), 0, 'Account IDs must render as text');
@@ -258,10 +265,19 @@ try {
   assert.equal(await evaluate('document.getElementById("save-bar").hidden'),false,'Cross-tab edits lost the shared save bar');
   assert.equal(await evaluate('document.getElementById("rule-ratio").value'),'2','Navigation discarded wake draft');
   conflict = false;
-  await evaluate(`{document.getElementById('query-automatic').checked=false; document.getElementById('query-automatic').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('query-manual').checked=false; document.getElementById('query-manual').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click();}`);
-  await waitFor(()=>config.quota_query.automatic===false && config.quota_query.manual===false,'Query switches did not persist');
-  await waitFor(()=>evaluate('document.getElementById("quota-query").disabled && document.getElementById("quota-query-status").textContent.includes("定期查询：关闭")'),'Saved manual/automatic switches did not apply');
-  assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>button.disabled)'),true,'Account query bypassed disabled manual permission');
+  await evaluate(`{document.getElementById('query-automatic').checked=false; document.getElementById('query-automatic').dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click();}`);
+  await waitFor(()=>config.quota_query.automatic===false,'Automatic query switch did not persist');
+  await waitFor(()=>evaluate('document.getElementById("save-bar").hidden'),'Query settings save did not finish');
+  config.quota_query.manual = false;
+  await evaluate('document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('!document.getElementById("refresh").disabled'),'Legacy config refresh did not finish');
+  await waitFor(()=>evaluate('!document.getElementById("quota-query").disabled && document.getElementById("quota-query-status").textContent.includes("定期查询：关闭")'),'Disabling automatic queries blocked manual queries');
+  assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>!button.disabled)'),true,'Account queries were blocked with automatic queries disabled');
+  await evaluate('document.getElementById("auto-refresh").click()');
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const stoppedReads = reads.length;
+  await new Promise(resolve => setTimeout(resolve, 5500));
+  assert.equal(reads.length, stoppedReads, 'Turning page refresh off did not stop polling');
   assert.equal(config.enabled,false,'Changing query settings enabled model wake');
   assert.equal(config.execution.model,'fixture-model','Query settings changed execution model');
   assert.ok(posts.every(p=>['config','quota-query','quota-connection-check'].includes(p.path)),'Query controls called a model/scheduler operation');

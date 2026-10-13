@@ -96,6 +96,7 @@ func fixture(t *testing.T, night, weekly bool) (*Engine, *fakeHost, *memoryStore
 	}
 	clock := &testClock{time.Date(2026, 10, 11, hour, 0, 0, 0, time.FixedZone("CST", 8*3600))}
 	cfg := config.Defaults()
+	cfg.Enabled, cfg.QuotaQuery.Automatic = true, true
 	cfg.Execution.Model = "codex-test"
 	cfg.ResetRules.FiveHour.RandomDelay = config.DelayRange{}
 	cfg.ResetRules.Weekly.RandomDelay = config.DelayRange{}

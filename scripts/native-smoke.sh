@@ -6,7 +6,7 @@ python3 - "$task_tmp" <<'PY'
 import base64,json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
 policy=root/'policy.yaml'
-policy.write_text('enabled: false\n')
+policy.write_text('enabled: false\nquota_query:\n  automatic: true\n')
 wrapper=f'enabled: true\npriority: 0\nconfig_file: {policy}\nstate_dir: {root / "state"}\n'
 (root/'lifecycle.json').write_text(json.dumps({'schema_version':6,'config_yaml':base64.b64encode(wrapper.encode()).decode()}))
 PY

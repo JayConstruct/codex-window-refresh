@@ -26,7 +26,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.10"
+const Version = "0.1.0-rc.11"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -98,6 +98,7 @@ func (w WrapperConfig) quotaTransport() string {
 func (w WrapperConfig) hostEnabled() bool { return w.HostEnabled == nil || *w.HostEnabled }
 func (w WrapperConfig) effective(cfg config.Config) config.Config {
 	cfg.Enabled = cfg.Enabled && w.hostEnabled()
+	cfg.ManualWakeDisabled = !w.hostEnabled()
 	return cfg
 }
 func (w WrapperConfig) samePlumbing(other WrapperConfig) bool {
@@ -433,7 +434,7 @@ func managementRegistration() any {
 	for _, p := range []string{"/summary", "/accounts", "/config", "/config-editor", "/capabilities"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
-	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check"} {
+	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check", "/manual-wake"} {
 		routes = append(routes, map[string]string{"Method": "POST", "Path": ManagementPrefix + p})
 	}
 	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Authenticated scheduler panel."}, {"Path": "/panel.js"}, {"Path": "/panel.css"}}}
@@ -508,6 +509,8 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		return s.readPolicyEditor(), nil
 	case "POST /config":
 		return s.savePolicyEditor(ctx, req.Body), nil
+	case "POST /manual-wake":
+		return manualWakeResponse(engine, wrapper, cfg, done, stopping, req.Body), nil
 	case "POST /quota-query":
 		if stopping || done == nil {
 			return response(409, map[string]string{"error": "scheduler_not_running"}), nil
@@ -516,9 +519,6 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		case <-done:
 			return response(409, map[string]string{"error": "scheduler_not_running"}), nil
 		default:
-		}
-		if !cfg.QuotaQuery.Manual {
-			return response(409, map[string]string{"error": "manual_quota_query_disabled"}), nil
 		}
 		// Only an optional exact account selector is accepted, never model input.
 		var target core.AccountID

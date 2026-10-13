@@ -246,6 +246,49 @@ class InstallIntegrationTests(unittest.TestCase):
         self.assertNotIn('management_key_env', wrapper)
         self.assertFalse(self.plan['env'].exists())
 
+    def test_deferred_model_first_install_needs_no_key_and_upgrades_preserve_policy(self):
+        self.args.quota_transport = 'host'
+        self.args.model = None
+        self.args.key_file = None
+        self.args.defer_model = True
+        self.plan = installer.infer(self.args)
+        with mock.patch.object(installer, 'management_credentials', side_effect=AssertionError('must not ask for a key')), \
+                mock.patch.object(installer, 'discover_codex_model', side_effect=AssertionError('must not query models')):
+            self.install()
+        policy = yaml.safe_load(self.plan['policy'].read_text())
+        self.assertFalse(policy['enabled'])
+        self.assertEqual(policy['execution']['model'], '')
+        self.assertFalse(policy['quota_query']['automatic'])
+        self.assertTrue(policy['quota_query']['manual'])
+        self.assertFalse(self.plan['env'].exists())
+        policy['enabled'] = True
+        policy['execution']['model'] = 'operator-selected-model'
+        self.plan['policy'].write_text(yaml.safe_dump(policy))
+        original = self.plan['policy'].read_bytes()
+        self.args.model = 'must-not-overwrite'
+        self.plan = installer.infer(self.args)
+        self.install()
+        self.assertEqual(self.plan['policy'].read_bytes(), original)
+
+    def test_deferred_model_respects_explicit_first_install_model(self):
+        self.args.quota_transport = 'host'
+        self.args.key_file = None
+        self.args.defer_model = True
+        self.plan = installer.infer(self.args)
+        with mock.patch.object(installer, 'management_credentials', side_effect=AssertionError('must not ask for a key')):
+            self.install()
+        self.assertEqual(yaml.safe_load(self.plan['policy'].read_text())['execution']['model'], 'test-model')
+
+    def test_deferred_model_host_install_does_not_require_management_tls_override(self):
+        self.config.write_text(self.original + 'tls: {enable: true}\n')
+        self.args.quota_transport = 'host'
+        self.args.model = None
+        self.args.key_file = None
+        self.args.defer_model = True
+        self.plan = installer.infer(self.args)
+        self.install()
+        self.assertEqual(yaml.safe_load(self.plan['policy'].read_text())['execution']['model'], '')
+
     def test_older_release_keeps_management_mode_and_rejects_explicit_host(self):
         self.args.version = 'v0.1.0-rc.8'
         self.args.quota_transport = None

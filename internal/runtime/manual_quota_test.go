@@ -12,6 +12,29 @@ import (
 	"codex-window-refresh/internal/core"
 )
 
+func TestDefaultConfigOnlyQueriesOnManualRequest(t *testing.T) {
+	e, h, _, clock := fixture(t, true, true)
+	if err := e.UpdateConfig(config.Defaults()); err != nil {
+		t.Fatal(err)
+	}
+	for cycle := 0; cycle < 3; cycle++ {
+		if err := e.Step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		clock.now = clock.now.Add(time.Minute)
+	}
+	if h.reads != 0 || len(h.sends) != 0 {
+		t.Fatal("default config performed automatic queries or model requests")
+	}
+	e.RequestQuotaQuery()
+	if err := e.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h.reads != 1 || len(h.sends) != 0 || e.manualQuery.Phase != "completed" {
+		t.Fatal("default config blocked manual query or dispatched model")
+	}
+}
+
 func TestAutomaticQuotaSwitchIsIndependentFromModelWake(t *testing.T) {
 	e, h, _, c := fixture(t, false, false)
 	e.cfg.Enabled = false
@@ -88,7 +111,7 @@ func TestManualSweepQueriesAllAccountsInBatchesWithoutDispatch(t *testing.T) {
 		t.Fatal("completed sweep prevented later manual request")
 	}
 }
-func TestManualQueryCancelsWhenPermissionDisabledAndNeverRetriesFailures(t *testing.T) {
+func TestManualQueryIgnoresLegacyPermissionAndNeverRetriesFailures(t *testing.T) {
 	e, h, _, _ := fixture(t, false, false)
 	e.cfg.Enabled = false
 	e.cfg.QuotaQuery.Automatic = false
@@ -97,10 +120,9 @@ func TestManualQueryCancelsWhenPermissionDisabledAndNeverRetriesFailures(t *test
 	if err := e.Step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h.reads != 0 || e.manualQuery.Phase != "cancelled" || len(h.sends) != 0 {
-		t.Fatal("disabled manual permission still queried")
+	if h.reads != 1 || e.manualQuery.Phase != "completed" || len(h.sends) != 0 {
+		t.Fatal("legacy manual permission blocked query or dispatched a model")
 	}
-	e.cfg.QuotaQuery.Manual = true
 	reads := 0
 	e.host = controlledHost{Host: h, read: func(context.Context, core.QuotaRead) (core.QuotaObservation, error) {
 		reads++
@@ -143,7 +165,7 @@ func TestConcurrentManualRequestsAreCoalesced(t *testing.T) {
 		t.Fatalf("accepted %d duplicate queries", accepted)
 	}
 }
-func TestDisablingManualQueriesCancelsRemainderOfRunningSweep(t *testing.T) {
+func TestLegacyManualSettingDoesNotCancelRemainderOfRunningSweep(t *testing.T) {
 	e, h, _, _ := fixture(t, false, false)
 	e.cfg.Enabled = false
 	e.cfg.QuotaQuery.Automatic = false
@@ -166,8 +188,8 @@ func TestDisablingManualQueriesCancelsRemainderOfRunningSweep(t *testing.T) {
 	if err := e.Step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h.reads != 4 || e.manualQuery.Phase != "cancelled" || len(h.sends) != 0 {
-		t.Fatal("disabled query continued or dispatched")
+	if h.reads != 6 || e.manualQuery.Phase != "completed" || len(h.sends) != 0 {
+		t.Fatal("legacy manual setting cancelled sweep or dispatched")
 	}
 }
 
@@ -219,8 +241,8 @@ func TestAccountQuotaQuerySkipsDisabledOrRemovedAccount(t *testing.T) {
 	}
 }
 
-func TestAccountQuotaQueryFailureAndPermissionCancellation(t *testing.T) {
-	for _, cancel := range []bool{false, true} {
+func TestAccountQuotaQueryFailureIgnoresLegacyPermission(t *testing.T) {
+	for _, manual := range []bool{false, true} {
 		e, h, _, _ := fixture(t, false, false)
 		e.cfg.Enabled = false
 		e.cfg.QuotaQuery.Automatic = false
@@ -230,14 +252,14 @@ func TestAccountQuotaQueryFailureAndPermissionCancellation(t *testing.T) {
 			return core.QuotaObservation{}, errors.New("test failure")
 		}}
 		e.QueueQuotaQuery("a")
-		e.cfg.QuotaQuery.Manual = !cancel
+		e.cfg.QuotaQuery.Manual = manual
 		for i := 0; i < 3; i++ {
 			if err := e.Step(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if len(h.sends) != 0 || (cancel && (reads != 0 || e.manualQuery.Phase != "cancelled")) || (!cancel && (reads != 1 || e.manualQuery.Failed != 1)) {
-			t.Fatalf("selected query retried, dispatched or ignored cancellation: reads=%d job=%+v", reads, e.manualQuery)
+		if len(h.sends) != 0 || reads != 1 || e.manualQuery.Failed != 1 || e.manualQuery.Phase != "completed" {
+			t.Fatalf("selected query retried, dispatched or was blocked: reads=%d job=%+v", reads, e.manualQuery)
 		}
 	}
 }

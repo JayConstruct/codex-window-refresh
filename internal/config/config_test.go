@@ -23,8 +23,8 @@ func valid(t *testing.T, data, format string) Config {
 }
 func TestParseDefaultsAndForceFreshObservation(t *testing.T) {
 	c := valid(t, `{"execution":{"model":"supported","quota_max_age_before_send":"0s"},"daily_rules":[{"id":"morning","random_time_range":"09:00-09:10"}]}`, "json")
-	if !c.QuotaQuery.Automatic || !c.QuotaQuery.Manual || c.QuotaQuery.Interval.Value() != 30*time.Second {
-		t.Fatal("old configs did not inherit compatible query settings")
+	if c.Enabled || c.QuotaQuery.Automatic || !c.QuotaQuery.Manual || c.QuotaQuery.Interval.Value() != 30*time.Second {
+		t.Fatal("automatic work must require explicit opt-in while manual queries stay allowed")
 	}
 	if c.Activity.IdentitySource != "host_caller_scope" || c.Activity.Lookback.Value() != 30*time.Minute || c.Execution.VerificationCapacityHold.Value() != 15*time.Minute {
 		t.Fatalf("defaults lost: %+v", c)
@@ -46,7 +46,7 @@ func TestParseDefaultsAndForceFreshObservation(t *testing.T) {
 }
 func TestQuerySettingsParseIndependentlyAndRejectInvalidTypes(t *testing.T) {
 	c := valid(t, `{"enabled":false,"execution":{"model":"supported"},"quota_query":{"automatic":true,"manual":false,"interval":"2m"}}`, "json")
-	if c.Enabled || !c.QuotaQuery.Automatic || c.QuotaQuery.Manual || c.QuotaQuery.Interval.Value() != 2*time.Minute {
+	if c.Enabled || !c.QuotaQuery.Automatic || !c.QuotaQuery.Manual || c.QuotaQuery.Interval.Value() != 2*time.Minute {
 		t.Fatal("independent query config lost")
 	}
 	for _, settings := range []string{`{"automatic":"false"}`, `{"manual":null}`, `{"interval":"29s"}`, `{"interval":"3601s"}`, `{"interval":30}`, `{"automatic":false,"automatic":true}`, `{"model":"unsupported"}`} {
@@ -55,6 +55,33 @@ func TestQuerySettingsParseIndependentlyAndRejectInvalidTypes(t *testing.T) {
 		}
 	}
 }
+func TestQuotaOnlyConfigAllowsDeferredModelButCannotEnableWakeups(t *testing.T) {
+	settings := valid(t, `{"enabled":false,"execution":{"model":""}}`, "json")
+	if settings.QuotaQuery.Automatic || !settings.QuotaQuery.Manual {
+		t.Fatal("quota-only configuration did not preserve manual-only defaults")
+	}
+	settings.Enabled = true
+	if err := settings.Validate(); err == nil {
+		t.Fatal("wakeups enabled without a model")
+	}
+}
+func TestAutomaticFeaturesRequireExplicitOptIn(t *testing.T) {
+	for _, format := range []string{"json", "yaml"} {
+		data := `{}`
+		if format == "yaml" {
+			data = "quota_query:\n  manual: false\n"
+		}
+		settings := valid(t, data, format)
+		if settings.Enabled || settings.QuotaQuery.Automatic || !settings.QuotaQuery.Manual {
+			t.Fatalf("%s did not keep automatic features off and manual queries available", format)
+		}
+	}
+	settings := valid(t, `{"enabled":true,"execution":{"model":"supported"},"quota_query":{"automatic":true,"manual":false}}`, "json")
+	if !settings.Enabled || !settings.QuotaQuery.Automatic || !settings.QuotaQuery.Manual {
+		t.Fatal("explicit automatic opt-in or always-allowed manual query lost")
+	}
+}
+
 func TestYAMLStrongScalarTypesAndDuplicateRejection(t *testing.T) {
 	c := valid(t, "execution:\n  model: supported\nactivity:\n  lookback: 1d\n  accounts_per_user: 0.5\n", "yaml")
 	if c.Activity.Lookback.Value() != 24*time.Hour || c.Activity.AccountsPerUser != 0.5 {

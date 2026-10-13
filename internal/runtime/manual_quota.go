@@ -31,6 +31,10 @@ func (e *Engine) RequestQuotaQuery() bool {
 // Different targets cannot silently join or widen a running query.
 func (e *Engine) QueueQuotaQuery(id core.AccountID) string {
 	e.queueMu.Lock()
+	if e.manualWakeActive {
+		e.queueMu.Unlock()
+		return "busy"
+	}
 	if e.manualActive {
 		same := e.manualTarget == id
 		e.queueMu.Unlock()
@@ -67,10 +71,6 @@ func (e *Engine) finishManualQuery(phase string) {
 	e.queueMu.Unlock()
 }
 func (e *Engine) stepManualQuery(ctx context.Context) {
-	if !e.cfg.QuotaQuery.Manual {
-		e.finishManualQuery("cancelled")
-		return
-	}
 	if !e.caps.QuotaAdapterReady {
 		e.finishManualQuery("unavailable")
 		return
