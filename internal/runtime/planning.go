@@ -20,6 +20,7 @@ type PlannedAction struct {
 	EarliestAt  time.Time      `json:"earliest_at"`
 	LatestAt    time.Time      `json:"latest_at"`
 	RepeatEvery string         `json:"repeat_every,omitempty"`
+	Window      string         `json:"window,omitempty"`
 	Status      string         `json:"status"`
 	Detail      string         `json:"detail"`
 	Model       string         `json:"model,omitempty"`
@@ -45,6 +46,9 @@ func actionBefore(first, second PlannedAction) bool {
 	}
 	if first.Trigger != second.Trigger {
 		return first.Trigger < second.Trigger
+	}
+	if first.Window != second.Window {
+		return first.Window < second.Window
 	}
 	if first.AccountID != second.AccountID {
 		return first.AccountID < second.AccountID
@@ -105,7 +109,25 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 			continue
 		}
 		if e.cfg.QuotaQuery.Automatic {
-			add(PlannedAction{Kind: "query", Trigger: "periodic", AccountID: id, EarliestAt: maxTime(now, maxTime(e.nextRead[id], e.nextPreflight[id])), RepeatEvery: e.cfg.QuotaQuery.Interval.Value().String(), Status: "estimated", Detail: "周期查询至计划结束；被动更新、退避或任务优先级可能推迟"})
+			for _, weekly := range []bool{false, true} {
+				query := e.cfg.QuotaQuery.Window(weekly)
+				if !query.PeriodicEnabled {
+					continue
+				}
+				due, ok := e.queryTime(account, weekly, true, time.Time{}, now, plan.Until)
+				if due.After(plan.Until) {
+					continue
+				}
+				window := "five_hour"
+				if weekly {
+					window = "weekly"
+				}
+				status, detail := "estimated", "周期查询至计划结束；避开排除时段并应用稳定随机延迟；同账号额度查询合并执行"
+				if !ok {
+					due, status, detail = now, "blocked", "计划范围内没有允许的定期查询时段"
+				}
+				add(PlannedAction{Kind: "query", Trigger: "periodic", Window: window, AccountID: id, EarliestAt: due, RepeatEvery: query.Interval.Value().String(), Status: status, Detail: detail})
+			}
 		}
 		for _, window := range []struct {
 			reason  core.Reason
@@ -122,7 +144,15 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 				continue
 			}
 			if window.query && !window.reset.Equal(window.queried) {
-				add(PlannedAction{Kind: "query", Trigger: string(window.reason), AccountID: id, EarliestAt: maxTime(window.reset, maxTime(e.nextRead[id], e.nextPreflight[id])), Status: "estimated", Detail: "已知窗口到期后查询一次；失败退避后重试"})
+				due, ok := e.queryTime(account, window.reason == core.ReasonWeekly, false, window.reset, now, plan.Until)
+				if due.After(plan.Until) {
+					continue
+				}
+				status, detail := "estimated", "已知窗口到期后查询一次；应用随机延迟与排除时段，失败退避后重试"
+				if !ok {
+					due, status, detail = maxTime(now, window.reset), "blocked", "计划范围内没有允许的到期查询时段"
+				}
+				add(PlannedAction{Kind: "query", Trigger: string(window.reason), AccountID: id, EarliestAt: due, Status: status, Detail: detail})
 			}
 			if !e.cfg.Enabled || !window.wake {
 				continue

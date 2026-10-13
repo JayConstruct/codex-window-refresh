@@ -25,6 +25,12 @@
 | `planning.horizon_days` | integer，`7` | 1–30 天；最多显示最早 256 项，周期查询以循环条目表示，窗口未知时不推算未来周期 |
 | `quota_query.manual` | boolean，`true` | 仅为兼容旧配置保留，解析时归一化为 true；手动查询始终允许，false 不再拒绝或取消查询 |
 | `quota_query.interval` | duration，`30s` | 普通定期查询间隔，允许 30 秒到 1 小时；完整被动额度也按此间隔推迟重复轮询 |
+| `quota_query.five_hour/weekly.periodic_enabled` | boolean，`true` | 本类额度是否参与定期查询；仍需 `quota_query.automatic` 总开关开启。两类均关闭则不定期查询，默认总开关仍关闭 |
+| `quota_query.five_hour/weekly.interval` | duration，`0s` | `0s` 继承公共间隔，否则为 30s–1h 且不得短于公共间隔；两类查询独立调度，同账号接口请求会合并 |
+| `quota_query.five_hour/weekly.expiry.excluded_hours` | string array，`[]` | 到期自动查询的每日排除时段；按 `timezone`，支持跨午夜、不重叠，全天排除写 `00:00-24:00`，留空不排除 |
+| `quota_query.five_hour/weekly.periodic.excluded_hours` | string array，`[]` | 定期查询独立排除时段，与到期查询互不影响；延迟到期仍处于排除时段时顺延至结束 |
+| `quota_query.five_hour/weekly.expiry.random_delay.min/max` | duration，`0s/0s` | 到期边界后随机延迟，`0 ≤ min ≤ max ≤ 24h`；按账号身份、凭据代际、窗口与边界生成稳定随机值，预览和重启不会重新抽取同一到期边界 |
+| `quota_query.five_hour/weekly.periodic.random_delay.min/max` | duration，`0s/0s` | 每次定期查询在间隔后附加的随机延迟；初次从引擎启动时间计算。下一次以最近查询或完整被动观测为基准，重复读取计划不重新抽取 |
 | `timezone` | string，`Asia/Shanghai` | 可加载的 IANA 时区；拒绝未识别名称，不能默默退回服务器时区 |
 | `reset_rules.five_hour.enabled` | boolean，`true` | 创建普通到期任务；关闭不影响周联合任务和每日目标选取到期账号 |
 | `reset_rules.five_hour.random_delay.min/max` | duration，`0s/10m` | `0 ≤ min ≤ max ≤ 24h`；事件到期后只抽一次 |

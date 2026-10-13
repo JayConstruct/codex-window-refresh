@@ -135,13 +135,23 @@ summary { cursor: pointer; font-weight: 600; }
 .wake-control { border-left: 4px solid #bb8a45; }
 .wake-control .hint { margin: 18px 0 0; padding-top: 14px; border-top: 1px solid var(--line); }
 .compact-note p { font-size: 13px; }
-.rule-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; margin-top: 22px; }
-.rule-block { padding: 18px; background: #f7f9f7; border: 1px solid var(--line); border-radius: 10px; }
-.rule-block .form-grid { gap: 12px; margin-top: 8px; }
-.rule-block .hint { margin: 12px 0 0; }
+.window-settings { border-top: 3px solid #527aaa; }
+.window-week { border-top-color: #9273ab; }
+.window-settings > .form-grid { margin-top: 16px; }
+.window-settings > .hint { margin-top: 16px; }
+.query-policy { border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin: 20px 0 0; min-width: 0; }
+.query-policy legend { padding: 0 8px; font-weight: 650; }
+.query-policy .form-grid { margin-top: 14px; }
 .daily-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 12px; align-items: end; padding: 18px 0; border-bottom: 1px solid var(--line); }
 .daily-times { grid-column: 1 / -1; grid-template-columns: repeat(3, minmax(0, 1fr)); }
-.plan-item { margin-bottom: 12px; overflow-wrap: anywhere; }
+.plan-timeline { list-style: none; margin: 20px 0 0 12px; padding: 0 0 0 26px; border-left: 2px solid var(--line); }
+.timeline-day { font-weight: 650; padding: 8px 0 16px; }
+.plan-item { position: relative; margin-bottom: 18px; overflow-wrap: anywhere; border-left: 3px solid #527aaa; }
+.plan-item::before { content: ''; position: absolute; left: -36px; top: 28px; width: 14px; height: 14px; border: 3px solid var(--paper); background: #527aaa; border-radius: 50%; }
+.plan-wake { border-left-color: #b78038; }
+.plan-wake::before { background: #b78038; }
+.plan-blocked { border-left-color: var(--muted); }
+.plan-blocked::before { background: var(--muted); }
 .daily-switches { grid-column: 1 / -1; display: flex; gap: 28px; }
 .daily-switches .check-field { min-height: 30px; }
 .disclosure { padding: 0; }
@@ -164,7 +174,6 @@ button.danger { color: var(--danger); }
   .account-list { grid-template-columns: 1fr; }
   .daily-row { grid-template-columns: 1fr 1fr; }
   .daily-switches { flex-wrap: wrap; gap: 12px; }
-  .rule-pair { grid-template-columns: 1fr; }
 }
 @media (max-width: 620px) {
   .shell { padding: 0 16px; }

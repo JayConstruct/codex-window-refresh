@@ -194,7 +194,10 @@ try {
   await waitFor(() => evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Reopening did not auto-connect');
   assert.equal(posts.length, 0, 'Auto-connect dispatched operations');
   assert.equal(await evaluate('document.getElementById("auto-refresh").checked'), false, 'Reopening enabled page refresh without opt-in');
+  assert.equal(await evaluate('document.getElementById("background-refresh").disabled && !document.getElementById("background-refresh").checked'), true, 'Background refresh was not explicit');
   await evaluate('document.getElementById("auto-refresh").click()');
+  await evaluate('document.getElementById("background-refresh").click()');
+  await waitFor(()=>evaluate('!document.getElementById("refresh").disabled && document.getElementById("refresh-status").textContent.includes("含后台标签页")'),'Background refresh opt-in did not apply');
   await evaluate(`document.querySelector('[data-tab="accounts"]').click()`);
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), 'Accounts did not render');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'), 0, 'Account IDs must render as text');
@@ -253,6 +256,9 @@ try {
   await evaluate(`{ document.querySelector('[data-tab="rules"]').click(); const ratio=document.getElementById('rule-ratio'); ratio.value='1.5'; ratio.dispatchEvent(new Event('input',{bubbles:true})); ratio.dispatchEvent(new Event('change',{bubbles:true})); }`);
   await evaluate(`{ document.querySelector('[data-tab="query"]').click(); const timeout=document.getElementById('query-timeout'); timeout.value='60s'; timeout.dispatchEvent(new Event('change',{bubbles:true})); }`);
   await evaluate(`{for(const [id,value] of [['rule-five-model','five-fixture-model'],['rule-five-prompt','Five hour content'],['rule-week-model','weekly-fixture-model'],['rule-week-prompt','Weekly content']]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event('change',{bubbles:true}));}document.getElementById('query-five-expiry').checked=true;document.getElementById('query-five-expiry').dispatchEvent(new Event('change',{bubbles:true}));document.getElementById('plan-enabled').checked=true;document.getElementById('plan-enabled').dispatchEvent(new Event('change',{bubbles:true}));document.getElementById('plan-days').value='3';document.getElementById('plan-days').dispatchEvent(new Event('change',{bubbles:true}));}`);
+  await evaluate(`{for(const [id,value] of [['query-five-expiry-hours','22:00-08:00，12:00-13:00'],['query-five-expiry-min','1m'],['query-five-expiry-max','5m'],['query-week-periodic-hours','00:00-06:00'],['query-week-periodic-max','2m']]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event('change',{bubbles:true}));}document.getElementById('query-week-periodic').checked=false;document.getElementById('query-week-periodic').dispatchEvent(new Event('change',{bubbles:true}));}`);
+  assert.equal(await evaluate('document.getElementById("query-five-expiry").closest(".window-settings") !== document.getElementById("query-week-expiry").closest(".window-settings")'), true, 'Window query settings are not separated');
+  assert.equal(await evaluate('document.getElementById("rule-five-model").closest(".window-settings") !== document.getElementById("rule-week-model").closest(".window-settings")'), true, 'Window wake settings are not separated');
   await evaluate(`document.getElementById('config-save').click()`);
   await waitFor(() => config.activity.accounts_per_user === 1.5, 'Rule save failed');
   await waitFor(() => evaluate('!document.getElementById("rule-ratio").disabled'), 'Save did not finish updating the view');
@@ -261,11 +267,16 @@ try {
   assert.equal(config.daily_rules[0].id, 'morning', 'Daily rules were lost');
   assert.equal(config.quota_query.on_five_hour_expiry,true,'Expiry query switch did not persist independently');
   assert.equal(config.quota_query.on_weekly_expiry,false,'Five-hour switch changed weekly query setting');
+  assert.deepEqual(config.quota_query.five_hour.expiry.excluded_hours,['22:00-08:00','12:00-13:00'],'Excluded hours did not serialize as a list');
+  assert.deepEqual(config.quota_query.five_hour.expiry.random_delay,{min:'1m',max:'5m'},'Expiry delay did not persist');
+  assert.equal(config.quota_query.weekly.periodic_enabled,false,'Weekly periodic participation did not persist');
+  assert.equal(config.quota_query.weekly.periodic.random_delay.max,'2m','Independent periodic delay did not persist');
   assert.equal(config.reset_rules.five_hour.model,'five-fixture-model','Five-hour model did not save');
   assert.equal(config.reset_rules.weekly.prompt,'Weekly content','Weekly message did not save');
   assert.deepEqual(config.planning,{enabled:true,horizon_days:3},'Plan settings did not save');
   await evaluate('document.querySelector("[data-tab=plan]").click()');
   await waitFor(()=>evaluate('document.getElementById("plan-list").textContent.includes("fixture-account") && document.getElementById("plan-status").textContent.includes("未来 3 天")'),'Saved future plan did not display');
+  assert.equal(await evaluate('document.querySelector("#plan-list .timeline-day") !== null && document.querySelector("#plan-list .plan-query") !== null'),true,'Plan timeline did not render query nodes');
   assert.ok(posts.every(post=>['quota-query','quota-connection-check','config'].includes(post.path)),'Planning dispatched unexpected operations');
   conflict = true;
   await evaluate(`{ const ratio=document.getElementById('rule-ratio'); ratio.value='2'; ratio.dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click(); }`);
@@ -285,6 +296,7 @@ try {
   await waitFor(()=>evaluate('!document.getElementById("quota-query").disabled && document.getElementById("quota-query-status").textContent.includes("定期查询：关闭")'),'Disabling automatic queries blocked manual queries');
   assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>!button.disabled)'),true,'Account queries were blocked with automatic queries disabled');
   await evaluate('document.getElementById("auto-refresh").click()');
+  assert.equal(await evaluate('document.getElementById("background-refresh").disabled && !document.getElementById("background-refresh").checked'),true,'Disabling polling retained background polling');
   await new Promise(resolve => setTimeout(resolve, 100));
   const stoppedReads = reads.length;
   await new Promise(resolve => setTimeout(resolve, 5500));

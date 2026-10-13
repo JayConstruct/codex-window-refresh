@@ -58,6 +58,7 @@ type Engine struct {
 	lastQuotaDiagnostic  *core.QuotaDiagnostic
 	poisoned             bool
 	nextRead             map[core.AccountID]time.Time
+	queryEpoch           time.Time
 	nextPreflight        map[core.AccountID]time.Time
 	readFailures         map[core.AccountID]int
 	activityEpoch        map[core.AccountID]uint64
@@ -90,7 +91,7 @@ func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, 
 		return nil, err
 	}
 	core.RecoverAfterRestart(&s, clock.Now())
-	e := &Engine{cfg: cfg, host: host, store: store, clock: clock, random: random, state: s, wake: make(chan struct{}, 1), nextRead: map[core.AccountID]time.Time{}, nextPreflight: map[core.AccountID]time.Time{}, readFailures: map[core.AccountID]int{}, activityEpoch: map[core.AccountID]uint64{}}
+	e := &Engine{cfg: cfg, host: host, store: store, clock: clock, random: random, state: s, wake: make(chan struct{}, 1), nextRead: map[core.AccountID]time.Time{}, queryEpoch: clock.Now(), nextPreflight: map[core.AccountID]time.Time{}, readFailures: map[core.AccountID]int{}, activityEpoch: map[core.AccountID]uint64{}}
 	if err = e.commit(context.Background()); err != nil {
 		return nil, err
 	}
@@ -424,7 +425,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		verifying := a.Task != nil && a.Task.OperationID != "" && !now.Before(a.Task.NextVerificationAt)
 		pendingOperation := a.Task != nil && a.Task.OperationID != ""
 		expiryQuery := e.expiryQueryDue(a, now)
-		if caps.QuotaAdapterReady && (a.Enabled || pendingOperation) && (verifying || ((e.cfg.QuotaQuery.Automatic || expiryQuery) && !pendingOperation && !now.Before(e.nextRead[id]))) && reads < 4 && !now.Before(e.nextPreflight[id]) {
+		if caps.QuotaAdapterReady && (a.Enabled || pendingOperation) && (verifying || ((e.periodicQueryDue(a, now) || expiryQuery) && !pendingOperation && !now.Before(e.nextRead[id]))) && reads < 4 && !now.Before(e.nextPreflight[id]) {
 			reads++
 			if readErr := e.observe(ctx, id); readErr == nil && expiryQuery {
 				e.markExpiryQueried(id, a, now)

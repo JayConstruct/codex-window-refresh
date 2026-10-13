@@ -95,7 +95,7 @@ func TestManualSweepQueriesAllAccountsInBatchesWithoutDispatch(t *testing.T) {
 	if err := e.Step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h.reads != 4 || len(h.sends) != 0 || e.manualQuery.Phase != "running" || e.manualQuery.Total != 6 {
+	if h.reads != 4 || len(h.sends) != 0 || e.manualQuery.Phase != "running" || e.manualQuery.Total != 7 {
 		t.Fatalf("manual batch entered dispatch or exceeded budget: %+v", e.manualQuery)
 	}
 	if e.RequestQuotaQuery() {
@@ -104,7 +104,7 @@ func TestManualSweepQueriesAllAccountsInBatchesWithoutDispatch(t *testing.T) {
 	if err := e.Step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h.reads != 6 || len(h.sends) != 0 || e.manualQuery.Completed != 6 || e.manualQuery.Phase != "completed" {
+	if h.reads != 7 || len(h.sends) != 0 || e.manualQuery.Completed != 7 || e.manualQuery.Phase != "completed" {
 		t.Fatalf("manual sweep did not finish read-only: %+v", e.manualQuery)
 	}
 	if !e.RequestQuotaQuery() {
@@ -222,7 +222,7 @@ func TestAccountQuotaQueryReadsOnlySelectedPausedAccountWithoutDispatch(t *testi
 	}
 }
 
-func TestAccountQuotaQuerySkipsDisabledOrRemovedAccount(t *testing.T) {
+func TestAccountQuotaQueryReadsDisabledAccountButSkipsRemovedAccount(t *testing.T) {
 	for _, disabled := range []bool{false, true} {
 		e, h, _, _ := fixture(t, false, false)
 		e.cfg.QuotaQuery.Automatic = false
@@ -235,8 +235,14 @@ func TestAccountQuotaQuerySkipsDisabledOrRemovedAccount(t *testing.T) {
 		if err := e.Step(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if h.reads != 0 || len(h.sends) != 0 || e.manualQuery.Total != 1 || e.manualQuery.Skipped != 1 || e.manualQuery.Phase != "completed" {
-			t.Fatalf("unavailable account caused upstream request: %+v", e.manualQuery)
+		if len(h.sends) != 0 || e.manualQuery.Total != 1 || e.manualQuery.Phase != "completed" {
+			t.Fatalf("selected query dispatched or did not finish: %+v", e.manualQuery)
+		}
+		if disabled && (h.reads != 1 || e.manualQuery.Completed != 1 || e.manualQuery.Skipped != 0) {
+			t.Fatalf("disabled account blocked read-only query: %+v", e.manualQuery)
+		}
+		if !disabled && (h.reads != 0 || e.manualQuery.Skipped != 1) {
+			t.Fatalf("removed account caused upstream request: %+v", e.manualQuery)
 		}
 	}
 }
@@ -261,6 +267,30 @@ func TestAccountQuotaQueryFailureIgnoresLegacyPermission(t *testing.T) {
 		if len(h.sends) != 0 || reads != 1 || e.manualQuery.Failed != 1 || e.manualQuery.Phase != "completed" {
 			t.Fatalf("selected query retried, dispatched or was blocked: reads=%d job=%+v", reads, e.manualQuery)
 		}
+	}
+}
+
+func TestManualQuotaQueryDoesNotEnableDisabledAccountOrAutomaticWork(t *testing.T) {
+	engine, host, _, _ := fixture(t, false, true)
+	host.initial[0].Enabled = false
+	if err := engine.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if host.reads != 0 || len(host.sends) != 0 {
+		t.Fatal("disabled account performed automatic work")
+	}
+	engine.QueueQuotaQuery("a")
+	if err := engine.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if host.reads != 1 || engine.state.Accounts["a"].Enabled || engine.manualQuery.Completed != 1 {
+		t.Fatal("manual query was blocked or enabled account")
+	}
+	if err := engine.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if host.reads != 1 || len(host.sends) != 0 {
+		t.Fatal("manual quota query triggered automatic work")
 	}
 }
 

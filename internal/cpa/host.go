@@ -117,6 +117,10 @@ func (h *Host) Accounts(ctx context.Context) ([]core.HostAccount, error) {
 	return result, nil
 }
 func (h *Host) validate(ctx context.Context, id core.AccountID, gen core.CredentialGeneration) (AuthBinding, error) {
+	return h.validateBinding(ctx, id, gen, true)
+}
+
+func (h *Host) validateBinding(ctx context.Context, id core.AccountID, gen core.CredentialGeneration, requireActive bool) (AuthBinding, error) {
 	h.mu.RLock()
 	old, ok := h.bindings[id]
 	h.mu.RUnlock()
@@ -130,7 +134,7 @@ func (h *Host) validate(ctx context.Context, id core.AccountID, gen core.Credent
 	if b.Generation != gen || old.Generation != gen {
 		return AuthBinding{}, ErrBindingChanged
 	}
-	if !active {
+	if requireActive && !active {
 		return AuthBinding{}, ErrBindingUnavailable
 	}
 	return b, nil
@@ -139,7 +143,7 @@ func (h *Host) ObserveQuota(ctx context.Context, read core.QuotaRead) (core.Quot
 	if h.reader == nil {
 		return core.QuotaObservation{}, ErrMissingBridge
 	}
-	b, err := h.validate(ctx, read.AccountID, read.Generation)
+	b, err := h.validateBinding(ctx, read.AccountID, read.Generation, false)
 	if err != nil {
 		return core.QuotaObservation{}, err
 	}
@@ -148,7 +152,7 @@ func (h *Host) ObserveQuota(ctx context.Context, read core.QuotaRead) (core.Quot
 	if err != nil {
 		return core.QuotaObservation{}, err
 	}
-	if _, err = h.validate(ctx, read.AccountID, read.Generation); err != nil {
+	if _, err = h.validateBinding(ctx, read.AccountID, read.Generation, false); err != nil {
 		return core.QuotaObservation{}, err
 	}
 	h.mu.RLock()

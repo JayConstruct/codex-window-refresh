@@ -78,6 +78,24 @@ func (c Config) Validate() error {
 	}
 	duration("activity.lookback", c.Activity.Lookback, time.Minute, 24*time.Hour)
 	duration("quota_query.interval", c.QuotaQuery.Interval, 30*time.Second, time.Hour)
+	for _, window := range []struct {
+		path  string
+		query WindowQuery
+	}{{"quota_query.five_hour", c.QuotaQuery.FiveHour}, {"quota_query.weekly", c.QuotaQuery.Weekly}} {
+		if window.query.Interval != 0 {
+			duration(window.path+".interval", window.query.Interval, 30*time.Second, time.Hour)
+			if window.query.Interval < c.QuotaQuery.Interval {
+				add(window.path+".interval", "QUERY_INTERVAL_BELOW_SHARED", "cannot be shorter than quota_query.interval; use 0s to inherit")
+			}
+		}
+		for _, timing := range []struct {
+			path  string
+			value QueryTiming
+		}{{"expiry", window.query.Expiry}, {"periodic", window.query.Periodic}} {
+			allowed(window.path+"."+timing.path+".excluded_hours", timing.value.ExcludedHours)
+			delay(window.path+"."+timing.path+".random_delay", timing.value.RandomDelay)
+		}
+	}
 	bound("planning.horizon_days", c.Planning.HorizonDays, 1, 30)
 	ratio := c.Activity.AccountsPerUser
 	if math.IsNaN(ratio) || math.IsInf(ratio, 0) {

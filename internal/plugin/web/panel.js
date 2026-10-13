@@ -20,6 +20,16 @@
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function validObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
   const settingDefaults = {'quota_query.automatic': false, 'quota_query.manual': true, 'quota_query.interval': '30s', 'quota_query.on_five_hour_expiry': false, 'quota_query.on_weekly_expiry': false, 'ordinary_rules.daily_enabled': true, 'planning.enabled': false, 'planning.horizon_days': 7, 'reset_rules.five_hour.model': '', 'reset_rules.five_hour.prompt': '', 'reset_rules.weekly.model': '', 'reset_rules.weekly.prompt': ''};
+  for (const window of ['five_hour', 'weekly']) {
+    settingDefaults['quota_query.' + window + '.periodic_enabled'] = true;
+    settingDefaults['quota_query.' + window + '.interval'] = '0s';
+    for (const trigger of ['expiry', 'periodic']) {
+      const prefix = 'quota_query.' + window + '.' + trigger;
+      settingDefaults[prefix + '.excluded_hours'] = [];
+      settingDefaults[prefix + '.random_delay.min'] = '0s';
+      settingDefaults[prefix + '.random_delay.max'] = '0s';
+    }
+  }
   // CPAMC/CPAMP use cli-proxy-auth or the legacy managementKey entry, either
   // plain JSON or reversible enc::v1:: obfuscation. Read only these known keys.
   // Format reference: router-for-me/Cli-Proxy-API-Management-Center,
@@ -77,35 +87,42 @@
       key = value.trim();
       return generation;
     }
-    async function request(path, method, body) {
+    async function request(path, method, body, signal) {
       method = method || 'GET';
       if (!paths.has(path) || !['GET', 'POST'].includes(method)) throw new PanelError('invalid_endpoint');
       if (!key) throw new PanelError('disconnected');
       const current = generation, controller = new AbortController();
       controllers.add(controller);
+      const cancelRequest = () => controller.abort();
+      if (signal) signal.addEventListener('abort', cancelRequest, {once: true});
       let timedOut = false;
       let timer;
       const readOnly = method === 'GET' || path === '/quota-connection-check';
       try {
+        if (signal?.aborted) throw new PanelError('cancelled');
         timer = timers.setTimeout(() => { timedOut = true; controller.abort(); }, readOnly ? 15000 : 120000);
         const headers = {'Authorization': 'Bearer ' + key, 'Accept': 'application/json'};
         if (body !== undefined) headers['Content-Type'] = 'application/json';
         const result = await fetcher(base + path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: 'omit', redirect: 'error', cache: 'no-store', signal: controller.signal});
         if (generation !== current || !key) throw new PanelError('stale');
+        if (controller.signal.aborted) throw new PanelError(timedOut ? (readOnly ? 'timeout' : 'write_unconfirmed') : 'cancelled');
         if (result.status === 401 || result.status === 403) { disconnect(); throw new PanelError('authentication', result.status); }
         if (!result.ok) throw new PanelError(result.status === 409 ? 'conflict' : result.status === 400 ? 'invalid_config' : 'http_error', result.status);
         // Ignore arbitrary error bodies and never reflect server text into the UI.
         if (!String(result.headers.get('content-type') || '').toLowerCase().includes('application/json')) throw new PanelError('invalid_response');
         const data = await result.json();
         if (generation !== current || !key) throw new PanelError('stale');
+        if (controller.signal.aborted) throw new PanelError(timedOut ? (readOnly ? 'timeout' : 'write_unconfirmed') : 'cancelled');
         return data;
       } catch (error) {
         if (generation !== current && !(error instanceof PanelError && error.code === 'authentication')) throw new PanelError('stale');
         if (error instanceof PanelError) throw error;
+        if (signal?.aborted && !timedOut) throw new PanelError('cancelled');
         throw new PanelError(timedOut ? (readOnly ? 'timeout' : 'write_unconfirmed') : (readOnly ? 'network' : 'write_unconfirmed'));
       } finally {
         timers.clearTimeout(timer);
         controllers.delete(controller);
+        if (signal) signal.removeEventListener('abort', cancelRequest);
       }
     }
     return {setKey, disconnect, request, generation: () => generation, connected: () => !!key};
@@ -120,6 +137,12 @@
       && (value.quota_query === undefined || (validObject(value.quota_query) && typeof value.quota_query.automatic === 'boolean' && typeof value.quota_query.manual === 'boolean' && typeof value.quota_query.interval === 'string'))
       && (value.quota_query?.on_five_hour_expiry === undefined || typeof value.quota_query.on_five_hour_expiry === 'boolean')
       && (value.quota_query?.on_weekly_expiry === undefined || typeof value.quota_query.on_weekly_expiry === 'boolean')
+      && [value.quota_query?.five_hour, value.quota_query?.weekly].every(window => window === undefined || (validObject(window)
+        && (window.periodic_enabled === undefined || typeof window.periodic_enabled === 'boolean')
+        && (window.interval === undefined || typeof window.interval === 'string')
+        && [window.expiry, window.periodic].every(timing => timing === undefined || (validObject(timing)
+          && (timing.excluded_hours === undefined || (Array.isArray(timing.excluded_hours) && timing.excluded_hours.every(hours => typeof hours === 'string')))
+          && (timing.random_delay === undefined || (validObject(timing.random_delay) && ['min', 'max'].every(bound => timing.random_delay[bound] === undefined || typeof timing.random_delay[bound] === 'string')))))))
       && (value.ordinary_rules.daily_enabled === undefined || typeof value.ordinary_rules.daily_enabled === 'boolean')
       && (value.planning === undefined || (validObject(value.planning) && typeof value.planning.enabled === 'boolean' && Number.isInteger(value.planning.horizon_days) && value.planning.horizon_days >= 1 && value.planning.horizon_days <= 30))
       && Array.isArray(value.daily_rules) && value.daily_rules.every(validObject) && validObject(value.account_overrides)
@@ -157,6 +180,7 @@
             if (parts[i] === 'planning') current.planning = {enabled: false, horizon_days: 7};
             if (parts[i] === 'quota_query') current.quota_query = {automatic: false, manual: true, interval: '30s', on_five_hour_expiry: false, on_weekly_expiry: false};
           }
+          if (!Object.hasOwn(current, parts[i]) && Object.hasOwn(settingDefaults, path)) current[parts[i]] = {};
           if (!Object.hasOwn(current, parts[i]) || !validObject(current[parts[i]])) throw new PanelError('invalid_config');
           current = current[parts[i]];
         }
@@ -202,7 +226,7 @@
     if (!summary?.running || summary.host_enabled === false) return '后台未运行或 CPA 插件已停用';
     if (!config?.execution?.model?.trim()) return '请先填写并保存唤醒模型，无需开启自动唤醒';
     if (capabilities?.StableAccountIdentity !== true || capabilities?.ExactAccountExecution !== true || capabilities?.QuotaAdapterReady !== true) return '宿主账号绑定、模型执行或额度接口未就绪';
-    if (!account?.Enabled || config.account_overrides?.[account.ID]?.paused === true) return '账号已禁用或暂停唤醒';
+    if (!account?.Enabled || config.account_overrides?.[account.ID]?.paused === true) return 'CPA 账号不可用或已暂停唤醒；仍可手动查询额度';
     if (account.Task?.OperationID) return '已有请求待验证，不重复唤醒';
     const currentTime = now === undefined ? Date.now() : now;
     if ((account.FiveHour?.State === 'active' && (resetTime(account.FiveHour.ResetAt) || 0) > currentTime) || (resetTime(account.FiveHourBaseline?.StableResetAt) || 0) > currentTime) return '5 小时窗口已启动，无需重复唤醒';
@@ -245,6 +269,7 @@
   let pendingQuotaQuery = null;
   let pendingManualWake = null;
   let noticeSource = '';
+  let pollFailures = 0, pollController = null;
   let summary = null, runningConfig = null, accounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
   const session = createSession(root.fetch.bind(root), clearView, undefined, apiBase(root.location));
   function el(tag, text, className) {
@@ -257,7 +282,11 @@
   function clearView() {
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null; pollBusy = false; actionBusy = false;
+    if (pollController) pollController.abort();
+    pollController = null; pollFailures = 0;
     $('auto-refresh').checked = false;
+    $('background-refresh').checked = false; $('background-refresh').disabled = true;
+    $('refresh-status').textContent = '自动刷新已关闭';
     summary = null; runningConfig = null; accounts = {}; capabilities = {}; editor.clear(); diskMatchesRunning = true;
     expandedAccounts.clear();
     pendingQuotaQuery = null;
@@ -290,7 +319,7 @@
     };
     return messages[error.code] || '操作未完成，请检查规则或服务状态。';
   }
-  function report(error, source) { if (error.code !== 'stale' && error.code !== 'disconnected') notice(errorMessage(error), 'error', source); }
+  function report(error, source) { if (!['stale', 'disconnected', 'cancelled'].includes(error.code)) notice(errorMessage(error), 'error', source); }
   function badge(text, type) { return el('span', text, 'badge' + (type ? ' ' + type : '')); }
   function date(value) {
     const time = resetTime(value);
@@ -347,7 +376,8 @@
     const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
     const progress = job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' + (job.failed && job.last_error ? '；最近失败：' + quotaFailure(job) : '') : '尚未执行手动查询';
     const reason = quotaQueryReason();
-    $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · 5 小时到期查询：' + (query.on_five_hour_expiry ? '开启' : '关闭') + ' · 周到期查询：' + (query.on_weekly_expiry ? '开启' : '关闭') + ' · ' + (reason || progress);
+    const periodic = [['five_hour', '5 小时'], ['weekly', '7 天']].filter(([window]) => query[window]?.periodic_enabled !== false).map(([window, label]) => label + '（' + (query[window]?.interval && query[window].interval !== '0s' ? query[window].interval : query.interval || '30s') + '）');
+    $('quota-query-status').textContent = '定期查询：' + (query.automatic ? periodic.join(' / ') || '无参与策略' : '关闭') + ' · 5 小时到期查询：' + (query.on_five_hour_expiry ? '开启' : '关闭') + ' · 周到期查询：' + (query.on_weekly_expiry ? '开启' : '关闭') + ' · ' + (reason || progress);
     $('quota-query').disabled = !session.connected() || actionBusy || !!reason || running;
   }
   function renderSchedulePlan() {
@@ -363,9 +393,17 @@
       return;
     }
     const triggers = {periodic: '定期额度查询', five_hour_reset: '5 小时到期', weekly_reset: '周额度到期', daily_schedule: '每日时间点 / 随机时段', verification: '发送后窗口核实'};
-    for (const entry of plan.entries) {
-      const row = el('article', undefined, 'card plan-item');
-      row.append(el('h3', (entry.kind === 'wake' ? '模型唤醒 · ' : '额度查询 · ') + (triggers[entry.trigger] || entry.trigger)), el('p', entry.account_id || '账号池目标' + (entry.rule_id ? ' · ' + entry.rule_id : ''), 'account-id'));
+    let lastDay = '';
+    const entries = [...plan.entries].sort((first, second) => new Date(first.earliest_at) - new Date(second.earliest_at));
+    for (const entry of entries) {
+      const day = date(entry.earliest_at).split(' ')[0];
+      if (day !== lastDay) {
+        $('plan-list').append(el('li', day, 'timeline-day'));
+        lastDay = day;
+      }
+      const row = el('li', undefined, 'card plan-item plan-' + (entry.kind === 'wake' ? 'wake' : 'query') + (entry.status === 'blocked' ? ' plan-blocked' : ''));
+      const window = {five_hour: ' · 5 小时', weekly: ' · 7 天'}[entry.window] || '';
+      row.append(el('h3', (entry.kind === 'wake' ? '模型唤醒 · ' : '额度查询 · ') + (triggers[entry.trigger] || entry.trigger) + window), el('p', entry.account_id || '账号池目标' + (entry.rule_id ? ' · ' + entry.rule_id : ''), 'account-id'));
       const range = date(entry.earliest_at) + (entry.latest_at && entry.latest_at !== entry.earliest_at ? ' — ' + date(entry.latest_at) : '');
       row.append(el('p', range + (entry.repeat_every ? ' · 每 ' + entry.repeat_every + ' 循环' : '')), el('p', ({scheduled: '已分配时间', estimated: '预计时间 / 随机范围', blocked: '暂不可执行'}[entry.status] || entry.status) + (entry.model ? ' · 模型 ' + entry.model : ''), 'hint'), el('p', entry.detail, 'hint'));
       $('plan-list').append(row);
@@ -435,19 +473,19 @@
       name.append(el('div', id, 'account-id'));
       const runningPaused = runningConfig?.account_overrides && Object.hasOwn(runningConfig.account_overrides, id) && runningConfig.account_overrides[id]?.paused === true;
       const pauseChanged = paused !== Boolean(runningPaused);
-      const accountStatus = pauseChanged ? (paused ? '待保存：暂停唤醒' : '待保存：恢复唤醒') : paused ? '唤醒已暂停' : a.Enabled ? '账号已启用' : '账号已禁用';
+      const accountStatus = pauseChanged ? (paused ? '待保存：暂停唤醒' : '待保存：恢复唤醒') : paused ? '唤醒已暂停' : a.Enabled ? '账号已启用' : 'CPA 账号不可用';
       header.append(name, badge(accountStatus, paused || pauseChanged || !a.Enabled ? 'warning' : '')); card.append(header);
       const windows = el('div', undefined, 'window-grid'); windows.append(windowCell('5 小时额度', a.FiveHour), windowCell('周额度', a.Weekly)); card.append(windows);
       const queryRow = el('div', undefined, 'account-query'), job = quotaJob();
       const querying = ['queued', 'running'].includes(job.phase), selected = job.account_id === id;
-      const reason = quotaQueryReason() || (!a.Enabled && !runningPaused ? '账号已禁用，无法查询' : '');
+      const reason = quotaQueryReason();
       const queryButton = el('button', querying && selected ? '正在查询…' : '查询此账号额度', 'quiet');
       queryButton.type = 'button'; queryButton.dataset.quotaAccount = id;
       queryButton.disabled = !session.connected() || actionBusy || !!reason || querying || ['queued', 'running'].includes(manualWakeJob().phase);
       queryButton.title = reason || (querying ? '请等待当前手动查询结束' : '只访问此账号的额度接口，不发送模型请求');
       queryButton.addEventListener('click', () => { if (!queryButton.disabled) void requestQuotaQuery(id); });
       let queryText = reason || '仅查询额度，不发送模型请求';
-      if (selected && job.phase) queryText = ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，' + quotaFailure(job) : job.skipped ? '未查询：账号已禁用或移除' : '查询完成 · ' + date(job.finished_at));
+      if (selected && job.phase) queryText = ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，' + quotaFailure(job) : job.skipped ? '未查询：账号已移除或绑定不存在' : '查询完成 · ' + date(job.finished_at));
       const queryStatus = el('span', queryText, 'hint'); queryStatus.setAttribute('role', 'status');
       queryRow.append(queryButton, queryStatus); card.append(queryRow);
       const wakeRow = el('div', undefined, 'account-query'), wake = manualWakeJob();
@@ -550,10 +588,10 @@
     for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button')) field.disabled = value || field.dataset.fixed === 'true';
     updateDraftBadge(); renderAccounts(); renderQuotaQuery(); renderCapabilities();
   }
-  async function readSnapshots() {
+  async function readSnapshots(signal) {
     const generation = session.generation();
-    const [nextSummary, nextAccounts, nextCapabilities] = await Promise.all([session.request('/summary'), session.request('/accounts'), session.request('/capabilities')]);
-    if (generation !== session.generation()) return;
+    const [nextSummary, nextAccounts, nextCapabilities] = await Promise.all([session.request('/summary', 'GET', undefined, signal), session.request('/accounts', 'GET', undefined, signal), session.request('/capabilities', 'GET', undefined, signal)]);
+    if (generation !== session.generation() || signal?.aborted) return;
     if (![nextSummary, nextAccounts, nextCapabilities].every(validObject)) throw new PanelError('invalid_response');
     summary = nextSummary; accounts = nextAccounts; capabilities = nextCapabilities; renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
     if (noticeSource === 'snapshots') notice('');
@@ -561,18 +599,52 @@
   function schedulePoll() {
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null;
-    if (session.connected() && !document.hidden && $('auto-refresh').checked) pollTimer = root.setTimeout(() => refreshSnapshots(false), 5000);
+    $('background-refresh').disabled = !$('auto-refresh').checked;
+    if (!session.connected() || !$('auto-refresh').checked) { $('refresh-status').textContent = '自动刷新已关闭'; return; }
+    if (root.navigator?.onLine === false) { $('refresh-status').textContent = '网络离线 · 联网后自动继续'; return; }
+    if (document.hidden && !$('background-refresh').checked) { $('refresh-status').textContent = '标签页隐藏 · 返回后自动继续'; return; }
+    const delay = Math.min(5000 * 2 ** Math.min(pollFailures, 4), 60000);
+    $('refresh-status').textContent = pollFailures ? '读取暂未恢复 · ' + delay / 1000 + ' 秒后自动重试，保留已有数据' : '持续刷新已开启' + ($('background-refresh').checked ? '（含后台标签页）' : '') + ' · 每 5 秒读取状态';
+    if (!pollBusy) pollTimer = root.setTimeout(() => refreshSnapshots(false), delay);
+  }
+  function stopAutomaticPoll() {
+    if (pollTimer) root.clearTimeout(pollTimer);
+    pollTimer = null;
+    if (pollController) pollController.abort();
+    schedulePoll();
+  }
+  function resumeAutomaticPoll() {
+    if (!session.connected() || !$('auto-refresh').checked || (document.hidden && !$('background-refresh').checked) || root.navigator?.onLine === false) { schedulePoll(); return; }
+    if (pollBusy) return;
+    if (pollTimer) root.clearTimeout(pollTimer);
+    pollTimer = null;
+    void refreshSnapshots(false);
   }
   async function refreshSnapshots(manual) {
-    if (!session.connected() || pollBusy || (!manual && (document.hidden || !$('auto-refresh').checked))) return;
+    if (!session.connected() || pollBusy || (!manual && ((document.hidden && !$('background-refresh').checked) || !$('auto-refresh').checked || root.navigator?.onLine === false))) return;
+    if (pollTimer) root.clearTimeout(pollTimer);
+    pollTimer = null;
     const generation = session.generation(); pollBusy = true; $('refresh').disabled = true;
-    try { if (manual) await readRunningConfig(); await readSnapshots(); if (manual && generation === session.generation()) notice('状态快照已更新。'); }
-    catch (error) { report(error, 'snapshots'); }
-    finally { if (generation === session.generation()) { pollBusy = false; $('refresh').disabled = false; schedulePoll(); } }
+    const controller = new AbortController();
+    if (!manual) pollController = controller;
+    try {
+      await readRunningConfig(controller.signal); await readSnapshots(controller.signal);
+      if (generation !== session.generation() || controller.signal.aborted) return;
+      pollFailures = 0;
+      if (manual) notice('状态快照已更新。');
+    } catch (error) {
+      if (error.code === 'authentication') { report(error); return; }
+      if (generation !== session.generation() || controller.signal.aborted) return;
+      pollFailures = Math.min(pollFailures + 1, 4);
+      report(error, 'snapshots');
+    } finally {
+      controller.abort();
+      if (generation === session.generation()) { if (pollController === controller) pollController = null; pollBusy = false; $('refresh').disabled = false; schedulePoll(); }
+    }
   }
-  async function readRunningConfig() {
-    const generation = session.generation(), config = await session.request('/config');
-    if (generation !== session.generation()) return;
+  async function readRunningConfig(signal) {
+    const generation = session.generation(), config = await session.request('/config', 'GET', undefined, signal);
+    if (generation !== session.generation() || signal?.aborted) return;
     if (!validObject(config)) throw new PanelError('invalid_response');
     runningConfig = config;
   }
@@ -643,7 +715,7 @@
       if (editor.rawDirty()) throw new PanelError('unapplied_json');
       let value = input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value;
       if (input.type === 'number' && (!input.value.trim() || !Number.isFinite(value))) throw new PanelError('invalid_config');
-      if (input.dataset.field === 'ordinary_rules.allowed_hours') value = input.value.split(/[,，\n]/).map(x => x.trim()).filter(Boolean);
+      if (input.dataset.field === 'ordinary_rules.allowed_hours' || input.dataset.field.endsWith('.excluded_hours')) value = input.value.split(/[,，\n]/).map(x => x.trim()).filter(Boolean);
       editor.update(input.dataset.field, value); draftChanged(); renderAccounts();
     } catch (error) { report(error); const cfg = editor.value(); if (cfg) { const old = fieldValue(cfg, input.dataset.field); if (input.type === 'checkbox') input.checked = old === true; else input.value = Array.isArray(old) ? old.join(', ') : old ?? ''; } }
   });
@@ -681,7 +753,8 @@
     finally { if (generation === session.generation()) busy(false); }
   });
   $('refresh').addEventListener('click', () => refreshSnapshots(true));
-  $('auto-refresh').addEventListener('change', schedulePoll);
+  $('auto-refresh').addEventListener('change', () => { if (!$('auto-refresh').checked) { $('background-refresh').checked = false; stopAutomaticPoll(); } else { pollFailures = 0; schedulePoll(); } });
+  $('background-refresh').addEventListener('change', () => { if (document.hidden && !$('background-refresh').checked) stopAutomaticPoll(); else resumeAutomaticPoll(); });
   function manualWakeJob() {
     const job = summary?.scheduler?.manual_wake || {};
     if (pendingManualWake) {
@@ -739,7 +812,11 @@
     finally { if (generation === session.generation()) busy(false); }
   });
   $('account-search').addEventListener('input', renderAccounts); $('account-filter').addEventListener('change', renderAccounts);
-  document.addEventListener('visibilitychange', () => { if (document.hidden) { if (pollTimer) root.clearTimeout(pollTimer); pollTimer = null; } else if (session.connected()) refreshSnapshots(false); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden && !$('background-refresh').checked) stopAutomaticPoll(); else resumeAutomaticPoll(); });
+  root.addEventListener('offline', stopAutomaticPoll);
+  root.addEventListener('online', resumeAutomaticPoll);
+  root.addEventListener('focus', resumeAutomaticPoll);
+  root.addEventListener('pageshow', () => { if (session.connected()) resumeAutomaticPoll(); });
   root.addEventListener('beforeunload', event => { if (editor.dirty()) { event.preventDefault(); event.returnValue = ''; } });
   root.addEventListener('pagehide', () => session.disconnect());
   root.setInterval(() => { if (!session.connected() || document.hidden) return; for (const item of document.querySelectorAll('[data-reset]')) item.textContent = countdown(item.dataset.reset); }, 1000);

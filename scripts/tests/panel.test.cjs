@@ -33,8 +33,9 @@ test('manual wake remains independent of automatic settings but requires safety 
   assert.ok(calls[0].url.endsWith('/manual-wake'));
   session.disconnect();
 });
-function createPanelFixture(fetcher, confirm = () => true) {
-  const elements = new Map(), timers = new Map(), visibility = new Map(), requests = [];
+function createPanelFixture(fetcher, confirm = () => true, fields = []) {
+  const elements = new Map(), timers = new Map(), visibility = new Map(), events = new Map(), requests = [];
+  const navigator = {onLine: true};
   let nextTimer = 0;
   function element() {
     return {value: '', textContent: '', checked: false, disabled: false, hidden: true, dataset: {}, listeners: new Map(), children: [],
@@ -45,28 +46,29 @@ function createPanelFixture(fetcher, confirm = () => true) {
     if (!elements.has(id)) elements.set(id, element());
     return elements.get(id);
   }
-  const document = {hidden: false, getElementById: lookup, createElement: element, querySelectorAll: () => [],
+  const fieldElements = fields.map(({id, field, type}) => { const input = lookup(id); input.dataset.field = field; input.type = type || 'text'; return input; });
+  const document = {hidden: false, getElementById: lookup, createElement: element, querySelectorAll: selector => selector === '[data-field]' || selector.startsWith('#workspace [data-field]') ? fieldElements : [],
     createTextNode: text => ({textContent: text, children: [], dataset: {}}),
     addEventListener: (event, handler) => visibility.set(event, handler)};
   const config = {...policy(), quota_query: {automatic: false, manual: false, interval: '30s'}};
   const data = {summary: {running: true, enabled: false, scheduler: {}}, accounts: {},
     capabilities: {QuotaAdapterReady: true}, config, 'config-editor': {config, revision: 'r1'}};
   runInNewContext(readFileSync(require.resolve('../../internal/plugin/web/panel.js'), 'utf8'), {
-    document, URL, AbortController, structuredClone, confirm,
+    document, navigator, URL, AbortController, structuredClone, confirm,
     location: {origin: 'https://cpa.test', pathname: '/v0/resource/plugins/codex-window-refresh/status'},
-    localStorage: {getItem: () => null}, addEventListener() {}, setInterval() {},
+    localStorage: {getItem: () => null}, addEventListener: (event, handler) => events.set(event, handler), setInterval() {},
     setTimeout: (callback, duration) => {const timer = ++nextTimer; timers.set(timer, {callback, duration}); return timer;},
     clearTimeout: timer => timers.delete(timer),
     fetch: async (url, options) => {requests.push({url, options}); return fetcher ? fetcher(url, options, data) : response(data[url.split('/').pop()] || {status: 'queued'});}
   });
   const settle = () => new Promise(resolve => setImmediate(resolve));
   async function poll() {
-    const [timerID, timer] = [...timers].find(([, value]) => value.duration === 5000);
+    const [timerID, timer] = [...timers].find(([, value]) => [5000, 10000, 20000, 40000, 60000].includes(value.duration));
     timers.delete(timerID);
     timer.callback();
     await settle();
   }
-  return {lookup, timers, visibility, requests, settle, poll};
+  return {lookup, timers, visibility, events, navigator, document, requests, settle, poll};
 }
 test('account cards require confirmation for exact manual wake and never animate an unstarted window', async () => {
   let confirmed = false;
@@ -100,6 +102,30 @@ test('account cards require confirmation for exact manual wake and never animate
   assert.match(confirmations[0], /真实模型请求并消耗额度/);
   lookup('disconnect').listeners.get('click')();
 });
+test('unavailable account still allows exact quota query while manual wake stays blocked', async () => {
+  const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
+    data.capabilities.StableAccountIdentity = data.capabilities.ExactAccountExecution = true;
+    data.accounts = {'unavailable-account': {ID: 'unavailable-account', Enabled: false, Permission: 'blocked', FiveHour: {State: 'expired', Remaining: {Value: 0, Unit: 'percent'}}}};
+    return response(data[url.split('/').pop()] || {status: 'queued'}, options.method === 'POST' ? 202 : 200);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  const descendants = item => [item, ...item.children.flatMap(descendants)];
+  const items = descendants(lookup('account-list'));
+  const query = items.find(item => item.dataset.quotaAccount === 'unavailable-account');
+  const wake = items.find(item => item.dataset.wakeAccount === 'unavailable-account');
+  assert.ok(query); assert.ok(wake);
+  assert.equal(query.disabled, false);
+  assert.equal(wake.disabled, true);
+  assert.ok(items.some(item => item.textContent === 'CPA 账号不可用'));
+  query.listeners.get('click')();
+  await settle();
+  const writes = requests.filter(request => request.options.method === 'POST');
+  assert.equal(writes.length, 1);
+  assert.ok(writes[0].url.endsWith('/quota-query'));
+  assert.deepEqual(JSON.parse(writes[0].options.body), {account_id: 'unavailable-account'});
+  lookup('disconnect').listeners.get('click')();
+});
 test('granular settings can be added to legacy drafts without enabling other features', () => {
   const editor = createEditor(), original = policy();
   editor.load({config: original, revision: 'r1'}, true);
@@ -129,6 +155,77 @@ test('daily point and range controls serialize valid wall-clock rules', () => {
     assert.throws(() => dailyTimeRange(mode, start, end), {code: 'invalid_config'});
   }
 });
+test('independent query policy fields scaffold old configurations without enabling requests', () => {
+  const editor = createEditor();
+  editor.load({config: policy(), revision: 'query-policy'});
+  assert.equal(editor.dirty(), false);
+  editor.update('quota_query.five_hour.expiry.excluded_hours', ['22:00-08:00']);
+  editor.update('quota_query.five_hour.expiry.random_delay.min', '1m');
+  editor.update('quota_query.five_hour.expiry.random_delay.max', '5m');
+  editor.update('quota_query.weekly.periodic_enabled', false);
+  editor.update('quota_query.weekly.periodic.random_delay.max', '2m');
+  const draft = editor.value();
+  assert.equal(draft.quota_query.automatic, false);
+  assert.equal(draft.quota_query.on_five_hour_expiry, false);
+  assert.equal(draft.quota_query.weekly.periodic_enabled, false);
+  assert.deepEqual(draft.quota_query.five_hour.expiry.excluded_hours, ['22:00-08:00']);
+  assert.deepEqual(draft.quota_query.five_hour.expiry.random_delay, {min: '1m', max: '5m'});
+  editor.replace(draft);
+  for (const invalid of [null, '22:00-08:00', [false]]) {
+    const config = structuredClone(draft);
+    config.quota_query.five_hour.expiry.excluded_hours = invalid;
+    assert.throws(() => editor.replace(config), {code: 'invalid_config'});
+  }
+  assert.throws(() => editor.update('quota_query.weekly.unrecognized.value', true), {code: 'invalid_config'});
+});
+test('query policy form parses excluded hours and saves separate windows as one draft', async () => {
+  const fields = [{id: 'five-hours', field: 'quota_query.five_hour.expiry.excluded_hours'}, {id: 'week-min', field: 'quota_query.weekly.periodic.random_delay.min'}];
+  const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
+    if (url.endsWith('/config') && options.method === 'POST') {
+      const saved = JSON.parse(options.body);
+      data.config = saved.config;
+      return response({config: saved.config, revision: 'r2'});
+    }
+    return response(data[url.split('/').pop()]);
+  }, () => true, fields);
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  assert.equal(lookup('five-hours').value, '');
+  assert.equal(lookup('week-min').value, '0s');
+  lookup('five-hours').value = '22:00-08:00，12:00-13:00\n';
+  lookup('five-hours').listeners.get('change')();
+  lookup('week-min').value = '0s'; lookup('week-min').listeners.get('change')();
+  lookup('config-save').listeners.get('click')();
+  await settle();
+  const writes = requests.filter(request => request.options.method === 'POST');
+  assert.equal(writes.length, 1);
+  const saved = JSON.parse(writes[0].options.body).config;
+  assert.deepEqual(saved.quota_query.five_hour.expiry.excluded_hours, ['22:00-08:00', '12:00-13:00']);
+  assert.equal(saved.quota_query.weekly.periodic.random_delay.min, '0s');
+  assert.equal(saved.quota_query.automatic, false);
+  lookup('disconnect').listeners.get('click')();
+});
+test('timeline sorts events and groups days in configured timezone without writes', async () => {
+  const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
+    data.config.timezone = 'Asia/Shanghai';
+    data.summary.scheduler.plan = {enabled: true, horizon_days: 3, entries: [
+      {kind: 'wake', trigger: 'weekly_reset', earliest_at: '2026-10-14T16:00:00Z', latest_at: '2026-10-14T16:00:00Z', status: 'blocked', detail: 'blocked'},
+      {kind: 'query', trigger: 'periodic', window: 'five_hour', earliest_at: '2026-10-13T16:00:00Z', latest_at: '2026-10-13T16:00:00Z', repeat_every: '30s', status: 'estimated', detail: 'query'}
+    ]};
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  const rows = lookup('plan-list').children;
+  assert.equal(rows.length, 4);
+  assert.match(rows[0].textContent, /2026\/10\/14/);
+  assert.match(rows[1].children[0].textContent, /5 小时/);
+  assert.match(rows[1].children[2].textContent, /每 30s 循环/);
+  assert.match(rows[2].textContent, /2026\/10\/15/);
+  assert.equal(rows[3].className, 'card plan-item plan-wake plan-blocked');
+  assert.equal(requests.some(request => request.options.method === 'POST'), false);
+  lookup('disconnect').listeners.get('click')();
+});
 test('future plan renders server state safely without dispatching operations', async () => {
   const now = new Date().toISOString();
   const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
@@ -137,7 +234,9 @@ test('future plan renders server state safely without dispatching operations', a
   });
   lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
   await settle();
-  const row = lookup('plan-list').children[0];
+  const row = lookup('plan-list').children[1];
+  assert.equal(lookup('plan-list').children[0].className, 'timeline-day');
+  assert.equal(row.className, 'card plan-item plan-query');
   assert.ok(row.children.some(item => item.textContent === '<img src=x onerror=alert(1)>'));
   assert.match(lookup('plan-status').textContent, /未来 3 天/);
   assert.equal(requests.some(request => request.options.method === 'POST'), false);
@@ -198,6 +297,125 @@ test('page polling requires opt-in and legacy manual permission does not block q
   lookup('disconnect').listeners.get('click')();
   assert.equal(lookup('auto-refresh').checked, false);
   assert.equal(timers.size, 0);
+});
+test('long-running polling backs off failures and returns to five seconds without accumulating requests', async () => {
+  let failing = false;
+  const {lookup, timers, settle, poll, requests} = createPanelFixture(async (url, options, data) => {
+    if (failing && url.endsWith('/accounts')) throw new Error('temporary network failure');
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('auto-refresh').checked = true; lookup('auto-refresh').listeners.get('change')();
+  failing = true;
+  for (const expected of [10000, 20000, 40000, 60000, 60000]) {
+    await poll();
+    assert.equal(timers.size, 1);
+    assert.equal([...timers.values()][0].duration, expected);
+    assert.match(lookup('refresh-status').textContent, /自动重试/);
+  }
+  failing = false;
+  for (let cycle = 0; cycle < 100; cycle++) {
+    await poll();
+    assert.equal(timers.size, 1);
+    assert.equal([...timers.values()][0].duration, 5000);
+    assert.equal(lookup('notice').hidden, true);
+  }
+  assert.equal(requests.filter(request => request.options.method === 'POST').length, 0);
+  lookup('disconnect').listeners.get('click')();
+  assert.equal(timers.size, 0);
+});
+test('background refresh is explicit and resumes after tab changes and offline periods', async () => {
+  const {lookup, timers, settle, poll, requests, document, navigator, visibility, events} = createPanelFixture();
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  assert.equal(lookup('background-refresh').checked, false);
+  assert.equal(lookup('background-refresh').disabled, true);
+  lookup('auto-refresh').checked = true; lookup('auto-refresh').listeners.get('change')();
+  document.hidden = true; visibility.get('visibilitychange')();
+  assert.equal(timers.size, 0);
+  assert.match(lookup('refresh-status').textContent, /标签页隐藏/);
+  const paused = requests.length;
+  events.get('focus')(); await settle();
+  assert.equal(requests.length, paused);
+  lookup('background-refresh').checked = true; lookup('background-refresh').listeners.get('change')();
+  await settle(); await poll();
+  assert.ok(requests.length > paused);
+  assert.equal(timers.size, 1);
+  assert.match(lookup('refresh-status').textContent, /含后台标签页/);
+  navigator.onLine = false; events.get('offline')();
+  assert.equal(timers.size, 0);
+  assert.match(lookup('refresh-status').textContent, /网络离线/);
+  const offline = requests.length;
+  events.get('focus')(); await settle();
+  assert.equal(requests.length, offline);
+  navigator.onLine = true; events.get('online')(); await settle();
+  assert.ok(requests.length > offline);
+  assert.equal(timers.size, 1);
+  lookup('auto-refresh').checked = false; lookup('auto-refresh').listeners.get('change')();
+  assert.equal(lookup('background-refresh').checked, false);
+  assert.equal(lookup('background-refresh').disabled, true);
+  assert.equal(timers.size, 0);
+  const disabled = requests.length;
+  document.hidden = false; visibility.get('visibilitychange')(); events.get('online')(); events.get('focus')();
+  await settle(); assert.equal(requests.length, disabled);
+  lookup('disconnect').listeners.get('click')();
+});
+test('pausing an in-flight poll cancels only its reads and does not render late data', async () => {
+  let pending = false, lateRead;
+  const {lookup, timers, settle, poll, requests, document, visibility, events} = createPanelFixture(async (url, options, data) => {
+    if (pending && url.endsWith('/accounts')) {
+      return new Promise(resolve => {lateRead = () => resolve(response({late: {ID: 'late', Enabled: true}}));});
+    }
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('auto-refresh').checked = true; lookup('auto-refresh').listeners.get('change')();
+  pending = true; await poll();
+  const outstanding = requests.at(-2), count = requests.length;
+  events.get('focus')(); events.get('online')();
+  assert.equal(requests.length, count, 'parallel wake-up events duplicated an in-flight refresh');
+  document.hidden = true; visibility.get('visibilitychange')();
+  assert.equal(outstanding.options.signal.aborted, true);
+  assert.equal(timers.size, 1, 'the pending transport retains only its timeout until it settles');
+  lateRead(); await settle();
+  assert.equal(timers.size, 0);
+  assert.equal(lookup('notice').hidden, true);
+  assert.equal(lookup('account-count').textContent, '显示 0 / 0 个账号');
+  pending = false; document.hidden = false; visibility.get('visibilitychange')(); await settle();
+  assert.equal(timers.size, 1);
+  assert.equal(lookup('refresh').disabled, false);
+  lookup('disconnect').listeners.get('click')();
+});
+test('polling updates applied configuration while preserving unsaved JSON and rule drafts', async () => {
+  let newConfig = false;
+  const {lookup, settle, poll} = createPanelFixture(async (url, options, data) => {
+    if (newConfig) data.config.quota_query.on_weekly_expiry = true;
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('config-json').value = '{unsaved-json'; lookup('config-json').listeners.get('input')();
+  lookup('auto-refresh').checked = true; lookup('auto-refresh').listeners.get('change')();
+  newConfig = true; await poll();
+  assert.equal(lookup('config-json').value, '{unsaved-json');
+  assert.match(lookup('quota-query-status').textContent, /周到期查询：开启/);
+  assert.equal(lookup('save-bar').hidden, false);
+});
+test('authenticated polling stops on rejected credentials rather than repeatedly retrying', async () => {
+  let rejected = false;
+  const {lookup, timers, settle, poll, requests, events} = createPanelFixture(async (url, options, data) => response(data[url.split('/').pop()], rejected ? 401 : 200));
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('auto-refresh').checked = true; lookup('auto-refresh').listeners.get('change')();
+  rejected = true; await poll();
+  assert.equal(lookup('workspace').hidden, true);
+  assert.match(lookup('notice').textContent, /认证失败/);
+  assert.equal(timers.size, 0);
+  const stopped = requests.length;
+  events.get('online')(); events.get('focus')(); await settle();
+  assert.equal(requests.length, stopped);
 });
 test('successful snapshot reads hide recovered timeout and network errors', async () => {
   for (const failure of ['timeout', 'network']) {
@@ -295,6 +513,22 @@ test('quota errors show safe stages and distinguish management authentication fr
   assert.match(quotaFailure({last_error: 'quota_query_timeout'}), /查询超时/);
   assert.equal(quotaFailure({last_error: 'private-token', diagnostic: {stage: 'private-proxy', http_status: 999, elapsed_ms: -1}}), '可手动重试');
   assert.equal(quotaFailure({last_error: '__proto__', diagnostic: {stage: 'constructor'}}), '可手动重试');
+});
+test('cancelling a poll does not cancel or retry a concurrent write', async () => {
+  const signals = new Map(), cancellation = new AbortController();
+  const session = createSession(async (url, options) => {
+    signals.set(url.split('/').pop(), options.signal);
+    return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+  }, null, {setTimeout: () => 1, clearTimeout() {}});
+  session.setKey('test-key');
+  const read = session.request('/accounts', 'GET', undefined, cancellation.signal);
+  const write = session.request('/manual-wake', 'POST', {account_id: 'a'});
+  cancellation.abort();
+  await assert.rejects(read, {code: 'cancelled'});
+  assert.equal(signals.get('manual-wake').aborted, false);
+  assert.equal(session.connected(), true);
+  session.disconnect();
+  await assert.rejects(write, {code: 'stale'});
 });
 test('host connection check timeout is read-only and never retries', async () => {
   let expire, duration, calls = 0;

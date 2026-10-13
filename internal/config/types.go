@@ -110,11 +110,23 @@ type Execution struct {
 
 // QuotaQuery controls read-only polling independently from model wake rules.
 type QuotaQuery struct {
-	Automatic        bool     `json:"automatic"`
-	Manual           bool     `json:"manual"`
-	Interval         Duration `json:"interval"`
-	OnFiveHourExpiry bool     `json:"on_five_hour_expiry"`
-	OnWeeklyExpiry   bool     `json:"on_weekly_expiry"`
+	Automatic        bool        `json:"automatic"`
+	Manual           bool        `json:"manual"`
+	Interval         Duration    `json:"interval"`
+	OnFiveHourExpiry bool        `json:"on_five_hour_expiry"`
+	OnWeeklyExpiry   bool        `json:"on_weekly_expiry"`
+	FiveHour         WindowQuery `json:"five_hour"`
+	Weekly           WindowQuery `json:"weekly"`
+}
+type QueryTiming struct {
+	ExcludedHours []string   `json:"excluded_hours"`
+	RandomDelay   DelayRange `json:"random_delay"`
+}
+type WindowQuery struct {
+	PeriodicEnabled bool        `json:"periodic_enabled"`
+	Interval        Duration    `json:"interval"`
+	Expiry          QueryTiming `json:"expiry"`
+	Periodic        QueryTiming `json:"periodic"`
 }
 type Planning struct {
 	Enabled     bool `json:"enabled"`
@@ -147,12 +159,27 @@ type Config struct {
 func Defaults() Config {
 	delay := DelayRange{Min: 0, Max: Duration(10 * time.Minute)}
 	return Config{SchemaVersion: 1, Enabled: false, Timezone: "Asia/Shanghai",
-		QuotaQuery:    QuotaQuery{Automatic: false, Manual: true, Interval: Duration(30 * time.Second)},
+		QuotaQuery:    QuotaQuery{Automatic: false, Manual: true, Interval: Duration(30 * time.Second), FiveHour: defaultWindowQuery(), Weekly: defaultWindowQuery()},
 		Planning:      Planning{Enabled: false, HorizonDays: 7},
 		ResetRules:    ResetRules{FiveHour: ResetRule{Enabled: true, RandomDelay: delay}, Weekly: WeeklyRule{Enabled: true, RandomDelay: delay, BypassActivityLimit: true, BypassAllowedHours: true}},
 		Activity:      Activity{Lookback: Duration(30 * time.Minute), AccountsPerUser: 1, MaxAccounts: 10, IdentitySource: "host_caller_scope"},
 		OrdinaryRules: OrdinaryRules{DailyEnabled: true, AllowedHours: []string{"08:00-23:00"}, AllowOutsideHoursWhenUsersActive: true}, DailyRules: []DailyRule{},
 		Execution: Execution{QuotaReadTimeout: Duration(15 * time.Second), RequestTimeout: Duration(time.Minute), Prompt: "Reply OK.", MaxConcurrency: 1, MinDispatchSpacing: Duration(5 * time.Second), QuotaMaxAgeBeforeSend: Duration(30 * time.Second), VerifyDelays: []Duration{Duration(5 * time.Second), Duration(30 * time.Second), Duration(2 * time.Minute)}, VerificationCapacityHold: Duration(15 * time.Minute), CatchUp: true}, AccountOverrides: map[core.AccountID]AccountOverride{}}
+}
+
+func defaultWindowQuery() WindowQuery {
+	return WindowQuery{PeriodicEnabled: true, Expiry: QueryTiming{ExcludedHours: []string{}}, Periodic: QueryTiming{ExcludedHours: []string{}}}
+}
+
+func (query QuotaQuery) Window(weekly bool) WindowQuery {
+	window := query.FiveHour
+	if weekly {
+		window = query.Weekly
+	}
+	if window.Interval == 0 {
+		window.Interval = query.Interval
+	}
+	return window
 }
 
 func (settings Config) WakeContent(reason core.Reason) (string, string) {

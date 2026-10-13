@@ -10,6 +10,24 @@ quota_query:
   on_weekly_expiry: false
   manual: true # 兼容旧配置；手动查询始终允许，此字段不再控制权限
   interval: 30s # 定期查询间隔，允许 30s 到 1h
+  five_hour:
+    periodic_enabled: true
+    interval: 0s
+    expiry:
+      excluded_hours: []
+      random_delay: {min: 0s, max: 0s}
+    periodic:
+      excluded_hours: []
+      random_delay: {min: 0s, max: 0s}
+  weekly:
+    periodic_enabled: true
+    interval: 0s
+    expiry:
+      excluded_hours: []
+      random_delay: {min: 0s, max: 0s}
+    periodic:
+      excluded_hours: []
+      random_delay: {min: 0s, max: 0s}
 timezone: Asia/Shanghai
 
 # 仅生成未来预览，不开启查询或模型请求；未知窗口不推算新周期。

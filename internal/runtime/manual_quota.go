@@ -80,23 +80,19 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 			e.manualIDs = append(e.manualIDs, e.manualQuery.AccountID)
 		} else {
 			for _, a := range e.inventory {
-				if a.Enabled {
-					e.manualIDs = append(e.manualIDs, a.ID)
-				}
+				e.manualIDs = append(e.manualIDs, a.ID)
 			}
 		}
 		sort.Slice(e.manualIDs, func(i, j int) bool { return e.manualIDs[i] < e.manualIDs[j] })
 		e.manualQuery.Total, e.manualQuery.Phase = len(e.manualIDs), "running"
 	}
-	// Query all enabled host accounts, including ones paused only for model
-	// wake. Bound each cycle; cancellation and failed queries never retry a key.
 	for n := 0; n < 4 && e.manualIndex < len(e.manualIDs) && ctx.Err() == nil; n++ {
 		id := e.manualIDs[e.manualIndex]
 		e.manualIndex++
 		available := false
 		for _, a := range e.inventory {
 			if a.ID == id {
-				available = a.Enabled
+				available = true
 				break
 			}
 		}
