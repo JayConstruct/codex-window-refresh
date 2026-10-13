@@ -423,9 +423,12 @@ func (e *Engine) Step(ctx context.Context) error {
 		a := e.state.Accounts[id]
 		verifying := a.Task != nil && a.Task.OperationID != "" && !now.Before(a.Task.NextVerificationAt)
 		pendingOperation := a.Task != nil && a.Task.OperationID != ""
-		if caps.QuotaAdapterReady && (a.Enabled || pendingOperation) && (verifying || (e.cfg.QuotaQuery.Automatic && !pendingOperation && !now.Before(e.nextRead[id]))) && reads < 4 && !now.Before(e.nextPreflight[id]) {
+		expiryQuery := e.expiryQueryDue(a, now)
+		if caps.QuotaAdapterReady && (a.Enabled || pendingOperation) && (verifying || ((e.cfg.QuotaQuery.Automatic || expiryQuery) && !pendingOperation && !now.Before(e.nextRead[id]))) && reads < 4 && !now.Before(e.nextPreflight[id]) {
 			reads++
-			_ = e.observe(ctx, id)
+			if readErr := e.observe(ctx, id); readErr == nil && expiryQuery {
+				e.markExpiryQueried(id, a, now)
+			}
 			a = e.state.Accounts[id]
 			if verifying && a.Task != nil && a.Task.OperationID != "" {
 				delays := e.cfg.Runtime().VerifyDelays
@@ -528,7 +531,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		task := *a.Task
 		task.Intents = append([]core.Intent(nil), a.Task.Intents...)
 		for i, v := range task.Intents {
-			if (v.Reason == core.ReasonWeekly && !p.WeeklyEnabled) || (v.Reason == core.ReasonFiveHour && !p.FiveHourEnabled) || (v.Reason == core.ReasonDaily && !p.OrdinaryParticipant) {
+			if (v.Reason == core.ReasonWeekly && !p.WeeklyEnabled) || (v.Reason == core.ReasonFiveHour && !p.FiveHourEnabled) || (v.Reason == core.ReasonDaily && (!p.OrdinaryParticipant || !e.cfg.OrdinaryRules.DailyEnabled)) {
 				task.Intents[i].Status = core.IntentSuperseded
 			}
 		}
@@ -591,7 +594,7 @@ func dueWeekly(a core.AccountState, now time.Time) bool {
 }
 func (e *Engine) hasEligibleDue(a core.AccountState, now time.Time) bool {
 	p := e.cfg.Account(a.ID)
-	return (p.WeeklyEnabled && hasDue(a, core.ReasonWeekly, now)) || (p.FiveHourEnabled && hasDue(a, core.ReasonFiveHour, now)) || (p.OrdinaryParticipant && hasDue(a, core.ReasonDaily, now))
+	return (p.WeeklyEnabled && hasDue(a, core.ReasonWeekly, now)) || (p.FiveHourEnabled && hasDue(a, core.ReasonFiveHour, now)) || (p.OrdinaryParticipant && e.cfg.OrdinaryRules.DailyEnabled && hasDue(a, core.ReasonDaily, now))
 }
 func oldestDue(a core.AccountState, now time.Time) time.Time {
 	var t time.Time

@@ -78,6 +78,7 @@ func (c Config) Validate() error {
 	}
 	duration("activity.lookback", c.Activity.Lookback, time.Minute, 24*time.Hour)
 	duration("quota_query.interval", c.QuotaQuery.Interval, 30*time.Second, time.Hour)
+	bound("planning.horizon_days", c.Planning.HorizonDays, 1, 30)
 	ratio := c.Activity.AccountsPerUser
 	if math.IsNaN(ratio) || math.IsInf(ratio, 0) {
 		add("activity.accounts_per_user", "NON_FINITE_NUMBER", "must be a finite number")
@@ -120,8 +121,16 @@ func (c Config) Validate() error {
 		}
 	}
 	model := c.Execution.Model
-	if c.Enabled && strings.TrimSpace(model) == "" {
-		add("execution.model", "MODEL_REQUIRED", "required when plugin is enabled")
+	needsFiveHour := c.ResetRules.FiveHour.Enabled
+	if c.OrdinaryRules.DailyEnabled {
+		for _, rule := range c.DailyRules {
+			needsFiveHour = needsFiveHour || rule.Enabled
+		}
+	}
+	fiveHourModel, _ := c.WakeContent("five_hour_reset")
+	weeklyModel, _ := c.WakeContent("weekly_reset")
+	if c.Enabled && ((needsFiveHour && strings.TrimSpace(fiveHourModel) == "") || (c.ResetRules.Weekly.Enabled && strings.TrimSpace(weeklyModel) == "")) {
+		add("execution.model", "MODEL_REQUIRED", "provide a default model or a model for every enabled wake rule")
 	}
 	if len(model) > 256 || !utf8.ValidString(model) {
 		add("execution.model", "OUT_OF_RANGE", "must be valid UTF-8 and at most 256 bytes")
@@ -131,6 +140,20 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Execution.Prompt) == "" || len(c.Execution.Prompt) > 4096 || !utf8.ValidString(c.Execution.Prompt) {
 		add("execution.prompt", "OUT_OF_RANGE", "must be nonempty valid UTF-8 and at most 4096 bytes")
+	}
+	for _, content := range []struct{ path, model, prompt string }{
+		{"reset_rules.five_hour", c.ResetRules.FiveHour.Model, c.ResetRules.FiveHour.Prompt},
+		{"reset_rules.weekly", c.ResetRules.Weekly.Model, c.ResetRules.Weekly.Prompt},
+	} {
+		if content.model != "" && (strings.TrimSpace(content.model) == "" || len(content.model) > 256 || !utf8.ValidString(content.model)) {
+			add(content.path+".model", "OUT_OF_RANGE", "must be empty or a valid model name of at most 256 bytes")
+		}
+		if strings.Contains(strings.ToUpper(content.model), "REPLACE_WITH") {
+			add(content.path+".model", "MODEL_PLACEHOLDER", "replace the example model placeholder")
+		}
+		if content.prompt != "" && (strings.TrimSpace(content.prompt) == "" || len(content.prompt) > 4096 || !utf8.ValidString(content.prompt)) {
+			add(content.path+".prompt", "OUT_OF_RANGE", "must be empty or valid content of at most 4096 bytes")
+		}
 	}
 	bound("execution.max_concurrency", c.Execution.MaxConcurrency, 1, 32)
 	duration("execution.quota_read_timeout", c.Execution.QuotaReadTimeout, time.Second, 5*time.Minute)

@@ -50,12 +50,16 @@ type DelayRange struct {
 type ResetRule struct {
 	Enabled     bool       `json:"enabled"`
 	RandomDelay DelayRange `json:"random_delay"`
+	Model       string     `json:"model"`
+	Prompt      string     `json:"prompt"`
 }
 type WeeklyRule struct {
 	Enabled             bool       `json:"enabled"`
 	RandomDelay         DelayRange `json:"random_delay"`
 	BypassActivityLimit bool       `json:"bypass_activity_limit"`
 	BypassAllowedHours  bool       `json:"bypass_allowed_hours"`
+	Model               string     `json:"model"`
+	Prompt              string     `json:"prompt"`
 }
 type ResetRules struct {
 	FiveHour ResetRule  `json:"five_hour"`
@@ -68,6 +72,7 @@ type Activity struct {
 	IdentitySource  string   `json:"identity_source"`
 }
 type OrdinaryRules struct {
+	DailyEnabled                     bool     `json:"daily_enabled"`
 	AllowedHours                     []string `json:"allowed_hours"`
 	AllowOutsideHoursWhenUsersActive bool     `json:"allow_outside_hours_when_users_active"`
 }
@@ -105,9 +110,15 @@ type Execution struct {
 
 // QuotaQuery controls read-only polling independently from model wake rules.
 type QuotaQuery struct {
-	Automatic bool     `json:"automatic"`
-	Manual    bool     `json:"manual"`
-	Interval  Duration `json:"interval"`
+	Automatic        bool     `json:"automatic"`
+	Manual           bool     `json:"manual"`
+	Interval         Duration `json:"interval"`
+	OnFiveHourExpiry bool     `json:"on_five_hour_expiry"`
+	OnWeeklyExpiry   bool     `json:"on_weekly_expiry"`
+}
+type Planning struct {
+	Enabled     bool `json:"enabled"`
+	HorizonDays int  `json:"horizon_days"`
 }
 type AccountOverride struct {
 	Paused                           *bool       `json:"paused,omitempty"`
@@ -129,6 +140,7 @@ type Config struct {
 	DailyRules         []DailyRule                        `json:"daily_rules"`
 	Execution          Execution                          `json:"execution"`
 	QuotaQuery         QuotaQuery                         `json:"quota_query"`
+	Planning           Planning                           `json:"planning"`
 	AccountOverrides   map[core.AccountID]AccountOverride `json:"account_overrides"`
 }
 
@@ -136,10 +148,29 @@ func Defaults() Config {
 	delay := DelayRange{Min: 0, Max: Duration(10 * time.Minute)}
 	return Config{SchemaVersion: 1, Enabled: false, Timezone: "Asia/Shanghai",
 		QuotaQuery:    QuotaQuery{Automatic: false, Manual: true, Interval: Duration(30 * time.Second)},
+		Planning:      Planning{Enabled: false, HorizonDays: 7},
 		ResetRules:    ResetRules{FiveHour: ResetRule{Enabled: true, RandomDelay: delay}, Weekly: WeeklyRule{Enabled: true, RandomDelay: delay, BypassActivityLimit: true, BypassAllowedHours: true}},
 		Activity:      Activity{Lookback: Duration(30 * time.Minute), AccountsPerUser: 1, MaxAccounts: 10, IdentitySource: "host_caller_scope"},
-		OrdinaryRules: OrdinaryRules{AllowedHours: []string{"08:00-23:00"}, AllowOutsideHoursWhenUsersActive: true}, DailyRules: []DailyRule{},
+		OrdinaryRules: OrdinaryRules{DailyEnabled: true, AllowedHours: []string{"08:00-23:00"}, AllowOutsideHoursWhenUsersActive: true}, DailyRules: []DailyRule{},
 		Execution: Execution{QuotaReadTimeout: Duration(15 * time.Second), RequestTimeout: Duration(time.Minute), Prompt: "Reply OK.", MaxConcurrency: 1, MinDispatchSpacing: Duration(5 * time.Second), QuotaMaxAgeBeforeSend: Duration(30 * time.Second), VerifyDelays: []Duration{Duration(5 * time.Second), Duration(30 * time.Second), Duration(2 * time.Minute)}, VerificationCapacityHold: Duration(15 * time.Minute), CatchUp: true}, AccountOverrides: map[core.AccountID]AccountOverride{}}
+}
+
+func (settings Config) WakeContent(reason core.Reason) (string, string) {
+	model, prompt := settings.Execution.Model, settings.Execution.Prompt
+	var overrideModel, overridePrompt string
+	switch reason {
+	case core.ReasonWeekly:
+		overrideModel, overridePrompt = settings.ResetRules.Weekly.Model, settings.ResetRules.Weekly.Prompt
+	case core.ReasonFiveHour, core.ReasonDaily:
+		overrideModel, overridePrompt = settings.ResetRules.FiveHour.Model, settings.ResetRules.FiveHour.Prompt
+	}
+	if overrideModel != "" {
+		model = overrideModel
+	}
+	if overridePrompt != "" {
+		prompt = overridePrompt
+	}
+	return model, prompt
 }
 
 // EffectiveAccount keeps candidate eligibility separate from automatic event creation.

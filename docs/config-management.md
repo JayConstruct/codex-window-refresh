@@ -19,13 +19,20 @@
 | `schema_version` | integer，`1` | 只接受 `1`；未知版本拒绝加载 |
 | `enabled` | boolean，`false` | 自动模型唤醒总开关；需用户手动开启并保存，关闭后不创建或发送自动任务，已有操作继续验证；明确确认的单账号手动唤醒独立于此开关，额度查询和被动采集独立控制 |
 | `quota_query.automatic` | boolean，`false` | 普通定期额度查询默认关闭，需用户手动开启并保存；不发送模型请求，关闭仍保留被动额度、独立启用的唤醒前核对和已有操作验证 |
+| `quota_query.on_five_hour_expiry` | boolean，`false` | 已确认的五小时窗口到期后查询一次，独立于普通定期查询和模型唤醒；失败或缺少窗口字段按间隔及退避重试；成功边界标记持久化 |
+| `quota_query.on_weekly_expiry` | boolean，`false` | 已确认的周窗口到期后查询一次，规则同上；两种窗口同时到期合并为一次账号额度查询 |
+| `planning.enabled` | boolean，`false` | 自动生成未来查询及唤醒预览；只读计算，不开启或增加请求，不重新抽取已分配的随机时间 |
+| `planning.horizon_days` | integer，`7` | 1–30 天；最多显示最早 256 项，周期查询以循环条目表示，窗口未知时不推算未来周期 |
 | `quota_query.manual` | boolean，`true` | 仅为兼容旧配置保留，解析时归一化为 true；手动查询始终允许，false 不再拒绝或取消查询 |
 | `quota_query.interval` | duration，`30s` | 普通定期查询间隔，允许 30 秒到 1 小时；完整被动额度也按此间隔推迟重复轮询 |
 | `timezone` | string，`Asia/Shanghai` | 可加载的 IANA 时区；拒绝未识别名称，不能默默退回服务器时区 |
 | `reset_rules.five_hour.enabled` | boolean，`true` | 创建普通到期任务；关闭不影响周联合任务和每日目标选取到期账号 |
 | `reset_rules.five_hour.random_delay.min/max` | duration，`0s/10m` | `0 ≤ min ≤ max ≤ 24h`；事件到期后只抽一次 |
+| `reset_rules.five_hour.model/prompt` | string，空字符串 | 五小时到期和每日时间规则专用模型/消息，分别留空时继承 execution 默认值；模型 ≤ 256 字节，消息 ≤ 4096 字节 |
 | `reset_rules.weekly.enabled` | boolean，`true` | 创建周联合重置任务 |
 | `reset_rules.weekly.random_delay.min/max` | duration，`0s/10m` | `0 ≤ min ≤ max ≤ 24h` |
+| `reset_rules.weekly.model/prompt` | string，空字符串 | 周到期唤醒专用模型/消息，分别留空时继承 execution 默认值；与五小时设置互不影响 |
+| `ordinary_rules.daily_enabled` | boolean，`true` | 每日时间点 / 随机时段规则独立开关；与五小时到期唤醒独立，仍需自动模型唤醒总开关开启。旧策略继承 true，不改变原有每日规则；关闭不删除规则 |
 | `reset_rules.weekly.bypass_activity_limit` | boolean，`true` | 当前必须为 `true`；周任务不受人数比例和普通最大账号数限制 |
 | `reset_rules.weekly.bypass_allowed_hours` | boolean，`true` | 当前必须为 `true`；周任务夜间也执行 |
 | `activity.lookback` | duration，`30m` | `1m～24h`；真实用户最近活动统计窗口，长请求期间仍活跃 |

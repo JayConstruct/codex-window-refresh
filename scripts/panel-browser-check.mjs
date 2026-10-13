@@ -18,7 +18,8 @@ const reads = [];
 let unauthorized = false, conflict = false, revision = 'a'.repeat(64);
 let config = {
   schema_version: 1, enabled: false, timezone: 'Asia/Shanghai',
-  quota_query: {automatic: true, manual: true, interval: '30s'},
+  quota_query: {automatic: true, manual: true, interval: '30s', on_five_hour_expiry: false, on_weekly_expiry: false},
+  planning: {enabled: false, horizon_days: 7},
   reset_rules: { five_hour: { enabled: true, random_delay: { min: '0s', max: '600s' } }, weekly: { enabled: true, random_delay: { min: '0s', max: '600s' }, bypass_activity_limit: true, bypass_allowed_hours: true } },
   activity: { lookback: '1800s', accounts_per_user: 1, max_accounts: 10, identity_source: 'host_caller_scope' },
   ordinary_rules: { allowed_hours: ['08:00-23:00'], allow_outside_hours_when_users_active: true },
@@ -104,6 +105,7 @@ try {
         }
         json(res, path === 'recheck' ? 202 : 200, { status: 'scheduled' }); return;
       }
+      summary.scheduler.plan = {enabled: config.planning.enabled, horizon_days: config.planning.horizon_days, generated_at: now, until: new Date(Date.now()+config.planning.horizon_days*86400000).toISOString(), entries: config.planning.enabled && config.quota_query.on_five_hour_expiry ? [{kind:'query',trigger:'five_hour_reset',account_id:'fixture-account',earliest_at:reset,latest_at:reset,status:'estimated',detail:'Only quota, no model'}] : []};
       const values = { summary, accounts, config, capabilities, 'config-editor': { config, revision, disk_matches_running: true } };
       json(res, 200, values[path] ?? {});
     } catch (err) { errors.push(String(err)); json(res, 500, { error: 'fixture error' }); }
@@ -250,12 +252,21 @@ try {
   await writeFile(join(temp, 'panel-desktop.png'), Buffer.from(capture.data, 'base64'));
   await evaluate(`{ document.querySelector('[data-tab="rules"]').click(); const ratio=document.getElementById('rule-ratio'); ratio.value='1.5'; ratio.dispatchEvent(new Event('input',{bubbles:true})); ratio.dispatchEvent(new Event('change',{bubbles:true})); }`);
   await evaluate(`{ document.querySelector('[data-tab="query"]').click(); const timeout=document.getElementById('query-timeout'); timeout.value='60s'; timeout.dispatchEvent(new Event('change',{bubbles:true})); }`);
+  await evaluate(`{for(const [id,value] of [['rule-five-model','five-fixture-model'],['rule-five-prompt','Five hour content'],['rule-week-model','weekly-fixture-model'],['rule-week-prompt','Weekly content']]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event('change',{bubbles:true}));}document.getElementById('query-five-expiry').checked=true;document.getElementById('query-five-expiry').dispatchEvent(new Event('change',{bubbles:true}));document.getElementById('plan-enabled').checked=true;document.getElementById('plan-enabled').dispatchEvent(new Event('change',{bubbles:true}));document.getElementById('plan-days').value='3';document.getElementById('plan-days').dispatchEvent(new Event('change',{bubbles:true}));}`);
   await evaluate(`document.getElementById('config-save').click()`);
   await waitFor(() => config.activity.accounts_per_user === 1.5, 'Rule save failed');
   await waitFor(() => evaluate('!document.getElementById("rule-ratio").disabled'), 'Save did not finish updating the view');
   assert.equal(config.execution.verify_delays[2], '120s', 'Unedited advanced settings were lost');
   assert.equal(config.execution.quota_read_timeout, '60s', 'Quota timeout setting was not saved');
   assert.equal(config.daily_rules[0].id, 'morning', 'Daily rules were lost');
+  assert.equal(config.quota_query.on_five_hour_expiry,true,'Expiry query switch did not persist independently');
+  assert.equal(config.quota_query.on_weekly_expiry,false,'Five-hour switch changed weekly query setting');
+  assert.equal(config.reset_rules.five_hour.model,'five-fixture-model','Five-hour model did not save');
+  assert.equal(config.reset_rules.weekly.prompt,'Weekly content','Weekly message did not save');
+  assert.deepEqual(config.planning,{enabled:true,horizon_days:3},'Plan settings did not save');
+  await evaluate('document.querySelector("[data-tab=plan]").click()');
+  await waitFor(()=>evaluate('document.getElementById("plan-list").textContent.includes("fixture-account") && document.getElementById("plan-status").textContent.includes("未来 3 天")'),'Saved future plan did not display');
+  assert.ok(posts.every(post=>['quota-query','quota-connection-check','config'].includes(post.path)),'Planning dispatched unexpected operations');
   conflict = true;
   await evaluate(`{ const ratio=document.getElementById('rule-ratio'); ratio.value='2'; ratio.dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click(); }`);
   await waitFor(() => posts.filter(p => p.path === 'config').length === 2, 'Conflict save was not sent');
@@ -288,7 +299,7 @@ try {
   capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp,'panel-rules-desktop.png'),Buffer.from(capture.data,'base64'));
   await cdp('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
-  for (const tab of ['overview','accounts','query','rules','capabilities']) {
+  for (const tab of ['overview','accounts','query','rules','plan','capabilities']) {
     await evaluate(`document.querySelector('[data-tab="${tab}"]').click()`);
     assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Mobile viewport has horizontal overflow: '+tab);
     capture = await cdp('Page.captureScreenshot');

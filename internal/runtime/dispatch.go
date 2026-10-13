@@ -27,7 +27,21 @@ func (e *Engine) dispatch(ctx context.Context, id core.AccountID, admission core
 		return err
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, e.cfg.Execution.RequestTimeout.Value())
-	result, sendErr := e.host.SendExact(sendCtx, core.ExactRequest{AccountID: id, Generation: account.Generation, OperationID: operation, ReadStartedSeq: sequence, Model: e.cfg.Execution.Model, Prompt: e.cfg.Execution.Prompt})
+	reason := core.ReasonFiveHour
+	if admission.WeeklyPriority {
+		reason = core.ReasonWeekly
+	}
+	for _, intent := range account.Task.Intents {
+		if intent.Reason == core.ReasonManual {
+			for _, covered := range admission.CoveredEventIDs {
+				if intent.ID == covered {
+					reason = core.ReasonManual
+				}
+			}
+		}
+	}
+	model, prompt := e.cfg.WakeContent(reason)
+	result, sendErr := e.host.SendExact(sendCtx, core.ExactRequest{AccountID: id, Generation: account.Generation, OperationID: operation, ReadStartedSeq: sequence, Model: model, Prompt: prompt})
 	if sendCtx.Err() != nil && result.Disposition != core.SendDefinitelyNotSent {
 		result.Disposition = core.SendUnknown
 	}

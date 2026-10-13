@@ -27,6 +27,7 @@ type SchedulingSummary struct {
 	NextInventoryAt        time.Time             `json:"next_inventory_at"`
 	QuotaQuery             ManualQueryStatus     `json:"quota_query"`
 	ManualWake             ManualWakeStatus      `json:"manual_wake"`
+	Plan                   SchedulePlan          `json:"plan"`
 	LastQuotaDiagnostic    *core.QuotaDiagnostic `json:"last_quota_diagnostic,omitempty"`
 }
 
@@ -41,6 +42,7 @@ func (e *Engine) publish(committed bool) {
 	now := e.clock.Now()
 	summary := SchedulingSummary{ObservedAt: now, RecentUsers: core.ActiveUserCount(state, now, e.cfg.Activity.Lookback.Value()), IdentitySource: e.cfg.Activity.IdentitySource, Capacity: capacityFor(e.cfg, state, now, ""), HoldCounts: map[string]int{}, NextInventoryAt: e.nextInventory}
 	summary.QuotaQuery = e.manualQuery
+	summary.Plan = e.schedulePlan(state, now)
 	summary.ManualWake = e.manualWake
 	if summary.ManualWake.Phase == "verifying" {
 		account := state.Accounts[summary.ManualWake.AccountID]
@@ -107,6 +109,7 @@ func (e *Engine) SchedulerDiagnostics() any {
 		return SchedulingSummary{HoldCounts: map[string]int{}}
 	}
 	s := v.scheduler
+	s.Plan.Entries = append([]PlannedAction{}, s.Plan.Entries...)
 	if s.LastQuotaDiagnostic != nil {
 		d := *s.LastQuotaDiagnostic
 		s.LastQuotaDiagnostic = &d

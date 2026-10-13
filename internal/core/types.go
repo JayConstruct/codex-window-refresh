@@ -102,6 +102,8 @@ type AccountState struct {
 	PermissionAcceptedSeq uint64
 	BackoffUntil          time.Time
 	LastRealRequestAt     time.Time
+	FiveHourExpiryQueried time.Time
+	WeeklyExpiryQueried   time.Time
 	Task                  *MergedTask
 }
 

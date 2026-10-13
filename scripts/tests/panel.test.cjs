@@ -3,7 +3,7 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {readFileSync} = require('node:fs');
 const {runInNewContext} = require('node:vm');
-const {createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure} = require('../../internal/plugin/web/panel.js');
+const {createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange} = require('../../internal/plugin/web/panel.js');
 const response = (value, status = 200, type = 'application/json') => ({ok: status >= 200 && status < 300, status, headers: {get: () => type}, json: async () => value});
 test('only confirmed active windows display a running countdown', () => {
   const now = Date.parse('2026-10-13T00:00:00Z');
@@ -46,6 +46,7 @@ function createPanelFixture(fetcher, confirm = () => true) {
     return elements.get(id);
   }
   const document = {hidden: false, getElementById: lookup, createElement: element, querySelectorAll: () => [],
+    createTextNode: text => ({textContent: text, children: [], dataset: {}}),
     addEventListener: (event, handler) => visibility.set(event, handler)};
   const config = {...policy(), quota_query: {automatic: false, manual: false, interval: '30s'}};
   const data = {summary: {running: true, enabled: false, scheduler: {}}, accounts: {},
@@ -97,6 +98,70 @@ test('account cards require confirmation for exact manual wake and never animate
   assert.ok(writes[0].url.endsWith('/manual-wake'));
   assert.equal(writes[0].options.body, JSON.stringify({account_id: 'account-a'}));
   assert.match(confirmations[0], /真实模型请求并消耗额度/);
+  lookup('disconnect').listeners.get('click')();
+});
+test('granular settings can be added to legacy drafts without enabling other features', () => {
+  const editor = createEditor(), original = policy();
+  editor.load({config: original, revision: 'r1'}, true);
+  editor.update('quota_query.on_five_hour_expiry', true);
+  editor.update('quota_query.on_weekly_expiry', false);
+  editor.update('planning.enabled', true); editor.update('planning.horizon_days', 3);
+  editor.update('reset_rules.five_hour.model', 'five-model'); editor.update('reset_rules.weekly.prompt', 'Weekly content');
+  editor.update('ordinary_rules.daily_enabled', false);
+  const settings = editor.value();
+  assert.equal(settings.enabled, false);
+  assert.equal(settings.quota_query.automatic, false);
+  assert.equal(settings.quota_query.manual, true);
+  assert.equal(settings.quota_query.on_five_hour_expiry, true);
+  assert.deepEqual(settings.planning, {enabled: true, horizon_days: 3});
+  assert.deepEqual(settings.execution, original.execution);
+  assert.equal(settings.reset_rules.five_hour.model, 'five-model');
+  assert.equal(settings.ordinary_rules.daily_enabled, false);
+  assert.throws(() => editor.update('planning.arbitrary', true), {code: 'invalid_config'});
+  assert.throws(() => editor.replace({...settings, planning: {enabled: true, horizon_days: 31}}), {code: 'invalid_config'});
+  assert.throws(() => editor.replace({...settings, quota_query: {...settings.quota_query, on_weekly_expiry: 'true'}}), {code: 'invalid_config'});
+});
+test('daily point and range controls serialize valid wall-clock rules', () => {
+  assert.equal(dailyTimeRange('point', '09:00', 'invalid'), '09:00-09:00');
+  assert.equal(dailyTimeRange('range', '09:00', '09:10'), '09:00-09:10');
+  assert.equal(dailyTimeRange('range', '22:00', '24:00'), '22:00-24:00');
+  for (const [mode, start, end] of [['range', '22:00', '02:00'], ['point', '24:00', '24:00'], ['range', '09:00', '09:00'], ['range', '9:00', '09:10'], ['point', '09:60', '09:60']]) {
+    assert.throws(() => dailyTimeRange(mode, start, end), {code: 'invalid_config'});
+  }
+});
+test('future plan renders server state safely without dispatching operations', async () => {
+  const now = new Date().toISOString();
+  const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
+    data.summary.scheduler.plan = {enabled: true, horizon_days: 3, generated_at: now, until: now, entries: [{kind: 'query', trigger: 'weekly_reset', account_id: '<img src=x onerror=alert(1)>', earliest_at: now, latest_at: now, status: 'estimated', detail: 'Only quota'}]};
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  const row = lookup('plan-list').children[0];
+  assert.ok(row.children.some(item => item.textContent === '<img src=x onerror=alert(1)>'));
+  assert.match(lookup('plan-status').textContent, /未来 3 天/);
+  assert.equal(requests.some(request => request.options.method === 'POST'), false);
+  lookup('disconnect').listeners.get('click')();
+});
+test('daily UI switches between a point and a random range without removing the rule', async () => {
+  const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
+    data.config.daily_rules = [{id: 'point', enabled: true, random_time_range: '09:00-09:00', minimum_ready_accounts: 1, catch_up: true}];
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  assert.equal(lookup('workspace').hidden, false);
+  const row = lookup('daily-rules').children[0];
+  const times = row.children.find(item => item.className === 'form-grid daily-times');
+  const mode = times.children[0].children[0], start = times.children[1].children[0], end = times.children[2].children[0];
+  assert.equal(mode.value, 'point'); assert.equal(end.disabled, true);
+  mode.value = 'range'; mode.listeners.get('change')();
+  assert.equal(end.disabled, false);
+  assert.equal(JSON.parse(lookup('config-json').value).daily_rules[0].random_time_range, '09:00-09:10');
+  mode.value = 'point'; mode.listeners.get('change')();
+  start.value = '10:30'; start.listeners.get('change')();
+  assert.equal(JSON.parse(lookup('config-json').value).daily_rules[0].random_time_range, '10:30-10:30');
+  assert.equal(requests.some(request => request.options.method === 'POST'), false);
   lookup('disconnect').listeners.get('click')();
 });
 test('page polling requires opt-in and legacy manual permission does not block queries', async () => {

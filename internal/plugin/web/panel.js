@@ -19,6 +19,7 @@
   }
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function validObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+  const settingDefaults = {'quota_query.automatic': false, 'quota_query.manual': true, 'quota_query.interval': '30s', 'quota_query.on_five_hour_expiry': false, 'quota_query.on_weekly_expiry': false, 'ordinary_rules.daily_enabled': true, 'planning.enabled': false, 'planning.horizon_days': 7, 'reset_rules.five_hour.model': '', 'reset_rules.five_hour.prompt': '', 'reset_rules.weekly.model': '', 'reset_rules.weekly.prompt': ''};
   // CPAMC/CPAMP use cli-proxy-auth or the legacy managementKey entry, either
   // plain JSON or reversible enc::v1:: obfuscation. Read only these known keys.
   // Format reference: router-for-me/Cli-Proxy-API-Management-Center,
@@ -114,10 +115,22 @@
       && validObject(value.activity) && validObject(value.execution) && validObject(value.ordinary_rules)
       && Array.isArray(value.ordinary_rules.allowed_hours) && value.ordinary_rules.allowed_hours.every(x => typeof x === 'string')
       && validObject(value.reset_rules) && validObject(value.reset_rules.five_hour) && validObject(value.reset_rules.weekly)
+      && [value.reset_rules.five_hour, value.reset_rules.weekly].every(rule => (rule.model === undefined || typeof rule.model === 'string') && (rule.prompt === undefined || typeof rule.prompt === 'string'))
       && validObject(value.reset_rules.five_hour.random_delay) && validObject(value.reset_rules.weekly.random_delay)
       && (value.quota_query === undefined || (validObject(value.quota_query) && typeof value.quota_query.automatic === 'boolean' && typeof value.quota_query.manual === 'boolean' && typeof value.quota_query.interval === 'string'))
+      && (value.quota_query?.on_five_hour_expiry === undefined || typeof value.quota_query.on_five_hour_expiry === 'boolean')
+      && (value.quota_query?.on_weekly_expiry === undefined || typeof value.quota_query.on_weekly_expiry === 'boolean')
+      && (value.ordinary_rules.daily_enabled === undefined || typeof value.ordinary_rules.daily_enabled === 'boolean')
+      && (value.planning === undefined || (validObject(value.planning) && typeof value.planning.enabled === 'boolean' && Number.isInteger(value.planning.horizon_days) && value.planning.horizon_days >= 1 && value.planning.horizon_days <= 30))
       && Array.isArray(value.daily_rules) && value.daily_rules.every(validObject) && validObject(value.account_overrides)
       && Object.values(value.account_overrides).every(validObject);
+  }
+  function dailyTimeRange(mode, start, end) {
+    const clock = value => typeof value === 'string' && /^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/.test(value);
+    if (!['point', 'range'].includes(mode) || !clock(start) || (mode === 'range' && (!clock(end) && end !== '24:00'))) throw new PanelError('invalid_config');
+    const finish = mode === 'point' ? start : end;
+    if (finish < start || (mode === 'range' && finish === start)) throw new PanelError('invalid_config');
+    return start + '-' + finish;
   }
   function createEditor() {
     let draft = null, revision = '', baseline = '', version = 0, raw = false;
@@ -140,10 +153,14 @@
         let current = draft;
         const parts = path.split('.');
         for (let i = 0; i < parts.length - 1; i++) {
+          if (i === 0 && !Object.hasOwn(current, parts[i]) && Object.hasOwn(settingDefaults, path)) {
+            if (parts[i] === 'planning') current.planning = {enabled: false, horizon_days: 7};
+            if (parts[i] === 'quota_query') current.quota_query = {automatic: false, manual: true, interval: '30s', on_five_hour_expiry: false, on_weekly_expiry: false};
+          }
           if (!Object.hasOwn(current, parts[i]) || !validObject(current[parts[i]])) throw new PanelError('invalid_config');
           current = current[parts[i]];
         }
-        if (!Object.hasOwn(current, parts[parts.length - 1])) throw new PanelError('invalid_config');
+        if (!Object.hasOwn(current, parts[parts.length - 1]) && !Object.hasOwn(settingDefaults, path)) throw new PanelError('invalid_config');
         current[parts[parts.length - 1]] = clone(value); version++;
       },
       pause(id, paused) {
@@ -219,7 +236,7 @@
     if (Number.isSafeInteger(detail.elapsed_ms) && detail.elapsed_ms >= 0) parts.push(detail.elapsed_ms + ' 毫秒');
     return (Object.hasOwn(messages, job.last_error) ? messages[job.last_error] : '可手动重试') + (parts.length ? '（' + parts.join(' · ') + '）' : '');
   }
-  const exported = {PanelError, createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure};
+  const exported = {PanelError, createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange};
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
   if (!root.document) return;
   const document = root.document, $ = id => document.getElementById(id);
@@ -247,7 +264,8 @@
     pendingManualWake = null;
     $('workspace').hidden = true; $('login-section').hidden = false; $('management-key').value = ''; $('config-json').value = '';
     $('connection-status').textContent = '未连接'; $('connection-status').className = 'badge neutral'; $('disconnect').disabled = true;
-    for (const id of ['metrics', 'schedule-info', 'hold-counts', 'account-list', 'daily-rules', 'capabilities-list']) $(id).replaceChildren();
+    for (const id of ['metrics', 'schedule-info', 'hold-counts', 'account-list', 'daily-rules', 'capabilities-list', 'plan-list']) $(id).replaceChildren();
+    $('plan-status').textContent = '';
     for (const input of document.querySelectorAll('[data-field]')) { if (input.type === 'checkbox') input.checked = false; else input.value = ''; input.disabled = input.dataset.fixed === 'true'; }
     $('account-search').value = ''; $('account-filter').value = 'all'; $('last-error').textContent = ''; $('updated-at').textContent = ''; $('json-message').textContent = '';
     $('bridge-status').textContent = ''; $('bridge-help').textContent = '';
@@ -307,7 +325,7 @@
     for (const [reason, count] of counts) { const row = el('div', undefined, 'hold-row'); row.append(el('span', holds[reason] || reason), badge(count, 'neutral')); $('hold-counts').append(row); }
     const diagnostic = s.last_quota_diagnostic;
     $('last-error').textContent = (summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误') + (diagnostic ? '；最近额度失败：' + quotaFailure({last_error: diagnostic.code, diagnostic}) : '');
-    renderQuotaQuery();
+    renderQuotaQuery(); renderSchedulePlan();
   }
   function quotaJob() {
     const job = summary?.scheduler?.quota_query || {};
@@ -329,8 +347,29 @@
     const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
     const progress = job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' + (job.failed && job.last_error ? '；最近失败：' + quotaFailure(job) : '') : '尚未执行手动查询';
     const reason = quotaQueryReason();
-    $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · ' + (reason || progress);
+    $('quota-query-status').textContent = '定期查询：' + (query.automatic ? '开启（' + query.interval + '）' : '关闭') + ' · 5 小时到期查询：' + (query.on_five_hour_expiry ? '开启' : '关闭') + ' · 周到期查询：' + (query.on_weekly_expiry ? '开启' : '关闭') + ' · ' + (reason || progress);
     $('quota-query').disabled = !session.connected() || actionBusy || !!reason || running;
+  }
+  function renderSchedulePlan() {
+    const plan = summary?.scheduler?.plan;
+    $('plan-list').replaceChildren();
+    if (!plan?.enabled) {
+      $('plan-status').textContent = '自动生成未来计划已关闭。开启并保存后展示生效配置的计划；不会因此开启查询或模型请求。';
+      return;
+    }
+    $('plan-status').textContent = '已应用配置 · 生成于 ' + date(plan.generated_at) + ' · 未来 ' + plan.horizon_days + ' 天，至 ' + date(plan.until) + (plan.truncated ? ' · 仅显示最早 256 项' : '') + ' · 预计计划随额度证据更新，不保证实际执行';
+    if (!Array.isArray(plan.entries) || !plan.entries.length) {
+      $('plan-list').append(el('p', '当前没有可展示计划。请检查独立开关或先查询账号；未知窗口不会推算新的五小时或周周期。', 'hint'));
+      return;
+    }
+    const triggers = {periodic: '定期额度查询', five_hour_reset: '5 小时到期', weekly_reset: '周额度到期', daily_schedule: '每日时间点 / 随机时段', verification: '发送后窗口核实'};
+    for (const entry of plan.entries) {
+      const row = el('article', undefined, 'card plan-item');
+      row.append(el('h3', (entry.kind === 'wake' ? '模型唤醒 · ' : '额度查询 · ') + (triggers[entry.trigger] || entry.trigger)), el('p', entry.account_id || '账号池目标' + (entry.rule_id ? ' · ' + entry.rule_id : ''), 'account-id'));
+      const range = date(entry.earliest_at) + (entry.latest_at && entry.latest_at !== entry.earliest_at ? ' — ' + date(entry.latest_at) : '');
+      row.append(el('p', range + (entry.repeat_every ? ' · 每 ' + entry.repeat_every + ' 循环' : '')), el('p', ({scheduled: '已分配时间', estimated: '预计时间 / 随机范围', blocked: '暂不可执行'}[entry.status] || entry.status) + (entry.model ? ' · 模型 ' + entry.model : ''), 'hint'), el('p', entry.detail, 'hint'));
+      $('plan-list').append(row);
+    }
   }
   function renderCapabilities() {
     const labels = {StableAccountIdentity: '稳定账号身份', ExactAccountExecution: '指定账号发送', QuotaAdapterReady: '额度适配器就绪', ActivityIdentityAtStart: '请求开始时识别用户范围', ActivityIdentityAtCompletion: '请求完成时识别用户范围', ForegroundGuard: '前台请求与调度互斥保护'};
@@ -448,7 +487,7 @@
     $('wake-draft-hint').textContent = editor.value()?.enabled ? '草稿：自动模型唤醒已开启。保存后按下方规则发送模型请求。' : '草稿：自动模型唤醒已关闭。单账号手动唤醒仍需明确确认，额度查询由独立设置控制。';
   }
   function draftChanged() { $('config-json').value = JSON.stringify(editor.value(), null, 2); $('json-message').textContent = ''; updateDraftBadge(); renderOverview(); }
-  function fieldValue(cfg, path) { let v = cfg; for (const part of path.split('.')) v = v?.[part]; return v; }
+  function fieldValue(cfg, path) { let v = cfg; for (const part of path.split('.')) v = v?.[part]; return v === undefined && Object.hasOwn(settingDefaults, path) ? settingDefaults[path] : v; }
   function renderForm() {
     const cfg = editor.value(); if (!cfg) return;
     for (const input of document.querySelectorAll('[data-field]')) {
@@ -462,7 +501,7 @@
     $('daily-rules').replaceChildren();
     const rawDaily = editor.value()?.daily_rules;
     const daily = Array.isArray(rawDaily) ? rawDaily : [];
-    if (!daily.length) $('daily-rules').append(el('p', '尚未配置每日规则。可以添加早上 09:00–09:10 的随机唤醒窗口。', 'hint'));
+    if (!daily.length) $('daily-rules').append(el('p', '尚未配置每日规则。09:00-09:00 表示固定时间点；09:00-09:10 表示该时段内随机时间。', 'hint'));
     daily.forEach((rule, index) => {
       const row = el('div', undefined, 'daily-row');
       function input(labelText, key, type) {
@@ -474,8 +513,32 @@
           value.daily_rules[index][key] = parsed; editor.replace(value); draftChanged();
         }); label.append(field); row.append(label);
       }
-      input('规则 ID', 'id'); input('随机时间窗口', 'random_time_range'); input('最低就绪账号数', 'minimum_ready_accounts', 'number');
+      input('规则 ID', 'id'); input('最低就绪账号数', 'minimum_ready_accounts', 'number');
+      const timeControls = el('div', undefined, 'form-grid daily-times'), mode = el('select'), startTime = el('input'), endTime = el('input');
+      const bounds = String(rule.random_time_range || '09:00-09:10').split('-');
+      startTime.value = bounds[0] || '09:00'; endTime.value = bounds[1] || startTime.value;
+      startTime.placeholder = '09:00'; endTime.placeholder = '09:10 / 24:00';
+      for (const [value, text] of [['point', '固定时间点'], ['range', '随机时间段']]) { const option = el('option', text); option.value = value; mode.append(option); }
+      mode.value = startTime.value === endTime.value ? 'point' : 'range'; endTime.disabled = mode.value === 'point';
+      function updateTime() {
+        if (editor.rawDirty()) { report(new PanelError('unapplied_json')); renderDaily(); return; }
+        try {
+          const range = dailyTimeRange(mode.value, startTime.value, endTime.value), value = editor.value();
+          value.daily_rules[index].random_time_range = range; editor.replace(value);
+          if (mode.value === 'point') endTime.value = startTime.value;
+          endTime.disabled = mode.value === 'point'; draftChanged();
+        } catch (error) { notice('请输入有效的 HH:mm 时间；每日随机时段不跨午夜，结束可为 24:00。', 'error'); }
+      }
+      mode.addEventListener('change', () => {
+        if (mode.value === 'range' && endTime.value === startTime.value && /^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/.test(startTime.value)) {
+          const [hours, minutes] = startTime.value.split(':').map(Number), finish = Math.min(1440, hours*60 + minutes + 10);
+          endTime.value = String(Math.floor(finish/60)).padStart(2, '0') + ':' + String(finish%60).padStart(2, '0');
+        }
+        updateTime();
+      }); startTime.addEventListener('change', updateTime); endTime.addEventListener('change', updateTime);
+      for (const [text, control] of [['时间类型', mode], ['时间点 / 开始时间', startTime], ['随机时段结束时间', endTime]]) { const label = el('label', text); label.append(control); timeControls.append(label); }
       const remove = el('button', '移除', 'quiet danger'); remove.type = 'button'; remove.addEventListener('click', () => { if (editor.rawDirty()) { report(new PanelError('unapplied_json')); return; } const cfg = editor.value(); cfg.daily_rules.splice(index, 1); editor.replace(cfg); renderDaily(); draftChanged(); }); row.append(remove);
+      row.append(timeControls);
       const switches = el('div', undefined, 'daily-switches');
       for (const [key, text] of [['enabled', '启用规则'], ['catch_up', '错过窗口后补发']]) { const label = el('label', undefined, 'check-field'), field = el('input'); field.type = 'checkbox'; field.checked = rule[key] === true; field.addEventListener('change', () => { if (editor.rawDirty()) { report(new PanelError('unapplied_json')); renderDaily(); return; } const cfg = editor.value(); cfg.daily_rules[index][key] = field.checked; editor.replace(cfg); draftChanged(); }); label.append(field, document.createTextNode(text)); switches.append(label); }
       row.append(switches); $('daily-rules').append(row);

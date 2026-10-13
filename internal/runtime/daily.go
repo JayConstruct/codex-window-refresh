@@ -30,6 +30,7 @@ func reconcileDaily(s *core.CoreState, cfg config.Config, now time.Time, rng cor
 		if _, exists := rules[rule.ID]; exists {
 			return errors.New("runtime: duplicate daily rule ID")
 		}
+		rule.Enabled = rule.Enabled && cfg.OrdinaryRules.DailyEnabled
 		rules[rule.ID] = rule
 		if !rule.Enabled {
 			continue
@@ -73,7 +74,7 @@ func reconcileDaily(s *core.CoreState, cfg config.Config, now time.Time, rng cor
 			}
 		}
 	}
-	if cfg.Enabled {
+	if cfg.Enabled && cfg.OrdinaryRules.DailyEnabled {
 		for _, rule := range cfg.DailyRules {
 			// Retained history also acts as a date watermark: a wall-clock
 			// rollback must not recreate an older, already-pruned daily event.

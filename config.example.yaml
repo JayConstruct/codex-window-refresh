@@ -6,17 +6,28 @@ enabled: false
 # 只调用额度接口，不发送模型请求；与 enabled（模型唤醒）独立。
 quota_query:
   automatic: false
+  on_five_hour_expiry: false
+  on_weekly_expiry: false
   manual: true # 兼容旧配置；手动查询始终允许，此字段不再控制权限
   interval: 30s # 定期查询间隔，允许 30s 到 1h
 timezone: Asia/Shanghai
+
+# 仅生成未来预览，不开启查询或模型请求；未知窗口不推算新周期。
+planning:
+  enabled: false
+  horizon_days: 7
 
 reset_rules:
   five_hour:
     enabled: true
     random_delay: {min: 0s, max: 10m}
+    model: ""
+    prompt: ""
   weekly:
     enabled: true
     random_delay: {min: 0s, max: 10m}
+    model: ""
+    prompt: ""
     # 已确定的行为：周任务夜间执行，且不受近期用户数限制。
     # 两项目前只接受 true，并不是可关闭的功能开关。
     bypass_activity_limit: true
@@ -30,6 +41,7 @@ activity:
   identity_source: host_caller_scope
 
 ordinary_rules:
+  daily_enabled: true
   # 同一时区下的每日半开区间 [start, end)，可配置多个不重叠时段。
   # 跨午夜示例："22:00-02:00"；全天写 "00:00-24:00"。
   allowed_hours: ["08:00-23:00"]
@@ -38,7 +50,8 @@ ordinary_rules:
 daily_rules:
   - id: morning
     enabled: true
-    # 默认按池容量准备账号，并非每个账号每天发一次请求。
+    # 固定时间点写 09:00-09:00；不同起止时间表示时段内随机一次。
+    # 按池容量准备账号，并非每个账号每天发一次请求。
     random_time_range: "09:00-09:10"
     minimum_ready_accounts: 1
     # 固定 true：错过后保留最近有效目标，不回放历日请求。

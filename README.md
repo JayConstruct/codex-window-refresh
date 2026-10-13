@@ -34,6 +34,10 @@ curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/ma
 
 设计规则：本地窗口到期后随机延迟，精确绑定对应账号；周重置优先且夜间不限人数；普通唤醒根据近期去重用户数补足账号容量；有效 5 小时窗口内不发送；错过时间后合并补发；发送后通过实际额度信息验证新窗口。
 
+## v0.1.0-rc.12 设置细分与未来计划
+
+管理面板增加独立的五小时/周到期查询开关；周唤醒与五小时唤醒各自配置开关、随机延迟、模型和消息，每日规则可选择固定时间点或随机时段并独立开关。“未来计划”可手动开启 1–30 天的自动预览，不额外开启查询或模型请求。新开关默认关闭，旧配置兼容继承原有行为；随 [v0.1.0-rc.12 安装包](https://github.com/JayConstruct/codex-window-refresh/releases/tag/v0.1.0-rc.12) 升级并重启 CPA 后生效。
+
 ## 设计文件
 
 - [用户规则与调度逻辑](docs/codex-refresh-design.md)

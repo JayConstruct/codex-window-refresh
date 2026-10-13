@@ -139,7 +139,9 @@ summary { cursor: pointer; font-weight: 600; }
 .rule-block { padding: 18px; background: #f7f9f7; border: 1px solid var(--line); border-radius: 10px; }
 .rule-block .form-grid { gap: 12px; margin-top: 8px; }
 .rule-block .hint { margin: 12px 0 0; }
-.daily-row { display: grid; grid-template-columns: 1.1fr 1.2fr .8fr auto; gap: 12px; align-items: end; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.daily-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; gap: 12px; align-items: end; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.daily-times { grid-column: 1 / -1; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.plan-item { margin-bottom: 12px; overflow-wrap: anywhere; }
 .daily-switches { grid-column: 1 / -1; display: flex; gap: 28px; }
 .daily-switches .check-field { min-height: 30px; }
 .disclosure { padding: 0; }
