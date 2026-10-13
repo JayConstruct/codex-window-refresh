@@ -69,6 +69,11 @@ try {
       if (req.method === 'POST') {
         let body = ''; for await (const chunk of req) body += chunk;
         posts.push({ path, body });
+        if (path === 'quota-connection-check') {
+          assert.equal(body, '', 'Connection check received credential input');
+          capabilities.quota_bridge.host_http_status = 'verified';
+          json(res, 200, {status:'verified'}); return;
+        }
         if (path === 'quota-query') {
           if (!config.quota_query.manual) {json(res,409,{error:'manual_quota_query_disabled'});return;}
           if (body) {
@@ -194,6 +199,11 @@ try {
   assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
   assert.equal(await evaluate('document.querySelector(".account-disclosure").open'),true,'Polling collapsed open account diagnostics');
   assert.equal(posts.length, 0, 'Snapshot polling dispatched operations');
+  await evaluate('document.querySelector("[data-tab=capabilities]").click(); document.getElementById("quota-connection-check").click()');
+  await waitFor(()=>evaluate('document.getElementById("bridge-status").textContent.includes("创建与取消已验证") && !document.getElementById("quota-connection-check").disabled'),'Explicit host connection check failed');
+  assert.equal(posts.length, 1, 'Connection check dispatched unexpected operations');
+  assert.equal(posts[0].path, 'quota-connection-check', 'Connection check used quota/model endpoint');
+  await evaluate('document.querySelector("[data-tab=accounts]").click()');
   assert.equal(await evaluate('document.querySelectorAll("[data-quota-account]").length'),2,'Account query buttons missing');
   assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>!button.closest("details"))'),true,'Account query was hidden in diagnostics');
   const singleQueryCount = posts.length;
@@ -210,6 +220,10 @@ try {
   await evaluate('document.getElementById("refresh").click()');
   await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("账号凭据已过期")'),'Expired upstream credentials lacked an actionable diagnosis');
   assert.equal(JSON.parse(posts.at(-1).body).account_id,'<img src=x onerror=alert(1)>','Account ID was not passed literally in JSON');
+  summary.scheduler.quota_query.last_error = 'quota_management_auth_failed';
+  summary.scheduler.quota_query.diagnostic = {code:'quota_management_auth_failed',stage:'management_http',http_status:403,elapsed_ms:120};
+  await evaluate('document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("后台管理密钥认证失败") && document.getElementById("account-list").textContent.includes("管理接口 · HTTP 403 · 120 毫秒")'),'Structured quota failure did not reach account card');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'),0,'Account query introduced unsafe rendering');
   await evaluate('document.querySelector(".account-disclosure").open=false; document.querySelector("[data-tab=overview]").click()');
   await waitFor(() => evaluate('!document.getElementById("quota-query").disabled'), 'Manual query was not enabled');
@@ -228,10 +242,12 @@ try {
   capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp, 'panel-desktop.png'), Buffer.from(capture.data, 'base64'));
   await evaluate(`{ document.querySelector('[data-tab="rules"]').click(); const ratio=document.getElementById('rule-ratio'); ratio.value='1.5'; ratio.dispatchEvent(new Event('input',{bubbles:true})); ratio.dispatchEvent(new Event('change',{bubbles:true})); }`);
+  await evaluate(`{ document.querySelector('[data-tab="query"]').click(); const timeout=document.getElementById('query-timeout'); timeout.value='60s'; timeout.dispatchEvent(new Event('change',{bubbles:true})); }`);
   await evaluate(`document.getElementById('config-save').click()`);
   await waitFor(() => config.activity.accounts_per_user === 1.5, 'Rule save failed');
   await waitFor(() => evaluate('!document.getElementById("rule-ratio").disabled'), 'Save did not finish updating the view');
   assert.equal(config.execution.verify_delays[2], '120s', 'Unedited advanced settings were lost');
+  assert.equal(config.execution.quota_read_timeout, '60s', 'Quota timeout setting was not saved');
   assert.equal(config.daily_rules[0].id, 'morning', 'Daily rules were lost');
   conflict = true;
   await evaluate(`{ const ratio=document.getElementById('rule-ratio'); ratio.value='2'; ratio.dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click(); }`);
@@ -248,7 +264,7 @@ try {
   assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>button.disabled)'),true,'Account query bypassed disabled manual permission');
   assert.equal(config.enabled,false,'Changing query settings enabled model wake');
   assert.equal(config.execution.model,'fixture-model','Query settings changed execution model');
-  assert.ok(posts.every(p=>['config','quota-query'].includes(p.path)),'Query controls called a model/scheduler operation');
+  assert.ok(posts.every(p=>['config','quota-query','quota-connection-check'].includes(p.path)),'Query controls called a model/scheduler operation');
   await waitFor(()=>evaluate('document.getElementById("save-bar").hidden'),'Successful save did not clear pending changes');
   capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp,'panel-query-desktop.png'),Buffer.from(capture.data,'base64'));

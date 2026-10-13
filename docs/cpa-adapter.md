@@ -19,7 +19,7 @@ host := cpa.NewHost(callback, quotaReader)
 | `host.auth.list` | 列举 Codex 宿主账号 | `files[].id/auth_index/provider` |
 | `host.auth.get_runtime` | 核对精确账号绑定与可用状态 | 请求 `auth_index`；响应 `auth.id/auth_index/provider/disabled/unavailable` |
 | `host.auth.get` | 核对身份并临时读取查询凭据 | 请求 `auth_index`；响应 `json.account_id/type/access_token/expired/proxy_url` |
-| `host.http.operation.open` / `host.http.do` / `host.http.cancel` | 查询上游额度并取消超时操作 | `operation_id`, GET 固定额度 URL, `headers`；响应 `StatusCode` 和 base64 `Body` |
+| `host.http.operation_open` / `host.http.do` / `host.http.cancel` | 查询上游额度并取消超时操作 | `operation_id`, GET 固定额度 URL, `headers`；响应 `StatusCode` 和 base64 `Body` |
 | `host.model.execute_stream` | 发送精确账号生成 | `auth_id`, `forced_provider`, `entry_protocol`, `exit_protocol`, `stream`, base64 `body` |
 | `host.model.stream_read` | 消费模型输出 | 请求 `stream_id`；响应 base64 `payload`, `error`, `done` |
 | `host.model.stream_close` | 显式释放模型流 | 请求 `stream_id` |
@@ -42,13 +42,15 @@ host := cpa.NewHost(callback, quotaReader)
 
 每次查询通过 `host.auth.get` 重新读取当前账号凭据，只解码身份、访问 token、有效期及代理字段。再次核对 auth_index、实际 account_id 和代际，然后 GET 固定的 `https://chatgpt.com/backend-api/wham/usage`。查询前后仍由 Host 核对账号状态与身份，不把 token 刷新当成账号更换。
 
-- 无账号专用代理时调用 `host.http.do`，沿用宿主全局代理。通过 `host.http.operation.open` 创建操作，超时或取消时使用 `host.http.cancel` 终止。
-- 账号配置 `proxy_url`（兼容 `proxyUrl`）时，使用私有 HTTP transport 支持 HTTP、HTTPS、SOCKS5、SOCKS5H 和显式 direct/none，不继承系统环境代理；禁用重定向与连接复用，响应限制为 2 MiB。
+- 无账号专用代理时调用 `host.http.do`，沿用宿主全局代理。通过 `host.http.operation_open` 创建操作，超时或取消时使用 `host.http.cancel` 终止。
+- 账号配置 `proxy_url`（兼容 `proxyUrl`、`proxy-url`、`proxyURL`）时，使用私有 HTTP transport 支持 HTTP、HTTPS、SOCKS5、SOCKS5H 和显式 direct/none，不继承系统环境代理；多个非空代理字段须一致，否则拒绝查询。禁用重定向与连接复用，响应限制为 2 MiB。
 - 不调用模型执行、登录、`host.auth.save` 或 refresh-token 接口。CPA 保持 OAuth 续期的唯一所有者。凭据文件明确过期或上游返回 401 时报告 `quota_credential_expired`，等待 CPA 更新或用户重新登录后重试；不通过模型请求更新凭据。
 - 物理凭据文件可能暂时落后于宿主内存。插件每次重新读取，但不能承诺文件 token 始终最新；可选择管理桥以复用宿主内存中的 token 解析。
 - token 只用于当前调用，不进入配置、状态、日志或错误。上游、代理和回调异常只发布固定分类，不附带响应正文或凭据。
 
 `QuotaAdapterReady` 在宿主回调配置具备时为 true，并不预先验证网络或每个账号的 token。`quota_bridge.mode=host`、`status=host_callback` 标识此方式。单账号手动任务的 `last_error` 可解释过期凭据、缺少凭据、无效代理和查询失败。
+
+`quota_bridge.host_http_status` 单独显示宿主操作接口验证结果：`unchecked`、`operation_open_verified`（真实查询已成功创建操作）、`verified`（显式检查已创建并取消操作）、`operation_open_failed`、`operation_cancel_failed` 或 `callback_missing`。读取能力接口只返回快照；显式 `POST /quota-connection-check` 才进行本地创建/取消检查，不读取账号凭据、不调用 host.http.do 或模型回调。接口检查失败不关闭全部账号查询，因为账号专用代理路径不依赖宿主 HTTP 操作。原生同步 C 回调若完全不返回，Go 的 deadline 无法强行中断它，仍需宿主恢复或重启。
 
 ## 可选管理桥
 
@@ -58,6 +60,27 @@ host := cpa.NewHost(callback, quotaReader)
 - 支持 CPA 服务基址、`/v0/management`、完整 `/v0/management/api-call` 或 `/v8/management/requests/api-call`。
 - POST 管理 `api-call`，正文使用绑定的 auth_index，上游 GET 仍固定为 wham/usage，Authorization 使用 `$TOKEN$`。CPA 解析账号 token，并继承账号/全局代理。
 - 管理与上游状态均须为 200；最多读取 2 MiB，禁止转送管理凭据到重定向地址。
+
+两种模式均设置官方额度面板使用的 Codex User-Agent、Content-Type 与账号 header。总查询 deadline 来自 `execution.quota_read_timeout`，默认 15 秒，允许 1 秒至 5 分钟；插件自有 HTTP client 的安全上限为 5 分钟。CPA 管理 api-call 还可能有宿主自己的请求超时，插件无法扩展该宿主限制。
+
+## 查询失败诊断
+
+查询器只返回固定错误代码及脱敏结构 `code/stage/http_status/elapsed_ms`，不携带远程原始错误、响应正文、管理地址或代理凭据。协调器再次校验代码和阶段白名单，只接受 100–599 的 HTTP 状态，用本地实测时间发布耗时。单账号及批量任务通过 `scheduler.quota_query.diagnostic` 发布最近一次失败；自动与手动查询的最近失败通过 `scheduler.last_quota_diagnostic` 发布，仅保存在运行时内存，后续成功不删除历史失败记录。
+
+| 固定代码 | 含义 |
+| --- | --- |
+| `quota_host_operation_failed` | 宿主 HTTP 操作创建或取消失败；stage 区分 operation_open / operation_cancel |
+| `quota_host_http_failed` / `quota_native_query_failed` | 宿主 / 账号代理请求失败 |
+| `quota_query_timeout` / `quota_query_cancelled` | 超时 / 取消，保留实际失败阶段 |
+| `quota_credential_expired` | 文件标记过期或上游 HTTP 401；不代表已自动刷新 |
+| `quota_upstream_forbidden` / `quota_upstream_rate_limited` | 上游 HTTP 403 / 429 |
+| `quota_upstream_server_failed` / `quota_upstream_http_failed` | 上游 5xx / 其他异常状态 |
+| `quota_management_auth_failed` | 管理 HTTP 401/403；与上游认证失败分开 |
+| `quota_management_endpoint_missing` / `quota_management_http_failed` | 管理 HTTP 404/405 / 其他异常状态 |
+| `quota_response_invalid` / `quota_response_too_large` | 非法 JSON、缺少或冲突的管理状态字段 / 响应超限 |
+| `quota_response_unrecognized` | 有效 JSON 的额度窗口缺失、矛盾或无法识别 |
+
+管理桥兼容 status_code/statusCode，二者同时存在须等值。失败保留已有额度；手动任务不自动重试，定期查询继续沿用退避策略。管理桥复用 Codex 运行时 token，不保证按需刷新 OAuth，物理文件与内存差异仍是部署边界。
 
 桥缺少地址或环境密钥时才会 `QuotaAdapterReady=false`。`quota_bridge.mode=management`，status 继续区分 `missing_management_url`、`missing_management_key_env`、`missing_management_key`、`invalid_management_url` 与 `configured`。诊断不返回地址或密钥，也不发送网络探测。接口来源见官方 `internal/api/handlers/management/api_tools.go`。
 

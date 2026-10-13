@@ -42,34 +42,35 @@ type Status struct {
 	EffectiveConcurrency int
 }
 type Engine struct {
-	published       atomic.Pointer[publishedStatus]
-	mu              sync.Mutex
-	queueMu         sync.Mutex
-	activity        []core.ActivityEvent
-	observations    []core.QuotaObservation
-	wake            chan struct{}
-	cfg             config.Config
-	host            core.Host
-	store           core.Store
-	clock           core.Clock
-	random          core.Random
-	state           core.CoreState
-	caps            core.HostCapabilities
-	lastError       string
-	poisoned        bool
-	nextRead        map[core.AccountID]time.Time
-	nextPreflight   map[core.AccountID]time.Time
-	readFailures    map[core.AccountID]int
-	activityEpoch   map[core.AccountID]uint64
-	inventory       []core.HostAccount
-	inventoryFailed bool
-	nextInventory   time.Time
-	manualRequested bool              // guarded by queueMu
-	manualActive    bool              // guarded by queueMu; includes queued and running jobs
-	manualTarget    core.AccountID    // guarded by queueMu; empty means all enabled accounts
-	manualQuery     ManualQueryStatus // guarded by mu, published with snapshots
-	manualIDs       []core.AccountID
-	manualIndex     int
+	published           atomic.Pointer[publishedStatus]
+	mu                  sync.Mutex
+	queueMu             sync.Mutex
+	activity            []core.ActivityEvent
+	observations        []core.QuotaObservation
+	wake                chan struct{}
+	cfg                 config.Config
+	host                core.Host
+	store               core.Store
+	clock               core.Clock
+	random              core.Random
+	state               core.CoreState
+	caps                core.HostCapabilities
+	lastError           string
+	lastQuotaDiagnostic *core.QuotaDiagnostic
+	poisoned            bool
+	nextRead            map[core.AccountID]time.Time
+	nextPreflight       map[core.AccountID]time.Time
+	readFailures        map[core.AccountID]int
+	activityEpoch       map[core.AccountID]uint64
+	inventory           []core.HostAccount
+	inventoryFailed     bool
+	nextInventory       time.Time
+	manualRequested     bool              // guarded by queueMu
+	manualActive        bool              // guarded by queueMu; includes queued and running jobs
+	manualTarget        core.AccountID    // guarded by queueMu; empty means all enabled accounts
+	manualQuery         ManualQueryStatus // guarded by mu, published with snapshots
+	manualIDs           []core.AccountID
+	manualIndex         int
 }
 
 func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, random core.Random) (*Engine, error) {
@@ -264,6 +265,7 @@ func (e *Engine) observe(ctx context.Context, id core.AccountID) error {
 	q := core.QuotaRead{AccountID: id, Generation: a.Generation, ReadStartedSeq: core.NextSequence(&e.state)}
 	epoch := e.activityEpoch[id]
 	readCtx, cancel := context.WithTimeout(ctx, e.cfg.Execution.QuotaReadTimeout.Value())
+	started := time.Now()
 	o, err := e.host.ObserveQuota(readCtx, q)
 	if err == nil && readCtx.Err() != nil {
 		err = readCtx.Err()
@@ -273,8 +275,10 @@ func (e *Engine) observe(ctx context.Context, id core.AccountID) error {
 	e.nextRead[id] = e.clock.Now().Add(e.cfg.QuotaQuery.Interval.Value())
 	if err != nil {
 		e.lastError = quotaReadErrorCode(err)
+		diagnostic := quotaReadDiagnostic(err, time.Since(started))
+		e.lastQuotaDiagnostic = &diagnostic
 		e.readFailed(id)
-		return errors.New(e.lastError)
+		return &quotaReadFailure{diagnostic: diagnostic}
 	}
 	if o.AccountID != id || o.Generation != a.Generation {
 		e.lastError = "quota_binding_mismatch"

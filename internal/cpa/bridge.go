@@ -24,7 +24,9 @@ type BridgeReader struct {
 	Client           *http.Client
 }
 
-func (b *BridgeReader) Read(ctx context.Context, a AuthBinding) ([]byte, error) {
+func (b *BridgeReader) Read(ctx context.Context, a AuthBinding) (body []byte, err error) {
+	started := time.Now()
+	defer func() { err = measuredQuotaError(err, started, "management_config") }()
 	if b == nil || b.ManagementURL == "" || b.ManagementKeyEnv == "" || a.AuthIndex == "" || a.UpstreamAccountID == "" {
 		return nil, ErrMissingBridge
 	}
@@ -55,43 +57,68 @@ func (b *BridgeReader) Read(ctx context.Context, a AuthBinding) ([]byte, error) 
 		Method    string            `json:"method"`
 		URL       string            `json:"url"`
 		Header    map[string]string `json:"header"`
-	}{a.AuthIndex, http.MethodGet, codexUsageURL, map[string]string{"Authorization": "Bearer $TOKEN$", "Chatgpt-Account-Id": a.UpstreamAccountID, "Accept": "application/json"}}
+	}{a.AuthIndex, http.MethodGet, codexUsageURL, map[string]string{"Authorization": "Bearer $TOKEN$", "Chatgpt-Account-Id": a.UpstreamAccountID, "Accept": "application/json", "Content-Type": "application/json", "User-Agent": codexQuotaUserAgent}}
 	payload, err := json.Marshal(request)
 	if err != nil {
-		return nil, ErrBridgeRead
+		return nil, quotaError(ErrBridgeRead, "management_http", 0)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(payload))
 	if err != nil {
-		return nil, ErrBridgeRead
+		return nil, quotaError(ErrBridgeRead, "management_http", 0)
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: maxQuotaRequestTimeout}
 	if b.Client != nil {
 		*client = *b.Client
 		if client.Timeout == 0 {
-			client.Timeout = 60 * time.Second
+			client.Timeout = maxQuotaRequestTimeout
 		}
 	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, ErrBridgeRead
+		return nil, quotaRequestError(ctx, err, ErrBridgeRead, "management_http")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, ErrBridgeRead
+		cause := ErrBridgeHTTP
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			cause = ErrBridgeAuthentication
+		}
+		if resp.StatusCode == 404 || resp.StatusCode == 405 {
+			cause = ErrBridgeEndpoint
+		}
+		return nil, quotaError(cause, "management_http", resp.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20+1))
-	if err != nil || len(data) > 2<<20 {
-		return nil, ErrBridgeRead
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxQuotaBody+1))
+	defer clear(data)
+	if err != nil {
+		return nil, quotaRequestError(ctx, err, ErrBridgeRead, "management_http")
+	}
+	if len(data) > maxQuotaBody {
+		return nil, quotaError(ErrQuotaResponseTooLarge, "management_parse", resp.StatusCode)
 	}
 	var result struct {
-		StatusCode int    `json:"status_code"`
-		Body       string `json:"body"`
+		StatusCode  *int   `json:"status_code"`
+		StatusCamel *int   `json:"statusCode"`
+		Body        string `json:"body"`
 	}
-	if json.Unmarshal(data, &result) != nil || result.StatusCode != http.StatusOK || !json.Valid([]byte(result.Body)) {
-		return nil, ErrBridgeRead
+	if json.Unmarshal(data, &result) != nil || (result.StatusCode == nil && result.StatusCamel == nil) || (result.StatusCode != nil && result.StatusCamel != nil && *result.StatusCode != *result.StatusCamel) {
+		return nil, quotaError(ErrQuotaResponseInvalid, "management_parse", resp.StatusCode)
+	}
+	status := result.StatusCode
+	if status == nil {
+		status = result.StatusCamel
+	}
+	if *status < 100 || *status > 599 {
+		return nil, quotaError(ErrQuotaResponseInvalid, "management_parse", resp.StatusCode)
+	}
+	if err := quotaUpstreamError(*status); err != nil {
+		return nil, err
+	}
+	if !json.Valid([]byte(result.Body)) {
+		return nil, quotaError(ErrQuotaResponseInvalid, "parse", *status)
 	}
 	return []byte(result.Body), nil
 }

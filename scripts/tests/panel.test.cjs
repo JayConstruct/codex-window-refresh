@@ -1,8 +1,26 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {createSession, createEditor, resetTime, countdown, apiBase, readPanelKey} = require('../../internal/plugin/web/panel.js');
+const {createSession, createEditor, resetTime, countdown, apiBase, readPanelKey, quotaFailure} = require('../../internal/plugin/web/panel.js');
 const response = (value, status = 200, type = 'application/json') => ({ok: status >= 200 && status < 300, status, headers: {get: () => type}, json: async () => value});
+test('quota errors show safe stages and distinguish management authentication from upstream rejection', () => {
+  const management = quotaFailure({last_error: 'quota_management_auth_failed', diagnostic: {stage: 'management_http', http_status: 403, elapsed_ms: 120}});
+  const upstream = quotaFailure({last_error: 'quota_upstream_forbidden', diagnostic: {stage: 'upstream_http', http_status: 403, elapsed_ms: 80}});
+  assert.match(management, /后台管理密钥认证失败/); assert.match(management, /管理接口 · HTTP 403 · 120 毫秒/);
+  assert.match(upstream, /上游拒绝访问/); assert.match(upstream, /上游响应 · HTTP 403/);
+  assert.match(quotaFailure({last_error: 'quota_host_operation_failed'}), /接口兼容性/);
+  assert.match(quotaFailure({last_error: 'quota_query_timeout'}), /查询超时/);
+  assert.equal(quotaFailure({last_error: 'private-token', diagnostic: {stage: 'private-proxy', http_status: 999, elapsed_ms: -1}}), '可手动重试');
+  assert.equal(quotaFailure({last_error: '__proto__', diagnostic: {stage: 'constructor'}}), '可手动重试');
+});
+test('host connection check timeout is read-only and never retries', async () => {
+  let expire, duration, calls = 0;
+  const session = createSession(async (_, options) => {calls++; return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('private network detail'))));}, null, {setTimeout: (fn, ms) => {expire=fn;duration=ms;return 1;}, clearTimeout: () => {}});
+  session.setKey('test-key');
+  const pending = session.request('/quota-connection-check', 'POST');
+  assert.equal(duration, 15000); expire();
+  await assert.rejects(pending, {code: 'timeout'}); assert.equal(calls, 1); session.disconnect();
+});
 function policy() {
   return {schema_version: 1, enabled: false, timezone: 'Asia/Shanghai', activity: {lookback: '1800s', accounts_per_user: 1, max_accounts: 10, identity_source: 'host_caller_scope'}, ordinary_rules: {allowed_hours: ['08:00-23:00'], allow_outside_hours_when_users_active: true}, reset_rules: {five_hour: {enabled: true, random_delay: {min: '0s', max: '600s'}}, weekly: {enabled: true, random_delay: {min: '0s', max: '600s'}, bypass_activity_limit: true, bypass_allowed_hours: true}}, daily_rules: [], execution: {model: 'test', prompt: 'Reply OK.', request_timeout: '60s', verification_capacity_hold: '900s', verify_delays: ['5s', '30s', '120s']}, account_overrides: {existing: {weekly_enabled: false, allowed_hours: ['09:00-18:00']}}};
 }

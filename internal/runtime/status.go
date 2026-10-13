@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"context"
+	"errors"
 	"time"
 
 	"codex-window-refresh/internal/core"
@@ -15,15 +17,16 @@ type publishedStatus struct {
 	scheduler SchedulingSummary
 }
 type SchedulingSummary struct {
-	ObservedAt             time.Time         `json:"observed_at"`
-	RecentUsers            int               `json:"recent_users"`
-	IdentitySource         string            `json:"identity_source"`
-	Capacity               core.Capacity     `json:"capacity"`
-	HoldCounts             map[string]int    `json:"hold_counts"`
-	QuotaUnknownAccounts   int               `json:"quota_unknown_accounts"`
-	ForegroundBusyAccounts int               `json:"foreground_busy_accounts"`
-	NextInventoryAt        time.Time         `json:"next_inventory_at"`
-	QuotaQuery             ManualQueryStatus `json:"quota_query"`
+	ObservedAt             time.Time             `json:"observed_at"`
+	RecentUsers            int                   `json:"recent_users"`
+	IdentitySource         string                `json:"identity_source"`
+	Capacity               core.Capacity         `json:"capacity"`
+	HoldCounts             map[string]int        `json:"hold_counts"`
+	QuotaUnknownAccounts   int                   `json:"quota_unknown_accounts"`
+	ForegroundBusyAccounts int                   `json:"foreground_busy_accounts"`
+	NextInventoryAt        time.Time             `json:"next_inventory_at"`
+	QuotaQuery             ManualQueryStatus     `json:"quota_query"`
+	LastQuotaDiagnostic    *core.QuotaDiagnostic `json:"last_quota_diagnostic,omitempty"`
 }
 
 func (e *Engine) publish(committed bool) {
@@ -37,6 +40,7 @@ func (e *Engine) publish(committed bool) {
 	now := e.clock.Now()
 	summary := SchedulingSummary{ObservedAt: now, RecentUsers: core.ActiveUserCount(state, now, e.cfg.Activity.Lookback.Value()), IdentitySource: e.cfg.Activity.IdentitySource, Capacity: capacityFor(e.cfg, state, now, ""), HoldCounts: map[string]int{}, NextInventoryAt: e.nextInventory}
 	summary.QuotaQuery = e.manualQuery
+	summary.LastQuotaDiagnostic = e.lastQuotaDiagnostic
 	busyAccounts := map[core.AccountID]bool{}
 	for _, r := range state.Requests {
 		if !r.Completed && r.AccountID != "" && state.Accounts[r.AccountID].Generation == r.Generation {
@@ -91,6 +95,14 @@ func (e *Engine) SchedulerDiagnostics() any {
 		return SchedulingSummary{HoldCounts: map[string]int{}}
 	}
 	s := v.scheduler
+	if s.LastQuotaDiagnostic != nil {
+		d := *s.LastQuotaDiagnostic
+		s.LastQuotaDiagnostic = &d
+	}
+	if s.QuotaQuery.Diagnostic != nil {
+		d := *s.QuotaQuery.Diagnostic
+		s.QuotaQuery.Diagnostic = &d
+	}
 	s.HoldCounts = make(map[string]int, len(v.scheduler.HoldCounts))
 	for k, n := range v.scheduler.HoldCounts {
 		s.HoldCounts[k] = n
@@ -108,10 +120,41 @@ func (e *Engine) readFailed(id core.AccountID) {
 // Only fixed public classifications may reach diagnostics; host errors can
 // contain tokens, proxy credentials, or upstream response bodies.
 func quotaReadErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "quota_query_timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "quota_query_cancelled"
+	}
 	switch code := err.Error(); code {
-	case "quota_credential_missing", "quota_credential_expired", "quota_proxy_invalid", "quota_host_http_failed", "quota_native_query_failed":
+	case "quota_credential_missing", "quota_credential_expired", "quota_proxy_invalid", "quota_host_http_failed", "quota_native_query_failed",
+		"quota_host_operation_failed", "quota_query_timeout", "quota_query_cancelled", "quota_upstream_forbidden", "quota_upstream_rate_limited", "quota_upstream_server_failed", "quota_upstream_http_failed", "quota_response_invalid", "quota_response_too_large", "quota_response_unrecognized", "quota_management_auth_failed", "quota_management_endpoint_missing", "quota_management_http_failed", "quota_management_bridge_failed", "quota_management_bridge_missing", "account_identity_unavailable", "account_binding_changed":
 		return code
 	default:
 		return "quota_read_failed"
 	}
+}
+
+type quotaReadFailure struct{ diagnostic core.QuotaDiagnostic }
+
+func (e *quotaReadFailure) Error() string                         { return e.diagnostic.Code }
+func (e *quotaReadFailure) QuotaDiagnostic() core.QuotaDiagnostic { return e.diagnostic }
+
+func quotaReadDiagnostic(err error, elapsed time.Duration) core.QuotaDiagnostic {
+	d := core.QuotaDiagnostic{Code: quotaReadErrorCode(err), Stage: "query", ElapsedMS: max(0, elapsed.Milliseconds())}
+	var provider interface{ QuotaDiagnostic() core.QuotaDiagnostic }
+	if errors.As(err, &provider) {
+		candidate := provider.QuotaDiagnostic()
+		switch candidate.Stage {
+		case "credential", "proxy", "operation_open", "operation_cancel", "host_http", "proxy_http", "management_config", "management_http", "management_parse", "upstream_http", "parse", "binding", "query":
+			d.Stage = candidate.Stage
+		}
+		if candidate.HTTPStatus >= 100 && candidate.HTTPStatus <= 599 {
+			d.HTTPStatus = candidate.HTTPStatus
+		}
+	}
+	return d
 }

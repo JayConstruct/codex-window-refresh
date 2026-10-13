@@ -24,7 +24,8 @@ static int callback(void*ctx,const char*method,const uint8_t*req,size_t len,buff
  if(strcmp(method,"host.auth.list")==0)json="{\"ok\":true,\"result\":{\"files\":[{\"id\":\"test-auth\",\"auth_index\":\"test-index\",\"provider\":\"codex\",\"status\":\"active\"}]}}";
  else if(strcmp(method,"host.auth.get_runtime")==0)json="{\"ok\":true,\"result\":{\"auth\":{\"id\":\"test-auth\",\"auth_index\":\"test-index\",\"provider\":\"codex\",\"status\":\"active\"}}}";
  else if(strcmp(method,"host.auth.get")==0)json="{\"ok\":true,\"result\":{\"auth_index\":\"test-index\",\"json\":{\"type\":\"codex\",\"account_id\":\"test-upstream\",\"access_token\":\"native-test-token\"}}}";
- else if(strcmp(method,"host.http.operation.open")==0)json="{\"ok\":true,\"result\":{\"operation_id\":\"test-quota-operation\"}}";
+ // Match MethodHostHTTPOperationOpen from the pinned official sdk/pluginabi/types.go.
+ else if(strcmp(method,"host.http.operation_open")==0)json="{\"ok\":true,\"result\":{\"operation_id\":\"test-quota-operation\"}}";
  else if(strcmp(method,"host.http.do")==0){
    char *request=calloc(len+1,1);if(!request)return 1;if(len)memcpy(request,req,len);
    int bound=strstr(request,"https://chatgpt.com/backend-api/wham/usage") && strstr(request,"Bearer native-test-token") && strstr(request,"test-upstream") && strstr(request,"\"method\":\"GET\"") && strstr(request,"test-quota-operation");
@@ -68,6 +69,9 @@ int main(int argc,char**argv){
  if(!account_ready){fprintf(stderr,"native quota account snapshot was not published\n");return 25;}
  if(!call(&api,"management.register","{}","/v0/management/codex-window-refresh/summary"))return 10;
  if(!call(&api,"management.handle","{\"Method\":\"GET\",\"Path\":\"/v0/management/codex-window-refresh/summary\"}","\"StatusCode\":200"))return 11;
+ int before_check=atomic_load(&quota_calls);
+ if(!call(&api,"management.handle","{\"Method\":\"POST\",\"Path\":\"/v0/management/codex-window-refresh/quota-connection-check\"}","\"StatusCode\":200"))return 26;
+ if(atomic_load(&quota_calls)!=before_check){fprintf(stderr,"local connection check issued HTTP\n");return 27;}
  int before=atomic_load(&quota_calls);
  if(!call(&api,"management.handle","{\"Method\":\"POST\",\"Path\":\"/v0/management/codex-window-refresh/quota-query\",\"Body\":\"eyJhY2NvdW50X2lkIjoidGVzdC1hdXRoIn0=\"}","\"StatusCode\":202"))return 23;
  for(int i=0;i<100 && atomic_load(&quota_calls)==before;i++)usleep(10000);

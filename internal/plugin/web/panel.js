@@ -13,7 +13,7 @@
     if (url.origin !== location.origin || !url.pathname.endsWith(API)) throw new PanelError('invalid_endpoint');
     return url.pathname;
   }
-  const paths = new Set(['/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query']);
+  const paths = new Set(['/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query', '/quota-connection-check']);
   class PanelError extends Error {
     constructor(code, status) { super(code); this.name = 'PanelError'; this.code = code; this.status = status || 0; }
   }
@@ -84,8 +84,9 @@
       controllers.add(controller);
       let timedOut = false;
       let timer;
+      const readOnly = method === 'GET' || path === '/quota-connection-check';
       try {
-        timer = timers.setTimeout(() => { timedOut = true; controller.abort(); }, method === 'POST' ? 120000 : 15000);
+        timer = timers.setTimeout(() => { timedOut = true; controller.abort(); }, readOnly ? 15000 : 120000);
         const headers = {'Authorization': 'Bearer ' + key, 'Accept': 'application/json'};
         if (body !== undefined) headers['Content-Type'] = 'application/json';
         const result = await fetcher(base + path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: 'omit', redirect: 'error', cache: 'no-store', signal: controller.signal});
@@ -100,7 +101,7 @@
       } catch (error) {
         if (generation !== current && !(error instanceof PanelError && error.code === 'authentication')) throw new PanelError('stale');
         if (error instanceof PanelError) throw error;
-        throw new PanelError(timedOut ? (method === 'POST' ? 'write_unconfirmed' : 'timeout') : (method === 'POST' ? 'write_unconfirmed' : 'network'));
+        throw new PanelError(timedOut ? (readOnly ? 'timeout' : 'write_unconfirmed') : (readOnly ? 'network' : 'write_unconfirmed'));
       } finally {
         timers.clearTimeout(timer);
         controllers.delete(controller);
@@ -174,7 +175,34 @@
     const days = Math.floor(seconds / 86400), hours = Math.floor(seconds % 86400 / 3600), minutes = Math.floor(seconds % 3600 / 60), s = seconds % 60;
     return (days ? days + ' 天 ' : '') + String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
-  const exported = {PanelError, createSession, createEditor, resetTime, countdown, apiBase, readPanelKey};
+  function quotaFailure(job) {
+    const messages = {
+      quota_credential_expired: '账号凭据已过期或上游拒绝认证，请在 CPA 刷新或重新登录账号',
+      quota_credential_missing: '账号缺少有效的访问凭据', quota_proxy_invalid: '账号代理配置无效或字段冲突',
+      quota_host_operation_failed: 'CPA 未能创建或取消查询操作，请检查宿主与插件接口兼容性',
+      quota_host_http_failed: 'CPA HTTP 请求失败，请检查全局代理与上游连接',
+      quota_native_query_failed: '账号代理请求失败，请检查代理与上游连接',
+      quota_query_timeout: '额度查询超时，请检查连接或调整额度查询超时', quota_query_cancelled: '额度查询已取消',
+      quota_upstream_forbidden: '上游拒绝访问，请检查账号状态与出口连接',
+      quota_upstream_rate_limited: '上游限制查询频率，请稍后重试',
+      quota_upstream_server_failed: '上游服务暂时异常，请稍后重试', quota_upstream_http_failed: '上游返回异常状态',
+      quota_response_invalid: '额度响应格式无效，未更新已有额度', quota_response_too_large: '额度响应超过大小限制',
+      quota_response_unrecognized: '额度响应缺少有效窗口或字段冲突，未更新已有额度',
+      quota_management_auth_failed: '后台管理密钥认证失败，请检查 CPA 进程中的管理密钥',
+      quota_management_endpoint_missing: '管理查询接口不存在，请检查管理地址与 CPA 版本',
+      quota_management_http_failed: 'CPA 管理接口返回异常状态', quota_management_bridge_failed: '无法连接管理桥，请检查本地地址与服务状态',
+      quota_management_bridge_missing: '管理桥地址或进程密钥未配置',
+      account_identity_unavailable: '无法核对账号身份，请检查 CPA 账号凭据', account_binding_changed: '账号身份已更换，请重新查询',
+      quota_read_failed: '可手动重试'
+    };
+    const stages = {credential: '读取凭据', proxy: '解析账号代理', operation_open: '创建宿主操作', operation_cancel: '取消宿主操作', host_http: '宿主请求', proxy_http: '账号代理请求', management_config: '管理桥配置', management_http: '管理接口', management_parse: '管理响应解析', upstream_http: '上游响应', parse: '额度解析', binding: '账号核对', query: '查询'};
+    const detail = job.diagnostic || {}, parts = [];
+    if (Object.hasOwn(stages, detail.stage)) parts.push(stages[detail.stage]);
+    if (Number.isInteger(detail.http_status) && detail.http_status >= 100 && detail.http_status <= 599) parts.push('HTTP ' + detail.http_status);
+    if (Number.isSafeInteger(detail.elapsed_ms) && detail.elapsed_ms >= 0) parts.push(detail.elapsed_ms + ' 毫秒');
+    return (Object.hasOwn(messages, job.last_error) ? messages[job.last_error] : '可手动重试') + (parts.length ? '（' + parts.join(' · ') + '）' : '');
+  }
+  const exported = {PanelError, createSession, createEditor, resetTime, countdown, apiBase, readPanelKey, quotaFailure};
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
   if (!root.document) return;
   const document = root.document, $ = id => document.getElementById(id);
@@ -256,7 +284,8 @@
     const counts = Object.entries(s.hold_counts || {}).sort((a, b) => b[1] - a[1]);
     if (!counts.length) $('hold-counts').append(el('p', '当前没有报告的阻塞原因。', 'hint'));
     for (const [reason, count] of counts) { const row = el('div', undefined, 'hold-row'); row.append(el('span', holds[reason] || reason), badge(count, 'neutral')); $('hold-counts').append(row); }
-    $('last-error').textContent = summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误';
+    const diagnostic = s.last_quota_diagnostic;
+    $('last-error').textContent = (summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误') + (diagnostic ? '；最近额度失败：' + quotaFailure({last_error: diagnostic.code, diagnostic}) : '');
     renderQuotaQuery();
   }
   function quotaJob() {
@@ -287,6 +316,11 @@
     const labels = {StableAccountIdentity: '稳定账号身份', ExactAccountExecution: '指定账号发送', QuotaAdapterReady: '额度适配器就绪', ActivityIdentityAtStart: '请求开始时识别用户范围', ActivityIdentityAtCompletion: '请求完成时识别用户范围', ForegroundGuard: '前台请求与调度互斥保护'};
     details($('capabilities-list'), Object.entries(labels).map(([key, label]) => [label, capabilities[key] === true ? (key === 'QuotaAdapterReady' ? '已就绪' : '支持') : capabilities[key] === false ? (key === 'QuotaAdapterReady' ? '未就绪' : '不支持') : '未知']));
     $('bridge-status').textContent = capabilities.QuotaAdapterReady === true ? '后台额度查询配置已就绪' : bridgeDescription();
+    const hostStatus = capabilities.quota_bridge?.host_http_status;
+    const hostLabels = {unchecked: '宿主查询接口尚未检查', verified: '宿主操作创建与取消已验证', operation_open_verified: '宿主操作创建已验证，取消尚未单独检查', operation_open_failed: '宿主查询操作创建失败', operation_cancel_failed: '宿主查询操作取消失败', callback_missing: '宿主回调不可用'};
+    if (capabilities.quota_bridge?.mode === 'host') $('bridge-status').textContent += ' · ' + (hostLabels[hostStatus] || '宿主查询接口尚未检查');
+    $('quota-connection-check').hidden = capabilities.quota_bridge?.mode !== 'host';
+    $('quota-connection-check').disabled = !session.connected() || actionBusy;
     const env = capabilities.quota_bridge?.management_key_env || 'management_key_env 指定的变量';
     const help = {
       host_callback: '当前使用 CPA 宿主账号凭据查询，不需要配置后台管理地址或管理密钥环境变量。凭据由 CPA 维护；账号专用代理优先，否则沿用 CPA 全局代理。',
@@ -300,9 +334,6 @@
   }
   function bridgeDescription() {
     return {host_callback: '宿主额度查询等待后台确认', missing_management_url: '未配置后台管理接口地址', missing_management_key_env: '未配置管理密钥环境变量名', missing_management_key: 'CPA 进程未读取到管理密钥环境变量', invalid_management_url: '后台管理接口地址配置无效', configured: '额度查询配置已具备，等待后台确认'}[capabilities.quota_bridge?.status] || '额度查询接口未就绪';
-  }
-  function quotaFailure(job) {
-    return {quota_credential_expired: '账号凭据已过期，请先在 CPA 刷新或重新登录账号', quota_credential_missing: '账号缺少有效的访问凭据', quota_proxy_invalid: '账号代理配置无效', quota_host_http_failed: 'CPA HTTP 查询失败，请检查连接或使用兼容管理桥', quota_native_query_failed: '上游额度查询失败，请检查连接与账号状态'}[job.last_error] || '可手动重试';
   }
   function windowCell(title, evidence) {
     evidence = evidence || {};
@@ -416,7 +447,7 @@
     actionBusy = value;
     for (const id of ['recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = value;
     for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button')) field.disabled = value || field.dataset.fixed === 'true';
-    updateDraftBadge(); renderAccounts(); renderQuotaQuery();
+    updateDraftBadge(); renderAccounts(); renderQuotaQuery(); renderCapabilities();
   }
   async function readSnapshots() {
     const generation = session.generation();
@@ -566,6 +597,18 @@
     finally { if (generation === session.generation()) { busy(false); renderQuotaQuery(); } }
   }
   $('quota-query').addEventListener('click', () => { if (!$('quota-query').disabled) void requestQuotaQuery(); });
+  $('quota-connection-check').addEventListener('click', async () => {
+    if ($('quota-connection-check').disabled) return;
+    const generation = session.generation();
+    busy(true);
+    try {
+      const result = await session.request('/quota-connection-check', 'POST');
+      if (generation !== session.generation()) return;
+      notice(result.error ? quotaFailure({last_error: result.error}) : '宿主查询操作创建与取消检查通过；上游连通性请通过账号额度查询确认。', result.error ? 'error' : undefined);
+      await readSnapshots();
+    } catch (error) { if (generation === session.generation()) report(error); }
+    finally { if (generation === session.generation()) busy(false); }
+  });
   $('account-search').addEventListener('input', renderAccounts); $('account-filter').addEventListener('change', renderAccounts);
   document.addEventListener('visibilitychange', () => { if (document.hidden) { if (pollTimer) root.clearTimeout(pollTimer); pollTimer = null; } else if (session.connected()) refreshSnapshots(false); });
   root.addEventListener('beforeunload', event => { if (editor.dirty()) { event.preventDefault(); event.returnValue = ''; } });

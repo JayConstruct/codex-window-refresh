@@ -22,6 +22,7 @@ CLIProxyAPI 的 Codex 账号窗口唤醒插件，插件 ID 为 `codex-window-ref
 - [运行时实现与限制](docs/runtime.md)
 - [插件构建、配置与管理 API](docs/plugin.md)
 - [额度与执行适配器](docs/cpa-adapter.md)
+- [单账号额度查询故障检查与方案完善](docs/quota-query-review.md)
 - [持久化存储](docs/storage.md)
 - [配置草案](config.example.yaml)
 

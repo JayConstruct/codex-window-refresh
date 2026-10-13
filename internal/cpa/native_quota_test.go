@@ -18,15 +18,21 @@ func nativeTestBinding() AuthBinding {
 	return AuthBinding{AccountID: "host-auth", AuthIndex: "auth-index", UpstreamAccountID: "real", Generation: generation("host-auth", "real")}
 }
 
+// RPC names below deliberately use independent literals from the pinned CPA
+// sdk/pluginabi/types.go. Reusing implementation constants would hide a typo in
+// the host contract, such as operation.open instead of operation_open.
 func TestNativeQuotaReusesHostCredentialsAndReadsRotatedTokenWithoutManagementKey(t *testing.T) {
 	f := &fakeCallbacks{upstream: "real", token: "private-first-token"}
 	reads := 0
 	cb := callbackFunc(func(ctx context.Context, method string, req, out any) error {
 		switch method {
-		case "host.http.operation.open":
+		case "host.http.operation_open":
 			return respond(out, map[string]string{"operation_id": "query-op"})
 		case "host.http.do":
 			request := req.(quotaHTTPRequest)
+			if request.Headers.Get("User-Agent") != codexQuotaUserAgent || request.Headers.Get("Content-Type") != "application/json" {
+				t.Fatal("host quota request lost its request identity")
+			}
 			if request.Method != "GET" || request.URL != codexUsageURL || request.OperationID != "query-op" || request.Headers.Get("Authorization") != "Bearer "+f.token || request.Headers.Get("Chatgpt-Account-Id") != "real" {
 				t.Fatal("quota query lost its account binding or sent the wrong request")
 			}
@@ -75,7 +81,7 @@ func TestNativeQuotaRejectsCredentialsBeforeNetworkAndSanitizesFailures(t *testi
 		{"invalid expiry", `{"type":"codex","account_id":"real","access_token":"private","expired":"not-a-date"}`, 200, ErrQuotaCredentialMissing},
 		{"header injection", `{"type":"codex","account_id":"real","access_token":"private\r\nX-Test: injected"}`, 200, ErrQuotaCredentialMissing},
 		{"upstream 401", `{"type":"codex","account_id":"real","access_token":"private"}`, 401, ErrQuotaCredentialExpired},
-		{"upstream 403", `{"type":"codex","account_id":"real","access_token":"private"}`, 403, ErrQuotaNativeRead},
+		{"upstream 403", `{"type":"codex","account_id":"real","access_token":"private"}`, 403, ErrQuotaForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reads := 0
@@ -83,7 +89,7 @@ func TestNativeQuotaRejectsCredentialsBeforeNetworkAndSanitizesFailures(t *testi
 				switch method {
 				case "host.auth.get":
 					return respond(out, authGet{AuthIndex: "auth-index", JSON: json.RawMessage(tc.credential)})
-				case "host.http.operation.open":
+				case "host.http.operation_open":
 					return respond(out, map[string]string{"operation_id": "test"})
 				case "host.http.do":
 					reads++
@@ -126,7 +132,7 @@ func TestNativeQuotaUsesAccountProxyWithoutHostHTTPAndBoundsResponses(t *testing
 			}), nil
 		}}
 		body, err := reader.Read(context.Background(), nativeTestBinding())
-		if reads != 1 || (oversized && !errors.Is(err, ErrQuotaNativeRead)) || (!oversized && (err != nil || !json.Valid(body))) {
+		if reads != 1 || (oversized && !errors.Is(err, ErrQuotaResponseTooLarge)) || (!oversized && (err != nil || !json.Valid(body))) {
 			t.Fatal("proxy query or response limit failed")
 		}
 	}
@@ -151,7 +157,7 @@ func TestNativeHostHTTPDeadlineCancelsHostOperation(t *testing.T) {
 	var once sync.Once
 	cb := callbackFunc(func(_ context.Context, method string, req, out any) error {
 		switch method {
-		case "host.http.operation.open":
+		case "host.http.operation_open":
 			return respond(out, map[string]string{"operation_id": "cancel-op"})
 		case "host.http.do":
 			close(entered)
@@ -178,7 +184,7 @@ func TestNativeHostHTTPDeadlineCancelsHostOperation(t *testing.T) {
 	cancel()
 	select {
 	case err := <-done:
-		if !errors.Is(err, ErrQuotaHostHTTP) {
+		if !errors.Is(err, ErrQuotaCancelled) {
 			t.Fatal("cancellation leaked an upstream error")
 		}
 	case <-time.After(time.Second):

@@ -26,7 +26,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.9"
+const Version = "0.1.0-rc.10"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -36,6 +36,7 @@ type quotaBridgeDiagnostic struct {
 	Mode             string `json:"mode"`
 	Status           string `json:"status"`
 	ManagementKeyEnv string `json:"management_key_env,omitempty"`
+	HostHTTPStatus   string `json:"host_http_status,omitempty"`
 }
 
 type Engine interface {
@@ -133,7 +134,7 @@ func New(callback cpa.Callback, options Options) *Service {
 			if w.quotaTransport() == "host" {
 				return cpa.NewHost(cb, &cpa.NativeReader{Callback: cb}), nil
 			}
-			return cpa.NewHost(cb, &cpa.BridgeReader{ManagementURL: w.ManagementURL, ManagementKeyEnv: w.ManagementKeyEnv, Getenv: os.Getenv, Client: &http.Client{Timeout: 30 * time.Second}}), nil
+			return cpa.NewHost(cb, &cpa.BridgeReader{ManagementURL: w.ManagementURL, ManagementKeyEnv: w.ManagementKeyEnv, Getenv: os.Getenv}), nil
 		}
 	}
 	if options.ShutdownTimeout <= 0 {
@@ -432,7 +433,7 @@ func managementRegistration() any {
 	for _, p := range []string{"/summary", "/accounts", "/config", "/config-editor", "/capabilities"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
-	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query"} {
+	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check"} {
 		routes = append(routes, map[string]string{"Method": "POST", "Path": ManagementPrefix + p})
 	}
 	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Authenticated scheduler panel."}, {"Path": "/panel.js"}, {"Path": "/panel.css"}}}
@@ -567,6 +568,12 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		diagnostic := quotaBridgeDiagnostic{Mode: wrapper.quotaTransport()}
 		if diagnostic.Mode == "host" {
 			diagnostic.Status = "host_callback"
+			s.mu.RLock()
+			host := s.host
+			s.mu.RUnlock()
+			if status, ok := host.(interface{ QuotaConnectionStatus() string }); ok {
+				diagnostic.HostHTTPStatus = status.QuotaConnectionStatus()
+			}
 		} else {
 			diagnostic.Status, diagnostic.ManagementKeyEnv = bridge.ConfigurationStatus(), wrapper.ManagementKeyEnv
 		}
@@ -574,6 +581,36 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 			core.HostCapabilities
 			QuotaBridge quotaBridgeDiagnostic `json:"quota_bridge"`
 		}{capabilities, diagnostic}), nil
+	case "POST /quota-connection-check":
+		if stopping {
+			return response(503, map[string]string{"error": "scheduler stopping"}), nil
+		}
+		if wrapper.quotaTransport() != "host" {
+			return response(409, map[string]string{"error": "host_transport_required"}), nil
+		}
+		s.mu.RLock()
+		host := s.host
+		s.mu.RUnlock()
+		checker, ok := host.(interface {
+			CheckQuotaConnection(context.Context) error
+			QuotaConnectionStatus() string
+		})
+		if !ok {
+			return response(501, map[string]string{"error": "connection_check_unavailable"}), nil
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		err := checker.CheckQuotaConnection(checkCtx)
+		result := map[string]string{"status": checker.QuotaConnectionStatus()}
+		if err != nil {
+			code := "quota_host_operation_failed"
+			switch err.Error() {
+			case "quota_query_timeout", "quota_query_cancelled":
+				code = err.Error()
+			}
+			result["error"] = code
+		}
+		return response(200, result), nil
 	case "POST /reload":
 		if stopping {
 			return response(409, map[string]string{"error": "scheduler stopping"}), nil

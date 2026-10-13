@@ -46,12 +46,15 @@ plugins:
 | POST `/v0/management/codex-window-refresh/reload` | 读取外部配置、验证后更新 |
 | POST `/v0/management/codex-window-refresh/recheck` | 通知协调器重新检查；不能绕过窗口、用户名额、时间段或送达抑制规则 |
 | POST `/v0/management/codex-window-refresh/quota-query` | 无请求体或 `{}` 时批量查询；可选 `{ "account_id": "账号 ID" }` 仅查询该账号。需要允许手动查询及额度桥就绪，返回 202 和 queued/already_queued；不同目标忙碌时返回 409，未知账号返回 404；不创建唤醒任务或派发模型，进度位于摘要 scheduler.quota_query |
+| POST `/v0/management/codex-window-refresh/quota-connection-check` | 宿主模式下显式创建并取消本地 HTTP 操作，不读凭据、不执行 HTTP 或模型。返回 200 和固定 status，可带脱敏 error；管理桥模式返回 409，不支持检查的适配器返回 501 |
 
 CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/codex-window-refresh/status` 与 `/panel.js`、`/panel.css` 只返回静态面板资产，HTML 不嵌入账号、配置、额度或运行状态。页面优先复用同源 CPA 已保存的管理凭据，无法复用时手动输入密钥，再通过已认证管理 API 查询与编辑；模块不持久化手动输入的密钥。资源使用限制同源脚本、样式与连接的 CSP。使用与保存行为详见 [网页面板](panel.md)。JSON 管理响应采用 schema 6 原始响应语义；Body 按官方 RPC 的 `[]byte` 序列化传输。
 
 `/summary` 的 `scheduler` 字段用于实测时解释为何尚未唤醒账号：包含汇总发布时间 `observed_at`、近期身份数量 `recent_users`、身份来源 `identity_source`、容量 `capacity`（目标、活跃、预约和缺口）、阻止发送的账号数量 `hold_counts`、额度未知账号数 `quota_unknown_accounts`、前台请求占用账号数 `foreground_busy_accounts` 和下一次账号清单检查时间 `next_inventory_at`。人数按宿主认证的 caller scope 去重；共用 scope 的多个自然人只计一个身份。指标只包含汇总，不返回活动身份、请求 ID 或原始请求。
 
 调度汇总从协调器发布的快照读取；查看管理状态不等待正在进行的额度查询或模型请求。`observed_at` 用于判断快照是否仍然新鲜。字段通过可选 `SchedulerDiagnostics() any` 接口提供，其他 Engine 实现可继续使用原有接口；未提供该接口时摘要不包含 `scheduler`。
+
+`scheduler.quota_query.diagnostic` 提供本次手动任务最近失败的 `code/stage/http_status/elapsed_ms`；`scheduler.last_quota_diagnostic` 提供运行期间最近一次额度查询失败。两者不持久化，仅包含固定分类及本地耗时；返回的快照不会暴露可变的内部诊断对象。`/capabilities` 的 `quota_bridge.host_http_status` 是已有宿主接口检查结果，读取它不会主动检查网络。
 
 ## 观测回调和生命周期
 

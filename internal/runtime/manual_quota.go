@@ -9,15 +9,16 @@ import (
 )
 
 type ManualQueryStatus struct {
-	AccountID  core.AccountID `json:"account_id,omitempty"`
-	Phase      string         `json:"phase"`
-	Total      int            `json:"total"`
-	Completed  int            `json:"completed"`
-	Failed     int            `json:"failed"`
-	Skipped    int            `json:"skipped"`
-	LastError  string         `json:"last_error,omitempty"`
-	StartedAt  time.Time      `json:"started_at"`
-	FinishedAt time.Time      `json:"finished_at"`
+	AccountID  core.AccountID        `json:"account_id,omitempty"`
+	Phase      string                `json:"phase"`
+	Total      int                   `json:"total"`
+	Completed  int                   `json:"completed"`
+	Failed     int                   `json:"failed"`
+	Skipped    int                   `json:"skipped"`
+	LastError  string                `json:"last_error,omitempty"`
+	Diagnostic *core.QuotaDiagnostic `json:"diagnostic,omitempty"`
+	StartedAt  time.Time             `json:"started_at"`
+	FinishedAt time.Time             `json:"finished_at"`
 }
 
 // RequestQuotaQuery queues one coalesced query-only sweep. The HTTP callback
@@ -106,6 +107,11 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 		if err := e.observe(ctx, id); err != nil {
 			e.manualQuery.Failed++
 			e.manualQuery.LastError = quotaReadErrorCode(err)
+			diagnostic := quotaReadDiagnostic(err, 0)
+			if failure, ok := err.(*quotaReadFailure); ok {
+				diagnostic = failure.diagnostic
+			}
+			e.manualQuery.Diagnostic = &diagnostic
 		} else {
 			e.manualQuery.Completed++
 		}

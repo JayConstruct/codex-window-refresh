@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -32,6 +33,54 @@ func TestCapabilitiesDiagnoseMissingProcessKeyWithoutExposingSecrets(t *testing.
 	check("configured")
 	s.wrapper.ManagementURL = "http://user:sentinel-private-key@localhost"
 	check("invalid_management_url")
+}
+
+type connectionCheckHost struct {
+	fakeHost
+	checks int
+	status string
+	err    error
+}
+
+func (h *connectionCheckHost) CheckQuotaConnection(context.Context) error {
+	h.checks++
+	if h.err == nil {
+		h.status = "verified"
+	}
+	return h.err
+}
+func (h *connectionCheckHost) QuotaConnectionStatus() string { return h.status }
+
+func TestConnectionChecksAreExplicitAndKeepHostErrorsPrivate(t *testing.T) {
+	s, _, _, cb := setupService(t)
+	h := &connectionCheckHost{status: "unchecked"}
+	s.mu.Lock()
+	s.host = h
+	s.mu.Unlock()
+	for i := 0; i < 2; i++ {
+		r := managementCall(t, s, "GET", ManagementPrefix+"/capabilities")
+		var body struct {
+			QuotaBridge quotaBridgeDiagnostic `json:"quota_bridge"`
+		}
+		if json.Unmarshal(r.Body, &body) != nil || body.QuotaBridge.HostHTTPStatus != "unchecked" || h.checks != 0 || cb.calls != 0 {
+			t.Fatal("viewing capabilities triggered a check")
+		}
+	}
+	r := managementCall(t, s, "POST", ManagementPrefix+"/quota-connection-check")
+	if r.StatusCode != 200 || !strings.Contains(string(r.Body), "verified") || h.checks != 1 {
+		t.Fatal("explicit check was not delegated")
+	}
+	h.err = errors.New("private token and proxy details")
+	h.status = "operation_open_failed"
+	r = managementCall(t, s, "POST", ManagementPrefix+"/quota-connection-check")
+	if r.StatusCode != 200 || strings.Contains(string(r.Body), "private") || !strings.Contains(string(r.Body), "quota_host_operation_failed") {
+		t.Fatal("probe reflected raw host errors")
+	}
+	s.wrapper.QuotaTransport = "management"
+	r = managementCall(t, s, "POST", ManagementPrefix+"/quota-connection-check")
+	if r.StatusCode != 409 || h.checks != 2 {
+		t.Fatal("management mode dispatched host check")
+	}
 }
 
 func TestDefaultHostQuotaTransportNeedsNoManagementEnvironment(t *testing.T) {

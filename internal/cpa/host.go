@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"time"
 
@@ -23,6 +24,20 @@ func (h *Host) Capabilities(context.Context) (core.HostCapabilities, error) {
 		ready = ready && reader.Available()
 	}
 	return core.HostCapabilities{StableAccountIdentity: h.callback != nil, ExactAccountExecution: h.callback != nil, QuotaAdapterReady: ready, ActivityIdentityAtStart: h.callback != nil, ActivityIdentityAtCompletion: h.callback != nil, ForegroundGuard: false}, nil
+}
+
+func (h *Host) QuotaConnectionStatus() string {
+	if reader, ok := h.reader.(interface{ ConnectionStatus() string }); ok {
+		return reader.ConnectionStatus()
+	}
+	return ""
+}
+
+func (h *Host) CheckQuotaConnection(ctx context.Context) error {
+	if reader, ok := h.reader.(interface{ CheckConnection(context.Context) error }); ok {
+		return reader.CheckConnection(ctx)
+	}
+	return ErrMissingBridge
 }
 func provider(e authEntry) string {
 	if e.Provider != "" {
@@ -139,5 +154,9 @@ func (h *Host) ObserveQuota(ctx context.Context, read core.QuotaRead) (core.Quot
 	h.mu.RLock()
 	baseline := h.baselines[read.AccountID]
 	h.mu.RUnlock()
-	return ParseQuota(raw, read, time.Now().UTC(), core.ObservationQuery, baseline)
+	observation, err := ParseQuota(raw, read, time.Now().UTC(), core.ObservationQuery, baseline)
+	if err != nil {
+		return core.QuotaObservation{}, quotaError(ErrQuotaMalformed, "parse", http.StatusOK)
+	}
+	return observation, nil
 }

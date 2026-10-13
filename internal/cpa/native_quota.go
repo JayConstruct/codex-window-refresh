@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -28,6 +29,8 @@ type NativeReader struct {
 	Callback Callback
 	// TransportForProxy is a test seam; production builds a private transport.
 	TransportForProxy func(string) (http.RoundTripper, error)
+	connectionMu      sync.RWMutex
+	connectionStatus  string
 }
 
 func (r *NativeReader) Available() bool { return r != nil && r.Callback != nil }
@@ -43,17 +46,19 @@ type quotaHTTPResponse struct {
 	Body       []byte
 }
 
-func (r *NativeReader) Read(ctx context.Context, binding AuthBinding) ([]byte, error) {
+func (r *NativeReader) Read(ctx context.Context, binding AuthBinding) (body []byte, err error) {
+	started := time.Now()
+	defer func() { err = measuredQuotaError(err, started, "credential") }()
 	if !r.Available() || binding.AuthIndex == "" || binding.UpstreamAccountID == "" {
 		return nil, ErrBindingUnavailable
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, quotaRequestError(ctx, err, ErrQuotaNativeRead, "credential")
 	}
 	var raw authGet
 	defer func() { clear(raw.JSON) }()
 	if err := r.Callback.Call(ctx, "host.auth.get", authRequest{binding.AuthIndex}, &raw); err != nil {
-		return nil, ErrBindingUnavailable
+		return nil, quotaRequestError(ctx, err, ErrBindingUnavailable, "credential")
 	}
 	var credential struct {
 		Type        string `json:"type"`
@@ -63,6 +68,8 @@ func (r *NativeReader) Read(ctx context.Context, binding AuthBinding) ([]byte, e
 		Expired     string `json:"expired"`
 		ProxyURL    string `json:"proxy_url"`
 		ProxyCamel  string `json:"proxyUrl"`
+		ProxyDash   string `json:"proxy-url"`
+		ProxyUpper  string `json:"proxyURL"`
 	}
 	if len(raw.JSON) > 1<<20 || json.Unmarshal(raw.JSON, &credential) != nil || raw.AuthIndex != binding.AuthIndex || credential.Type != "codex" || credential.AccountID != binding.UpstreamAccountID || generation(string(binding.AccountID), credential.AccountID) != binding.Generation {
 		return nil, ErrBindingChanged
@@ -83,15 +90,19 @@ func (r *NativeReader) Read(ctx context.Context, binding AuthBinding) ([]byte, e
 			return nil, ErrQuotaCredentialExpired
 		}
 	}
-	proxy := strings.TrimSpace(credential.ProxyURL)
-	if proxy == "" {
-		proxy = strings.TrimSpace(credential.ProxyCamel)
-	} else if credential.ProxyCamel != "" && strings.TrimSpace(credential.ProxyCamel) != proxy {
-		return nil, ErrQuotaProxyInvalid
+	proxy := ""
+	for _, value := range []string{credential.ProxyURL, credential.ProxyCamel, credential.ProxyDash, credential.ProxyUpper} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if proxy != "" && proxy != value {
+			return nil, quotaError(ErrQuotaProxyInvalid, "proxy", 0)
+		}
+		proxy = value
 	}
-	headers := http.Header{"Authorization": {"Bearer " + token}, "Chatgpt-Account-Id": {binding.UpstreamAccountID}, "Accept": {"application/json"}}
+	headers := quotaRequestHeaders(token, binding.UpstreamAccountID)
 	var response quotaHTTPResponse
-	var err error
 	if proxy == "" {
 		response, err = r.hostHTTP(ctx, headers)
 	} else {
@@ -101,37 +112,48 @@ func (r *NativeReader) Read(ctx context.Context, binding AuthBinding) ([]byte, e
 		clear(response.Body)
 		return nil, err
 	}
-	if response.StatusCode == http.StatusUnauthorized {
+	if err = quotaUpstreamError(response.StatusCode); err != nil {
 		clear(response.Body)
-		return nil, ErrQuotaCredentialExpired
+		return nil, err
 	}
-	if response.StatusCode != http.StatusOK || len(response.Body) > maxQuotaBody || !json.Valid(response.Body) {
+	if len(response.Body) > maxQuotaBody {
 		clear(response.Body)
-		return nil, ErrQuotaNativeRead
+		return nil, quotaError(ErrQuotaResponseTooLarge, "parse", response.StatusCode)
+	}
+	if !json.Valid(response.Body) {
+		clear(response.Body)
+		return nil, quotaError(ErrQuotaResponseInvalid, "parse", response.StatusCode)
 	}
 	return response.Body, nil
 }
 
 func (r *NativeReader) hostHTTP(ctx context.Context, headers http.Header) (quotaHTTPResponse, error) {
 	if ctx.Err() != nil {
-		return quotaHTTPResponse{}, ErrQuotaHostHTTP
+		return quotaHTTPResponse{}, quotaRequestError(ctx, ctx.Err(), ErrQuotaHostHTTP, "host_http")
 	}
 	var operation struct {
 		ID string `json:"operation_id"`
 	}
 	// Opening is local bookkeeping. Preserve the returned handle even if the
 	// query deadline expires during the RPC, so it can still be cancelled.
-	if err := r.Callback.Call(context.WithoutCancel(ctx), "host.http.operation.open", struct{}{}, &operation); err != nil || operation.ID == "" {
-		return quotaHTTPResponse{}, ErrQuotaHostHTTP
+	if err := r.Callback.Call(context.WithoutCancel(ctx), "host.http.operation_open", struct{}{}, &operation); err != nil || operation.ID == "" {
+		if operation.ID != "" {
+			_ = r.cancelOperation(operation.ID)
+		}
+		r.setConnectionStatus("operation_open_failed")
+		return quotaHTTPResponse{}, quotaRequestError(ctx, err, ErrQuotaHostOperation, "operation_open")
 	}
+	r.connectionMu.Lock()
+	if r.connectionStatus != "verified" && r.connectionStatus != "operation_cancel_failed" {
+		r.connectionStatus = "operation_open_verified"
+	}
+	r.connectionMu.Unlock()
 	finished, cancelled := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(cancelled)
 		select {
 		case <-ctx.Done():
-			cancelCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			_ = r.Callback.Call(cancelCtx, "host.http.cancel", map[string]string{"operation_id": operation.ID}, &struct{}{})
+			_ = r.cancelOperation(operation.ID)
 		case <-finished:
 		}
 	}()
@@ -140,17 +162,18 @@ func (r *NativeReader) hostHTTP(ctx context.Context, headers http.Header) (quota
 	close(finished)
 	<-cancelled
 	if err != nil || ctx.Err() != nil {
-		cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = r.Callback.Call(cleanup, "host.http.cancel", map[string]string{"operation_id": operation.ID}, &struct{}{})
-		cancel()
+		_ = r.cancelOperation(operation.ID)
 		clear(response.Body)
-		return quotaHTTPResponse{}, ErrQuotaHostHTTP
+		return quotaHTTPResponse{}, quotaRequestError(ctx, err, ErrQuotaHostHTTP, "host_http")
 	}
 	return response, nil
 }
 
 func nativeProxyTransport(proxy string) (http.RoundTripper, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := &http.Transport{}
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
+		transport = base.Clone()
+	}
 	transport.Proxy = nil // An explicit account proxy must never inherit env proxies.
 	transport.DisableKeepAlives = true
 	transport.TLSHandshakeTimeout = 10 * time.Second
@@ -183,24 +206,87 @@ func (r *NativeReader) proxyHTTP(ctx context.Context, proxy string, headers http
 	}
 	transport, err := factory(proxy)
 	if err != nil {
-		return quotaHTTPResponse{}, ErrQuotaProxyInvalid
+		return quotaHTTPResponse{}, quotaError(ErrQuotaProxyInvalid, "proxy", 0)
 	}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: transport, Timeout: maxQuotaRequestTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexUsageURL, nil)
 	if err != nil {
-		return quotaHTTPResponse{}, ErrQuotaNativeRead
+		return quotaHTTPResponse{}, quotaError(ErrQuotaNativeRead, "proxy_http", 0)
 	}
 	req.Header = headers
 	resp, err := client.Do(req)
 	if err != nil {
-		return quotaHTTPResponse{}, ErrQuotaNativeRead
+		return quotaHTTPResponse{}, quotaRequestError(ctx, err, ErrQuotaNativeRead, "proxy_http")
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxQuotaBody+1))
 	if err != nil {
 		clear(body)
-		return quotaHTTPResponse{}, ErrQuotaNativeRead
+		return quotaHTTPResponse{}, quotaRequestError(ctx, err, ErrQuotaNativeRead, "proxy_http")
 	}
 	return quotaHTTPResponse{resp.StatusCode, body}, nil
+}
+
+func (r *NativeReader) setConnectionStatus(status string) {
+	r.connectionMu.Lock()
+	r.connectionStatus = status
+	r.connectionMu.Unlock()
+}
+
+// ConnectionStatus is a snapshot. It never probes the host or upstream network.
+func (r *NativeReader) ConnectionStatus() string {
+	if !r.Available() {
+		return "callback_missing"
+	}
+	r.connectionMu.RLock()
+	defer r.connectionMu.RUnlock()
+	if r.connectionStatus == "" {
+		return "unchecked"
+	}
+	return r.connectionStatus
+}
+
+func (r *NativeReader) cancelOperation(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := r.Callback.Call(ctx, "host.http.cancel", map[string]string{"operation_id": id}, &struct{}{})
+	if err != nil {
+		r.setConnectionStatus("operation_cancel_failed")
+	}
+	return err
+}
+
+// CheckConnection only creates/cancels local host bookkeeping. It does not
+// read credentials, issue HTTP, or execute a model request.
+func (r *NativeReader) CheckConnection(ctx context.Context) (err error) {
+	started := time.Now()
+	defer func() { err = measuredQuotaError(err, started, "operation_open") }()
+	if !r.Available() {
+		return quotaError(ErrQuotaHostOperation, "operation_open", 0)
+	}
+	if ctx.Err() != nil {
+		return quotaRequestError(ctx, ctx.Err(), ErrQuotaHostOperation, "operation_open")
+	}
+	var operation struct {
+		ID string `json:"operation_id"`
+	}
+	err = r.Callback.Call(context.WithoutCancel(ctx), "host.http.operation_open", struct{}{}, &operation)
+	var cleanupErr error
+	if operation.ID != "" {
+		cleanupErr = r.cancelOperation(operation.ID)
+	}
+	if err != nil || operation.ID == "" {
+		r.setConnectionStatus("operation_open_failed")
+		return quotaRequestError(ctx, err, ErrQuotaHostOperation, "operation_open")
+	}
+	if cleanupErr != nil {
+		r.setConnectionStatus("operation_cancel_failed")
+		return quotaError(ErrQuotaHostOperation, "operation_cancel", 0)
+	}
+	r.setConnectionStatus("verified")
+	if ctx.Err() != nil {
+		return quotaRequestError(ctx, ctx.Err(), ErrQuotaHostOperation, "operation_open")
+	}
+	return nil
 }
