@@ -169,9 +169,73 @@ func (h *Host) Accounts(ctx context.Context) ([]core.HostAccount, error) {
 	h.bindings = bindings
 	h.accounts = accounts
 	h.inventoryDiagnostics = diagnostics
+	for id, baseline := range h.baselines {
+		binding, ok := bindings[id]
+		if !ok || baseline.Generation != binding.Generation {
+			delete(h.baselines, id)
+		}
+	}
 	h.mu.Unlock()
 	return result, nil
 }
+
+// Account refreshes one previously validated identity without scanning other
+// credentials. Unknown and ambiguous identities require a full inventory first.
+func (h *Host) Account(ctx context.Context, id core.AccountID) (core.HostAccount, error) {
+	if err := ctx.Err(); err != nil {
+		return core.HostAccount{}, err
+	}
+	h.mu.RLock()
+	old, bound := h.bindings[id]
+	a, known := h.accounts[id]
+	h.mu.RUnlock()
+	if !bound {
+		if known {
+			return a, nil
+		}
+		return core.HostAccount{}, ErrBindingUnavailable
+	}
+	b, active, err := h.readBinding(ctx, id, old.AuthIndex)
+	if contextErr := inventoryContextError(ctx, err); contextErr != nil {
+		return core.HostAccount{}, contextErr
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return core.HostAccount{}, contextErr
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// A concurrent inventory may have removed or replaced this account while
+	// its callback was running. Never restore that obsolete binding.
+	if current, ok := h.bindings[id]; !ok || current != old {
+		return core.HostAccount{}, ErrBindingChanged
+	}
+	if err != nil {
+		a = core.HostAccount{ID: id, Generation: unavailableGeneration(id)}
+		delete(h.bindings, id)
+		if h.inventoryDiagnostics == nil {
+			h.inventoryDiagnostics = map[core.AccountID]string{}
+		}
+		h.inventoryDiagnostics[id] = err.Error()
+	} else {
+		a = core.HostAccount{ID: id, Generation: b.Generation, Enabled: active}
+		h.bindings[id] = b
+		delete(h.inventoryDiagnostics, id)
+	}
+	h.accounts[id] = a
+	if baseline, ok := h.baselines[id]; ok && (err != nil || baseline.Generation != a.Generation) {
+		delete(h.baselines, id)
+	}
+	return a, nil
+}
+
+// Close releases resources owned by the quota reader after service shutdown.
+func (h *Host) Close() error {
+	if closer, ok := h.reader.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func (h *Host) validate(ctx context.Context, id core.AccountID, gen core.CredentialGeneration) (AuthBinding, error) {
 	return h.validateBinding(ctx, id, gen, true)
 }

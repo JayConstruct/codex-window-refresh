@@ -15,7 +15,7 @@ const temp = await mkdtemp(join(tmpdir(), 'window-refresh-panel-browser-'));
 let browser, server, ws;
 const posts = [];
 const reads = [];
-let snapshotSequence = 0, jobSequence = 0;
+let snapshotSequence = 0, jobSequence = 0, quotaCompletedAt = 0;
 const jobs = new Map();
 function recordJob(kind, detail) { jobs.set(detail.job_id, {kind, detail}); summary.scheduler[kind] = detail; }
 let unauthorized = false, conflict = false, revision = 'a'.repeat(64);
@@ -95,6 +95,7 @@ try {
             const accountID = selected.account_id, failed = accountID !== 'fixture-account';
             // Publish acceptance immediately; execution completes asynchronously.
             setTimeout(() => {
+              quotaCompletedAt = Date.now();
               recordJob('quota_query', {job_id:jobID,account_id:accountID,phase:'completed',total:1,completed:failed?0:1,failed:failed?1:0,skipped:0,started_at:new Date().toISOString(),finished_at:new Date().toISOString()});
               if (!failed) {
                 accounts[accountID].FiveHour.Remaining.Value = 70;
@@ -149,17 +150,18 @@ try {
   }, 'Chromium did not create a page target');
   ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
   await new Promise((r, j) => { ws.addEventListener('open', r, { once: true }); ws.addEventListener('error', j, { once: true }); });
-  let serial = 0; const pending = new Map(), caughtExceptions = [];
+  let serial = 0; const pending = new Map(), caughtExceptions = [], dialogs = [];
   function cdp(method, params = {}) { return new Promise((r, j) => { const id = ++serial; const timer = setTimeout(() => { pending.delete(id); j(new Error(`CDP timeout: ${method}`)); }, 15000); pending.set(id, { r, j, timer }); ws.send(JSON.stringify({ id, method, params })); }); }
   ws.addEventListener('message', event => {
     const data = JSON.parse(event.data);
     if (data.id) { const p = pending.get(data.id); if (!p) return; clearTimeout(p.timer); pending.delete(data.id); data.error ? p.j(new Error(JSON.stringify(data.error))) : p.r(data.result); }
     if (data.method === 'Runtime.exceptionThrown') errors.push(data.params.exceptionDetails.text);
-    if (data.method === 'Page.javascriptDialogOpening') void cdp('Page.handleJavaScriptDialog', { accept: true });
+    if (data.method === 'Page.javascriptDialogOpening') { dialogs.push(data.params.message); void cdp('Page.handleJavaScriptDialog', { accept: true }); }
     if (data.method === 'Debugger.paused') { caughtExceptions.push(data.params.data?.description || data.params.reason); void cdp('Debugger.resume'); }
   });
   await cdp('Page.enable'); await cdp('Runtime.enable'); await cdp('Debugger.enable');
   await cdp('Debugger.setPauseOnExceptions', { state: 'all' });
+  await cdp('Emulation.setDeviceMetricsOverride', {width:1280,height:960,deviceScaleFactor:1,mobile:false});
   async function evaluate(expression) {
     const result = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
     assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails)); return result.result.value;
@@ -172,11 +174,16 @@ try {
   assert.equal(posts.length, 0, 'Read-only login must not dispatch operations');
   assert.equal(await evaluate('document.getElementById("auto-refresh").checked'), false, 'Page refresh must require explicit opt-in');
   assert.equal(await evaluate('document.getElementById("query-manual")'), null, 'Manual queries must not have a permission switch');
+  assert.equal(await evaluate('document.querySelector(".overview-guide").open || document.querySelector(".mode-help").open'), false, 'Overview help should start collapsed');
+  assert.equal(await evaluate('document.getElementById("quota-query").getBoundingClientRect().top < innerHeight'), true, 'Primary quota action is below the desktop fold');
+  assert.equal(await evaluate('document.getElementById("updated-at").textContent.includes("页面更新于") && document.getElementById("quota-freshness").textContent.includes("额度观测")'), true, 'Page reads were not separated from quota observations');
+  await evaluate('document.getElementById("refresh-options").open=true');
   const initialReads = reads.length;
   await new Promise(resolve => setTimeout(resolve, 5500));
   assert.equal(reads.length, initialReads, 'Snapshots refreshed without explicit opt-in');
   await evaluate('document.getElementById("auto-refresh").click()');
-  assert.equal(await evaluate('localStorage.length'), 0, 'Manual login persisted the key');
+  assert.equal(await evaluate('localStorage.length'), 1, 'Only panel preferences should be persisted');
+  assert.deepEqual(await evaluate('JSON.parse(localStorage.getItem("codex-window-refresh:panel-preferences:v1:/v0/management/codex-window-refresh"))'), {version:1,autoRefresh:true,backgroundRefresh:false}, 'Manual key leaked into preferences');
   assert.equal(await evaluate('document.getElementById("mode-title").textContent'), '仅查看与查询额度', 'Applied mode did not explain model behavior');
   assert.equal(await evaluate('document.getElementById("query-automatic").closest(".view").id'), 'tab-query', 'Query controls are mixed with wake rules');
   assert.equal(await evaluate('document.getElementById("save-bar").hidden'), true, 'Clean draft displayed a pending save bar');
@@ -212,7 +219,11 @@ try {
     }
   }
   await cdp('Page.navigate', {url: new URL('/management.html', url).href});
-  await waitFor(() => evaluate('!!document.querySelector("iframe")?.contentDocument?.getElementById("workspace") && !document.querySelector("iframe").contentDocument.getElementById("workspace").hidden'), 'CPA menu iframe did not auto-connect');
+  try { await waitFor(() => evaluate('!!document.querySelector("iframe")?.contentDocument?.getElementById("workspace") && !document.querySelector("iframe").contentDocument.getElementById("workspace").hidden'), 'CPA menu iframe did not auto-connect'); }
+  catch (error) {
+    console.error('Iframe diagnostic:', await evaluate('JSON.stringify({url:location.pathname,frame:document.querySelector("iframe")?.contentDocument?.readyState,notice:document.querySelector("iframe")?.contentDocument?.getElementById("notice")?.textContent})'), errors, caughtExceptions);
+    throw error;
+  }
   await cdp('Page.navigate', {url});
   await waitFor(() => evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Reopening did not auto-connect');
   assert.equal(posts.length, 0, 'Auto-connect dispatched operations');
@@ -221,18 +232,53 @@ try {
   await evaluate('document.getElementById("auto-refresh").click()');
   await evaluate('document.getElementById("background-refresh").click()');
   await waitFor(()=>evaluate('!document.getElementById("refresh").disabled && document.getElementById("refresh-status").textContent.includes("含后台标签页")'),'Background refresh opt-in did not apply');
+  const hostLogin = await evaluate('localStorage.getItem("managementKey")');
+  await cdp('Page.reload');
+  await waitFor(()=>evaluate('document.readyState === "complete" && !document.getElementById("workspace").hidden && document.getElementById("auto-refresh").checked && document.getElementById("background-refresh").checked'),'Reload did not restore saved refresh preferences');
+  assert.equal(await evaluate('localStorage.getItem("managementKey")'), hostLogin, 'Preference restoration changed host login');
   await evaluate(`document.querySelector('[data-tab="accounts"]').click()`);
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), 'Accounts did not render');
   assert.equal(await evaluate('document.getElementById("account-list").querySelectorAll("img").length'), 0, 'Account IDs must render as text');
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("正常请求响应")'), true, 'Quota source was not displayed');
+  const beforeDisplayChange = posts.length;
+  await evaluate('document.getElementById("account-sort").value="five-remaining";document.getElementById("account-sort").dispatchEvent(new Event("change"));document.getElementById("account-layout").value="compact";document.getElementById("account-layout").dispatchEvent(new Event("change"))');
+  assert.equal(await evaluate('document.querySelector(".account-card").dataset.accountId'), 'fixture-account', 'Unknown quota sorted ahead of known percentage');
+  assert.equal(await evaluate('document.getElementById("account-list").classList.contains("compact")'), true, 'Compact layout did not apply');
+  assert.equal(posts.length, beforeDisplayChange, 'Changing account display wrote server rules');
+  await cdp('Page.reload');
+  await waitFor(()=>evaluate('document.readyState === "complete" && !document.getElementById("workspace").hidden && document.getElementById("account-layout").value==="compact" && document.getElementById("account-sort").value==="five-remaining"'),'Account display preferences did not survive reload');
+  await evaluate('document.querySelector("[data-tab=accounts]").click()');
   assert.equal(await evaluate('Array.from(document.querySelectorAll(".account-disclosure")).every(item=>!item.open)'),true,'Account diagnostics were not collapsed');
   await evaluate('document.querySelector(".account-disclosure").open=true');
   await waitFor(()=>evaluate('document.querySelector(".account-disclosure").open'),'Account details did not open');
+  await evaluate('window.retainedAccountCard=document.querySelector(".account-card");window.retainedAccountButton=window.retainedAccountCard.querySelector("[data-quota-account]");window.retainedAccountButton.focus()');
+  const otherAccount = '<img src=x onerror=alert(1)>', originalOtherWindow = structuredClone(accounts[otherAccount].FiveHour);
+  accounts[otherAccount].FiveHour = {...originalOtherWindow, Remaining: {Value: 1, Unit: 'percent'}};
   accounts['fixture-account'].FiveHour.Remaining.Value = 72;
   const pollStarted = Date.now();
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("72%")'), 'Passive quota did not appear on automatic panel polling');
   assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
   assert.equal(await evaluate('document.querySelector(".account-disclosure").open'),true,'Polling collapsed open account diagnostics');
+  assert.equal(await evaluate('document.activeElement===window.retainedAccountButton && document.querySelector(".account-card")===window.retainedAccountCard'),true,'Passive refresh replaced the focused account or moved its sort position');
+  await evaluate('window.retainedAccountText=window.retainedAccountCard.querySelector(".account-id").firstChild;const range=document.createRange();range.selectNodeContents(window.retainedAccountText);getSelection().removeAllRanges();getSelection().addRange(range)');
+  accounts['fixture-account'].FiveHour.Remaining.Value = 71;
+  await evaluate('document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("71%")'),'Selected account snapshot did not update');
+  assert.equal(await evaluate('getSelection().toString()'), 'fixture-account', 'Passive updates cleared selected account text');
+  const selectedObservation = await evaluate('const observed=window.retainedAccountCard.querySelector("[data-observed]");const selectionRange=document.createRange();selectionRange.selectNodeContents(observed);getSelection().removeAllRanges();getSelection().addRange(selectionRange);getSelection().toString()');
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  assert.equal(await evaluate('getSelection().toString()'), selectedObservation, 'Local clock updates cleared selected observation time');
+  await evaluate('getSelection().removeAllRanges();document.getElementById("account-sort").dispatchEvent(new Event("change"))');
+  assert.equal(await evaluate('document.querySelector(".account-card").dataset.accountId'), otherAccount, 'An explicit sort failed to update order');
+  accounts[otherAccount].FiveHour = originalOtherWindow;
+  await evaluate('document.getElementById("account-sort").focus();document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('!document.getElementById("refresh").disabled && document.querySelector(".account-card").dataset.accountId==="fixture-account"'),'Restoring unknown quota did not restore sort order');
+  await evaluate('window.retainedAccountCard.querySelector(".account-footer button").click()');
+  assert.equal(await evaluate('JSON.parse(document.getElementById("config-json").value).account_overrides["fixture-account"].paused'), true, 'Pause did not update the current account draft');
+  await evaluate('window.retainedAccountCard.querySelector(".account-footer button").click()');
+  assert.equal(await evaluate('JSON.parse(document.getElementById("config-json").value).account_overrides["fixture-account"].paused'), false, 'Reused pause listener retained stale account state');
+  await evaluate('document.getElementById("draft-restore").click()');
+  await waitFor(()=>evaluate('document.getElementById("save-bar").hidden'),'Discarding pause draft did not restore clean state');
   assert.equal(posts.length, 0, 'Snapshot polling dispatched operations');
   await evaluate('document.querySelector("[data-tab=capabilities]").click(); document.getElementById("quota-connection-check").click()');
   await waitFor(()=>evaluate('document.getElementById("bridge-status").textContent.includes("创建与取消已验证") && !document.getElementById("quota-connection-check").disabled'),'Explicit host connection check failed');
@@ -248,6 +294,8 @@ try {
   await waitFor(()=>posts.length===singleQueryCount+1,'Account query was not sent');
   await waitFor(()=>evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>button.disabled)'),'Queued query allowed another target before snapshot');
   await waitFor(()=>evaluate('document.getElementById("account-list").textContent.includes("70%") && document.getElementById("account-list").textContent.includes("查询完成")'),'Single-account result did not update');
+  const singleQueryLatency = Date.now() - quotaCompletedAt;
+  assert.ok(quotaCompletedAt > 0 && singleQueryLatency < 2000, 'Single-account result took more than two seconds to appear after backend completion');
   assert.deepEqual(JSON.parse(posts.at(-1).body),{account_id:'fixture-account'},'Account query widened to all accounts');
   assert.equal(posts.length,singleQueryCount+1,'Double click duplicated the account query');
   assert.equal(accounts['<img src=x onerror=alert(1)>'].FiveHour.State,'unknown','Selected query changed another account');
@@ -283,15 +331,42 @@ try {
   await evaluate('document.querySelector("[data-tab=accounts]").click()');
   capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp, 'panel-desktop.png'), Buffer.from(capture.data, 'base64'));
+  const beforeInvalidInput = posts.length;
+  await evaluate('document.querySelector("[data-tab=rules]").click();const ratioField=document.getElementById("rule-ratio");ratioField.value="";ratioField.dispatchEvent(new Event("input",{bubbles:true}));ratioField.dispatchEvent(new Event("change",{bubbles:true}));document.querySelector("[data-tab=overview]").click();document.getElementById("config-save").click()');
+  assert.equal(await evaluate('document.activeElement.id'), 'rule-ratio', 'Save did not locate the invalid number across tabs');
+  assert.equal(await evaluate('document.getElementById("rule-ratio").value'), '', 'Invalid number was overwritten');
+  assert.equal(await evaluate('document.getElementById("rule-ratio").getAttribute("aria-invalid")'), 'true', 'Invalid number was not marked');
+  capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp, 'panel-field-error-desktop.png'), Buffer.from(capture.data, 'base64'));
+  assert.equal(posts.length,beforeInvalidInput,'Invalid numeric input submitted a write');
+  await evaluate('document.getElementById("rule-ratio").value="1";document.getElementById("rule-ratio").dispatchEvent(new Event("change",{bubbles:true}));document.getElementById("rule-five-min").value="10m";document.getElementById("rule-five-min").dispatchEvent(new Event("change",{bubbles:true}));document.getElementById("rule-five-max").value="1m";document.getElementById("rule-five-max").dispatchEvent(new Event("change",{bubbles:true}));document.getElementById("config-save").click()');
+  assert.equal(await evaluate('document.activeElement.id'), 'rule-five-max', 'Inverted delay range did not focus its maximum field');
+  assert.equal(posts.length,beforeInvalidInput,'Invalid delay range submitted a write');
+  await evaluate('document.getElementById("rule-five-min").value="0s";document.getElementById("rule-five-min").dispatchEvent(new Event("change",{bubbles:true}));document.getElementById("rule-five-max").value="600s";document.getElementById("rule-five-max").dispatchEvent(new Event("change",{bubbles:true}));document.getElementById("rule-timezone").value="Factory";document.getElementById("rule-timezone").dispatchEvent(new Event("change",{bubbles:true}))');
+  assert.equal(await evaluate('document.getElementById("rule-timezone").getAttribute("aria-invalid")'), 'false', 'Browser tzdata rejected a server-valid alias');
+  await evaluate('document.getElementById("rule-timezone").value="Asia/Shanghai";document.getElementById("rule-timezone").dispatchEvent(new Event("change",{bubbles:true}))');
+  await waitFor(()=>evaluate('document.getElementById("save-bar").hidden'),'Correcting invalid input did not return to a clean draft');
   await evaluate(`{ document.querySelector('[data-tab="rules"]').click(); const ratio=document.getElementById('rule-ratio'); ratio.value='1.5'; ratio.dispatchEvent(new Event('input',{bubbles:true})); ratio.dispatchEvent(new Event('change',{bubbles:true})); }`);
   await evaluate(`{ document.querySelector('[data-tab="query"]').click(); const timeout=document.getElementById('query-timeout'); timeout.value='60s'; timeout.dispatchEvent(new Event('change',{bubbles:true})); }`);
   await evaluate(`{for(const [id,value] of [['rule-five-model','five-fixture-model'],['rule-five-prompt','Five hour content'],['rule-week-model','weekly-fixture-model'],['rule-week-prompt','Weekly content']]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event('change',{bubbles:true}));}document.getElementById('query-five-expiry').checked=true;document.getElementById('query-five-expiry').dispatchEvent(new Event('change',{bubbles:true}));document.getElementById('plan-enabled').checked=true;document.getElementById('plan-enabled').dispatchEvent(new Event('change',{bubbles:true}));document.getElementById('plan-days').value='3';document.getElementById('plan-days').dispatchEvent(new Event('change',{bubbles:true}));}`);
   await evaluate(`{for(const [id,value] of [['query-five-expiry-hours','22:00-08:00，12:00-13:00'],['query-five-expiry-min','1m'],['query-five-expiry-max','5m'],['query-week-periodic-hours','00:00-06:00'],['query-week-periodic-max','2m']]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event('change',{bubbles:true}));}document.getElementById('query-week-periodic').checked=false;document.getElementById('query-week-periodic').dispatchEvent(new Event('change',{bubbles:true}));}`);
   assert.equal(await evaluate('document.getElementById("query-five-expiry").closest(".window-settings") !== document.getElementById("query-week-expiry").closest(".window-settings")'), true, 'Window query settings are not separated');
   assert.equal(await evaluate('document.getElementById("rule-five-model").closest(".window-settings") !== document.getElementById("rule-week-model").closest(".window-settings")'), true, 'Window wake settings are not separated');
+  await evaluate('document.getElementById("changes-preview").open=true;document.getElementById("save-bar").scrollIntoView({block:"end"})');
+  assert.equal(await evaluate('document.getElementById("config-changes").textContent.includes("每用户账号数") && document.getElementById("config-changes").textContent.includes("60s")'), true, 'Save review omitted edits from another tab');
+  assert.equal(await evaluate('document.querySelectorAll("#config-changes script, #config-changes img").length'), 0, 'Review interpreted data as markup');
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Save review overflowed on desktop');
+  capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp, 'panel-save-review-desktop.png'), Buffer.from(capture.data, 'base64'));
+  await cdp('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Save review overflowed on mobile');
+  capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp, 'panel-save-review-mobile.png'), Buffer.from(capture.data, 'base64'));
+  await cdp('Emulation.setDeviceMetricsOverride', {width:1280,height:960,deviceScaleFactor:1,mobile:false});
   await evaluate(`document.getElementById('config-save').click()`);
   await waitFor(() => config.activity.accounts_per_user === 1.5, 'Rule save failed');
   await waitFor(() => evaluate('!document.getElementById("rule-ratio").disabled'), 'Save did not finish updating the view');
+  assert.ok(dialogs.some(message => message.includes('每用户账号数：1 → 1.5') && message.includes('额度查询超时：15s → 60s')), 'Save confirmation did not include specific changes');
   assert.equal(config.execution.verify_delays[2], '120s', 'Unedited advanced settings were lost');
   assert.equal(config.execution.quota_read_timeout, '60s', 'Quota timeout setting was not saved');
   assert.equal(config.daily_rules[0].id, 'morning', 'Daily rules were lost');
@@ -308,17 +383,29 @@ try {
   await waitFor(()=>evaluate('document.getElementById("plan-list").textContent.includes("fixture-account") && document.getElementById("plan-status").textContent.includes("未来 3 天")'),'Saved future plan did not display');
   assert.equal(await evaluate('document.querySelector("#plan-list .timeline-day") !== null && document.querySelector("#plan-list .plan-query") !== null'),true,'Plan timeline did not render query nodes');
   assert.ok(posts.every(post=>['quota-query','quota-connection-check','config'].includes(post.path)),'Planning dispatched unexpected operations');
+  await evaluate('document.getElementById("plan-view-history").click()');
   await waitFor(()=>evaluate('document.getElementById("history-list").textContent.includes("每日规则") && document.getElementById("history-list").textContent.includes("<script>text-only</script>")'),'Task history or sources did not render');
   assert.equal(await evaluate('document.querySelectorAll("#history-list script").length'),0,'History prompt was interpreted as markup');
+  const historyWrites = posts.length;
+  await evaluate('document.getElementById("history-today").click()');
+  await waitFor(()=>reads.some(path=>path.includes('/history?') && path.includes('from=')),'Today shortcut did not apply a lower time bound');
+  await evaluate('document.getElementById("history-failed").click()');
+  await waitFor(()=>reads.some(path=>path.includes('/history?') && path.includes('status=failed')),'Failure shortcut did not filter result');
+  await evaluate('document.querySelector("[data-tab=accounts]").click();Array.from(document.querySelectorAll("[data-history-account]")).find(button=>button.dataset.historyAccount==="fixture-account").click()');
+  await waitFor(()=>evaluate('!document.getElementById("tab-plan").hidden && !document.getElementById("plan-history").hidden && document.getElementById("history-account").value==="fixture-account"'),'Account history link did not open the correct history view');
+  await waitFor(()=>reads.some(path=>path.includes('/history?') && path.includes('account_id=fixture-account')),'Account history link did not scope the read');
+  assert.equal(posts.length,historyWrites,'History controls dispatched a write');
   assert.equal(await evaluate('document.getElementById("generation-start").disabled'),false,'Saving settings did not restore generation controls');
   await evaluate(`{document.querySelector('[data-tab=rules]').click();document.getElementById('generation-account').value='fixture-account';document.getElementById('generation-model').value='generator-fixture';document.getElementById('generation-count').value='5';document.getElementById('generation-start').click();}`);
   await waitFor(()=>evaluate('document.getElementById("generation-preview").value.includes("Hello.")'),'Explicit content generation did not show candidate preview');
   const generationWrites = posts.filter(post=>post.path==='prompt-generation');
   assert.equal(generationWrites.length,1,'Generation repeated a model request');
   const beforeCandidateApply = posts.length;
+  await evaluate('document.getElementById("rule-ratio").value="";document.getElementById("rule-ratio").dispatchEvent(new Event("input",{bubbles:true}));document.getElementById("rule-ratio").dispatchEvent(new Event("change",{bubbles:true}))');
   await evaluate('document.getElementById("generation-apply").click()');
   assert.deepEqual(await evaluate('JSON.parse(document.getElementById("config-json").value).execution.prompt_pool'),['Hello.','Hi.','Ready.','Yes.','OK.'],'Candidates were not added to draft');
   assert.equal(posts.length,beforeCandidateApply,'Applying candidates automatically saved or generated');
+  assert.equal(await evaluate('document.getElementById("rule-ratio").value'), '', 'Applying generated candidates discarded another invalid input');
   conflict = true;
   await evaluate(`{ const ratio=document.getElementById('rule-ratio'); ratio.value='2'; ratio.dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click(); }`);
   await waitFor(() => posts.filter(p => p.path === 'config').length === 2, 'Conflict save was not sent');
@@ -356,6 +443,8 @@ try {
   for (const tab of ['overview','accounts','query','rules','plan','capabilities']) {
     await evaluate(`document.querySelector('[data-tab="${tab}"]').click()`);
     assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Mobile viewport has horizontal overflow: '+tab);
+    if (tab === 'overview') assert.ok(await evaluate('document.getElementById("quota-query").getBoundingClientRect().top < innerHeight'), 'Primary quota action is below the mobile fold');
+    if (tab === 'accounts') assert.equal(await evaluate('getComputedStyle(document.querySelector(".desktop-layout")).display'), 'none', 'Desktop layout selector occupied the mobile screen');
     capture = await cdp('Page.captureScreenshot');
     await writeFile(join(temp,`panel-${tab}-mobile.png`),Buffer.from(capture.data,'base64'));
   }
@@ -374,12 +463,13 @@ try {
   await cdp('Page.reload');
   await waitFor(async () => reads.length > beforeRejectedLogin && await evaluate('document.readyState === "complete" && !!document.getElementById("login-section") && !document.getElementById("login-section").hidden && document.getElementById("notice").textContent.includes("认证失败")'), 'Rejected saved key did not return to manual login');
   assert.equal(reads.length - beforeRejectedLogin, 1, 'Rejected saved key retried or dispatched parallel reads');
-  assert.equal(await evaluate('localStorage.length'), 1, 'Failed auto-connect changed host login');
+  assert.equal(await evaluate('localStorage.length'), 3, 'Failed auto-connect changed host login or preferences');
+  assert.equal(await evaluate('localStorage.getItem("managementKey")'), hostLogin, 'Failed auto-connect changed host login');
   unauthorized = false;
   await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
   await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Manual fallback did not connect');
   assert.deepEqual(errors, [], 'Browser or fixture errors');
-  console.log(`Browser smoke passed: CPA login, live bridge readiness/diagnosis, query/wake separation, mode summary, shared drafts/save bar, persistent account disclosures, keyboard tabs, quota sources/polling, manual and single-account queries, five mobile views, JSON editor, 401 cleanup. Screenshots: ${temp}`);
+  console.log(`Browser smoke passed: CPA login, bridge diagnosis, field validation and error focus, stable account nodes/focus/selection/order, current pause handlers, plan/history filters and account links, preserved form input after candidate application, config diff, manual queries (${singleQueryLatency} ms after backend completion), six mobile views, JSON editor, 401 cleanup. Screenshots: ${temp}`);
 } finally {
   if (ws) ws.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) { browser.kill('SIGTERM'); await new Promise(r => { browser.once('exit', r); setTimeout(r, 1500); }); }

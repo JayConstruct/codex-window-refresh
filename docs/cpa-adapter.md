@@ -43,7 +43,7 @@ host := cpa.NewHost(callback, quotaReader)
 每次查询通过 `host.auth.get` 重新读取当前账号凭据，只解码身份、访问 token、有效期及代理字段。再次核对 auth_index、实际 account_id 和代际，然后 GET 固定的 `https://chatgpt.com/backend-api/wham/usage`。查询前后仍由 Host 核对账号状态与身份，不把 token 刷新当成账号更换。
 
 - 无账号专用代理时调用 `host.http.do`，沿用宿主全局代理。通过 `host.http.operation_open` 创建操作，超时或取消时使用 `host.http.cancel` 终止。
-- 账号配置 `proxy_url`（兼容 `proxyUrl`、`proxy-url`、`proxyURL`）时，使用私有 HTTP transport 支持 HTTP、HTTPS、SOCKS5、SOCKS5H 和显式 direct/none，不继承系统环境代理；多个非空代理字段须一致，否则拒绝查询。禁用重定向与连接复用，响应限制为 2 MiB。
+- 账号配置 `proxy_url`（兼容 `proxyUrl`、`proxy-url`、`proxyURL`）时，使用私有 HTTP transport 支持 HTTP、HTTPS、SOCKS5、SOCKS5H 和显式 direct/none，不继承系统环境代理；多个非空代理字段须一致，否则拒绝查询。禁用重定向，响应限制为 2 MiB。按规范化后的完整代理配置复用连接，代理认证信息不同则隔离；最多保留 16 个 transport，空闲连接 90 秒到期。每次请求仍重新读取账号 token，不缓存认证 header。关闭插件时等待工作线程结束，再释放连接；配置失败也释放已创建的连接。
 - 不调用模型执行、登录、`host.auth.save` 或 refresh-token 接口。CPA 保持 OAuth 续期的唯一所有者。凭据文件明确过期或上游返回 401 时报告 `quota_credential_expired`，等待 CPA 更新或用户重新登录后重试；不通过模型请求更新凭据。
 - 物理凭据文件可能暂时落后于宿主内存。插件每次重新读取，但不能承诺文件 token 始终最新；可选择管理桥以复用宿主内存中的 token 解析。
 - token 只用于当前调用，不进入配置、状态、日志或错误。上游、代理和回调异常只发布固定分类，不附带响应正文或凭据。

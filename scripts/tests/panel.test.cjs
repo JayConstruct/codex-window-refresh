@@ -3,7 +3,7 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {readFileSync} = require('node:fs');
 const {runInNewContext} = require('node:vm');
-const {createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange} = require('../../internal/plugin/web/panel.js');
+const {createSession, createEditor, createPanelPreferences, createAccountPreferences, configChanges, changeValue, accountComparator, observationAge, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange} = require('../../internal/plugin/web/panel.js');
 const response = (value, status = 200, type = 'application/json') => ({ok: status >= 200 && status < 300, status, headers: {get: () => type}, json: async () => value});
 test('history endpoints allow only local read filters', async () => {
   const calls=[], session=createSession(async (url,options)=>{calls.push({url,options});return response({entries:[]});});session.setKey('key');
@@ -103,10 +103,11 @@ test('manual wake remains independent of automatic settings but requires safety 
   assert.ok(calls[0].url.endsWith('/manual-wake'));
   session.disconnect();
 });
-function createPanelFixture(fetcher, confirm = () => true, fields = []) {
+function createPanelFixture(fetcher, confirm = () => true, fields = [], options = {}) {
   const elements = new Map(), timers = new Map(), visibility = new Map(), events = new Map(), requests = [];
   const navigator = {onLine: true};
-  let nextTimer = 0;
+  let nextTimer = 0, clock = Date.now();
+  class FixtureDate extends Date { static now() { return clock; } }
   function element() {
     return {value: '', textContent: '', checked: false, disabled: false, hidden: true, dataset: {}, listeners: new Map(), children: [],
       classList: {toggle() {}}, append(...items) {this.children.push(...items);}, replaceChildren(...items) {this.children = items;}, setAttribute() {},
@@ -134,9 +135,9 @@ function createPanelFixture(fetcher, confirm = () => true, fields = []) {
     return snapshot;
   }});
   runInNewContext(readFileSync(require.resolve('../../internal/plugin/web/panel.js'), 'utf8'), {
-    document, navigator, URL, URLSearchParams, TextEncoder, AbortController, structuredClone, confirm,
+    document, navigator, URL, URLSearchParams, TextEncoder, AbortController, structuredClone, confirm, Date: FixtureDate,
     location: {origin: 'https://cpa.test', pathname: '/v0/resource/plugins/codex-window-refresh/status'},
-    localStorage: {getItem: () => null}, addEventListener: (event, handler) => events.set(event, handler), setInterval() {},
+    localStorage: options.localStorage || {getItem: () => null}, addEventListener: (event, handler) => events.set(event, handler), setInterval() {},
     setTimeout: (callback, duration) => {const timer = ++nextTimer; timers.set(timer, {callback, duration}); return timer;},
     clearTimeout: timer => timers.delete(timer),
     fetch: async (url, options) => {
@@ -155,13 +156,224 @@ function createPanelFixture(fetcher, confirm = () => true, fields = []) {
   });
   const settle = () => new Promise(resolve => setImmediate(resolve));
   async function poll() {
-    const [timerID, timer] = [...timers].find(([, value]) => [5000, 10000, 20000, 40000, 60000].includes(value.duration));
+    const entry = [...timers].find(([, value]) => [500, 1000, 2000, 4000, 5000, 8000, 10000, 16000, 20000, 32000, 40000, 60000].includes(value.duration));
+    assert.ok(entry, 'Expected a scheduled snapshot poll');
+    const [timerID, timer] = entry;
     timers.delete(timerID);
+    clock += timer.duration;
     timer.callback();
     await settle();
   }
   return {lookup, timers, visibility, events, navigator, document, requests, settle, poll};
 }
+test('configuration changes preserve baseline values and include nested, removed and account settings', () => {
+  const editor = createEditor(), initial = policy();
+  editor.load({config: initial, revision: 'r1'});
+  const baseline = editor.baseline(); baseline.enabled = !initial.enabled;
+  assert.equal(editor.baseline().enabled, initial.enabled, 'A caller cannot mutate the baseline');
+  const draft = editor.value(); draft.enabled = !initial.enabled;
+  draft.execution.model = 'different-model'; draft.execution.prompt_pool = ['One', 'Two'];
+  draft.account_overrides = JSON.parse('{"account.with.dots":{"paused":true}}');
+  delete draft.timezone;
+  const changes = configChanges(initial, draft);
+  assert.ok(changes.some(change => change.label === '自动模型唤醒' && change.before === initial.enabled && change.after === draft.enabled));
+  assert.ok(changes.some(change => change.label === '规则时区' && change.after === undefined));
+  assert.ok(changes.some(change => change.label.includes('账号「account.with.dots」') && change.after === true));
+  assert.ok(changes.some(change => change.label === '模型执行 / 模型' && change.after === 'different-model'));
+  assert.equal(changeValue(true), '开启'); assert.equal(changeValue(false), '关闭');
+  assert.match(changeValue(undefined), /继承默认/);
+  assert.equal(changeValue(['One', 'Two']), 'One；Two');
+  assert.deepEqual(configChanges(initial, initial), []);
+});
+test('history subview paginates both ways and keeps the previous page after read failures', async () => {
+  let fail = false;
+  const panel = createPanelFixture((url, options, data) => {
+    if (url.includes('/history?')) {
+      if (fail) return response({}, 503);
+      const cursor = Number(new URL(url, 'https://cpa.test').searchParams.get('cursor') || 0);
+      return response({entries: [{id: cursor + 1, kind: 'query', status: 'completed', account_id: 'page-' + cursor, started_at: '2026-10-14T01:00:00Z'}], next_cursor: cursor === 0 ? 50 : 0, retention_days: 30, maximum_entries: 10000});
+    }
+    return response(data[url.split('/').pop()]);
+  });
+  panel.lookup('management-key').value = 'key'; panel.lookup('login-form').listeners.get('submit')({preventDefault() {}}); await panel.settle();
+  assert.equal(panel.requests.some(request => request.url.includes('/history?')), false, 'Initial viewing must not load history');
+  panel.lookup('plan-view-history').listeners.get('click')(); await panel.settle();
+  assert.match(panel.lookup('history-status').textContent, /第 1 页/);
+  assert.equal(panel.lookup('history-prev').disabled, true);
+  assert.equal(panel.lookup('history-next').disabled, false);
+  const first = panel.lookup('history-list').children[0];
+  fail = true; panel.lookup('history-next').listeners.get('click')(); await panel.settle();
+  assert.equal(panel.lookup('history-list').children[0], first, 'A failed read must retain the prior page');
+  assert.match(panel.lookup('history-status').textContent, /保留上次结果/);
+  fail = false; panel.lookup('history-next').listeners.get('click')(); await panel.settle();
+  assert.match(panel.lookup('history-status').textContent, /第 2 页/);
+  assert.equal(panel.lookup('history-prev').disabled, false);
+  panel.lookup('history-prev').listeners.get('click')(); await panel.settle();
+  assert.match(panel.lookup('history-status').textContent, /第 1 页/);
+  const reads = panel.requests.length;
+  panel.lookup('history-from').value = 'invalid-time'; panel.lookup('history-refresh').listeners.get('click')(); await panel.settle();
+  assert.equal(panel.requests.length, reads, 'Invalid time filters must fail locally');
+  assert.match(panel.lookup('history-status').textContent, /时间需包含/);
+  assert.equal(panel.requests.filter(request => request.options.method === 'POST').length, 0);
+});
+test('save review shows cross-page changes and cancellation sends no write', async () => {
+  let accepted = false;
+  const confirmations = [], fixture = createPanelFixture((url, options, data) => {
+    if (url.endsWith('/config') && options.method === 'POST') {
+      data.config = JSON.parse(options.body).config;
+      data['config-editor'] = {config: data.config, revision: 'r2'};
+      return response(data['config-editor']);
+    }
+    return response(data[url.split('/').pop()]);
+  }, message => {confirmations.push(message); return accepted;});
+  const {lookup, settle, requests} = fixture;
+  lookup('management-key').value = 'key'; lookup('login-form').listeners.get('submit')({preventDefault() {}}); await settle();
+  const config = JSON.parse(lookup('config-json').value);
+  config.quota_query.automatic = true; config.quota_query.interval = '5m'; config.execution.model = '<img src=x>';
+  lookup('config-json').value = JSON.stringify(config); lookup('config-json').listeners.get('input')(); lookup('json-apply').listeners.get('click')();
+  const text = item => item.textContent + item.children.map(text).join('');
+  assert.match(text(lookup('config-changes')), /定期查询总开关关闭开启/);
+  assert.match(text(lookup('config-changes')), /查询间隔30s5m/);
+  assert.match(text(lookup('config-changes')), /<img src=x>/);
+  assert.equal(lookup('changes-preview').hidden, false);
+  lookup('config-save').listeners.get('click')(); await settle();
+  assert.equal(requests.filter(request => request.options.method === 'POST').length, 0);
+  assert.match(confirmations[0], /定期查询总开关：关闭 → 开启/);
+  assert.match(confirmations[0], /查询间隔：30s → 5m/);
+  accepted = true; lookup('config-save').listeners.get('click')(); await settle();
+  assert.equal(requests.filter(request => request.options.method === 'POST').length, 1);
+  assert.equal(lookup('save-bar').hidden, true);
+  assert.equal(lookup('config-changes').children.length, 0);
+});
+test('observation age remains independent of page reads and failed quota queries keep old values', async () => {
+  const observed = new Date(Date.now() - 12 * 60000).toISOString();
+  const panel = createPanelFixture((url, options, data) => {
+    data.accounts = {a: {ID: 'a', Enabled: true, FiveHour: {State: 'active', ConfirmedAt: observed, Remaining: {Value: 21, Unit: 'percent'}}}};
+    data.summary.scheduler.quota_query = {phase: 'completed', account_id: 'a', failed: 1, last_error: 'quota_credential_expired', finished_at: observed};
+    return response(data[url.split('/').pop()]);
+  });
+  panel.lookup('management-key').value = 'key'; panel.lookup('login-form').listeners.get('submit')({preventDefault() {}}); await panel.settle();
+  assert.match(panel.lookup('updated-at').textContent, /页面更新于/);
+  assert.match(panel.lookup('quota-freshness').textContent, /12 分钟前/);
+  assert.equal(panel.lookup('quota-freshness-warning').hidden, false);
+  const text = item => item.textContent + item.children.map(text).join('');
+  assert.match(text(panel.lookup('account-list')), /21%/);
+  assert.match(text(panel.lookup('account-list')), /保留上次额度/);
+  panel.lookup('refresh').listeners.get('click')(); await panel.settle();
+  assert.match(panel.lookup('quota-freshness').textContent, /12 分钟前/);
+  assert.equal(panel.requests.filter(request => request.options.method === 'POST').length, 0);
+  assert.match(observationAge('0001-01-01T00:00:00Z'), /尚无/);
+  assert.match(observationAge(new Date(Date.now() + 60000).toISOString()), /晚于本机/);
+});
+test('account sorting keeps unknown values last and compares only matching percentage units', () => {
+  const rows = [['unknown', {}], ['tokens', {FiveHour: {Remaining: {Value: 1, Unit: 'tokens'}}}], ['full', {FiveHour: {Remaining: {Value: 90, Unit: 'percent'}}}], ['low', {FiveHour: {Remaining: {Value: 10, Unit: 'percent'}}}]];
+  assert.deepEqual([...rows].sort(accountComparator('five-remaining')).map(([id]) => id), ['low', 'full', 'tokens', 'unknown']);
+  const resets = [['inactive', {FiveHour: {State: 'inactive', ResetAt: '2026-01-01T00:00:00Z'}}], ['later', {FiveHour: {State: 'active', ResetAt: '2026-10-14T12:00:00Z'}}], ['early', {FiveHour: {State: 'active', ResetAt: '2026-10-14T11:00:00Z'}}]];
+  assert.deepEqual(resets.sort(accountComparator('reset')).map(([id]) => id), ['early', 'later', 'inactive']);
+  assert.deepEqual([['healthy', {Enabled: true, FiveHour: {State: 'active'}}], ['blocked', {Enabled: false}]].sort(accountComparator('attention')).map(([id]) => id), ['blocked', 'healthy']);
+});
+test('account display preferences persist independently of auth, refresh and server rules', async () => {
+  const entries = new Map(), localStorage = {getItem: name => entries.get(name) ?? null, setItem: (name, value) => entries.set(name, value)};
+  const base = '/v0/management/codex-window-refresh';
+  const preferences = createAccountPreferences({localStorage}, base);
+  preferences.save('five-remaining', 'compact');
+  assert.deepEqual(createAccountPreferences({localStorage}, base).value(), {sort: 'five-remaining', layout: 'compact'});
+  assert.deepEqual(createAccountPreferences({localStorage}, '/other' + base).value(), {sort: 'id', layout: 'cards'});
+  assert.deepEqual(createAccountPreferences({localStorage: {getItem() {throw new Error('blocked');}}}, base).value(), {sort: 'id', layout: 'cards'});
+  const panel = createPanelFixture((url, options, data) => {
+    data.accounts = {full: {ID: 'full', FiveHour: {Remaining: {Value: 90, Unit: 'percent'}}}, low: {ID: 'low', FiveHour: {Remaining: {Value: 10, Unit: 'percent'}}}};
+    return response(data[url.split('/').pop()]);
+  }, undefined, [], {localStorage});
+  panel.lookup('management-key').value = 'key'; panel.lookup('login-form').listeners.get('submit')({preventDefault() {}}); await panel.settle();
+  assert.equal(panel.lookup('account-sort').value, 'five-remaining');
+  assert.equal(panel.lookup('account-layout').value, 'compact');
+  assert.equal(panel.lookup('account-list').children[0].dataset.accountId, 'low');
+  panel.lookup('account-sort').value = 'id'; panel.lookup('account-sort').listeners.get('change')();
+  assert.equal(panel.lookup('account-list').children[0].dataset.accountId, 'full');
+  assert.equal(panel.requests.filter(request => request.options.method === 'POST').length, 0);
+  assert.equal(panel.lookup('auto-refresh').checked, false);
+});
+test('refresh preferences survive reopening and reconnecting without storing secrets or sending operations', async () => {
+  const entries = new Map([['unrelated-host-setting', 'unchanged']]);
+  const localStorage = {getItem: name => entries.get(name) ?? null, setItem: (name, value) => entries.set(name, value)};
+  const fixture = () => createPanelFixture(undefined, undefined, [], {localStorage});
+  async function login(panel) {
+    panel.lookup('management-key').value = 'private-test-key';
+    panel.lookup('login-form').listeners.get('submit')({preventDefault() {}});
+    await panel.settle();
+  }
+  const first = fixture(); await login(first);
+  assert.equal(first.timers.size, 0);
+  for (const id of ['auto-refresh', 'background-refresh']) {
+    first.lookup(id).checked = true; first.lookup(id).listeners.get('change')();
+  }
+  await first.settle();
+  const saved = [...entries].find(([key]) => key.startsWith('codex-window-refresh:panel-preferences:'));
+  assert.deepEqual(JSON.parse(saved[1]), {version: 1, autoRefresh: true, backgroundRefresh: true});
+  assert.equal(entries.size, 2);
+  assert.equal(entries.get('unrelated-host-setting'), 'unchanged');
+  assert.ok(!JSON.stringify([...entries]).includes('private-test-key'));
+  first.lookup('disconnect').listeners.get('click')();
+  assert.equal(first.timers.size, 0);
+  assert.equal(first.lookup('auto-refresh').checked, false);
+  assert.equal(entries.get(saved[0]), saved[1]);
+  await login(first);
+  assert.equal(first.lookup('auto-refresh').checked, true);
+  assert.equal(first.lookup('background-refresh').checked, true);
+  assert.equal(first.timers.size, 1);
+  first.events.get('pagehide')();
+  const reopened = fixture();
+  assert.equal(reopened.timers.size, 0);
+  assert.equal(reopened.requests.length, 0, 'Preferences must wait for authentication');
+  await login(reopened);
+  assert.equal(reopened.lookup('auto-refresh').checked, true);
+  assert.equal(reopened.lookup('background-refresh').checked, true);
+  assert.equal([...reopened.timers.values()][0].duration, 5000);
+  assert.ok(reopened.requests.every(request => request.options.method === 'GET'));
+  reopened.lookup('auto-refresh').checked = false; reopened.lookup('auto-refresh').listeners.get('change')();
+  assert.equal(reopened.timers.size, 0);
+  assert.deepEqual(JSON.parse(entries.get(saved[0])), {version: 1, autoRefresh: false, backgroundRefresh: false});
+  const disabled = fixture(); await login(disabled);
+  assert.equal(disabled.lookup('auto-refresh').checked, false);
+  assert.equal(disabled.lookup('background-refresh').checked, false);
+  assert.equal(disabled.timers.size, 0);
+});
+test('damaged, blocked and unavailable preference storage falls back safely and proxy mounts are isolated', () => {
+  const base = '/v0/management/codex-window-refresh';
+  const defaults = {autoRefresh: false, backgroundRefresh: false};
+  for (const raw of [null, '{broken', 'null', '[]', '{"version":2,"autoRefresh":true,"backgroundRefresh":true}', '{"version":1,"autoRefresh":"true","backgroundRefresh":true}']) {
+    assert.deepEqual(createPanelPreferences({localStorage: {getItem: () => raw}}, base).value(), defaults);
+  }
+  const blocked = {};
+  Object.defineProperty(blocked, 'localStorage', {get() {throw new Error('storage denied');}});
+  for (const context of [{}, blocked, {localStorage: {getItem() {throw new Error('blocked');}, setItem() {throw new Error('full');}}}]) {
+    const preferences = createPanelPreferences(context, base);
+    assert.deepEqual(preferences.value(), defaults);
+    assert.doesNotThrow(() => preferences.save(true, true));
+    assert.deepEqual(preferences.value(), {autoRefresh: true, backgroundRefresh: true});
+  }
+  const entries = new Map(), context = {localStorage: {getItem: name => entries.get(name) ?? null, setItem: (name, value) => entries.set(name, value)}};
+  createPanelPreferences(context, base).save(true, true);
+  assert.deepEqual(createPanelPreferences(context, '/other' + base).value(), defaults);
+  assert.deepEqual(createPanelPreferences(context, base).value(), {autoRefresh: true, backgroundRefresh: true});
+});
+test('authentication failure stops restored polling without erasing browser preferences', async () => {
+  const saved = JSON.stringify({version: 1, autoRefresh: true, backgroundRefresh: true});
+  let rejected = false;
+  const panel = createPanelFixture((url, options, data) => response(data[url.split('/').pop()], rejected ? 401 : 200), undefined, [], {
+    localStorage: {getItem: name => name.startsWith('codex-window-refresh:panel-preferences:') ? saved : null, setItem() {assert.fail('Authentication must not write preferences');}}
+  });
+  panel.lookup('management-key').value = 'key'; panel.lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await panel.settle();
+  assert.equal(panel.lookup('auto-refresh').checked, true);
+  rejected = true; await panel.poll();
+  assert.equal(panel.lookup('workspace').hidden, true);
+  assert.equal(panel.timers.size, 0);
+  assert.equal(panel.lookup('auto-refresh').checked, false);
+  const count = panel.requests.length;
+  panel.events.get('online')(); panel.events.get('focus')(); await panel.settle();
+  assert.equal(panel.requests.length, count);
+});
 test('account cards require confirmation for exact manual wake and never animate an unstarted window', async () => {
   let confirmed = false;
   const confirmations = [], now = new Date().toISOString();
@@ -414,6 +626,7 @@ test('manual queries track delayed snapshots through completion with page pollin
       assert.match(lookup('quota-query-status').textContent, /等待查询/);
       assert.match(lookup('refresh-status').textContent, /手动任务进行中/);
       assert.equal(timers.size, 1);
+      assert.equal([...timers.values()][0].duration, 500, 'Manual queries must not wait for the idle five-second refresh');
       await poll(); // The runtime has not published this request yet.
       assert.match(lookup('quota-query-status').textContent, /等待查询/);
       phase = 'running'; await poll();
@@ -447,7 +660,7 @@ test('accepted manual queries recover from snapshot failures without resubmittin
   assert.match(lookup('notice').textContent, /无法读取 CPA/);
   assert.equal(lookup('quota-query').disabled, true);
   await poll();
-  assert.equal([...timers.values()][0].duration, 10000);
+  assert.equal([...timers.values()][0].duration, 1000);
   failing = false; completed = true; await poll();
   assert.match(lookup('quota-query-status').textContent, /查询结束/);
   assert.equal(lookup('notice').hidden, true);
@@ -540,6 +753,60 @@ test('long-running polling backs off failures and returns to five seconds withou
   assert.equal(requests.filter(request => request.options.method === 'POST').length, 0);
   lookup('disconnect').listeners.get('click')();
   assert.equal(timers.size, 0);
+});
+test('active task polling slows after ten seconds and returns to idle cadence after completion', async () => {
+  let completed = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.summary.scheduler.jobs = [trackedEnvelope('active-at-connect', 'quota_query', completed ? 'completed' : 'running')];
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  for (let cycle = 0; cycle < 20; cycle++) {
+    assert.equal(fixture.timers.size, 1);
+    assert.equal([...fixture.timers.values()][0].duration, 500);
+    await fixture.poll();
+  }
+  for (let cycle = 0; cycle < 5; cycle++) {
+    assert.equal([...fixture.timers.values()][0].duration, 1000);
+    await fixture.poll();
+  }
+  fixture.lookup('auto-refresh').checked = true; fixture.lookup('auto-refresh').listeners.get('change')();
+  assert.equal([...fixture.timers.values()][0].duration, 1000, 'Enabling idle refresh must not restart a long task burst');
+  completed = true; await fixture.poll();
+  assert.equal([...fixture.timers.values()][0].duration, 5000);
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 0);
+  fixture.lookup('disconnect').listeners.get('click')();
+});
+test('active task read failures back off to sixty seconds without resubmitting and reset after recovery', async () => {
+  let failing = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    if (failing && url.endsWith('/snapshot')) throw new Error('temporary network failure');
+    data.summary.scheduler.jobs = [trackedEnvelope('slow-task', 'quota_query', 'running')];
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture); failing = true;
+  for (const expected of [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]) {
+    await fixture.poll();
+    assert.equal(fixture.timers.size, 1);
+    assert.equal([...fixture.timers.values()][0].duration, expected);
+  }
+  failing = false; await fixture.poll();
+  assert.equal([...fixture.timers.values()][0].duration, 1000);
+  assert.equal(fixture.lookup('notice').hidden, true);
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 0);
+  fixture.lookup('disconnect').listeners.get('click')();
+});
+test('completed quota jobs show optional total duration and support older timestamp-only jobs', async () => {
+  for (const timing of [{total_ms: 1234}, undefined, {total_ms: -10}]) {
+    const fixture = createPanelFixture(async (url, options, data) => {
+      data.summary.scheduler.jobs = [trackedEnvelope('timed', 'quota_query', 'completed', {timing, started_at: '2026-10-14T00:00:00Z', finished_at: '2026-10-14T00:00:02Z'})];
+      return response(data[url.split('/').pop()]);
+    });
+    await loginFixture(fixture);
+    assert.match(fixture.lookup('quota-query-status').textContent, timing?.total_ms === 1234 ? /耗时 1\.2 秒/ : /耗时 2 秒/);
+    assert.equal(fixture.timers.size, 0);
+    fixture.lookup('disconnect').listeners.get('click')();
+  }
 });
 test('background refresh is explicit and resumes after tab changes and offline periods', async () => {
   const {lookup, timers, settle, poll, requests, document, navigator, visibility, events} = createPanelFixture();

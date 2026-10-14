@@ -27,7 +27,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.15"
+const Version = "0.1.0-rc.16"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -321,6 +321,12 @@ func (s *Service) configure(payload []byte) error {
 	if err != nil {
 		return errors.New("host adapter initialization failed")
 	}
+	hostCommitted := false
+	defer func() {
+		if !hostCommitted {
+			closeHostConnections(host)
+		}
+	}()
 	store, err := s.options.OpenStore(wrapper.StateDir)
 	if err != nil {
 		return errors.New("state store initialization failed")
@@ -347,6 +353,7 @@ func (s *Service) configure(payload []byte) error {
 	s.done = done
 	s.mu.Unlock()
 	committed = true
+	hostCommitted = true
 	go func() {
 		defer close(done)
 		defer func() {
@@ -374,7 +381,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	defer s.lifecycle.Unlock()
 	s.mu.Lock()
 	s.stopping = true
-	cancel, done, store := s.cancel, s.done, s.store
+	cancel, done, store, host := s.cancel, s.done, s.store, s.host
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -390,6 +397,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			return errors.New("shutdown waiting for host callback; process restart required")
 		}
 	}
+	closeHostConnections(host)
 	if store != nil {
 		if err := store.Close(); err != nil {
 			return errors.New("state store close failed")
@@ -410,11 +418,12 @@ func (s *Service) WaitForShutdown() {
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
 	s.mu.RLock()
-	done, store := s.done, s.store
+	done, store, host := s.done, s.store, s.host
 	s.mu.RUnlock()
 	if done != nil {
 		<-done
 	}
+	closeHostConnections(host)
 	if store != nil {
 		_ = store.Close()
 	}
@@ -423,6 +432,12 @@ func (s *Service) WaitForShutdown() {
 	s.cancel = nil
 	s.done = nil
 	s.mu.Unlock()
+}
+
+func closeHostConnections(host Host) {
+	if closer, ok := host.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	}
 }
 
 func registration() any {

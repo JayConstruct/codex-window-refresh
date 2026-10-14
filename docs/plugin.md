@@ -58,6 +58,8 @@ CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/co
 
 `scheduler.quota_query.diagnostic` 提供本次手动任务最近失败的 `code/stage/http_status/elapsed_ms`；`scheduler.last_quota_diagnostic` 提供运行期间最近一次额度查询失败。两者不持久化，仅包含固定分类及本地耗时；返回的快照不会暴露可变的内部诊断对象。`/capabilities` 的 `quota_bridge.host_http_status` 是已有宿主接口检查结果，读取它不会主动检查网络。
 
+手动额度任务的可选 `timing` 同时出现在 `scheduler.quota_query` 和对应 `scheduler.jobs[].quota_query` 中，提供毫秒值 `queued_ms`（等待工作线程）、`inventory_ms`（清单或目标身份刷新）、`query_ms`（额度读取与应用）、`commit_ms`（状态提交）、`total_ms`（接受任务至完成提交）。采用本地单调时钟，完成后固定，不计浏览器轮询、响应传输或渲染；各阶段不是全部执行开销的穷尽分解。数据只保存在内存，不包含 token、代理或上游响应正文。
+
 ### 快照与任务同步协议
 
 `/snapshot` 从同一次原子加载取得已发布账号、调度摘要、任务、能力及生效配置；不包含用户活动身份、请求元数据或凭据。`instance_id` 在每个运行时实例新建时变化，`snapshot_seq` 在该实例内随配置、接受任务、进度、诊断或提交发布递增，区别于持久化状态 revision 和配置文件 revision。`config.enabled` 是宿主开关约束后的生效值，`summary.business_enabled` 保留业务开关，草稿仍来自 `/config-editor`。旧的 summary/accounts/config/capabilities 接口保留兼容用途，不能跨接口假定同一版本。

@@ -49,6 +49,23 @@ func (h *Host) SetBaseline(state core.CoreState) {
 		h.baselines[id] = a
 	}
 }
+
+// SetAccountBaseline avoids copying the full account inventory for a targeted
+// quota query. The reader retains only detached window evidence for this account.
+func (h *Host) SetAccountBaseline(account core.AccountState) {
+	account.Task = nil
+	if account.FiveHour.Remaining != nil {
+		remaining := *account.FiveHour.Remaining
+		account.FiveHour.Remaining = &remaining
+	}
+	if account.Weekly.Remaining != nil {
+		remaining := *account.Weekly.Remaining
+		account.Weekly.Remaining = &remaining
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.baselines[account.ID] = account
+}
 func (h *Host) ActivityAccounts() map[core.AccountID]core.HostAccount {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

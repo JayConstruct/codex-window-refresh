@@ -18,6 +18,12 @@ curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/ma
 
 当前已实现 **Linux 原生插件原型**：后台协调器、持久化状态、宿主额度查询与可选管理桥、指定账号执行、活动与正常请求额度观测及已认证管理 API。普通 HTTP/流式响应头和 WebSocket 额度事件可更新对应账号，完整有效的活跃窗口证据会推迟后台重复查询。手动查询始终允许；定期额度查询与模型唤醒默认关闭，需用户手动开启并保存，已有配置中显式开启的设置保持不变。“立即查询额度”分批查询额度接口，账号卡片的“查询此账号额度”只查询指定账号，两者都不发送模型请求。只查看额度时保持“启用模型唤醒”关闭，仍可手动查询并被动更新。面板按总览、账号额度、额度查询、模型唤醒和诊断与高级分区；页面自动刷新默认关闭，手动勾选后每 5 秒读取快照，也可随时点击“更新页面数据”。面板显示额度来源与手动查询进度，各页面共用草稿和保存栏。动态库已通过本地 C 假宿主加载验证；尚未在真实 CPA 宿主或生产账号上联调。
 
+## v0.1.0-rc.16 面板体验与查询链路优化
+
+浏览器保存页面刷新与后台刷新偏好、账号排序和桌面布局；总览更紧凑，页面更新时间与额度观测时间分开显示。保存前可预览配置差异，字段出错时保留输入并定位；账号刷新保留操作焦点、展开与文字选择。“计划与历史”分开查看，支持快捷筛选、双向翻页和单账号入口。定期查询和模型唤醒继续独立保存，页面恢复偏好不会开启上游请求。
+
+同时优化已绑定账号的单账号身份核验和显式代理连接复用，增加手动查询阶段耗时；首次、批量与未知账号仍完整发现。改动随 [v0.1.0-rc.16 安装包](https://github.com/JayConstruct/codex-window-refresh/releases/tag/v0.1.0-rc.16) 升级并重启 CPA 后生效。详见 [面板说明](docs/panel.md)、[查询性能说明](docs/query-performance.md) 与 [网页设计参考](docs/panel-design-references.md)。
+
 ## v0.1.0-rc.11 查询、刷新与手动唤醒
 
 - **手动查询始终允许**：批量查询与单账号查询不再需要开启权限开关；旧配置中的 `quota_query.manual: false` 不再阻止查询。仍需要管理认证、后台运行及额度接口就绪。
@@ -64,6 +70,7 @@ curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/ma
 
 ## 设计文件
 
+- [面板设计参考与浏览器偏好保存](docs/panel-design-references.md)
 - [用户规则与调度逻辑](docs/codex-refresh-design.md)
 - [核心模型与并发边界](docs/core-architecture.md)
 - [官方 CPA 接口核对](docs/cpa-integration.md)
@@ -73,6 +80,7 @@ curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/ma
 - [插件构建、配置与管理 API](docs/plugin.md)
 - [额度与执行适配器](docs/cpa-adapter.md)
 - [单账号额度查询故障检查与方案完善](docs/quota-query-review.md)
+- [额度查询性能优化与验收](docs/query-performance.md)
 - [持久化存储](docs/storage.md)
 - [配置草案](config.example.yaml)
 

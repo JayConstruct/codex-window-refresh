@@ -15,6 +15,8 @@ import (
 
 const codexUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 const maxQuotaBody = 2 << 20
+const maxProxyTransports = 16
+const proxyTransportIdleTimeout = 90 * time.Second
 
 var ErrQuotaCredentialMissing = errors.New("quota_credential_missing")
 var ErrQuotaCredentialExpired = errors.New("quota_credential_expired")
@@ -31,6 +33,16 @@ type NativeReader struct {
 	TransportForProxy func(string) (http.RoundTripper, error)
 	connectionMu      sync.RWMutex
 	connectionStatus  string
+	proxyMu           sync.Mutex
+	proxyTransports   map[string]*quotaProxyTransport
+	closed            bool
+}
+
+type quotaProxyTransport struct {
+	transport http.RoundTripper
+	lastUsed  time.Time
+	users     int
+	retired   bool
 }
 
 func (r *NativeReader) Available() bool { return r != nil && r.Callback != nil }
@@ -170,46 +182,67 @@ func (r *NativeReader) hostHTTP(ctx context.Context, headers http.Header) (quota
 }
 
 func nativeProxyTransport(proxy string) (http.RoundTripper, error) {
+	normalized, err := normalizeQuotaProxy(proxy)
+	if err != nil {
+		return nil, err
+	}
 	transport := &http.Transport{}
 	if base, ok := http.DefaultTransport.(*http.Transport); ok && base != nil {
 		transport = base.Clone()
 	}
 	transport.Proxy = nil // An explicit account proxy must never inherit env proxies.
-	transport.DisableKeepAlives = true
+	transport.DisableKeepAlives = false
+	transport.MaxIdleConns = 4
+	transport.MaxIdleConnsPerHost = 2
+	transport.IdleConnTimeout = proxyTransportIdleTimeout
 	transport.TLSHandshakeTimeout = 10 * time.Second
-	if strings.EqualFold(proxy, "direct") || strings.EqualFold(proxy, "none") {
+	if normalized == "direct" {
 		return transport, nil
 	}
-	parsed, err := url.Parse(proxy)
-	if err != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
-		return nil, ErrQuotaProxyInvalid
-	}
-	switch parsed.Scheme {
-	case "http", "https", "socks5", "socks5h":
-	default:
-		return nil, ErrQuotaProxyInvalid
-	}
-	if port := parsed.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		if err != nil || n < 1 || n > 65535 {
-			return nil, ErrQuotaProxyInvalid
-		}
-	}
+	parsed, _ := url.Parse(normalized)
 	transport.Proxy = http.ProxyURL(parsed)
 	return transport, nil
 }
 
-func (r *NativeReader) proxyHTTP(ctx context.Context, proxy string, headers http.Header) (quotaHTTPResponse, error) {
-	factory := r.TransportForProxy
-	if factory == nil {
-		factory = nativeProxyTransport
+func normalizeQuotaProxy(proxy string) (string, error) {
+	proxy = strings.TrimSpace(proxy)
+	if strings.EqualFold(proxy, "direct") || strings.EqualFold(proxy, "none") {
+		return "direct", nil
 	}
-	transport, err := factory(proxy)
+	parsed, err := url.Parse(proxy)
+	if err != nil || parsed.Hostname() == "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return "", ErrQuotaProxyInvalid
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	switch parsed.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return "", ErrQuotaProxyInvalid
+	}
+	if port := parsed.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", ErrQuotaProxyInvalid
+		}
+	}
+	// DNS names and IP literals are case insensitive; an IPv6 zone names a
+	// local interface and must retain its case on case-sensitive platforms.
+	if zone := strings.IndexByte(parsed.Host, '%'); zone >= 0 {
+		parsed.Host = strings.ToLower(parsed.Host[:zone]) + parsed.Host[zone:]
+	} else {
+		parsed.Host = strings.ToLower(parsed.Host)
+	}
+	parsed.Path, parsed.RawPath = "", ""
+	return parsed.String(), nil
+}
+
+func (r *NativeReader) proxyHTTP(ctx context.Context, proxy string, headers http.Header) (quotaHTTPResponse, error) {
+	transport, release, err := r.acquireProxyTransport(proxy)
 	if err != nil {
 		return quotaHTTPResponse{}, quotaError(ErrQuotaProxyInvalid, "proxy", 0)
 	}
+	defer release()
 	client := &http.Client{Transport: transport, Timeout: maxQuotaRequestTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, codexUsageURL, nil)
 	if err != nil {
 		return quotaHTTPResponse{}, quotaError(ErrQuotaNativeRead, "proxy_http", 0)
@@ -226,6 +259,111 @@ func (r *NativeReader) proxyHTTP(ctx context.Context, proxy string, headers http
 		return quotaHTTPResponse{}, quotaRequestError(ctx, err, ErrQuotaNativeRead, "proxy_http")
 	}
 	return quotaHTTPResponse{resp.StatusCode, body}, nil
+}
+
+func closeQuotaTransport(transport http.RoundTripper) {
+	if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
+}
+
+// The pool belongs to this reader. Keys include the complete proxy identity,
+// including proxy credentials, but are never returned in diagnostics or logs.
+func (r *NativeReader) acquireProxyTransport(proxy string) (http.RoundTripper, func(), error) {
+	key, err := normalizeQuotaProxy(proxy)
+	if err != nil {
+		return nil, nil, ErrQuotaProxyInvalid
+	}
+	r.proxyMu.Lock()
+	if r.closed {
+		r.proxyMu.Unlock()
+		return nil, nil, ErrQuotaNativeRead
+	}
+	now := time.Now()
+	retired := []http.RoundTripper{}
+	retire := func(key string, entry *quotaProxyTransport) {
+		delete(r.proxyTransports, key)
+		entry.retired = true
+		if entry.users == 0 {
+			retired = append(retired, entry.transport)
+		}
+	}
+	for key, entry := range r.proxyTransports {
+		if now.Sub(entry.lastUsed) >= proxyTransportIdleTimeout {
+			retire(key, entry)
+		}
+	}
+	entry := r.proxyTransports[key]
+	if entry == nil {
+		factory := r.TransportForProxy
+		if factory == nil {
+			factory = nativeProxyTransport
+		}
+		// Factories only configure transports, so creation is serialized to
+		// avoid duplicate pools for simultaneous queries of one proxy.
+		transport, factoryErr := factory(proxy)
+		if factoryErr != nil || transport == nil {
+			r.proxyMu.Unlock()
+			if transport != nil {
+				closeQuotaTransport(transport)
+			}
+			for _, transport := range retired {
+				closeQuotaTransport(transport)
+			}
+			return nil, nil, ErrQuotaProxyInvalid
+		}
+		if len(r.proxyTransports) >= maxProxyTransports {
+			var oldestKey string
+			var oldest *quotaProxyTransport
+			for key, candidate := range r.proxyTransports {
+				if oldest == nil || candidate.lastUsed.Before(oldest.lastUsed) {
+					oldestKey, oldest = key, candidate
+				}
+			}
+			retire(oldestKey, oldest)
+		}
+		entry = &quotaProxyTransport{transport: transport}
+		if r.proxyTransports == nil {
+			r.proxyTransports = map[string]*quotaProxyTransport{}
+		}
+		r.proxyTransports[key] = entry
+	}
+	entry.users++
+	entry.lastUsed = now
+	r.proxyMu.Unlock()
+	for _, transport := range retired {
+		closeQuotaTransport(transport)
+	}
+	return entry.transport, func() {
+		r.proxyMu.Lock()
+		entry.users--
+		entry.lastUsed = time.Now()
+		closeIdle := entry.retired && entry.users == 0
+		r.proxyMu.Unlock()
+		if closeIdle {
+			closeQuotaTransport(entry.transport)
+		}
+	}, nil
+}
+
+// Close releases idle proxy connections. Active requests retain their context
+// and release their transport after reading the response.
+func (r *NativeReader) Close() error {
+	r.proxyMu.Lock()
+	r.closed = true
+	retired := []http.RoundTripper{}
+	for _, entry := range r.proxyTransports {
+		entry.retired = true
+		if entry.users == 0 {
+			retired = append(retired, entry.transport)
+		}
+	}
+	r.proxyTransports = nil
+	r.proxyMu.Unlock()
+	for _, transport := range retired {
+		closeQuotaTransport(transport)
+	}
+	return nil
 }
 
 func (r *NativeReader) setConnectionStatus(status string) {

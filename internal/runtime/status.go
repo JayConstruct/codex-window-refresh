@@ -56,6 +56,10 @@ func (e *Engine) publish(committed bool) {
 	summary := SchedulingSummary{ObservedAt: now, RecentUsers: core.ActiveUserCount(state, now, e.cfg.Activity.Lookback.Value()), IdentitySource: e.cfg.Activity.IdentitySource, Capacity: capacityFor(e.cfg, state, now, ""), HoldCounts: map[string]int{}, NextInventoryAt: e.nextInventory}
 	summary.Jobs = e.collectJobStatuses(state)
 	summary.QuotaQuery = e.manualQuery
+	if summary.QuotaQuery.Timing != nil {
+		timing := *summary.QuotaQuery.Timing
+		summary.QuotaQuery.Timing = &timing
+	}
 	summary.Plan = e.schedulePlan(state, now)
 	summary.ManualWake = e.manualWake
 	summary.GenerationJob = state.GenerationJob

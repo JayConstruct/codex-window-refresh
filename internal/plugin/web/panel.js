@@ -1,5 +1,6 @@
 /* Public assets reuse the same-origin CPA panel's saved management key.
- * Storage is read-only; requests use fixed local endpoints and never auto-write. */
+ * Host auth storage is read-only; only non-secret panel preferences are persisted.
+ * Requests use fixed local endpoints and never automatically repeat writes. */
 (function (root) {
   'use strict';
   const API = '/v0/management/codex-window-refresh';
@@ -19,6 +20,42 @@
   }
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function validObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+  function createPanelPreferences(context, base) {
+    // localStorage is origin-scoped; include the API path to isolate proxy mounts.
+    const key = 'codex-window-refresh:panel-preferences:v1:' + base;
+    let value = {autoRefresh: false, backgroundRefresh: false};
+    try {
+      const saved = JSON.parse(context.localStorage.getItem(key));
+      if (validObject(saved) && saved.version === 1 && typeof saved.autoRefresh === 'boolean' && typeof saved.backgroundRefresh === 'boolean') {
+        value = {autoRefresh: saved.autoRefresh, backgroundRefresh: saved.autoRefresh && saved.backgroundRefresh};
+      }
+    } catch (_) { /* Storage can be unavailable or contain damaged JSON. */ }
+    return {
+      value: () => ({...value}),
+      save(autoRefresh, backgroundRefresh) {
+        value = {autoRefresh: autoRefresh === true, backgroundRefresh: autoRefresh === true && backgroundRefresh === true};
+        try { context.localStorage.setItem(key, JSON.stringify({version: 1, ...value})); }
+        catch (_) { /* Keep the current session usable when persistence is denied. */ }
+      }
+    };
+  }
+  const accountSorts = ['id', 'five-remaining', 'weekly-remaining', 'reset', 'attention'];
+  function createAccountPreferences(context, base) {
+    const key = 'codex-window-refresh:account-view:v1:' + base;
+    let value = {sort: 'id', layout: 'cards'};
+    try {
+      const saved = JSON.parse(context.localStorage.getItem(key));
+      if (validObject(saved) && saved.version === 1 && accountSorts.includes(saved.sort) && ['cards', 'compact'].includes(saved.layout)) value = {sort: saved.sort, layout: saved.layout};
+    } catch (_) { /* Display preferences must not prevent login. */ }
+    return {
+      value: () => ({...value}),
+      save(sort, layout) {
+        if (!accountSorts.includes(sort) || !['cards', 'compact'].includes(layout)) return;
+        value = {sort, layout};
+        try { context.localStorage.setItem(key, JSON.stringify({version: 1, ...value})); } catch (_) {}
+      }
+    };
+  }
   const settingDefaults = {'quota_query.automatic': false, 'quota_query.manual': true, 'quota_query.interval': '30s', 'quota_query.on_five_hour_expiry': false, 'quota_query.on_weekly_expiry': false, 'ordinary_rules.daily_enabled': true, 'planning.enabled': false, 'planning.horizon_days': 7, 'reset_rules.five_hour.model': '', 'reset_rules.five_hour.prompt': '', 'reset_rules.weekly.model': '', 'reset_rules.weekly.prompt': ''};
   Object.assign(settingDefaults, {'execution.prompt_mode': 'random', 'execution.prompt_pool': ['Reply OK.', 'Say hello briefly.', 'Respond with Ready.', 'Give a short greeting.', 'Reply with one friendly word.'], 'reset_rules.five_hour.prompt_pool': [], 'reset_rules.weekly.prompt_pool': [], 'quota_query.five_hour_recent_usage.enabled': false, 'quota_query.five_hour_recent_usage.lookback': '30m'});
   for (const window of ['five_hour', 'weekly']) {
@@ -164,20 +201,113 @@
     if (finish < start || (mode === 'range' && finish === start)) throw new PanelError('invalid_config');
     return start + '-' + finish;
   }
+  // Match the configuration wire format: integer durations with s/m/h/d units.
+  function durationSeconds(value) {
+    if (typeof value !== 'string' || !/^[0-9]+[smhd]$/.test(value)) return NaN;
+    const result = Number(value.slice(0, -1)) * {s: 1, m: 60, h: 3600, d: 86400}[value.slice(-1)];
+    return Number.isSafeInteger(result) ? result : NaN;
+  }
+  function hoursError(values) {
+    if (!Array.isArray(values)) return '请填写 HH:mm-HH:mm 时段，多个时段用逗号分隔。';
+    const ranges = [];
+    for (const value of values) {
+      const match = /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/.exec(value);
+      if (!match || +match[1] > 23 || +match[2] > 59 || +match[3] > 24 || +match[4] > 59 || (+match[3] === 24 && +match[4] !== 0)) return '请填写有效的 HH:mm-HH:mm 时段，结束可为 24:00。';
+      const start = +match[1]*60 + +match[2], end = +match[3]*60 + +match[4];
+      if (start === end) return '允许或排除时段的开始与结束不能相同；全天可填 00:00-24:00。';
+      if (end < start) { ranges.push([start, 1440]); if (end > 0) ranges.push([0, end]); }
+      else ranges.push([start, end]);
+    }
+    ranges.sort((a, b) => a[0] - b[0]);
+    for (let i = 1; i < ranges.length; i++) if (ranges[i][0] < ranges[i - 1][1]) return '时段不能重叠；相邻时段可以连接，跨午夜时也需避免重叠。';
+    return '';
+  }
+  function configFieldErrors(config) {
+    const errors = {}, get = path => path.split('.').reduce((value, key) => value?.[key], config);
+    const put = (path, message) => { if (!errors[path]) errors[path] = message; };
+    const duration = (path, min, max, range) => {
+      const value = get(path); if (value === undefined) return;
+      const seconds = durationSeconds(value);
+      if (!Number.isFinite(seconds) || seconds < min || seconds > max) put(path, '请填写' + range + '，使用整数加 s、m、h 或 d（例如 30s、5m）。');
+    };
+    const number = (path, min, max, integer) => {
+      const value = get(path); if (value === undefined) return;
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max || (integer && !Number.isInteger(value))) put(path, '请填写 ' + min + '–' + max + ' 之间的' + (integer ? '整数。' : '数值。'));
+    };
+    if (config.timezone !== undefined) {
+      // Go's zone database is authoritative. Intl rejects some valid server
+      // aliases (for example Factory), so reject only malformed names here.
+      const timezone = config.timezone;
+      if (typeof timezone !== 'string' || timezone === 'Local' || !/^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+)*$/.test(timezone)) put('timezone', '请填写 IANA 时区名称，例如 Asia/Shanghai 或 UTC；不能使用 Local、空格或数字偏移。名称是否可用由服务器校验。');
+    }
+    duration('activity.lookback', 60, 86400, '1 分钟至 24 小时');
+    duration('quota_query.interval', 30, 3600, '30 秒至 1 小时');
+    duration('quota_query.five_hour_recent_usage.lookback', 60, 604800, '1 分钟至 7 天');
+    number('activity.accounts_per_user', 0, 100, false); number('activity.max_accounts', 0, 100000, true); number('planning.horizon_days', 1, 30, true);
+    number('execution.max_concurrency', 1, 32, true);
+    for (const [key, min, max, text] of [['quota_read_timeout',1,300,'1 秒至 5 分钟'],['request_timeout',1,1800,'1 秒至 30 分钟'],['min_dispatch_spacing',0,3600,'0 秒至 1 小时'],['quota_max_age_before_send',0,300,'0 秒至 5 分钟'],['verification_capacity_hold',60,86400,'1 分钟至 24 小时']]) duration('execution.' + key, min, max, text);
+    const delay = path => {
+      duration(path + '.min', 0, 86400, '0 秒至 24 小时'); duration(path + '.max', 0, 86400, '0 秒至 24 小时');
+      if (durationSeconds(get(path + '.min')) > durationSeconds(get(path + '.max'))) put(path + '.max', '最长延迟不能小于最短延迟。');
+    };
+    const hours = path => { if (get(path) !== undefined) { const message = hoursError(get(path)); if (message) put(path, message); } };
+    hours('ordinary_rules.allowed_hours');
+    for (const window of ['five_hour', 'weekly']) {
+      delay('reset_rules.' + window + '.random_delay');
+      const path = 'quota_query.' + window + '.interval', interval = get(path);
+      if (interval !== undefined && interval !== '0s' && durationSeconds(interval) !== 0) {
+        duration(path, 30, 3600, '0 秒（继承）或 30 秒至 1 小时');
+        if (durationSeconds(interval) < durationSeconds(get('quota_query.interval'))) put(path, '本类查询间隔不能低于公共查询间隔；填 0s 可继承。');
+      } else if (interval !== undefined && !Number.isFinite(durationSeconds(interval))) put(path, '请填写 0s（继承）或 30s–1h 的整数时长。');
+      for (const trigger of ['expiry', 'periodic']) { const prefix = 'quota_query.' + window + '.' + trigger; hours(prefix + '.excluded_hours'); delay(prefix + '.random_delay'); }
+    }
+    const bytes = value => new TextEncoder().encode(value).length;
+    for (const prefix of ['execution', 'reset_rules.five_hour', 'reset_rules.weekly']) {
+      const model = get(prefix + '.model'), prompt = get(prefix + '.prompt'), pool = get(prefix + '.prompt_pool');
+      if (model !== undefined && (typeof model !== 'string' || bytes(model) > 256 || (prefix !== 'execution' && model !== '' && !model.trim()) || /REPLACE_WITH/i.test(model))) put(prefix + '.model', '模型名最多 256 字节，请替换示例占位符；专用模型留空可继承默认值。');
+      if (prompt !== undefined && (typeof prompt !== 'string' || bytes(prompt) > 4096 || (prefix === 'execution' || prompt !== '') && !prompt.trim())) put(prefix + '.prompt', prefix === 'execution' ? '默认发送内容不能为空，最多 4096 字节。' : '专用内容可留空继承；填写时不能为空白，最多 4096 字节。');
+      if (pool !== undefined) {
+        const required = prefix === 'execution' && get('execution.prompt_mode') === 'random';
+        if (!Array.isArray(pool) || pool.length > 50 || (required && !pool.length)) put(prefix + '.prompt_pool', required ? '随机模式需要 1–50 条短句，每行一条。' : '最多填写 50 条短句，每行一条；专用池可留空继承。');
+        else if (pool.some(value => typeof value !== 'string' || !value.trim() || bytes(value) > 256 || /[\x00\r\n]/.test(value))) put(prefix + '.prompt_pool', '每条短句必须为单行非空内容，最多 256 字节（中文通常每字 3 字节）。');
+        else if (new Set(pool.map(value => value.trim())).size !== pool.length) put(prefix + '.prompt_pool', '短句池中有重复内容，请删除重复行。');
+      }
+    }
+    if (get('execution.prompt_mode') !== undefined && !['fixed', 'random'].includes(get('execution.prompt_mode'))) put('execution.prompt_mode', '请选择固定内容或随机短句池。');
+    const modelText = path => typeof get(path) === 'string' ? get(path).trim() : '';
+    const needsFive = get('reset_rules.five_hour.enabled') || (get('ordinary_rules.daily_enabled') !== false && config.daily_rules?.some(rule => rule.enabled));
+    if (config.enabled && ((needsFive && !(modelText('reset_rules.five_hour.model') || modelText('execution.model'))) || (get('reset_rules.weekly.enabled') && !(modelText('reset_rules.weekly.model') || modelText('execution.model'))))) put('execution.model', '开启的唤醒规则需要默认模型或对应的专用模型。');
+    for (const path of ['execution.catch_up', 'reset_rules.weekly.bypass_activity_limit', 'reset_rules.weekly.bypass_allowed_hours']) if (get(path) === false) put(path, '此安全设置必须保持开启。');
+    const ids = new Set();
+    for (const [index, rule] of (config.daily_rules || []).entries()) {
+      const path = 'daily_rules.' + index;
+      if (typeof rule.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(rule.id) || ids.has(rule.id)) put(path + '.id', '规则 ID 必须唯一，包含 1–64 个字母、数字、下划线或连字符。'); ids.add(rule.id);
+      const match = /^(\d{2}:\d{2})-(\d{2}:\d{2})$/.exec(rule.random_time_range || '');
+      try { if (!match) throw new Error(); dailyTimeRange(match[1] === match[2] ? 'point' : 'range', match[1], match[2]); }
+      catch (_) { put(path + '.random_time_range', '请输入有效的 HH:mm 时间；每日时段不能跨午夜，结束可为 24:00。'); }
+      if (!Number.isInteger(rule.minimum_ready_accounts) || rule.minimum_ready_accounts < 0 || rule.minimum_ready_accounts > get('activity.max_accounts')) put(path + '.minimum_ready_accounts', '最低就绪账号数必须为非负整数，且不超过普通唤醒账号数上限。');
+      if (rule.catch_up === false) put(path + '.catch_up', '每日规则必须启用错过窗口后补发。');
+    }
+    if ((config.daily_rules || []).length > 100) put('daily_rules', '每日规则最多 100 条。');
+    return errors;
+  }
   function createEditor() {
-    let draft = null, revision = '', baseline = '', version = 0, raw = false;
+    let draft = null, revision = '', baseline = '', version = 0, raw = false, formRaw = false;
     const editor = {
       load(envelope, force) {
         if (!validObject(envelope) || !validObject(envelope.config) || typeof envelope.revision !== 'string') throw new PanelError('invalid_response');
         if (editor.dirty() && !force) return false;
-        draft = clone(envelope.config); revision = envelope.revision; baseline = JSON.stringify(draft); raw = false; version++;
+        draft = clone(envelope.config); revision = envelope.revision; baseline = JSON.stringify(draft); raw = false; formRaw = false; version++;
         return true;
       },
       value: () => draft ? clone(draft) : null,
+      baseline: () => baseline ? JSON.parse(baseline) : null,
       revision: () => revision,
       version: () => version,
-      dirty: () => raw || (draft !== null && JSON.stringify(draft) !== baseline),
+      dirty: () => raw || formRaw || (draft !== null && JSON.stringify(draft) !== baseline),
       rawDirty: () => raw,
+      formDirty: () => formRaw,
+      markFormDirty(value) { formRaw = value === true; version++; },
       markRaw() { raw = true; version++; },
       replace(value) { if (!validDraft(value)) throw new PanelError('invalid_config'); draft = clone(value); raw = false; version++; },
       update(path, value) {
@@ -196,6 +326,11 @@
         if (!Object.hasOwn(current, parts[parts.length - 1]) && !Object.hasOwn(settingDefaults, path)) throw new PanelError('invalid_config');
         current[parts[parts.length - 1]] = clone(value); version++;
       },
+      setDailyRules(rules) {
+        if (!draft || raw) throw new PanelError('unapplied_json');
+        if (!Array.isArray(rules) || !rules.every(validObject)) throw new PanelError('invalid_config');
+        draft.daily_rules = clone(rules); version++;
+      },
       pause(id, paused) {
         if (!draft || raw) throw new PanelError('unapplied_json');
         if (!validObject(draft.account_overrides)) draft.account_overrides = {};
@@ -208,7 +343,7 @@
         if (version === savedVersion) editor.load(envelope, true);
         else { revision = envelope.revision; baseline = JSON.stringify(envelope.config); }
       },
-      clear() { draft = null; revision = ''; baseline = ''; raw = false; version++; }
+      clear() { draft = null; revision = ''; baseline = ''; raw = false; formRaw = false; version++; }
     };
     return editor;
   }
@@ -216,6 +351,94 @@
     if (!value || typeof value !== 'string' || value.startsWith('0001-')) return null;
     const time = Date.parse(value);
     return Number.isFinite(time) ? time : null;
+  }
+  function observationAge(value, now = Date.now()) {
+    const time = resetTime(value);
+    if (time === null) return '尚无观测时间';
+    const seconds = Math.floor((now - time) / 1000);
+    if (seconds < -5) return '观测时间晚于本机时间';
+    if (seconds < 60) return '刚刚';
+    if (seconds < 3600) return Math.floor(seconds / 60) + ' 分钟前';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + ' 小时前';
+    return Math.floor(seconds / 86400) + ' 天前';
+  }
+  function accountComparator(sort) {
+    function rank(account) {
+      if (sort === 'five-remaining' || sort === 'weekly-remaining') {
+        const amount = account[sort === 'five-remaining' ? 'FiveHour' : 'Weekly']?.Remaining;
+        return amount?.Unit === 'percent' && Number.isFinite(amount.Value) ? amount.Value : Infinity;
+      }
+      if (sort === 'reset') return ['active', 'expired'].includes(account.FiveHour?.State) ? resetTime(account.FiveHour.ResetAt) ?? Infinity : Infinity;
+      if (sort === 'attention') {
+        if (account.Enabled === false || account.Permission === 'blocked') return 0;
+        if (['account_inventory_unavailable', 'quota_adapter_unavailable', 'credential_changed', 'weekly_reset_conflict', 'backoff', 'quota_exhausted'].includes(account.Task?.HoldReason)) return 1;
+        if (!account.FiveHour?.State || account.FiveHour.State === 'unknown' || account.Permission === 'unknown') return 2;
+        return 3;
+      }
+      return 0;
+    }
+    return ([idA, a], [idB, b]) => {
+      const rankA = rank(a), rankB = rank(b);
+      return (rankA < rankB ? -1 : rankA > rankB ? 1 : 0) || idA.localeCompare(idB);
+    };
+  }
+  const changeLabels = {
+    enabled: '启用', timezone: '规则时区', schema_version: '规则格式版本', quota_query: '额度查询', automatic: '定期查询总开关', manual: '手动查询兼容字段', interval: '查询间隔',
+    on_five_hour_expiry: '5 小时到期查询', on_weekly_expiry: '周到期查询', five_hour: '5 小时规则', weekly: '周规则',
+    five_hour_recent_usage: '近期用户条件', lookback: '活动回溯', periodic_enabled: '参与定期查询', expiry: '到期查询', periodic: '定期查询', excluded_hours: '排除时段',
+    reset_rules: '自动唤醒规则', random_delay: '随机延迟', min: '最短', max: '最长', model: '模型', prompt: '固定内容', prompt_mode: '内容模式', prompt_pool: '短句池',
+    activity: '账号容量', accounts_per_user: '每用户账号数', max_accounts: '账号数上限', identity_source: '用户统计来源',
+    ordinary_rules: '普通唤醒', allowed_hours: '允许时段', allow_outside_hours_when_users_active: '有用户时允许时段外唤醒', daily_enabled: '每日规则总开关',
+    daily_rules: '每日规则', id: '规则名称', minimum_ready_accounts: '最低就绪账号数', random_time_range: '执行时间', account_overrides: '账号覆盖', paused: '暂停唤醒', execution: '模型执行', catch_up: '错过后补发',
+    max_concurrency: '最大并发', min_dispatch_spacing: '发送间隔', quota_read_timeout: '额度查询超时', request_timeout: '模型请求超时', quota_max_age_before_send: '发送前额度有效期',
+    verify_delays: '验证间隔', verification_capacity_hold: '验证容量保留', planning: '未来计划', horizon_days: '覆盖天数', bypass_activity_limit: '豁免人数限制', bypass_allowed_hours: '豁免允许时段'
+  };
+  function configChanges(before, after) {
+    const changes = [];
+    function walk(left, right, parts) {
+      if (validObject(left) || validObject(right)) {
+        const keys = [...new Set([...Object.keys(validObject(left) ? left : {}), ...Object.keys(validObject(right) ? right : {})])].sort();
+        for (const key of keys) walk(validObject(left) && Object.hasOwn(left, key) ? left[key] : undefined, validObject(right) && Object.hasOwn(right, key) ? right[key] : undefined, [...parts, key]);
+      } else if (JSON.stringify(left) !== JSON.stringify(right)) {
+        const label = parts.map((part, index) => parts[0] === 'account_overrides' && index === 1 ? '账号「' + part + '」' : parts.length === 1 && part === 'enabled' ? '自动模型唤醒' : Object.hasOwn(changeLabels, part) ? changeLabels[part] : part).join(' / ');
+        changes.push({label, before: left, after: right});
+      }
+    }
+    walk(before, after, []);
+    return changes;
+  }
+  function changeValue(value) {
+    if (value === undefined) return '未设置（继承默认）';
+    if (typeof value === 'boolean') return value ? '开启' : '关闭';
+    if (Array.isArray(value)) return value.length ? value.map(item => validObject(item) ? Object.entries(item).map(([key, value]) => (changeLabels[key] || key) + '：' + changeValue(value)).join('，') : String(item)).join('；') : '空列表';
+    if (value === '') return '留空';
+    return String(value);
+  }
+  function patchAccountNode(current, next, selection) {
+    if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+      current.replaceWith(next);
+      return;
+    }
+    if (current.nodeType === 3) {
+      let selected = false;
+      try { selected = selection && !selection.isCollapsed && selection.containsNode(current, true); } catch (_) {}
+      if (!selected && current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
+      return;
+    }
+    for (const attribute of Array.from(current.attributes || [])) if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+    for (const attribute of Array.from(next.attributes || [])) if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+    const children = Array.from(next.childNodes);
+    for (let index = 0; index < children.length; index++) {
+      const previous = current.childNodes[index];
+      if (previous) patchAccountNode(previous, children[index], selection);
+      else current.append(children[index]);
+    }
+    while (current.childNodes.length > children.length) current.lastChild.remove();
+  }
+  function updateLiveText(item, value, selection) {
+    if (item.textContent === value) return;
+    try { if (selection && !selection.isCollapsed && selection.containsNode(item, true)) return; } catch (_) {}
+    item.textContent = value;
   }
   function countdown(value, now) {
     const time = resetTime(value);
@@ -278,19 +501,31 @@
     const evidence = {cpa_response_headers: '用户响应头', cpa_websocket_quota: '用户 WebSocket 响应', cpa_wham_usage: '额度接口查询', cpa_execution_quota: '模块模型响应'};
     return (labels[source.trigger] || source.trigger || '未提供来源') + (source.config_path ? ' · ' + source.config_path : '') + (source.rule_id ? ' · 规则 ' + source.rule_id : '') + (source.event_id ? ' · 事件 ' + source.event_id : '') + (source.evidence_source ? ' · 证据：' + (evidence[source.evidence_source] || source.evidence_source) : ' · 无窗口证据');
   }
-  const exported = {PanelError, createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange, sourceText};
+  function historyTimeRange(range, now = Date.now()) {
+    if (range !== 'today' && range !== 'week') return {from: '', until: ''};
+    const start = new Date(now);
+    start.setHours(0, 0, 0, 0);
+    if (range === 'week') start.setDate(start.getDate() - 6);
+    return {from: start.toISOString(), until: ''};
+  }
+  const exported = {PanelError, createSession, createEditor, createPanelPreferences, createAccountPreferences, configChanges, changeValue, accountComparator, observationAge, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange, sourceText, historyTimeRange, durationSeconds, hoursError, configFieldErrors};
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
   if (!root.document) return;
   const document = root.document, $ = id => document.getElementById(id);
   const editor = createEditor();
+  const preferences = createPanelPreferences(root, apiBase(root.location));
+  const accountPreferences = createAccountPreferences(root, apiBase(root.location));
   const expandedAccounts = new Set();
+  const accountNodes = new Map();
+  let renderedAccountOrder = [];
   let pendingQuotaQuery = null;
   let pendingManualWake = null;
   let noticeSource = '';
   let snapshotInstance = '', snapshotVersion = -1, readSequence = 0, appliedRead = 0, mutationEpoch = 0;
   const retiredInstances = new Set();
-  let pollFailures = 0, pollController = null;
+  let pollFailures = 0, pollController = null, taskPollKey = '', taskPollStartedAt = 0;
   let pendingGeneration = null, previewGeneration = '', historyCursor = 0, historyNextCursor = 0, historyLoaded = false, historySequence = 0;
+  let planView = 'upcoming', historyPreviousCursors = [];
   let summary = null, runningConfig = null, accounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
   const session = createSession(root.fetch.bind(root), clearView, undefined, apiBase(root.location));
   function el(tag, text, className) {
@@ -304,16 +539,21 @@
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null; pollBusy = false; actionBusy = false;
     if (pollController) pollController.abort();
-    pollController = null; pollFailures = 0;
+    pollController = null; pollFailures = 0; taskPollKey = ''; taskPollStartedAt = 0;
     $('auto-refresh').checked = false;
     $('background-refresh').checked = false; $('background-refresh').disabled = true;
     $('refresh-status').textContent = '自动刷新已关闭';
+    $('quota-freshness').textContent = ''; $('quota-freshness-warning').hidden = true;
+    $('config-changes').replaceChildren(); $('changes-preview').open = false;
     snapshotInstance = ''; snapshotVersion = -1; readSequence++; appliedRead = readSequence; mutationEpoch++; retiredInstances.clear();
     summary = null; runningConfig = null; accounts = {}; capabilities = {}; editor.clear(); diskMatchesRunning = true;
     expandedAccounts.clear();
+    accountNodes.clear(); renderedAccountOrder = [];
     pendingQuotaQuery = null;
     pendingManualWake = null;
     pendingGeneration = null; previewGeneration = ''; historyLoaded = false; historyCursor = 0; historyNextCursor = 0; historySequence++;
+    historyPreviousCursors = []; $('history-next').disabled = true; $('history-prev').disabled = true;
+    $('history-list').setAttribute('aria-busy', 'false');
     $('generation-preview').value = ''; $('generation-status').textContent = ''; $('history-status').textContent = ''; $('history-list').replaceChildren();
     $('workspace').hidden = true; $('login-section').hidden = false; $('management-key').value = ''; $('config-json').value = '';
     $('connection-status').textContent = '未连接'; $('connection-status').className = 'badge neutral'; $('disconnect').disabled = true;
@@ -368,7 +608,7 @@
     const pool = Object.values(accounts || {});
     const known = pool.filter(a => Number.isFinite(a.FiveHour?.Remaining?.Value) && Number.isFinite(a.Weekly?.Remaining?.Value)).length;
     const active = pool.filter(a => a.FiveHour?.State === 'active' && (resetTime(a.FiveHour.ResetAt) || 0) > Date.now()).length;
-    const cards = [['账号总数', summary.accounts ?? pool.length, 'CPA 中发现的 Codex 账号'], ['有额度数据', known, '5 小时与周额度都有数值'], ['5 小时窗口内', active, '窗口尚未到重置时间'], ['额度待确认', s.quota_unknown_accounts ?? '—', '窗口或请求权限仍未知']];
+    const cards = [['账号总数', summary.accounts ?? pool.length, 'CPA 中发现的 Codex 账号'], ['双窗口额度已知', known, '5 小时与周额度都有数值'], ['5 小时窗口内', active, '窗口尚未到重置时间'], ['额度待确认', s.quota_unknown_accounts ?? '—', '窗口或请求权限仍未知']];
     $('mode-banner').classList.toggle('wake-enabled', summary.enabled === true);
     $('mode-title').textContent = !summary.running ? '后台未运行' : summary.enabled ? '模型唤醒已开启' : '仅查看与查询额度';
     $('mode-description').textContent = !summary.running ? '当前显示已保存的数据；请在“诊断与高级”检查后台状态。' : summary.enabled ? '后台会按已保存的规则发送模型请求。额度查询由独立开关控制。' : '不会自动创建新的模型唤醒请求；明确确认的单账号手动唤醒仍可发送模型请求。用户响应被动更新，额度接口按查询设置运行。';
@@ -383,6 +623,16 @@
     const diagnostic = s.last_quota_diagnostic;
     $('last-error').textContent = (summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误') + (diagnostic ? '；最近额度失败：' + quotaFailure({last_error: diagnostic.code, diagnostic}) : '');
     renderQuotaQuery(); renderSchedulePlan(); renderGeneration();
+    renderFreshness();
+  }
+  function renderFreshness() {
+    const times = Object.values(accounts).flatMap(account => [account.FiveHour, account.Weekly].map(window => resetTime(window?.ConfirmedAt))).filter(time => time !== null);
+    const missing = Object.values(accounts).filter(account => [account.FiveHour, account.Weekly].some(window => resetTime(window?.ConfirmedAt) === null)).length;
+    const earliest = times.length ? Math.min(...times) : null, latest = times.length ? Math.max(...times) : null;
+    $('quota-freshness').textContent = times.length ? '额度观测：' + (earliest === latest ? observationAge(new Date(latest).toISOString()) : '最早 ' + observationAge(new Date(earliest).toISOString()) + '，最新 ' + observationAge(new Date(latest).toISOString())) + (missing ? '；' + missing + ' 个账号观测不完整' : '') : '尚无额度观测，可查询上游获取；更新页面只读取已有数据。';
+    const job = quotaJob(), failed = job.failed > 0 || job.phase === 'failed';
+    $('quota-freshness-warning').hidden = !failed;
+    $('quota-freshness-warning').textContent = failed ? '最近查询有失败' + (resetTime(job.finished_at) !== null ? '（' + date(job.finished_at) + '）' : '') + '，未成功更新的账号保留上次观测。' : '';
   }
   function activeJob(job) {
     if (job?.phase === 'blocked' && resetTime(job.finished_at || job[job.kind]?.finished_at) !== null) return false;
@@ -434,11 +684,16 @@
     if (capabilities.QuotaAdapterReady !== true) return bridgeDescription() + '，请查看诊断';
     return '';
   }
+  function jobDuration(job) {
+    const start = resetTime(job.started_at), end = resetTime(job.finished_at);
+    const elapsed = Number.isFinite(job.timing?.total_ms) && job.timing.total_ms >= 0 ? job.timing.total_ms : start !== null && end !== null ? end - start : null;
+    return elapsed !== null && elapsed >= 0 ? ' · 耗时 ' + Number((elapsed / 1000).toFixed(1)) + ' 秒' : '';
+  }
   function renderQuotaQuery() {
     const query = runningConfig?.quota_query || {}, job = quotaJob();
     const running = activeJob(job);
     const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
-    const progress = jobProblem(job) || (job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' + (job.failed && job.last_error ? '；最近失败：' + quotaFailure(job) : '') : '尚未执行手动查询');
+    const progress = jobProblem(job) || (job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' + (job.phase === 'completed' ? jobDuration(job) : '') + (job.failed && job.last_error ? '；最近失败：' + quotaFailure(job) : '') : '尚未执行手动查询');
     const reason = quotaQueryReason();
     const periodic = [['five_hour', '5 小时'], ['weekly', '7 天']].filter(([window]) => query[window]?.periodic_enabled !== false).map(([window, label]) => label + '（' + (query[window]?.interval && query[window].interval !== '0s' ? query[window].interval : query.interval || '30s') + '）');
     $('quota-query-status').textContent = '定期查询：' + (query.automatic ? periodic.join(' / ') || '无参与策略' : '关闭') + ' · 5 小时到期查询：' + (query.on_five_hour_expiry ? '开启' : '关闭') + ' · 周到期查询：' + (query.on_weekly_expiry ? '开启' : '关闭') + ' · ' + (reason || progress);
@@ -521,18 +776,35 @@
   async function readHistory(cursor, signal) {
     if (!session.connected()) return;
     const generation = session.generation(), sequence = ++historySequence;
+    $('history-list').setAttribute('aria-busy', 'true');
+    $('history-next').disabled = true; $('history-prev').disabled = true;
+    $('history-status').className = 'hint';
+    if (!signal) $('history-status').textContent = '正在读取执行历史…';
     try {
       const query = new URLSearchParams({limit: '50'});
       if (cursor) query.set('cursor', String(cursor));
+      for (const id of ['history-from', 'history-until']) $(id).setAttribute('aria-invalid', 'false');
       for (const [id, name] of [['history-account', 'account_id'], ['history-kind', 'kind'], ['history-result', 'status'], ['history-from', 'from'], ['history-until', 'until']]) {
         const value = $(id).value.trim();
         if (!value) continue;
-        if (['from', 'until'].includes(name) && !Number.isFinite(Date.parse(value))) throw new PanelError('invalid_config');
+        if (['from', 'until'].includes(name) && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value)))) {
+          $(id).setAttribute('aria-invalid', 'true');
+          $('history-status').textContent = (name === 'from' ? '开始' : '结束') + '时间需包含日期、时分秒和时区，例如 2026-10-14T00:00:00+08:00。';
+          $('history-status').className = 'hint history-error';
+          $(id).focus?.(); return;
+        }
         query.set(name, value);
+      }
+      if (query.has('from') && query.has('until') && Date.parse(query.get('from')) > Date.parse(query.get('until'))) {
+        $('history-until').setAttribute('aria-invalid', 'true'); $('history-until').focus?.();
+        $('history-status').textContent = '结束时间不能早于开始时间。'; $('history-status').className = 'hint history-error'; return;
       }
       const page = await session.request('/history?' + query, 'GET', undefined, signal);
       if (generation !== session.generation() || signal?.aborted || sequence !== historySequence) return;
       if (!validObject(page) || !Array.isArray(page.entries)) throw new PanelError('invalid_response');
+      if (!cursor) historyPreviousCursors = [];
+      else if (cursor !== historyCursor && cursor === historyPreviousCursors[historyPreviousCursors.length - 1]) historyPreviousCursors.pop();
+      else if (cursor !== historyCursor) historyPreviousCursors.push(historyCursor);
       historyLoaded = true; historyCursor = cursor; historyNextCursor = page.next_cursor || 0;
       $('history-list').replaceChildren();
       const statuses = {completed: '成功', failed: '失败', skipped: '跳过', dispatched: '已发送', verifying: '已发送待验证', verified: '已验证', unknown: '送达不确定'};
@@ -546,12 +818,43 @@
         if (entry.operation_id) row.append(el('p', '操作：' + entry.operation_id, 'hint'));
         renderSources(row, entry.sources || []); $('history-list').append(row);
       }
-      $('history-status').textContent = '保留 ' + page.retention_days + ' 天，最多 ' + page.maximum_entries + ' 条 · 本页 ' + page.entries.length + ' 条 · 重启后保留';
-      $('history-next').disabled = !historyNextCursor;
+      if (!page.entries.length) $('history-list').append(el('li', '没有符合当前筛选条件的执行记录。可以清空筛选，或调整账号、日期和结果。', 'card history-empty'));
+      $('history-status').textContent = '第 ' + (historyPreviousCursors.length + 1) + ' 页 · 本页 ' + page.entries.length + ' 条 · 保留 ' + page.retention_days + ' 天，最多 ' + page.maximum_entries + ' 条 · 重启后保留';
       if (noticeSource === 'history') notice('');
-    } catch (error) { if (generation === session.generation()) report(error, 'history'); }
+    } catch (error) {
+      if (generation === session.generation() && sequence === historySequence && !signal?.aborted) {
+        $('history-status').textContent = '历史读取失败，已保留上次结果。可稍后重新读取。'; $('history-status').className = 'hint history-error';
+        report(error, 'history');
+      }
+    } finally {
+      if (generation === session.generation() && sequence === historySequence) {
+        $('history-list').setAttribute('aria-busy', 'false');
+        $('history-next').disabled = !historyNextCursor;
+        $('history-prev').disabled = !historyPreviousCursors.length;
+      }
+    }
   }
+  function historyFiltersChanged() {
+    historyLoaded = false; historyNextCursor = 0; historyPreviousCursors = []; historySequence++;
+    $('history-list').setAttribute('aria-busy', 'false');
+    $('history-next').disabled = true; $('history-prev').disabled = true;
+    $('history-status').className = 'hint'; $('history-status').textContent = '筛选已更改，点击“筛选并读取最新历史”查看结果。';
+  }
+  for (const id of ['history-account', 'history-kind', 'history-result', 'history-from', 'history-until']) {
+    $(id).addEventListener('input', historyFiltersChanged);
+    $(id).addEventListener('change', historyFiltersChanged);
+  }
+  for (const [id, range] of [['history-today', 'today'], ['history-week', 'week']]) $(id).addEventListener('click', () => {
+    const bounds = historyTimeRange(range); $('history-from').value = bounds.from; $('history-until').value = bounds.until;
+    historyFiltersChanged(); void readHistory(0);
+  });
+  $('history-failed').addEventListener('click', () => { $('history-result').value = 'failed'; historyFiltersChanged(); void readHistory(0); });
+  $('history-clear').addEventListener('click', () => {
+    for (const id of ['history-account', 'history-kind', 'history-result', 'history-from', 'history-until']) $(id).value = '';
+    historyFiltersChanged(); void readHistory(0);
+  });
   $('history-refresh').addEventListener('click', () => void readHistory(0));
+  $('history-prev').addEventListener('click', () => { if (historyPreviousCursors.length) void readHistory(historyPreviousCursors[historyPreviousCursors.length - 1]); });
   $('history-next').addEventListener('click', () => { if (historyNextCursor) void readHistory(historyNextCursor); });
   $('generation-start').addEventListener('click', async () => {
     if ($('generation-start').disabled) return;
@@ -587,7 +890,9 @@
       if (!pool.length || pool.length > 50 || pool.some(value => new TextEncoder().encode(value).length > 256)) throw new PanelError('invalid_config');
       const path = {default: 'execution.prompt_pool', five_hour: 'reset_rules.five_hour.prompt_pool', weekly: 'reset_rules.weekly.prompt_pool'}[job.request.target];
       if (!path) throw new PanelError('invalid_config');
-      editor.update(path, pool); renderForm(); notice('候选已替换对应短句池草稿；请检查后保存并应用，不会自动保存。');
+      editor.update(path, pool);
+      for (const [control, field] of validationControls) if (field === path) { control.value = pool.join('\n'); pendingFormInputs.delete(control); pendingParseErrors.delete(control); }
+      editor.markFormDirty(pendingFormInputs.size > 0); validateForm(false); draftChanged(); renderAccounts(); notice('候选已替换对应短句池草稿；请检查后保存并应用，不会自动保存。');
     } catch (error) { report(error); }
   });
   function bridgeDescription() {
@@ -605,16 +910,21 @@
       const meter = el('progress'); meter.max = 100; meter.value = Math.max(0, Math.min(100, remaining.Value)); meter.setAttribute('aria-label', title + '剩余 ' + text); cell.append(meter);
     }
     const kind = evidence.Source === 'cpa_execution_quota' ? 'wake' : evidence.Source === 'cpa_wham_usage' ? 'query' : 'passive';
-    cell.append(el('div', source, 'quota-source ' + kind), el('div', '观测 ' + date(evidence.ConfirmedAt), 'window-time'));
+    const observed = el('div', '额度观测：' + observationAge(evidence.ConfirmedAt), 'window-time observation-age');
+    observed.dataset.observed = evidence.ConfirmedAt || ''; observed.title = '额度观测时间：' + date(evidence.ConfirmedAt);
+    cell.append(el('div', source, 'quota-source ' + kind), observed);
     if (evidence.State === 'active' || evidence.State === 'expired') cell.append(el('div', '重置 ' + date(evidence.ResetAt), 'window-time'));
     const timer = el('div', windowCountdown(evidence), 'countdown');
     if (evidence.State === 'active') timer.dataset.reset = evidence.ResetAt || '';
     cell.append(timer);
     return cell;
   }
-  function renderAccounts() {
+  function renderAccounts(forceOrder) {
     const cfg = editor.value(), search = $('account-search').value.toLowerCase(), filter = $('account-filter').value;
-    const all = Object.entries(accounts || {}).sort(([a], [b]) => a.localeCompare(b));
+    const list = $('account-list'), selection = root.getSelection?.();
+    const interacting = list.contains?.(document.activeElement) || (selection && !selection.isCollapsed && (list.contains?.(selection.anchorNode) || list.contains?.(selection.focusNode)));
+    const all = Object.entries(accounts || {}).sort(accountComparator($('account-sort').value));
+    $('account-list').classList.toggle('compact', $('account-layout').value === 'compact');
     const visible = all.filter(([id, a]) => {
       const override = cfg?.account_overrides && Object.hasOwn(cfg.account_overrides, id) ? cfg.account_overrides[id] : {};
       const paused = override?.paused === true;
@@ -625,12 +935,25 @@
       if (filter === 'unknown') return !a.FiveHour?.State || a.FiveHour.State === 'unknown' || a.Permission === 'unknown';
       return true;
     });
+    if (interacting && forceOrder !== true) {
+      const positions = new Map(renderedAccountOrder.map((id, index) => [id, index]));
+      visible.sort(([a], [b]) => (positions.get(a) ?? Infinity) - (positions.get(b) ?? Infinity));
+    }
     $('account-count').textContent = '显示 ' + visible.length + ' / ' + all.length + ' 个账号';
-    $('account-list').replaceChildren();
-    if (!visible.length) $('account-list').append(el('div', all.length ? '没有符合筛选条件的账号。' : '暂无账号；等待调度器读取 CPA 账号清单。', 'empty'));
+    const liveIDs = new Set(visible.map(([id]) => id));
+    for (const [id, node] of accountNodes) if (!liveIDs.has(id)) { node.remove?.(); accountNodes.delete(id); expandedAccounts.delete(id); }
+    const nativeDOM = typeof list.insertBefore === 'function';
+    if (!nativeDOM || !visible.length || !accountNodes.size) list.replaceChildren();
+    if (!visible.length) list.append(el('div', all.length ? '没有符合筛选条件的账号。' : '暂无账号；等待调度器读取 CPA 账号清单。', 'empty'));
     for (const [id, a] of visible) {
+      const existing = accountNodes.get(id);
+      if (existing && nativeDOM) {
+        const disclosure = existing.querySelector('.account-disclosure');
+        if (disclosure?.open) expandedAccounts.add(id); else expandedAccounts.delete(id);
+      }
       const paused = cfg?.account_overrides && Object.hasOwn(cfg.account_overrides, id) && cfg.account_overrides[id]?.paused === true;
       const card = el('article', undefined, 'card account-card'), header = el('div', undefined, 'account-head'), name = el('div');
+      card.dataset.accountId = id;
       name.append(el('div', id, 'account-id'));
       const runningPaused = runningConfig?.account_overrides && Object.hasOwn(runningConfig.account_overrides, id) && runningConfig.account_overrides[id]?.paused === true;
       const pauseChanged = paused !== Boolean(runningPaused);
@@ -646,9 +969,13 @@
       queryButton.title = reason || (querying ? '请等待当前手动查询结束' : '只访问此账号的额度接口，不发送模型请求');
       queryButton.addEventListener('click', () => { if (!queryButton.disabled) void requestQuotaQuery(id); });
       let queryText = reason || '仅查询额度，不发送模型请求';
-      if (selected && job.phase) queryText = jobProblem(job) || ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，' + quotaFailure(job) : job.skipped ? '未查询：账号已移除或绑定不存在' : '查询完成 · ' + date(job.finished_at));
+      if (selected && job.phase) {
+        queryText = jobProblem(job) || ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，' + quotaFailure(job) : job.skipped ? '未查询：账号已移除或绑定不存在' : '查询完成 · ' + date(job.finished_at) + jobDuration(job));
+        if (job.failed > 0 || job.phase === 'failed') queryText += ' · 保留上次额度' + (resetTime(job.finished_at) !== null ? ' · 最近失败 ' + date(job.finished_at) : '');
+      }
       const queryStatus = el('span', queryText, 'hint'); queryStatus.setAttribute('role', 'status');
-      queryRow.append(queryButton, queryStatus); card.append(queryRow);
+      const actions = el('div', undefined, 'account-actions');
+      queryRow.append(queryButton, queryStatus); actions.append(queryRow);
       const wakeRow = el('div', undefined, 'account-query'), wake = manualWakeJob();
       const waking = activeJob(wake), wakeSelected = wake.account_id === id;
       const wakeReason = manualWakeReason(a, runningConfig, summary, capabilities);
@@ -663,7 +990,9 @@
         wakeText = jobProblem(wake) || phases[wake.phase] || '未完成唤醒：' + (holds[wake.last_error] || ({model_required: '请填写并保存唤醒模型', host_capability_unavailable: '宿主接口未就绪', dispatch_spacing: '发送间隔未到，请稍后重试', send_not_sent: '模型请求未送达，请稍后重试', credential_changed: '账号凭据已更换，请重新查询'}[wake.last_error]) || quotaFailure({last_error: wake.last_error}));
       }
       const wakeStatus = el('span', wakeText, 'hint'); wakeStatus.setAttribute('role', 'status');
-      wakeRow.append(wakeButton, wakeStatus); card.append(wakeRow);
+      wakeRow.append(wakeButton, wakeStatus); actions.append(wakeRow); card.append(actions);
+      const historyButton = el('button', '查看执行历史', 'text-button account-history'); historyButton.type = 'button'; historyButton.dataset.historyAccount = id;
+      historyButton.addEventListener('click', () => openAccountHistory(id)); actions.append(historyButton);
       const task = a.Task, taskInfo = el('dl', undefined, 'details task-info'), disclosure = el('details', undefined, 'account-disclosure');
       disclosure.open = expandedAccounts.has(id);
       disclosure.addEventListener('toggle', () => { if (disclosure.isConnected) { if (disclosure.open) expandedAccounts.add(id); else expandedAccounts.delete(id); } });
@@ -673,18 +1002,89 @@
       details(taskInfo, [['任务状态', task ? states[task.State] || task.State : '无任务'], ['触发原因', [...new Set(pendingReasons)].join('、') || '无'], ['阻塞原因', task?.HoldReason ? holds[task.HoldReason] || task.HoldReason : '无'], ['随机延迟结束', due.length ? date(new Date(Math.min(...due)).toISOString()) : '无'], ['下一次检查', resetTime(task?.NextCheckAt) !== null ? date(task.NextCheckAt) : '未安排'], ['下一次窗口核实', resetTime(task?.NextVerificationAt) !== null ? date(task.NextVerificationAt) : '未安排'], ['失败退避到', resetTime(a.BackoffUntil) !== null ? date(a.BackoffUntil) : '无'], ['请求权限', a.Permission === 'allowed' ? '允许' : a.Permission === 'blocked' ? '额度阻止' : '未知'], ['普通唤醒参与', a.OrdinaryParticipant ? '是' : '否'], ['周任务参与', a.WeeklyEnabled ? '是' : '否']]); disclosure.append(taskInfo);
       const footer = el('div', undefined, 'account-footer'); footer.append(el('span', '最近真实请求 ' + date(a.LastRealRequestAt), 'hint'));
       const pause = el('button', paused ? '恢复唤醒（草稿）' : '暂停唤醒（草稿）', 'quiet'); pause.type = 'button'; pause.disabled = actionBusy || editor.rawDirty();
-      pause.addEventListener('click', () => { try { editor.pause(id, !paused); draftChanged(); renderAccounts(); notice('已更新账号规则草稿；保存并应用后生效。'); } catch (error) { report(error); } });
-      footer.append(pause); disclosure.append(footer); card.append(disclosure); $('account-list').append(card);
+      pause.addEventListener('click', () => { try {
+        const overrides = editor.value()?.account_overrides;
+        const currentPaused = overrides && Object.hasOwn(overrides, id) && overrides[id]?.paused === true;
+        editor.pause(id, !currentPaused); draftChanged(); renderAccounts(); notice('已更新账号规则草稿；保存并应用后生效。');
+      } catch (error) { report(error); } });
+      footer.append(pause); disclosure.append(footer); card.append(disclosure);
+      if (nativeDOM && existing) patchAccountNode(existing, card, selection);
+      else accountNodes.set(id, card);
     }
+    visible.forEach(([id], index) => {
+      const node = accountNodes.get(id);
+      if (nativeDOM) { if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null); }
+      else list.append(node);
+    });
+    renderedAccountOrder = visible.map(([id]) => id);
+  }
+  const validationControls = new Map(), validationMessages = new Map(), pendingFormInputs = new Set(), pendingParseErrors = new Map();
+  let validationSequence = 0, formErrors = {};
+  function setFieldError(control, message) {
+    control.setAttribute('aria-invalid', message ? 'true' : 'false');
+    let item = validationMessages.get(control);
+    if (!item && message && control.parentElement) {
+      item = el('small', '', 'validation-error'); item.id = 'validation-error-' + ++validationSequence;
+      control.parentElement.append(item); validationMessages.set(control, item);
+      const described = control.getAttribute('aria-describedby');
+      control.setAttribute('aria-describedby', [described, item.id].filter(Boolean).join(' '));
+    }
+    if (item) { item.textContent = message || ''; item.hidden = !message; }
+  }
+  function validateForm(focus) {
+    const cfg = editor.value(); if (!cfg) return true;
+    formErrors = configFieldErrors(cfg);
+    let first;
+    for (const [control, path] of validationControls) {
+      let message = pendingParseErrors.get(control) || formErrors[path] || '';
+      if (pendingFormInputs.has(control)) message = control.type === 'number' && (!control.value.trim() || !Number.isFinite(Number(control.value))) ? '请填写有效数值，不能留空。' : message;
+      setFieldError(control, message);
+      if (message && !first && !control.disabled) first = control;
+    }
+    if (focus && (first || Object.keys(formErrors).length)) {
+      if (first) {
+        if (first.closest?.('#plan-upcoming')) activatePlanView('upcoming', false, false);
+        const view = first.closest?.('.view'); if (view) activateTab(view.id.slice(4));
+        for (let parent = first.parentElement; parent; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true;
+        first.focus?.(); first.scrollIntoView?.({block: 'center', behavior: 'smooth'});
+      } else { activateTab('capabilities'); $('advanced-editor').open = true; $('config-json').focus?.(); }
+      notice('请先修正标出的配置字段；输入与草稿已保留。' + (!first ? '完整配置中仍有错误，请在 JSON 中检查。' : ''), 'error', 'validation');
+    }
+    if (!first && !Object.keys(formErrors).length && noticeSource === 'validation') notice('');
+    return !first && !Object.keys(formErrors).length;
+  }
+  function registerValidation(control, path) {
+    validationControls.set(control, path);
+    control.addEventListener('input', () => { pendingFormInputs.add(control); editor.markFormDirty(true); updateDraftBadge(); });
+  }
+  function commitFormInput(control) {
+    pendingFormInputs.delete(control); pendingParseErrors.delete(control); editor.markFormDirty(pendingFormInputs.size > 0); validateForm(false);
+  }
+  function resetFormValidation() {
+    for (const [control, path] of validationControls) { setFieldError(control, ''); if (path.startsWith('daily_rules.')) validationMessages.delete(control); }
+    validationControls.clear(); pendingFormInputs.clear(); pendingParseErrors.clear(); formErrors = {}; editor.markFormDirty(false);
+    for (const control of document.querySelectorAll('[data-field]')) validationControls.set(control, control.dataset.field);
   }
   function updateDraftBadge() {
     const dirty = editor.dirty();
+    const invalid = Object.keys(formErrors).length > 0 || pendingFormInputs.size > 0 || pendingParseErrors.size > 0;
+    $('config-save').textContent = invalid ? '检查并定位错误' : '保存并应用';
     $('draft-status').textContent = dirty ? '有未保存的草稿' : '已与服务器同步'; $('draft-status').className = 'badge' + (dirty ? ' warning' : ' neutral');
     $('save-bar').hidden = !dirty && diskMatchesRunning && !actionBusy;
     $('config-save').disabled = actionBusy || (!dirty && diskMatchesRunning) || editor.rawDirty();
-    $('save-help').textContent = !diskMatchesRunning ? '服务器规则文件与当前运行策略不同。保存将应用草稿；开启模型唤醒时可能发送模型请求。' : '保存会写入服务器规则文件并立即应用。额度查询不生成内容；开启模型唤醒时可能发送模型请求。';
+    $('save-help').textContent = invalid ? '有待检查或修正的输入；点击右侧按钮可定位错误，草稿会保留。' : !diskMatchesRunning ? '服务器规则文件与当前运行策略不同。保存将应用草稿；开启模型唤醒时可能发送模型请求。' : '保存会写入服务器规则文件并立即应用。额度查询不生成内容；开启模型唤醒时可能发送模型请求。';
     $('wake-draft-hint').textContent = editor.value()?.enabled ? '草稿：自动模型唤醒已开启。保存后按下方规则发送模型请求。' : '草稿：自动模型唤醒已关闭。单账号手动唤醒仍需明确确认，额度查询由独立设置控制。';
+    const changes = draftChanges();
+    $('changes-preview').hidden = editor.rawDirty() || !changes.length;
+    $('changes-summary').textContent = '查看 ' + changes.length + ' 项配置变更';
+    $('changes-context').textContent = diskMatchesRunning ? '对比载入时的服务器规则；所有页面的草稿一起保存。' : '对比当前生效规则；保存会应用文件草稿中的全部差异。';
+    $('config-changes').replaceChildren();
+    for (const change of changes) {
+      const row = el('tr'); row.append(el('th', change.label), el('td', changeValue(change.before)), el('td', changeValue(change.after)));
+      row.children[0].setAttribute('scope', 'row'); $('config-changes').append(row);
+    }
   }
+  function draftChanges() { return configChanges(diskMatchesRunning ? editor.baseline() : runningConfig, editor.value()); }
   function draftChanged() { $('config-json').value = JSON.stringify(editor.value(), null, 2); $('json-message').textContent = ''; updateDraftBadge(); renderOverview(); }
   function fieldValue(cfg, path) { let v = cfg; for (const part of path.split('.')) v = v?.[part]; return v === undefined && Object.hasOwn(settingDefaults, path) ? settingDefaults[path] : v; }
   function renderForm() {
@@ -694,9 +1094,11 @@
       if (input.type === 'checkbox') input.checked = value === true;
       else input.value = Array.isArray(value) ? value.join(input.dataset.field.endsWith('.prompt_pool') ? '\n' : ', ') : value ?? '';
     }
-    renderDaily(); draftChanged();
+    resetFormValidation(); renderDaily(); validateForm(false); draftChanged();
   }
   function renderDaily() {
+    for (const [control, path] of validationControls) if (path.startsWith('daily_rules.')) { validationControls.delete(control); pendingFormInputs.delete(control); pendingParseErrors.delete(control); validationMessages.delete(control); }
+    editor.markFormDirty(pendingFormInputs.size > 0);
     $('daily-rules').replaceChildren();
     const rawDaily = editor.value()?.daily_rules;
     const daily = Array.isArray(rawDaily) ? rawDaily : [];
@@ -704,12 +1106,13 @@
     daily.forEach((rule, index) => {
       const row = el('div', undefined, 'daily-row');
       function input(labelText, key, type) {
-        const label = el('label', labelText), field = el('input'); field.type = type || 'text'; field.value = rule[key] ?? ''; if (type === 'number') { field.min = '1'; field.step = '1'; }
+        const label = el('label', labelText), field = el('input'); field.type = type || 'text'; field.value = rule[key] ?? ''; if (type === 'number') { field.min = '0'; field.step = '1'; }
+        registerValidation(field, 'daily_rules.' + index + '.' + key);
         field.addEventListener('change', () => {
-          if (editor.rawDirty()) { report(new PanelError('unapplied_json')); renderDaily(); return; }
+          if (editor.rawDirty()) { report(new PanelError('unapplied_json')); return; }
           const value = editor.value(), parsed = type === 'number' ? Number(field.value) : field.value;
-          if (type === 'number' && (!field.value.trim() || !Number.isFinite(parsed))) { notice('每日最低就绪数需要填写有效整数。', 'error'); return; }
-          value.daily_rules[index][key] = parsed; editor.replace(value); draftChanged();
+          if (type === 'number' && (!field.value.trim() || !Number.isFinite(parsed))) { pendingFormInputs.add(field); editor.markFormDirty(true); validateForm(false); updateDraftBadge(); return; }
+          value.daily_rules[index][key] = parsed; editor.setDailyRules(value.daily_rules); commitFormInput(field); draftChanged();
         }); label.append(field); row.append(label);
       }
       input('规则 ID', 'id'); input('最低就绪账号数', 'minimum_ready_accounts', 'number');
@@ -718,15 +1121,22 @@
       startTime.value = bounds[0] || '09:00'; endTime.value = bounds[1] || startTime.value;
       startTime.placeholder = '09:00'; endTime.placeholder = '09:10 / 24:00';
       for (const [value, text] of [['point', '固定时间点'], ['range', '随机时间段']]) { const option = el('option', text); option.value = value; mode.append(option); }
-      mode.value = startTime.value === endTime.value ? 'point' : 'range'; endTime.disabled = mode.value === 'point';
+      mode.value = startTime.value === endTime.value ? 'point' : 'range'; endTime.disabled = mode.value === 'point'; endTime.dataset.fixed = String(endTime.disabled);
+      for (const control of [startTime, endTime, mode]) registerValidation(control, 'daily_rules.' + index + '.random_time_range');
       function updateTime() {
-        if (editor.rawDirty()) { report(new PanelError('unapplied_json')); renderDaily(); return; }
+        if (editor.rawDirty()) { report(new PanelError('unapplied_json')); return; }
         try {
           const range = dailyTimeRange(mode.value, startTime.value, endTime.value), value = editor.value();
-          value.daily_rules[index].random_time_range = range; editor.replace(value);
+          value.daily_rules[index].random_time_range = range; editor.setDailyRules(value.daily_rules);
           if (mode.value === 'point') endTime.value = startTime.value;
-          endTime.disabled = mode.value === 'point'; draftChanged();
-        } catch (error) { notice('请输入有效的 HH:mm 时间；每日随机时段不跨午夜，结束可为 24:00。', 'error'); }
+          endTime.disabled = mode.value === 'point'; endTime.dataset.fixed = String(endTime.disabled);
+          for (const control of [mode, startTime, endTime]) { pendingFormInputs.delete(control); pendingParseErrors.delete(control); }
+          editor.markFormDirty(pendingFormInputs.size > 0); validateForm(false); draftChanged();
+        } catch (error) {
+          endTime.disabled = mode.value === 'point'; endTime.dataset.fixed = String(endTime.disabled); pendingFormInputs.add(startTime); pendingParseErrors.set(startTime, '请输入有效的 HH:mm 时间；每日随机时段不跨午夜，结束可为 24:00。'); editor.markFormDirty(true);
+          setFieldError(startTime, '请输入有效的 HH:mm 时间；每日随机时段不跨午夜，结束可为 24:00。');
+          formErrors['daily_rules.' + index + '.random_time_range'] = '时间无效'; updateDraftBadge();
+        }
       }
       mode.addEventListener('change', () => {
         if (mode.value === 'range' && endTime.value === startTime.value && /^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/.test(startTime.value)) {
@@ -736,10 +1146,10 @@
         updateTime();
       }); startTime.addEventListener('change', updateTime); endTime.addEventListener('change', updateTime);
       for (const [text, control] of [['时间类型', mode], ['时间点 / 开始时间', startTime], ['随机时段结束时间', endTime]]) { const label = el('label', text); label.append(control); timeControls.append(label); }
-      const remove = el('button', '移除', 'quiet danger'); remove.type = 'button'; remove.addEventListener('click', () => { if (editor.rawDirty()) { report(new PanelError('unapplied_json')); return; } const cfg = editor.value(); cfg.daily_rules.splice(index, 1); editor.replace(cfg); renderDaily(); draftChanged(); }); row.append(remove);
+      const remove = el('button', '移除', 'quiet danger'); remove.type = 'button'; remove.addEventListener('click', () => { if ([...pendingFormInputs].some(control => validationControls.get(control)?.startsWith('daily_rules.'))) { validateForm(true); return; } if (editor.rawDirty()) { report(new PanelError('unapplied_json')); return; } const cfg = editor.value(); cfg.daily_rules.splice(index, 1); editor.setDailyRules(cfg.daily_rules); renderDaily(); validateForm(false); draftChanged(); }); row.append(remove);
       row.append(timeControls);
       const switches = el('div', undefined, 'daily-switches');
-      for (const [key, text] of [['enabled', '启用规则'], ['catch_up', '错过窗口后补发']]) { const label = el('label', undefined, 'check-field'), field = el('input'); field.type = 'checkbox'; field.checked = rule[key] === true; field.addEventListener('change', () => { if (editor.rawDirty()) { report(new PanelError('unapplied_json')); renderDaily(); return; } const cfg = editor.value(); cfg.daily_rules[index][key] = field.checked; editor.replace(cfg); draftChanged(); }); label.append(field, document.createTextNode(text)); switches.append(label); }
+      for (const [key, text] of [['enabled', '启用规则'], ['catch_up', '错过窗口后补发']]) { const label = el('label', undefined, 'check-field'), field = el('input'); field.type = 'checkbox'; field.checked = rule[key] === true; registerValidation(field, 'daily_rules.' + index + '.' + key); field.addEventListener('change', () => { if (editor.rawDirty()) { report(new PanelError('unapplied_json')); return; } const cfg = editor.value(); cfg.daily_rules[index][key] = field.checked; editor.setDailyRules(cfg.daily_rules); commitFormInput(field); draftChanged(); }); label.append(field, document.createTextNode(text)); switches.append(label); }
       row.append(switches); $('daily-rules').append(row);
     });
   }
@@ -747,7 +1157,7 @@
     actionBusy = value;
     if (value) mutationEpoch++;
     for (const id of ['recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = value;
-    for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button')) field.disabled = value || field.dataset.fixed === 'true';
+    for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button, #daily-rules input, #daily-rules select')) field.disabled = value || field.dataset.fixed === 'true';
     updateDraftBadge(); renderAccounts(); renderQuotaQuery(); renderCapabilities(); renderGeneration();
   }
   async function readSnapshots(signal) {
@@ -762,23 +1172,30 @@
     snapshotInstance = snapshot.instance_id; snapshotVersion = snapshot.snapshot_seq; appliedRead = sequence;
     summary = snapshot.summary; accounts = snapshot.accounts; capabilities = snapshot.capabilities; runningConfig = snapshot.config;
     reconcileJob(pendingQuotaQuery, 'quota_query'); reconcileJob(pendingManualWake, 'manual_wake'); reconcileJob(pendingGeneration, 'prompt_generation');
-    renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
+    renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '页面更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
     if (noticeSource === 'snapshots') notice('');
-    if (historyLoaded && !$('tab-plan').hidden) await readHistory(historyCursor, signal);
+    if (historyLoaded && !$('tab-plan').hidden && planView === 'history') await readHistory(historyCursor, signal);
     return true;
   }
+  function activePollJobs() {
+    return summary?.running === true ? [quotaJob(), manualWakeJob(), generationJob(), ...(summary?.scheduler?.jobs || [])].filter(activeJob) : [];
+  }
   function shouldPoll() {
-    return $('auto-refresh').checked || (summary?.running === true && [quotaJob(), manualWakeJob(), generationJob(), ...(summary?.scheduler?.jobs || [])].some(activeJob));
+    return $('auto-refresh').checked || activePollJobs().length > 0;
   }
   function schedulePoll() {
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null;
     $('background-refresh').disabled = !$('auto-refresh').checked;
+    const jobs = activePollJobs(), key = [...new Set(jobs.map(job => job.job_id || (job.kind || 'task') + ':' + (job.account_id || '')))].sort().join('|');
+    if (key !== taskPollKey) { taskPollKey = key; taskPollStartedAt = Date.now(); }
     if (!session.connected() || !shouldPoll()) { $('refresh-status').textContent = '自动刷新已关闭'; return; }
     if (root.navigator?.onLine === false) { $('refresh-status').textContent = '网络离线 · 联网后自动继续'; return; }
     if (document.hidden && !$('background-refresh').checked) { $('refresh-status').textContent = '标签页隐藏 · 返回后自动继续'; return; }
-    const delay = Math.min(5000 * 2 ** Math.min(pollFailures, 4), 60000);
-    $('refresh-status').textContent = pollFailures ? '读取暂未恢复 · ' + delay / 1000 + ' 秒后自动重试，保留已有数据' : !$('auto-refresh').checked ? '手动任务进行中 · 每 5 秒更新进度，结束后停止' : '持续刷新已开启' + ($('background-refresh').checked ? '（含后台标签页）' : '') + ' · 每 5 秒读取状态';
+    const tracking = jobs.length > 0;
+    const interval = tracking ? Date.now() - taskPollStartedAt < 10000 ? 500 : 1000 : 5000;
+    const delay = pollFailures ? Math.min((tracking ? 1000 : 5000) * 2 ** (tracking ? pollFailures - 1 : pollFailures), 60000) : interval;
+    $('refresh-status').textContent = pollFailures ? '读取暂未恢复 · ' + delay / 1000 + ' 秒后自动重试，保留已有数据' : tracking ? '手动任务进行中 · 每 ' + interval / 1000 + ' 秒更新进度' + (!$('auto-refresh').checked ? '，结束后停止' : '') : '持续刷新已开启' + ($('background-refresh').checked ? '（含后台标签页）' : '') + ' · 每 5 秒读取状态';
     if (!pollBusy) pollTimer = root.setTimeout(() => refreshSnapshots(false), delay);
   }
   function stopAutomaticPoll() {
@@ -809,7 +1226,7 @@
     } catch (error) {
       if (error.code === 'authentication') { report(error); return; }
       if (generation !== session.generation() || controller.signal.aborted) return;
-      pollFailures = Math.min(pollFailures + 1, 4);
+      pollFailures = Math.min(pollFailures + 1, 7);
       report(error, 'snapshots');
     } finally {
       controller.abort();
@@ -838,8 +1255,12 @@
       await loadEditor();
       if (generation !== session.generation()) return;
       $('workspace').hidden = false; $('login-section').hidden = true; $('connection-status').textContent = '已连接'; $('connection-status').className = 'badge'; $('disconnect').disabled = false;
-      renderForm(); renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
+      const accountView = accountPreferences.value(); $('account-sort').value = accountView.sort; $('account-layout').value = accountView.layout;
+      renderForm(); renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '页面更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
       if (!diskMatchesRunning) notice('服务器规则文件尚未应用。这里显示的是文件草稿；运行概览中的启用状态来自当前调度器。', 'warning');
+      const savedPreferences = preferences.value();
+      $('auto-refresh').checked = savedPreferences.autoRefresh;
+      $('background-refresh').checked = savedPreferences.backgroundRefresh;
       schedulePoll();
     } catch (error) {
       if (generation === session.generation()) session.disconnect();
@@ -855,13 +1276,39 @@
     void connectPanel($('management-key').value, false);
   });
   $('disconnect').addEventListener('click', () => { if (editor.dirty() && !root.confirm('断开将清除未保存的规则草稿。继续断开？')) return; session.disconnect(); });
+  function activatePlanView(name, focus, load = true) {
+    if (!['upcoming', 'history'].includes(name)) return;
+    planView = name;
+    for (const view of ['upcoming', 'history']) {
+      const selected = view === name, button = $('plan-view-' + view);
+      button.classList.toggle('active', selected); button.setAttribute('aria-selected', String(selected)); button.tabIndex = selected ? 0 : -1;
+      $('plan-' + view).hidden = !selected;
+    }
+    if (focus) $('plan-view-' + name).focus?.();
+    if (name === 'history' && load && session.connected()) void readHistory(0);
+  }
+  function openAccountHistory(accountID) {
+    for (const id of ['history-kind', 'history-result', 'history-from', 'history-until']) $(id).value = '';
+    $('history-account').value = String(accountID);
+    historyFiltersChanged(); activatePlanView('history', false, false); activateTab('plan');
+    $('plan-view-history').focus?.();
+  }
+  for (const name of ['upcoming', 'history']) {
+    const button = $('plan-view-' + name);
+    button.addEventListener('click', () => activatePlanView(name));
+    button.addEventListener('keydown', event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      activatePlanView(event.key === 'Home' ? 'upcoming' : event.key === 'End' ? 'history' : name === 'upcoming' ? 'history' : 'upcoming', true);
+    });
+  }
   function activateTab(name, focus) {
     const button = Array.from(document.querySelectorAll('[data-tab]')).find(tab => tab.dataset.tab === name);
     if (!button) return;
     document.querySelectorAll('[data-tab]').forEach(tab => { const selected = tab === button; tab.classList.toggle('active', selected); tab.setAttribute('aria-selected', String(selected)); tab.tabIndex = selected ? 0 : -1; });
     for (const view of document.querySelectorAll('.view')) view.hidden = view.id !== 'tab-' + name;
     if (focus) button.focus();
-    if (name === 'plan' && session.connected()) void readHistory(0);
+    if (name === 'plan' && planView === 'history' && session.connected()) void readHistory(0);
   }
   document.querySelectorAll('[data-tab]').forEach(button => {
     button.addEventListener('click', () => activateTab(button.dataset.tab));
@@ -877,28 +1324,36 @@
     });
   });
   document.querySelectorAll('[data-open-tab]').forEach(button => button.addEventListener('click', () => activateTab(button.dataset.openTab, true)));
-  for (const input of document.querySelectorAll('[data-field]')) input.addEventListener('change', () => {
+  for (const input of document.querySelectorAll('[data-field]')) {
+    registerValidation(input, input.dataset.field);
+    input.addEventListener('change', () => {
     try {
       if (editor.rawDirty()) throw new PanelError('unapplied_json');
       let value = input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value;
-      if (input.type === 'number' && (!input.value.trim() || !Number.isFinite(value))) throw new PanelError('invalid_config');
+      if (input.type === 'number' && (!input.value.trim() || !Number.isFinite(value))) { pendingFormInputs.add(input); editor.markFormDirty(true); validateForm(false); updateDraftBadge(); return; }
       if (input.dataset.field === 'ordinary_rules.allowed_hours' || input.dataset.field.endsWith('.excluded_hours')) value = input.value.split(/[,，\n]/).map(x => x.trim()).filter(Boolean);
-      if (input.dataset.field.endsWith('.prompt_pool')) value = [...new Set(input.value.split(/\r?\n/).map(text => text.trim()).filter(Boolean))];
-      editor.update(input.dataset.field, value); draftChanged(); renderAccounts();
-    } catch (error) { report(error); const cfg = editor.value(); if (cfg) { const old = fieldValue(cfg, input.dataset.field); if (input.type === 'checkbox') input.checked = old === true; else input.value = Array.isArray(old) ? old.join(', ') : old ?? ''; } }
-  });
+      if (input.dataset.field.endsWith('.prompt_pool')) value = input.value.split(/\r?\n/).map(text => text.trim()).filter(Boolean);
+      editor.update(input.dataset.field, value); commitFormInput(input); draftChanged(); renderAccounts();
+    } catch (error) { report(error); if (error.code !== 'unapplied_json') { pendingFormInputs.add(input); editor.markFormDirty(true); setFieldError(input, '此输入尚未应用，请修正后重试；草稿已保留。'); updateDraftBadge(); } }
+    });
+  }
   $('daily-add').addEventListener('click', () => {
+    if ([...pendingFormInputs].some(control => validationControls.get(control)?.startsWith('daily_rules.'))) { validateForm(true); return; }
     if (editor.rawDirty()) { report(new PanelError('unapplied_json')); return; }
     const cfg = editor.value(); cfg.daily_rules = cfg.daily_rules || []; const ids = new Set(cfg.daily_rules.map(r => r.id)); let n = 1; while (ids.has('morning-' + n)) n++;
-    cfg.daily_rules.push({id: 'morning-' + n, enabled: true, random_time_range: '09:00-09:10', minimum_ready_accounts: 1, catch_up: true}); editor.replace(cfg); renderDaily(); draftChanged();
+    cfg.daily_rules.push({id: 'morning-' + n, enabled: true, random_time_range: '09:00-09:10', minimum_ready_accounts: 1, catch_up: true}); editor.setDailyRules(cfg.daily_rules); renderDaily(); validateForm(false); draftChanged();
   });
   $('config-json').addEventListener('input', () => { editor.markRaw(); $('json-message').textContent = 'JSON 尚未应用到草稿。'; updateDraftBadge(); renderAccounts(); });
   $('json-apply').addEventListener('click', () => { try { const cfg = JSON.parse($('config-json').value); editor.replace(cfg); renderForm(); renderAccounts(); notice('JSON 已应用到本地草稿，尚未保存到服务器。'); } catch (_) { notice('JSON 无法解析或缺少完整规则结构。请保留完整字段并修正后再应用。', 'error'); } });
   $('json-format').addEventListener('click', () => { try { const value = JSON.parse($('config-json').value); if (!validObject(value)) throw new Error(); $('config-json').value = JSON.stringify(value, null, 2); } catch (_) { notice('JSON 无法解析或顶层不是对象。', 'error'); } });
   $('config-save').addEventListener('click', async () => {
     if (!session.connected() || actionBusy || editor.rawDirty() || (!editor.dirty() && diskMatchesRunning)) return;
+    if (!validateForm(true)) { updateDraftBadge(); return; }
     const config = editor.value();
-    if (!root.confirm(config.enabled ? '保存并应用这些规则？模型唤醒已开启，调度器可能发送真实模型请求。' : '保存并应用规则？模型唤醒保持关闭，额度查询按独立设置运行；已发出的请求仍可能完成。')) return;
+    const changes = draftChanges(), shortValue = value => { const text = changeValue(value).replace(/\s+/g, ' '); return text.length > 90 ? text.slice(0, 90) + '…' : text; };
+    const changeSummary = changes.slice(0, 12).map(change => change.label + '：' + shortValue(change.before) + ' → ' + shortValue(change.after)).join('\n');
+    const impact = config.enabled ? '模型唤醒已开启，调度器可能发送真实模型请求。' : '模型唤醒保持关闭，额度查询按独立设置运行；已发出的请求仍可能完成。';
+    if (!root.confirm('保存并应用 ' + changes.length + ' 项配置变更？\n\n' + changeSummary + (changes.length > 12 ? '\n其余 ' + (changes.length - 12) + ' 项请在保存栏的变更预览中查看。' : '') + '\n\n' + impact)) return;
     const generation = session.generation(), version = editor.version(); let accepted = false; busy(true);
     try { const envelope = await session.request('/config', 'POST', {config, revision: editor.revision()}); if (generation !== session.generation()) return; mutationEpoch++; accepted = true; editor.saved(envelope, version); runningConfig = {...envelope.config, enabled: envelope.config.enabled === true && summary?.host_enabled !== false}; if (summary) summary.enabled = runningConfig.enabled; diskMatchesRunning = envelope.disk_matches_running !== false; renderForm(); renderOverview(); renderAccounts(); notice('规则已保存并应用。'); await readSnapshots(); }
     catch (error) { if (error.code === 'authentication') report(error); else if (generation === session.generation()) { if (accepted && error.code !== 'authentication') notice('规则已保存并应用；状态暂未读取成功，请更新页面数据核对。', 'warning', 'snapshots'); else report(error); } }
@@ -921,8 +1376,15 @@
     finally { if (generation === session.generation()) busy(false); }
   });
   $('refresh').addEventListener('click', () => refreshSnapshots(true));
-  $('auto-refresh').addEventListener('change', () => { if (!$('auto-refresh').checked) { $('background-refresh').checked = false; stopAutomaticPoll(); } else { pollFailures = 0; schedulePoll(); } });
-  $('background-refresh').addEventListener('change', () => { if (document.hidden && !$('background-refresh').checked) stopAutomaticPoll(); else resumeAutomaticPoll(); });
+  $('auto-refresh').addEventListener('change', () => {
+    if (!$('auto-refresh').checked) $('background-refresh').checked = false;
+    preferences.save($('auto-refresh').checked, $('background-refresh').checked);
+    if (!$('auto-refresh').checked) stopAutomaticPoll(); else { pollFailures = 0; schedulePoll(); }
+  });
+  $('background-refresh').addEventListener('change', () => {
+    preferences.save($('auto-refresh').checked, $('background-refresh').checked);
+    if (document.hidden && !$('background-refresh').checked) stopAutomaticPoll(); else resumeAutomaticPoll();
+  });
   function manualWakeJob() { return trackedJob(pendingManualWake, 'manual_wake'); }
   async function requestManualWake(accountID) {
     if (actionBusy || !session.connected()) return;
@@ -985,6 +1447,9 @@
     finally { if (generation === session.generation()) busy(false); }
   });
   $('account-search').addEventListener('input', renderAccounts); $('account-filter').addEventListener('change', renderAccounts);
+  for (const id of ['account-sort', 'account-layout']) $(id).addEventListener('change', () => {
+    accountPreferences.save($('account-sort').value, $('account-layout').value); renderAccounts(true);
+  });
   document.addEventListener('visibilitychange', () => { if (document.hidden && !$('background-refresh').checked) stopAutomaticPoll(); else resumeAutomaticPoll(); });
   root.addEventListener('offline', stopAutomaticPoll);
   root.addEventListener('online', resumeAutomaticPoll);
@@ -992,7 +1457,13 @@
   root.addEventListener('pageshow', () => { if (session.connected()) resumeAutomaticPoll(); });
   root.addEventListener('beforeunload', event => { if (editor.dirty()) { event.preventDefault(); event.returnValue = ''; } });
   root.addEventListener('pagehide', () => session.disconnect());
-  root.setInterval(() => { if (!session.connected() || document.hidden) return; for (const item of document.querySelectorAll('[data-reset]')) item.textContent = countdown(item.dataset.reset); }, 1000);
+  root.setInterval(() => {
+    if (!session.connected() || document.hidden) return;
+    const selection = root.getSelection?.();
+    for (const item of document.querySelectorAll('[data-reset]')) updateLiveText(item, countdown(item.dataset.reset), selection);
+    for (const item of document.querySelectorAll('[data-observed]')) updateLiveText(item, '额度观测：' + observationAge(item.dataset.observed), selection);
+    renderFreshness();
+  }, 1000);
   (function autoConnect() {
     const key = readPanelKey(root, apiBase(root.location));
     if (key) void connectPanel(key, true);

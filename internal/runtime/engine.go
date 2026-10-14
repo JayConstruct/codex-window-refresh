@@ -48,6 +48,8 @@ type Engine struct {
 	jobs                        []JobStatus // guarded by queueMu; bounded immutable copies
 	queuePoisoned               bool        // guarded by queueMu; refuses jobs after a failed commit
 	manualJobID                 string
+	manualAcceptedAt            time.Time // guarded by queueMu; monotonic latency clock
+	manualExecutionStarted      time.Time // guarded by mu; monotonic latency clock
 	manualWakeJobID             string
 	activity                    []core.ActivityEvent
 	observations                []core.QuotaObservation
@@ -234,7 +236,9 @@ func (e *Engine) commit(ctx context.Context) error {
 		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 	}
+	commitStarted := time.Now()
 	r, err := e.store.Commit(ctx, e.state.Revision, e.state)
+	e.measureManualCommit(time.Since(commitStarted))
 	if err != nil {
 		e.poisoned = true
 		e.lastError = "durable_commit_failed"
@@ -302,7 +306,9 @@ func (e *Engine) observe(ctx context.Context, id core.AccountID, sources ...core
 		}
 		core.AppendHistory(&e.state, entry)
 	}()
-	if b, ok := e.host.(interface{ SetBaseline(core.CoreState) }); ok {
+	if b, ok := e.host.(interface{ SetAccountBaseline(core.AccountState) }); ok {
+		b.SetAccountBaseline(a)
+	} else if b, ok := e.host.(interface{ SetBaseline(core.CoreState) }); ok {
 		b.SetBaseline(cloneState(e.state))
 	}
 	q := core.QuotaRead{AccountID: id, Generation: a.Generation, ReadStartedSeq: core.NextSequence(&e.state)}
@@ -390,6 +396,11 @@ func (e *Engine) Step(ctx context.Context) error {
 	}
 	e.caps = caps
 	now := e.clock.Now()
+	// An explicitly selected account is revalidated directly. A periodic full
+	// inventory refresh (or its global backoff) must not hold this read-only task.
+	if e.canQuerySelectedAccount() {
+		return e.stepSelectedAccountQuery(ctx, before)
+	}
 	if e.inventoryFailed && now.Before(e.nextInventory) {
 		e.lastError = "account_read_failed"
 		e.blockManualJobs(e.lastError, e.nextInventory)
@@ -398,7 +409,9 @@ func (e *Engine) Step(ctx context.Context) error {
 	if e.inventory == nil || !now.Before(e.nextInventory) {
 		e.nextInventory = now.Add(30 * time.Second)
 		inventoryCtx, cancel := context.WithTimeout(ctx, e.cfg.Execution.QuotaReadTimeout.Value())
+		inventoryStarted := time.Now()
 		hs, readErr := e.host.Accounts(inventoryCtx)
+		e.measureManualInventory(time.Since(inventoryStarted))
 		if readErr == nil && inventoryCtx.Err() != nil {
 			readErr = inventoryCtx.Err()
 		}
@@ -472,6 +485,9 @@ func (e *Engine) Step(ctx context.Context) error {
 		return e.nextRead[readIDs[i]].Before(e.nextRead[readIDs[j]])
 	})
 	for _, id := range readIDs {
+		if e.manualQueryWaiting() {
+			return e.commitChanged(ctx, before)
+		}
 		if ctx.Err() != nil {
 			return e.commitChanged(ctx, before)
 		}
@@ -501,6 +517,9 @@ func (e *Engine) Step(ctx context.Context) error {
 			}
 		}
 	}
+	if e.manualQueryWaiting() {
+		return e.commitChanged(ctx, before)
+	}
 	now = e.clock.Now()
 	if err = e.generate(now); err != nil {
 		return err
@@ -523,6 +542,9 @@ func (e *Engine) Step(ctx context.Context) error {
 		return oldestDue(ai, now).Before(oldestDue(aj, now))
 	})
 	for _, id := range ids {
+		if e.manualQueryWaiting() {
+			return e.commitChanged(ctx, before)
+		}
 		if ctx.Err() != nil {
 			return e.commitChanged(ctx, before)
 		}
@@ -568,6 +590,9 @@ func (e *Engine) Step(ctx context.Context) error {
 			e.hold(id, core.HoldQuotaUnknown)
 			continue
 		}
+		if e.manualQueryWaiting() {
+			return e.commitChanged(ctx, before)
+		}
 		now = e.clock.Now()
 		e.drain()
 		if ctx.Err() != nil {
@@ -608,6 +633,9 @@ func (e *Engine) Step(ctx context.Context) error {
 			}
 			continue
 		}
+		if e.manualQueryWaiting() {
+			return e.commitChanged(ctx, before)
+		}
 		return e.dispatch(ctx, id, ad)
 	}
 	return e.commitChanged(ctx, before)
@@ -617,6 +645,7 @@ func (e *Engine) commitChanged(ctx context.Context, before []byte) error {
 	if bytes.Equal(before, after) {
 		// Query-only outcomes can be terminal without changing durable account
 		// state (for example, an unavailable adapter or an empty inventory).
+		e.measureManualCommit(0)
 		e.confirmJobsCommitted()
 		return nil
 	}

@@ -9,6 +9,7 @@ import (
 )
 
 type ManualQueryStatus struct {
+	Timing        *ManualQueryTiming    `json:"timing,omitempty"`
 	JobID         string                `json:"job_id,omitempty"`
 	BlockedReason string                `json:"blocked_reason,omitempty"`
 	RetryAt       time.Time             `json:"retry_at,omitempty"`
@@ -61,6 +62,7 @@ func (e *Engine) QueueQuotaQueryJob(id core.AccountID) (string, string) {
 		return "durable_commit_failed", ""
 	}
 	e.manualRequested, e.manualActive = true, true
+	e.manualAcceptedAt = time.Now()
 	e.manualTarget, e.manualJobID = id, newJobID()
 	queued := ManualQueryStatus{JobID: e.manualJobID, AccountID: id, Phase: "queued", StartedAt: e.clock.Now()}
 	e.putJobLocked(JobStatus{JobID: e.manualJobID, Kind: "quota_query", Phase: "queued", AccountID: id, QuotaQuery: &queued})
@@ -72,19 +74,34 @@ func (e *Engine) QueueQuotaQueryJob(id core.AccountID) (string, string) {
 func (e *Engine) startManualQuery() {
 	e.queueMu.Lock()
 	requested := e.manualRequested
-	target, jobID := e.manualTarget, e.manualJobID
+	target, jobID, acceptedAt := e.manualTarget, e.manualJobID, e.manualAcceptedAt
+	startedAt := e.clock.Now()
+	for _, job := range e.jobs {
+		if job.JobID == jobID && job.QuotaQuery != nil {
+			startedAt = job.QuotaQuery.StartedAt
+			break
+		}
+	}
 	e.manualRequested = false
 	e.queueMu.Unlock()
 	if requested {
-		e.manualQuery = ManualQueryStatus{JobID: jobID, AccountID: target, Phase: "queued", StartedAt: e.clock.Now()}
+		e.manualExecutionStarted = time.Now()
+		e.manualQuery = ManualQueryStatus{JobID: jobID, AccountID: target, Phase: "queued", StartedAt: startedAt,
+			Timing: &ManualQueryTiming{QueuedMS: max(0, time.Since(acceptedAt).Milliseconds())}}
 		e.manualIDs = nil
 		e.manualIndex = 0
-		// Synchronize inventory once for this sweep, including newly added accounts.
-		e.nextInventory = time.Time{}
+		// Full sweeps discover newly added accounts. Selected queries reuse the
+		// known index and revalidate only that credential on capable hosts.
+		_, targeted := e.host.(selectedAccountReader)
+		_, known := e.state.Accounts[target]
+		if target == "" || !targeted || !known {
+			e.nextInventory = time.Time{}
+		}
 	}
 }
 func (e *Engine) finishManualQuery(phase string) {
 	e.manualQuery.Phase, e.manualQuery.FinishedAt = phase, e.clock.Now()
+	e.refreshManualTiming()
 	e.manualQuery.BlockedReason, e.manualQuery.RetryAt = "", time.Time{}
 	e.manualIDs = nil
 	e.recordQuotaJob()
@@ -125,7 +142,13 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 			core.AppendHistory(&e.state, core.HistoryEntry{Kind: "query", AccountID: id, StartedAt: e.clock.Now(), FinishedAt: e.clock.Now(), Status: "skipped", ErrorCode: "account_removed", Sources: []core.ActionSource{{Trigger: "manual_query"}}})
 			continue
 		}
-		if err := e.observe(ctx, id, core.ActionSource{Trigger: "manual_query"}); err != nil {
+		queryStarted := time.Now()
+		err := e.observe(ctx, id, core.ActionSource{Trigger: "manual_query"})
+		if e.manualQuery.Timing != nil {
+			e.manualQuery.Timing.QueryMS += max(0, time.Since(queryStarted).Milliseconds())
+		}
+		e.refreshManualTiming()
+		if err != nil {
 			e.manualQuery.Failed++
 			e.manualQuery.LastError = quotaReadErrorCode(err)
 			diagnostic := quotaReadDiagnostic(err, 0)

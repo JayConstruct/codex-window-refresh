@@ -30,7 +30,7 @@ installer-check: build
 	python3 -m unittest discover -s scripts/tests -v
 
 panel-check:
-	node --test scripts/tests/panel.test.cjs
+	node --test scripts/tests/panel*.test.cjs
 
 release-check:
 	python3 scripts/release_check.py
