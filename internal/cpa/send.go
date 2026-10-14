@@ -63,9 +63,21 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 	h.mu.RLock()
 	baseline := h.baselines[req.AccountID]
 	h.mu.RUnlock()
-	var observation *core.QuotaObservation
+	var observations []core.QuotaObservation
+	remember := func(o core.QuotaObservation) {
+		operationObservation(&o, req.OperationID)
+		observations = retainSendObservations(observations, o)
+	}
+	result := func(disposition core.SendDisposition, code string) core.SendResult {
+		out := core.SendResult{Disposition: disposition, Observations: observations, ErrorCode: code}
+		if len(observations) > 0 {
+			latest := observations[len(observations)-1]
+			out.Observation = &latest
+		}
+		return out
+	}
 	if o, err := ParseQuota(quotaHeaders(opened.Headers), read, time.Now().UTC(), core.ObservationExecution, baseline); err == nil {
-		observation = &o
+		remember(o)
 	}
 	completed := false
 	streamFailed := false
@@ -94,19 +106,26 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 			streamFailed = true
 		case "codex.rate_limits":
 			if o, err := ParseQuota(data, read, time.Now().UTC(), core.ObservationExecution, baseline); err == nil {
-				observation = &o
+				remember(o)
 			}
 		}
 	}
 	for {
 		var chunk streamRead
 		if err := h.callback.Call(ctx, "host.model.stream_read", streamRequest{opened.StreamID}, &chunk); err != nil {
-			return core.SendResult{Disposition: core.SendUnknown, Observation: operationObservation(observation, req.OperationID), ErrorCode: "model_stream_read_failed"}, nil
+			return result(core.SendUnknown, "model_stream_read_failed"), nil
 		}
 		if len(chunk.Payload) > 0 {
+			// The native Codex executor returns scanner lines as separate
+			// callback payloads, without their terminating newline. Keep SSE
+			// metadata separate from a following native data line while still
+			// retaining genuinely fragmented JSON and multiline data events.
+			if nativeSSELineBoundary(pending, chunk.Payload) {
+				pending = append(pending, '\n')
+			}
 			pending = append(pending, chunk.Payload...)
 			if len(pending) > 1<<20 {
-				return core.SendResult{Disposition: core.SendUnknown, ErrorCode: "model_stream_frame_too_large"}, nil
+				return result(core.SendUnknown, "model_stream_frame_too_large"), nil
 			}
 			pending = bytes.ReplaceAll(pending, []byte("\r\n"), []byte("\n"))
 			for {
@@ -122,6 +141,12 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 			if json.Valid(bytes.TrimSpace(pending)) {
 				process(bytes.TrimSpace(pending))
 				pending = nil
+			} else if data, ok := sseEventData(pending); ok && json.Valid(data) {
+				// A complete native data line needs no blank SSE separator.
+				// Never consume an incomplete JSON payload: subsequent callback
+				// chunks may finish it or add another data line to the event.
+				process(data)
+				pending = nil
 			}
 		}
 		if chunk.Error != "" {
@@ -131,7 +156,7 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 			break
 		}
 		if ctx.Err() != nil {
-			return core.SendResult{Disposition: core.SendUnknown, ErrorCode: "model_stream_canceled"}, nil
+			return result(core.SendUnknown, "model_stream_canceled"), nil
 		}
 	}
 	if len(bytes.TrimSpace(pending)) > 0 {
@@ -145,9 +170,54 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 	} else if streamFailed {
 		code = "model_stream_failed"
 	}
-	return core.SendResult{Disposition: disposition, Observation: operationObservation(observation, req.OperationID), ErrorCode: code}, nil
+	return result(disposition, code), nil
 }
+
+// Keep original messages which still own a latest field or positive activation
+// proof, bounding storage to five regardless of stream length. Keeping shape and receive
+// time avoids fabricating same-message joint-reset or recovery evidence.
+func retainSendObservations(observations []core.QuotaObservation, next core.QuotaObservation) []core.QuotaObservation {
+	observations = append(observations, next)
+	var seen uint8
+	kept := make([]core.QuotaObservation, 0, 5)
+	for index := len(observations) - 1; index >= 0; index-- {
+		o := observations[index]
+		var fields uint8
+		if o.Permission != nil {
+			fields |= 1
+		}
+		if o.FiveHour != nil {
+			fields |= 2
+			if o.FiveHour.State == core.WindowActive {
+				fields |= 8
+			}
+		}
+		if o.Weekly != nil {
+			fields |= 4
+			if o.Weekly.State == core.WindowActive {
+				fields |= 16
+			}
+		}
+		if fields & ^seen != 0 {
+			kept = append(kept, o)
+		}
+		seen |= fields
+	}
+	for left, right := 0, len(kept)-1; left < right; left, right = left+1, right-1 {
+		kept[left], kept[right] = kept[right], kept[left]
+	}
+	return kept
+}
+
 func parseSSEEvent(event []byte, process func([]byte)) {
+	if data, ok := sseEventData(event); ok {
+		process(data)
+	} else if json.Valid(bytes.TrimSpace(event)) {
+		process(bytes.TrimSpace(event))
+	}
+}
+
+func sseEventData(event []byte) ([]byte, bool) {
 	data := []string{}
 	for _, line := range strings.Split(string(event), "\n") {
 		if strings.HasPrefix(line, "data:") {
@@ -155,10 +225,62 @@ func parseSSEEvent(event []byte, process func([]byte)) {
 		}
 	}
 	if len(data) > 0 {
-		process([]byte(strings.Join(data, "\n")))
-	} else if json.Valid(bytes.TrimSpace(event)) {
-		process(bytes.TrimSpace(event))
+		return []byte(strings.Join(data, "\n")), true
 	}
+	return nil, false
+}
+
+func sseMetadataOnly(event []byte) bool {
+	if len(bytes.TrimSpace(event)) == 0 {
+		return false
+	}
+	for _, line := range strings.Split(string(event), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if line != "" && !strings.HasPrefix(line, ":") && !strings.HasPrefix(line, "event:") && !strings.HasPrefix(line, "id:") && !strings.HasPrefix(line, "retry:") {
+			return false
+		}
+	}
+	return true
+}
+
+func nativeSSELineBoundary(pending, payload []byte) bool {
+	if len(pending) == 0 || bytes.HasSuffix(pending, []byte("\n")) || !startsSSEField(payload) {
+		return false
+	}
+	if sseMetadataOnly(pending) {
+		return true
+	}
+	// A native multiline data event also loses the newlines between data
+	// fields. Only insert one outside a JSON string, where literal newlines
+	// are valid JSON whitespace. A fragmented JSON string may itself resume
+	// with "data:" and must retain those exact bytes.
+	if !bytes.HasPrefix(payload, []byte("data:")) {
+		return false
+	}
+	data, ok := sseEventData(pending)
+	if !ok {
+		return false
+	}
+	inString, escaped := false, false
+	for _, ch := range data {
+		if escaped {
+			escaped = false
+		} else if inString && ch == '\\' {
+			escaped = true
+		} else if ch == '"' {
+			inString = !inString
+		}
+	}
+	return !inString
+}
+
+func startsSSEField(payload []byte) bool {
+	for _, prefix := range [][]byte{[]byte("data:"), []byte("event:"), []byte("id:"), []byte("retry:"), []byte(":")} {
+		if bytes.HasPrefix(payload, prefix) {
+			return true
+		}
+	}
+	return false
 }
 func operationObservation(o *core.QuotaObservation, id core.OperationID) *core.QuotaObservation {
 	if o == nil {

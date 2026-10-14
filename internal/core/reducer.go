@@ -445,8 +445,11 @@ func ApplySendResult(s *CoreState, id AccountID, op OperationID, result SendResu
 		t.NextVerificationAt = now
 	}
 	s.Accounts[id] = a
-	if result.Observation != nil {
-		o := *result.Observation
+	observations := result.Observations
+	if len(observations) == 0 && result.Observation != nil {
+		observations = []QuotaObservation{*result.Observation}
+	}
+	for _, o := range observations {
 		if o.AccountID == id && o.Generation == a.Generation {
 			o.Class = ObservationExecution
 			ApplyObservation(s, o)

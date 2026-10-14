@@ -168,6 +168,22 @@ func (e *Engine) stepManualWake(ctx context.Context) error {
 		return err
 	}
 	account = e.state.Accounts[id]
+	sendCode := ""
+	for index := len(e.state.History) - 1; index >= 0; index-- {
+		entry := e.state.History[index]
+		if entry.Kind != "wake" || entry.AccountID != id || entry.Generation != e.manualWake.Generation {
+			continue
+		}
+		for _, covered := range entry.CoveredEvents {
+			if covered == event.ID {
+				sendCode = safeSendErrorCode(entry.ErrorCode)
+				break
+			}
+		}
+		if sendCode != "" {
+			break
+		}
+	}
 	if account.Task != nil && account.Task.SendOutcome == core.SendDefinitelyNotSent {
 		for index := range account.Task.Intents {
 			if account.Task.Intents[index].ID == event.ID {
@@ -175,9 +191,12 @@ func (e *Engine) stepManualWake(ctx context.Context) error {
 			}
 		}
 		e.state.Accounts[id] = account
-		e.finishManualWake("failed", "send_not_sent")
+		if sendCode == "" {
+			sendCode = "send_not_sent"
+		}
+		e.finishManualWake("failed", sendCode)
 	} else {
-		e.finishManualWake("verifying", "")
+		e.finishManualWake("verifying", sendCode)
 	}
 	return nil
 }

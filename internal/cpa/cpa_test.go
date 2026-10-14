@@ -207,12 +207,12 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-func TestZeroUsedPreservesOnlyAlreadyConfirmedSameActiveWindow(t *testing.T) {
+func TestZeroUsedFullWindowPreservesOnlyAlreadyConfirmedSameActiveWindow(t *testing.T) {
 	at := time.Unix(1800000000, 0).UTC()
 	read := core.QuotaRead{AccountID: "a", Generation: "g", ReadStartedSeq: 9}
-	reset := at.Add(time.Hour)
+	reset := at.Add(5 * time.Hour)
 	baseline := core.AccountState{ID: "a", Generation: "g", FiveHour: core.WindowEvidence{State: core.WindowActive, ResetAt: reset}, FiveHourBaseline: core.WindowBaseline{CycleID: "confirmed-cycle", StableResetAt: reset}}
-	raw := []byte(`{"rate_limit":{"allowed":true,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1800003600}}}`)
+	raw := []byte(`{"rate_limit":{"allowed":true,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_at":1800018000}}}`)
 	o, err := ParseQuota(raw, read, at, core.ObservationQuery, baseline)
 	if err != nil || o.FiveHour.State != core.WindowActive || o.FiveHour.CycleID != "confirmed-cycle" {
 		t.Fatalf("confirmed active cycle was lost: %+v %v", o, err)

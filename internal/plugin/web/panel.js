@@ -465,6 +465,22 @@
     if ((resetTime(account.BackoffUntil) || 0) > currentTime) return '账号失败退避中，请稍后重试';
     return '';
   }
+  function modelFailureMessage(code) {
+    const messages = {
+      model_callback_failed: 'CPA 模型执行回调失败，尚不能确认请求是否完成',
+      host_callback_failed: 'CPA 宿主回调失败，尚不能确认请求是否完成',
+      model_stream_missing: 'CPA 没有返回可读取的模型流',
+      model_stream_read_failed: '读取模型响应流失败，尚不能确认完整结果',
+      model_stream_frame_too_large: '模型响应事件超过大小限制，未完成结果解析',
+      model_stream_canceled: '模型响应读取被中断，尚不能确认完整结果',
+      model_stream_missing_completion: '模型流未识别到完成事件，不能仅凭请求成功确认窗口启动',
+      model_stream_failed: '模型响应包含失败或未完成事件，请核对 CPA 对应请求的错误记录',
+      invalid_exact_request: '模型请求缺少必要参数，请核对已保存的模型和内容',
+      send_failed: '模型执行出现异常，尚不能确认请求是否完成',
+      send_not_sent: '请求已确认未发送'
+    };
+    return Object.hasOwn(messages, code) ? messages[code] : '';
+  }
   function quotaFailure(job) {
     const messages = {
       quota_credential_expired: '账号凭据已过期或上游拒绝认证，请在 CPA 刷新或重新登录账号',
@@ -494,7 +510,7 @@
     if (Object.hasOwn(stages, detail.stage)) parts.push(stages[detail.stage]);
     if (Number.isInteger(detail.http_status) && detail.http_status >= 100 && detail.http_status <= 599) parts.push('HTTP ' + detail.http_status);
     if (Number.isSafeInteger(detail.elapsed_ms) && detail.elapsed_ms >= 0) parts.push(detail.elapsed_ms + ' 毫秒');
-    return (Object.hasOwn(messages, job.last_error) ? messages[job.last_error] : '可手动重试') + (parts.length ? '（' + parts.join(' · ') + '）' : '');
+    return (modelFailureMessage(job.last_error) || (Object.hasOwn(messages, job.last_error) ? messages[job.last_error] : '可手动重试')) + (parts.length ? '（' + parts.join(' · ') + '）' : '');
   }
   function sourceText(source) {
     const labels = {periodic: '定期查询', five_hour_reset: '5 小时到期', weekly_reset: '周到期', daily_schedule: '每日规则', manual_wake: '手动唤醒', manual_query: '手动查询', verification: '发送后验证', preflight: '发送前核对', generation_preflight: '生成前核对', prompt_generation: '用户确认生成内容', early_recovery: '双满额提前恢复'};
@@ -675,6 +691,8 @@
     if (job.phase === 'interrupted') return '后台已停止或重启，任务已中断；请核对结果后再操作';
     if (job.phase === 'lost') return '任务记录已不可用，请核对账号数据后再操作';
     if (job.phase === 'unconfirmed') return '操作结果尚未确认，请手动更新页面核对；不会自动重试';
+    const sendCode = job.last_error || job.error_code;
+    if (['unknown', 'verifying'].includes(job.phase) && !['send_not_sent', 'invalid_exact_request'].includes(sendCode) && modelFailureMessage(sendCode)) return modelFailureMessage(sendCode) + '；继续核对窗口证据，不自动重发';
     if (job.phase === 'failed') return '任务失败，不自动重试：' + quotaFailure({last_error: job.last_error || job.error_code || job.blocked_reason, diagnostic: job.diagnostic});
     if (activeJob(job) && job.blocked_reason) return '暂时阻塞：' + ((Object.hasOwn(holds, job.blocked_reason) ? holds[job.blocked_reason] : '') || quotaFailure({last_error: job.blocked_reason})) + (resetTime(job.retry_at) !== null ? ' · 下次检查 ' + date(job.retry_at) : '');
     return '';
@@ -814,7 +832,7 @@
         row.append(el('h3', (kinds[entry.kind] || entry.kind) + ' · ' + (statuses[entry.status] || entry.status)), el('p', entry.account_id, 'account-id'), el('p', date(entry.started_at) + (resetTime(entry.finished_at) !== null ? ' — ' + date(entry.finished_at) : ' · 结果尚未确认')));
         if (entry.model) row.append(el('p', '模型：' + entry.model, 'hint'));
         if (entry.prompt) row.append(el('p', '实际发送：' + entry.prompt, 'history-prompt'));
-        if (entry.error_code) row.append(el('p', '结果代码：' + entry.error_code, 'hint'));
+        if (entry.error_code) row.append(el('p', (modelFailureMessage(entry.error_code) ? modelFailureMessage(entry.error_code) + '；' : '') + '结果代码：' + entry.error_code, 'hint'));
         if (entry.operation_id) row.append(el('p', '操作：' + entry.operation_id, 'hint'));
         renderSources(row, entry.sources || []); $('history-list').append(row);
       }

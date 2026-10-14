@@ -63,6 +63,60 @@ func TestFullFiveHourQuotaQueryDoesNotActivateWindowOrSendModel(t *testing.T) {
 	}
 }
 
+func TestZeroUsageShortCountdownStopsOrVerifiesManualWake(t *testing.T) {
+	for _, phase := range []string{"preflight", "response", "verification"} {
+		t.Run(phase, func(t *testing.T) {
+			engine, _, _, clock := manualWakeFixture(t)
+			engine.cfg.Execution.Model = "gpt-5.6-luna"
+			delegate := engine.host
+			sends := 0
+			quota := func(read core.QuotaRead, class core.ObservationClass) (core.QuotaObservation, error) {
+				return cpa.ParseQuota([]byte(`{"rate_limit":{"allowed":true,"primary_window":{"limit_window_seconds":18000,"used_percent":0,"reset_after_seconds":17999}}}`), read, clock.now, class, engine.state.Accounts[read.AccountID])
+			}
+			engine.host = controlledHost{Host: delegate,
+				read: func(ctx context.Context, read core.QuotaRead) (core.QuotaObservation, error) {
+					if phase == "preflight" || sends > 0 {
+						return quota(read, core.ObservationQuery)
+					}
+					return delegate.ObserveQuota(ctx, read)
+				},
+				send: func(_ context.Context, request core.ExactRequest) (core.SendResult, error) {
+					sends++
+					if request.Model != "gpt-5.6-luna" {
+						t.Fatal("manual wake changed the selected model")
+					}
+					if phase == "verification" {
+						return core.SendResult{Disposition: core.SendUnknown}, nil
+					}
+					o, err := quota(core.QuotaRead{AccountID: request.AccountID, Generation: request.Generation, ReadStartedSeq: request.ReadStartedSeq}, core.ObservationExecution)
+					return core.SendResult{Disposition: core.SendCompleted, Observation: &o}, err
+				},
+			}
+			_, jobID := engine.QueueManualWakeJob("a")
+			if err := engine.Step(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if phase == "verification" {
+				clock.now = clock.now.Add(6 * time.Second)
+				if err := engine.Step(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			account := engine.Snapshot().Accounts["a"]
+			if account.FiveHour.State != core.WindowActive || account.FiveHour.Remaining.Value != 100 || !account.FiveHour.ResetAt.After(clock.now) {
+				t.Fatal("shortened zero-usage countdown did not activate the window")
+			}
+			if phase == "preflight" {
+				if sends != 0 {
+					t.Fatal("already active window caused a duplicate model send")
+				}
+			} else if job := findJob(t, engine, jobID); sends != 1 || job.Phase != "completed" {
+				t.Fatalf("manual wake was not verified exactly once: sends=%d phase=%s", sends, job.Phase)
+			}
+		})
+	}
+}
+
 func TestManualWakePreservesAllSafetyGates(t *testing.T) {
 	for _, scenario := range []string{"paused", "disabled", "model", "host_disabled", "foreground", "active", "unknown", "old_active_baseline", "credential_changed", "backoff", "spacing", "quota_failed", "disk_failed"} {
 		t.Run(scenario, func(t *testing.T) {
@@ -85,7 +139,7 @@ func TestManualWakePreservesAllSafetyGates(t *testing.T) {
 				engine.host = host
 			case "unknown":
 				engine.host = controlledHost{Host: host, read: func(_ context.Context, read core.QuotaRead) (core.QuotaObservation, error) {
-					return cpa.ParseQuota([]byte(`{"rate_limit":{"allowed":true,"primary_window":{"limit_window_seconds":18000,"used_percent":0,"reset_after_seconds":17000}}}`), read, clock.now, core.ObservationQuery, engine.state.Accounts[read.AccountID])
+					return cpa.ParseQuota([]byte(`{"rate_limit":{"allowed":true}}`), read, clock.now, core.ObservationQuery, engine.state.Accounts[read.AccountID])
 				}}
 			case "old_active_baseline":
 				account := engine.state.Accounts["a"]

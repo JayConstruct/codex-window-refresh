@@ -303,7 +303,7 @@ func TestUnknownWakeJobStopsSpinnerWithoutResendingAndCanVerifyLater(t *testing.
 		t.Fatal(err)
 	}
 	job := findJob(t, e, id)
-	if job.Phase != "unknown" || job.ManualWake.Phase != "unknown" || job.ManualWake.LastError != "delivery_unconfirmed" {
+	if job.Phase != "unknown" || job.ManualWake.Phase != "unknown" || job.ManualWake.LastError != "send_failed" {
 		t.Fatalf("uncertain send not explicitly surfaced: %+v", job)
 	}
 	if e.manualWake.Phase != "verifying" || e.QueueManualWake("a") != "delivery_evidence_pending" {

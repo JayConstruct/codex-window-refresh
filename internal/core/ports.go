@@ -64,9 +64,15 @@ const (
 
 type SendResult struct {
 	Disposition SendDisposition
+	// Observation is the latest message, retained for single-observation hosts.
 	Observation *QuotaObservation
-	RetryAfter  time.Time
-	ErrorCode   string // sanitized classification, no upstream body or credential
+	// Observations preserves distinct original messages in receive order. The
+	// adapter retains at most five: latest permission, window fields and positive
+	// activation evidence. Fields and timestamps must never be merged across messages.
+	// When nonempty, this list takes precedence over Observation.
+	Observations []QuotaObservation
+	RetryAfter   time.Time
+	ErrorCode    string // sanitized classification, no upstream body or credential
 }
 
 // Host is a proposed adapter boundary, not a CPA plugin SDK contract.

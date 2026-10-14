@@ -216,6 +216,19 @@ test('history subview paginates both ways and keeps the previous page after read
   assert.match(panel.lookup('history-status').textContent, /时间需包含/);
   assert.equal(panel.requests.filter(request => request.options.method === 'POST').length, 0);
 });
+test('unconfirmed model streams expose the diagnostic without suggesting a duplicate send', async () => {
+  const panel = createPanelFixture((url, options, data) => {
+    data.accounts = {a: {ID: 'a', Enabled: true}};
+    data.summary.scheduler.manual_wake = {account_id: 'a', phase: 'unknown', last_error: 'model_stream_missing_completion'};
+    return response(data[url.split('/').pop()]);
+  });
+  panel.lookup('management-key').value = 'key'; panel.lookup('login-form').listeners.get('submit')({preventDefault() {}}); await panel.settle();
+  const text = item => item.textContent + item.children.map(text).join('');
+  assert.match(text(panel.lookup('account-list')), /模型流未识别到完成事件/);
+  assert.match(text(panel.lookup('account-list')), /不自动重发/);
+  assert.doesNotMatch(text(panel.lookup('account-list')), /可手动重试/);
+  assert.equal(panel.requests.filter(request => request.options.method === 'POST').length, 0);
+});
 test('save review shows cross-page changes and cancellation sends no write', async () => {
   let accepted = false;
   const confirmations = [], fixture = createPanelFixture((url, options, data) => {

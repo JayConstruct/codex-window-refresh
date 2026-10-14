@@ -150,10 +150,20 @@ func classifyWindow(w quotaWindow, read core.QuotaRead, at time.Time, class core
 		}
 		reset = at.Add(time.Duration(*after) * time.Second)
 	}
+	// A shortened five-hour countdown is activation evidence even when the
+	// upstream percentage still rounds to zero. Prefer the explicit server
+	// countdown; a full-window placeholder must not become active merely because
+	// its absolute timestamp was sampled earlier. With absolute-only evidence,
+	// compare whole Unix seconds to match the server's timestamp precision.
+	remainingSeconds := reset.Unix() - at.Unix()
+	if after != nil {
+		remainingSeconds = *after
+	}
+	shortCountdown := kind == core.FiveHour && remainingSeconds > 0 && remainingSeconds < seconds
 	state := core.WindowUnknown
 	if !reset.After(at) {
 		state = core.WindowExpired
-	} else if *w.UsedPercent > 0 {
+	} else if *w.UsedPercent > 0 || shortCountdown {
 		state = core.WindowActive
 	} else if class == core.ObservationQuery && baseline.ID == read.AccountID && baseline.Generation == read.Generation {
 		prior, stable := baseline.FiveHour, baseline.FiveHourBaseline
@@ -161,12 +171,12 @@ func classifyWindow(w quotaWindow, read core.QuotaRead, at time.Time, class core
 			prior, stable = baseline.Weekly, baseline.WeeklyBaseline
 		}
 		// This preserves an already confirmed active cycle; it never declares a new
-		// zero-used future window active merely because an old cycle has expired.
+		// full-window placeholder active merely because an old cycle has expired.
 		if prior.State == core.WindowActive && prior.ResetAt.Equal(reset) && stable.StableResetAt.Equal(reset) && at.Before(reset) {
 			state = core.WindowActive
 		}
 	}
-	// Query zero-usage future boundaries may be unactivated moving placeholders.
+	// Full-length zero-usage boundaries may be unactivated moving placeholders.
 	// Even an expired baseline cannot alone prove that the current value is inactive.
 	// After a completed plugin generation, a future boundary remains subject to
 	// normal evidence verification; we do not treat successful HTTP as activation.

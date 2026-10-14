@@ -69,6 +69,7 @@ func (e *Engine) publish(committed bool) {
 			for _, event := range account.Task.Intents {
 				if event.ID == summary.ManualWake.EventID && event.Status == core.IntentSatisfied {
 					summary.ManualWake.Phase = "completed"
+					summary.ManualWake.LastError = ""
 				}
 			}
 		}

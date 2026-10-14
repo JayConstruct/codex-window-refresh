@@ -131,6 +131,7 @@ func (e *Engine) collectJobStatuses(state core.CoreState) []JobStatus {
 			for _, event := range account.Task.Intents {
 				if event.ID == job.ManualWake.EventID && event.Status == core.IntentSatisfied {
 					job.Phase, job.ManualWake.Phase = "completed", "completed"
+					job.ManualWake.LastError = ""
 				}
 			}
 		}
@@ -146,7 +147,10 @@ func (e *Engine) collectJobStatuses(state core.CoreState) []JobStatus {
 					}
 				} else if eventID == job.ManualWake.EventID && entry.Status == "unknown" && job.Phase != "completed" {
 					job.Phase, job.ManualWake.Phase = "unknown", "unknown"
-					job.ManualWake.LastError = "delivery_unconfirmed"
+					job.ManualWake.LastError = safeSendErrorCode(entry.ErrorCode)
+					if job.ManualWake.LastError == "" {
+						job.ManualWake.LastError = "delivery_unconfirmed"
+					}
 				}
 			}
 		}

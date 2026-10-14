@@ -65,8 +65,15 @@ func (e *Engine) dispatch(ctx context.Context, id core.AccountID, admission core
 	if result.Disposition == "" {
 		result.Disposition = core.SendUnknown
 	}
-	if sendErr != nil {
-		e.lastError = "send_failed"
+	sendCode := safeSendErrorCode(result.ErrorCode)
+	if sendCode == "" && sendErr != nil {
+		sendCode = "send_failed"
+		if result.Disposition == core.SendDefinitelyNotSent {
+			sendCode = "send_not_sent"
+		}
+	}
+	if sendCode != "" {
+		e.lastError = sendCode
 	}
 	finished := e.clock.Now()
 	if result.Disposition == core.SendDefinitelyNotSent && result.RetryAfter.IsZero() {
@@ -79,11 +86,15 @@ func (e *Engine) dispatch(ctx context.Context, id core.AccountID, admission core
 			continue
 		}
 		entry.Status = "unknown"
+		entry.ErrorCode = sendCode
 		if result.Disposition == core.SendCompleted {
 			entry.Status = "verifying"
 		}
 		if result.Disposition == core.SendDefinitelyNotSent {
-			entry.Status, entry.ErrorCode, entry.FinishedAt = "failed", "send_not_sent", finished
+			entry.Status, entry.FinishedAt = "failed", finished
+			if entry.ErrorCode == "" {
+				entry.ErrorCode = "send_not_sent"
+			}
 		}
 	}
 	for index := range e.state.Reservations {
@@ -101,4 +112,16 @@ func (e *Engine) dispatch(ctx context.Context, id core.AccountID, admission core
 	e.drain()
 	e.reconcileDailyCapacity(finished)
 	return e.commit(ctx)
+}
+
+// Host errors may contain credentials or upstream response bodies. Persist only
+// stable classifications understood by this runtime; never reflect error text.
+func safeSendErrorCode(code string) string {
+	switch code {
+	case "", "send_failed", "send_not_sent", "invalid_exact_request", "account_identity_unavailable", "account_binding_changed", "host_callback_failed",
+		"model_callback_failed", "model_stream_missing", "model_stream_read_failed", "model_stream_frame_too_large", "model_stream_canceled", "model_stream_missing_completion", "model_stream_failed":
+		return code
+	default:
+		return "send_failed"
+	}
 }
