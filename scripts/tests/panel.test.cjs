@@ -59,6 +59,22 @@ test('model generated candidates require confirmation and explicit draft applica
   assert.equal(requests.filter(request=>request.options.method==='POST').length,1);
   lookup('disconnect').listeners.get('click')();
 });
+test('saving settings immediately restores the generation button without requiring polling', async () => {
+  const {lookup,settle}=createPanelFixture(async(url,options,data)=>{
+    data.summary.host_enabled=true;data.capabilities.ExactAccountExecution=true;data.accounts={a:{ID:'a',Enabled:true}};
+    if(url.endsWith('/config')&&options.method==='POST'){
+      const config=JSON.parse(options.body).config;data.config=config;return response({config,revision:'r2'});
+    }
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value='key';lookup('login-form').listeners.get('submit')({preventDefault(){}});await settle();
+  assert.equal(lookup('generation-start').disabled,false);
+  const config=JSON.parse(lookup('config-json').value);config.execution.prompt='saved fixed text';
+  lookup('config-json').value=JSON.stringify(config);lookup('config-json').listeners.get('input')();lookup('json-apply').listeners.get('click')();
+  lookup('config-save').listeners.get('click')();await settle();
+  assert.equal(lookup('generation-start').disabled,false);
+  lookup('disconnect').listeners.get('click')();
+});
 test('only confirmed active windows display a running countdown', () => {
   const now = Date.parse('2026-10-13T00:00:00Z');
   const fullWindow = {Kind: 'five_hour', State: 'unknown', Source: 'cpa_wham_usage', ResetAt: '2026-10-13T05:00:00Z', Remaining: {Value: 100, Unit: 'percent'}};

@@ -696,7 +696,7 @@
     actionBusy = value;
     for (const id of ['recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = value;
     for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button')) field.disabled = value || field.dataset.fixed === 'true';
-    updateDraftBadge(); renderAccounts(); renderQuotaQuery(); renderCapabilities();
+    updateDraftBadge(); renderAccounts(); renderQuotaQuery(); renderCapabilities(); renderGeneration();
   }
   async function readSnapshots(signal) {
     const generation = session.generation();

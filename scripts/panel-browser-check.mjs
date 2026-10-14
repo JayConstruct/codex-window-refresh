@@ -290,6 +290,7 @@ try {
   assert.ok(posts.every(post=>['quota-query','quota-connection-check','config'].includes(post.path)),'Planning dispatched unexpected operations');
   await waitFor(()=>evaluate('document.getElementById("history-list").textContent.includes("每日规则") && document.getElementById("history-list").textContent.includes("<script>text-only</script>")'),'Task history or sources did not render');
   assert.equal(await evaluate('document.querySelectorAll("#history-list script").length'),0,'History prompt was interpreted as markup');
+  assert.equal(await evaluate('document.getElementById("generation-start").disabled'),false,'Saving settings did not restore generation controls');
   await evaluate(`{document.querySelector('[data-tab=rules]').click();document.getElementById('generation-account').value='fixture-account';document.getElementById('generation-model').value='generator-fixture';document.getElementById('generation-count').value='5';document.getElementById('generation-start').click();}`);
   await waitFor(()=>evaluate('document.getElementById("generation-preview").value.includes("Hello.")'),'Explicit content generation did not show candidate preview');
   const generationWrites = posts.filter(post=>post.path==='prompt-generation');
