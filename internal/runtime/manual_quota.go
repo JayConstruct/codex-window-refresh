@@ -31,7 +31,7 @@ func (e *Engine) RequestQuotaQuery() bool {
 // Different targets cannot silently join or widen a running query.
 func (e *Engine) QueueQuotaQuery(id core.AccountID) string {
 	e.queueMu.Lock()
-	if e.manualWakeActive {
+	if e.manualWakeActive || e.generationActive {
 		e.queueMu.Unlock()
 		return "busy"
 	}
@@ -98,9 +98,10 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 		}
 		if !available {
 			e.manualQuery.Skipped++
+			core.AppendHistory(&e.state, core.HistoryEntry{Kind: "query", AccountID: id, StartedAt: e.clock.Now(), FinishedAt: e.clock.Now(), Status: "skipped", ErrorCode: "account_removed", Sources: []core.ActionSource{{Trigger: "manual_query"}}})
 			continue
 		}
-		if err := e.observe(ctx, id); err != nil {
+		if err := e.observe(ctx, id, core.ActionSource{Trigger: "manual_query"}); err != nil {
 			e.manualQuery.Failed++
 			e.manualQuery.LastError = quotaReadErrorCode(err)
 			diagnostic := quotaReadDiagnostic(err, 0)

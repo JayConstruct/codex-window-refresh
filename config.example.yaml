@@ -8,6 +8,9 @@ quota_query:
   automatic: false
   on_five_hour_expiry: false
   on_weekly_expiry: false
+  five_hour_recent_usage:
+    enabled: false
+    lookback: 30m
   manual: true # 兼容旧配置；手动查询始终允许，此字段不再控制权限
   interval: 30s # 定期查询间隔，允许 30s 到 1h
   five_hour:
@@ -41,11 +44,13 @@ reset_rules:
     random_delay: {min: 0s, max: 10m}
     model: ""
     prompt: ""
+    prompt_pool: []
   weekly:
     enabled: true
     random_delay: {min: 0s, max: 10m}
     model: ""
     prompt: ""
+    prompt_pool: []
     # 已确定的行为：周任务夜间执行，且不受近期用户数限制。
     # 两项目前只接受 true，并不是可关闭的功能开关。
     bypass_activity_limit: true
@@ -80,6 +85,13 @@ execution:
   request_timeout: 1m
   model: "REPLACE_WITH_SUPPORTED_MODEL"
   prompt: "Reply OK."
+  prompt_mode: random
+  prompt_pool:
+    - "Reply OK."
+    - "Say hello briefly."
+    - "Respond with Ready."
+    - "Give a short greeting."
+    - "Reply with one friendly word."
   max_concurrency: 1
   min_dispatch_spacing: 5s
   # 0s 要求本次生成前完成主动查询；不得转换为正数缓存期限替代。

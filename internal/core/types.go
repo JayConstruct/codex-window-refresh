@@ -85,6 +85,7 @@ type WindowBaseline struct {
 	CycleID                 string
 	StableResetAt           time.Time
 	LastConfirmedActivation time.Time
+	LastConsumedAt          time.Time
 }
 
 type AccountState struct {
@@ -105,15 +106,17 @@ type AccountState struct {
 	FiveHourExpiryQueried time.Time
 	WeeklyExpiryQueried   time.Time
 	Task                  *MergedTask
+	EarlyRecoveryAt       time.Time
 }
 
 type Reason string
 
 const (
-	ReasonFiveHour Reason = "five_hour_reset"
-	ReasonWeekly   Reason = "weekly_reset"
-	ReasonDaily    Reason = "daily_schedule"
-	ReasonManual   Reason = "manual_wake"
+	ReasonFiveHour   Reason = "five_hour_reset"
+	ReasonWeekly     Reason = "weekly_reset"
+	ReasonDaily      Reason = "daily_schedule"
+	ReasonManual     Reason = "manual_wake"
+	ReasonGeneration Reason = "prompt_generation"
 )
 
 type IntentStatus string
@@ -150,20 +153,24 @@ const (
 )
 
 type MergedTask struct {
-	AccountID             AccountID
-	Generation            CredentialGeneration
-	Intents               []Intent
-	State                 TaskState
-	NextCheckAt           time.Time
-	HoldReason            HoldReason
-	ReservationID         ReservationID
-	OperationID           OperationID
-	DispatchIntentAt      time.Time
-	CoveredEventIDs       []EventID
-	SendOutcome           SendDisposition
-	NextVerificationAt    time.Time
-	VerificationStartedAt time.Time
-	VerificationAttempt   int
+	AccountID                 AccountID
+	Generation                CredentialGeneration
+	Intents                   []Intent
+	State                     TaskState
+	NextCheckAt               time.Time
+	HoldReason                HoldReason
+	ReservationID             ReservationID
+	OperationID               OperationID
+	DispatchIntentAt          time.Time
+	CoveredEventIDs           []EventID
+	SendOutcome               SendDisposition
+	NextVerificationAt        time.Time
+	VerificationStartedAt     time.Time
+	VerificationAttempt       int
+	SelectedModel             string
+	SelectedPrompt            string
+	DispatchReadSequence      uint64
+	GenerationBaselineResetAt time.Time
 }
 
 // PoolDailyIntent exists before any account is selected. Daily rules express
@@ -203,6 +210,8 @@ type CoreState struct {
 	Activity         map[UserIdentity]UserActivity
 	Requests         map[RequestID]RequestActivity
 	LastDispatchAt   time.Time
+	History          []HistoryEntry
+	GenerationJob    *PromptGenerationJob
 }
 
 // Completed bindings are tombstones: repeated finish callbacks cannot count a

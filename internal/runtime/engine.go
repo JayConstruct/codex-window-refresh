@@ -41,41 +41,45 @@ type Status struct {
 	EffectiveConcurrency int
 }
 type Engine struct {
-	published            atomic.Pointer[publishedStatus]
-	mu                   sync.Mutex
-	queueMu              sync.Mutex
-	activity             []core.ActivityEvent
-	observations         []core.QuotaObservation
-	wake                 chan struct{}
-	cfg                  config.Config
-	host                 core.Host
-	store                core.Store
-	clock                core.Clock
-	random               core.Random
-	state                core.CoreState
-	caps                 core.HostCapabilities
-	lastError            string
-	lastQuotaDiagnostic  *core.QuotaDiagnostic
-	poisoned             bool
-	nextRead             map[core.AccountID]time.Time
-	queryEpoch           time.Time
-	nextPreflight        map[core.AccountID]time.Time
-	readFailures         map[core.AccountID]int
-	activityEpoch        map[core.AccountID]uint64
-	inventory            []core.HostAccount
-	inventoryFailed      bool
-	nextInventory        time.Time
-	manualRequested      bool              // guarded by queueMu
-	manualActive         bool              // guarded by queueMu; includes queued and running jobs
-	manualTarget         core.AccountID    // guarded by queueMu; empty means all enabled accounts
-	manualQuery          ManualQueryStatus // guarded by mu, published with snapshots
-	manualIDs            []core.AccountID
-	manualIndex          int
-	manualWakeRequested  bool
-	manualWakeActive     bool
-	manualWakeTarget     core.AccountID
-	manualWakeGeneration core.CredentialGeneration
-	manualWake           ManualWakeStatus
+	published                   atomic.Pointer[publishedStatus]
+	mu                          sync.Mutex
+	queueMu                     sync.Mutex
+	activity                    []core.ActivityEvent
+	observations                []core.QuotaObservation
+	wake                        chan struct{}
+	cfg                         config.Config
+	host                        core.Host
+	store                       core.Store
+	clock                       core.Clock
+	random                      core.Random
+	state                       core.CoreState
+	caps                        core.HostCapabilities
+	lastError                   string
+	lastQuotaDiagnostic         *core.QuotaDiagnostic
+	poisoned                    bool
+	nextRead                    map[core.AccountID]time.Time
+	queryEpoch                  time.Time
+	nextPreflight               map[core.AccountID]time.Time
+	readFailures                map[core.AccountID]int
+	activityEpoch               map[core.AccountID]uint64
+	inventory                   []core.HostAccount
+	inventoryFailed             bool
+	nextInventory               time.Time
+	manualRequested             bool              // guarded by queueMu
+	manualActive                bool              // guarded by queueMu; includes queued and running jobs
+	manualTarget                core.AccountID    // guarded by queueMu; empty means all enabled accounts
+	manualQuery                 ManualQueryStatus // guarded by mu, published with snapshots
+	manualIDs                   []core.AccountID
+	manualIndex                 int
+	manualWakeRequested         bool
+	manualWakeActive            bool
+	manualWakeTarget            core.AccountID
+	manualWakeGeneration        core.CredentialGeneration
+	manualWake                  ManualWakeStatus
+	generationRequested         bool
+	generationActive            bool
+	generationRequest           core.PromptGenerationRequest
+	generationAccountGeneration core.CredentialGeneration
 }
 
 func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, random core.Random) (*Engine, error) {
@@ -91,6 +95,14 @@ func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, 
 		return nil, err
 	}
 	core.RecoverAfterRestart(&s, clock.Now())
+	for index := range s.History {
+		if s.History[index].Status == "dispatched" {
+			s.History[index].Status = "unknown"
+		}
+	}
+	if s.GenerationJob != nil && (s.GenerationJob.Phase == "queued" || s.GenerationJob.Phase == "running" || s.GenerationJob.Phase == "dispatched") {
+		s.GenerationJob.Phase, s.GenerationJob.ErrorCode, s.GenerationJob.FinishedAt = "unknown", "interrupted_no_retry", clock.Now()
+	}
 	e := &Engine{cfg: cfg, host: host, store: store, clock: clock, random: random, state: s, wake: make(chan struct{}, 1), nextRead: map[core.AccountID]time.Time{}, queryEpoch: clock.Now(), nextPreflight: map[core.AccountID]time.Time{}, readFailures: map[core.AccountID]int{}, activityEpoch: map[core.AccountID]uint64{}}
 	if err = e.commit(context.Background()); err != nil {
 		return nil, err
@@ -202,6 +214,7 @@ func maxTime(a, b time.Time) time.Time {
 	return b
 }
 func (e *Engine) commit(ctx context.Context) error {
+	e.reconcileHistory(e.clock.Now())
 	// Once a transition exists, cancellation stops network work but must not
 	// discard durable delivery evidence. The store is local and remains bounded.
 	if ctx.Err() != nil {
@@ -263,8 +276,19 @@ func (e *Engine) ids() []core.AccountID {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
 }
-func (e *Engine) observe(ctx context.Context, id core.AccountID) error {
+func (e *Engine) observe(ctx context.Context, id core.AccountID, sources ...core.ActionSource) (readError error) {
 	a := e.state.Accounts[id]
+	if len(sources) == 0 {
+		sources = []core.ActionSource{queryEvidenceSource(a, false, "preflight", "execution.quota_max_age_before_send")}
+	}
+	entry := core.HistoryEntry{Kind: "query", AccountID: id, Generation: a.Generation, Sources: sources, StartedAt: e.clock.Now()}
+	defer func() {
+		entry.FinishedAt, entry.Status = e.clock.Now(), "completed"
+		if readError != nil {
+			entry.Status, entry.ErrorCode = "failed", quotaReadErrorCode(readError)
+		}
+		core.AppendHistory(&e.state, entry)
+	}()
 	if b, ok := e.host.(interface{ SetBaseline(core.CoreState) }); ok {
 		b.SetBaseline(cloneState(e.state))
 	}
@@ -330,8 +354,10 @@ func (e *Engine) Step(ctx context.Context) error {
 		return err
 	}
 	before, _ := json.Marshal(e.state)
+	e.reconcileHistory(e.clock.Now())
 	e.startManualQuery()
 	e.startManualWake()
+	e.startPromptGeneration()
 	e.lastError = ""
 	if len(e.readFailures) > 0 {
 		e.lastError = "quota_read_failed"
@@ -397,6 +423,12 @@ func (e *Engine) Step(ctx context.Context) error {
 		}
 		return e.commitChanged(ctx, before)
 	}
+	if e.state.GenerationJob != nil && (e.state.GenerationJob.Phase == "queued" || e.state.GenerationJob.Phase == "running") {
+		if err := e.stepPromptGeneration(ctx); err != nil {
+			return err
+		}
+		return e.commitChanged(ctx, before)
+	}
 	if err = e.generate(now); err != nil {
 		return err
 	}
@@ -427,7 +459,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		expiryQuery := e.expiryQueryDue(a, now)
 		if caps.QuotaAdapterReady && (a.Enabled || pendingOperation) && (verifying || ((e.periodicQueryDue(a, now) || expiryQuery) && !pendingOperation && !now.Before(e.nextRead[id]))) && reads < 4 && !now.Before(e.nextPreflight[id]) {
 			reads++
-			if readErr := e.observe(ctx, id); readErr == nil && expiryQuery {
+			if readErr := e.observe(ctx, id, e.automaticQuerySources(a, now, verifying)...); readErr == nil && expiryQuery {
 				e.markExpiryQueried(id, a, now)
 			}
 			a = e.state.Accounts[id]
@@ -702,13 +734,17 @@ func (e *Engine) attachDaily(now time.Time) {
 // Completion tombstones cover the host's asynchronous callback replay horizon.
 // An unfinished request is never released by a guessed time limit.
 func (e *Engine) pruneActivity(now time.Time) {
+	lookback := e.cfg.Runtime().ActivityLookback
+	if e.cfg.QuotaQuery.FiveHourRecentUsage.Enabled && e.cfg.QuotaQuery.FiveHourRecentUsage.Lookback.Value() > lookback {
+		lookback = e.cfg.QuotaQuery.FiveHourRecentUsage.Lookback.Value()
+	}
 	for id, r := range e.state.Requests {
 		if r.Completed && r.LastEventAt.Before(now.Add(-24*time.Hour)) {
 			delete(e.state.Requests, id)
 		}
 	}
 	for id, u := range e.state.Activity {
-		if u.InFlightCount == 0 && u.LastActivity.Before(now.Add(-e.cfg.Runtime().ActivityLookback)) {
+		if u.InFlightCount == 0 && u.LastActivity.Before(now.Add(-lookback)) {
 			delete(e.state.Activity, id)
 		}
 	}

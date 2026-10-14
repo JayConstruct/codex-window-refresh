@@ -11,6 +11,10 @@ import (
 )
 
 func (h *Host) SendExact(ctx context.Context, req core.ExactRequest) (core.SendResult, error) {
+	return h.sendExact(ctx, req, nil)
+}
+
+func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *generationText) (core.SendResult, error) {
 	if _, err := h.validate(ctx, req.AccountID, req.Generation); err != nil {
 		return core.SendResult{Disposition: core.SendDefinitelyNotSent, ErrorCode: err.Error()}, nil
 	}
@@ -67,6 +71,9 @@ func (h *Host) SendExact(ctx context.Context, req core.ExactRequest) (core.SendR
 	streamFailed := false
 	pending := []byte{}
 	process := func(data []byte) {
+		if text != nil {
+			text.accept(data)
+		}
 		var event struct {
 			Type     string `json:"type"`
 			Response struct {

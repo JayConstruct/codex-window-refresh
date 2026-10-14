@@ -13,13 +13,14 @@
     if (url.origin !== location.origin || !url.pathname.endsWith(API)) throw new PanelError('invalid_endpoint');
     return url.pathname;
   }
-  const paths = new Set(['/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query', '/quota-connection-check', '/manual-wake']);
+  const paths = new Set(['/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query', '/quota-connection-check', '/manual-wake', '/prompt-generation', '/history']);
   class PanelError extends Error {
     constructor(code, status) { super(code); this.name = 'PanelError'; this.code = code; this.status = status || 0; }
   }
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
   function validObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
   const settingDefaults = {'quota_query.automatic': false, 'quota_query.manual': true, 'quota_query.interval': '30s', 'quota_query.on_five_hour_expiry': false, 'quota_query.on_weekly_expiry': false, 'ordinary_rules.daily_enabled': true, 'planning.enabled': false, 'planning.horizon_days': 7, 'reset_rules.five_hour.model': '', 'reset_rules.five_hour.prompt': '', 'reset_rules.weekly.model': '', 'reset_rules.weekly.prompt': ''};
+  Object.assign(settingDefaults, {'execution.prompt_mode': 'random', 'execution.prompt_pool': ['Reply OK.', 'Say hello briefly.', 'Respond with Ready.', 'Give a short greeting.', 'Reply with one friendly word.'], 'reset_rules.five_hour.prompt_pool': [], 'reset_rules.weekly.prompt_pool': [], 'quota_query.five_hour_recent_usage.enabled': false, 'quota_query.five_hour_recent_usage.lookback': '30m'});
   for (const window of ['five_hour', 'weekly']) {
     settingDefaults['quota_query.' + window + '.periodic_enabled'] = true;
     settingDefaults['quota_query.' + window + '.interval'] = '0s';
@@ -89,7 +90,12 @@
     }
     async function request(path, method, body, signal) {
       method = method || 'GET';
-      if (!paths.has(path) || !['GET', 'POST'].includes(method)) throw new PanelError('invalid_endpoint');
+      const endpoint = path.split('?')[0];
+      if (!paths.has(endpoint) || !['GET', 'POST'].includes(method) || (endpoint !== path && (endpoint !== '/history' || method !== 'GET'))) throw new PanelError('invalid_endpoint');
+      if (endpoint === '/history' && path !== endpoint) {
+        const query = new URLSearchParams(path.slice(endpoint.length + 1));
+        for (const name of query.keys()) if (!['account_id', 'kind', 'status', 'from', 'until', 'cursor', 'limit'].includes(name) || query.getAll(name).length !== 1) throw new PanelError('invalid_endpoint');
+      }
       if (!key) throw new PanelError('disconnected');
       const current = generation, controller = new AbortController();
       controllers.add(controller);
@@ -130,6 +136,9 @@
   function validDraft(value) {
     return validObject(value) && typeof value.enabled === 'boolean' && typeof value.timezone === 'string'
       && validObject(value.activity) && validObject(value.execution) && validObject(value.ordinary_rules)
+      && (value.execution.prompt_mode === undefined || ['fixed', 'random'].includes(value.execution.prompt_mode))
+      && [value.execution.prompt_pool, value.reset_rules?.five_hour?.prompt_pool, value.reset_rules?.weekly?.prompt_pool].every(pool => pool === undefined || (Array.isArray(pool) && pool.length <= 50 && pool.every(prompt => typeof prompt === 'string' && prompt.trim())))
+      && (value.quota_query?.five_hour_recent_usage === undefined || (validObject(value.quota_query.five_hour_recent_usage) && (value.quota_query.five_hour_recent_usage.enabled === undefined || typeof value.quota_query.five_hour_recent_usage.enabled === 'boolean') && (value.quota_query.five_hour_recent_usage.lookback === undefined || typeof value.quota_query.five_hour_recent_usage.lookback === 'string')))
       && Array.isArray(value.ordinary_rules.allowed_hours) && value.ordinary_rules.allowed_hours.every(x => typeof x === 'string')
       && validObject(value.reset_rules) && validObject(value.reset_rules.five_hour) && validObject(value.reset_rules.weekly)
       && [value.reset_rules.five_hour, value.reset_rules.weekly].every(rule => (rule.model === undefined || typeof rule.model === 'string') && (rule.prompt === undefined || typeof rule.prompt === 'string'))
@@ -260,7 +269,12 @@
     if (Number.isSafeInteger(detail.elapsed_ms) && detail.elapsed_ms >= 0) parts.push(detail.elapsed_ms + ' 毫秒');
     return (Object.hasOwn(messages, job.last_error) ? messages[job.last_error] : '可手动重试') + (parts.length ? '（' + parts.join(' · ') + '）' : '');
   }
-  const exported = {PanelError, createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange};
+  function sourceText(source) {
+    const labels = {periodic: '定期查询', five_hour_reset: '5 小时到期', weekly_reset: '周到期', daily_schedule: '每日规则', manual_wake: '手动唤醒', manual_query: '手动查询', verification: '发送后验证', preflight: '发送前核对', generation_preflight: '生成前核对', prompt_generation: '用户确认生成内容', early_recovery: '双满额提前恢复'};
+    const evidence = {cpa_response_headers: '用户响应头', cpa_websocket_quota: '用户 WebSocket 响应', cpa_wham_usage: '额度接口查询', cpa_execution_quota: '模块模型响应'};
+    return (labels[source.trigger] || source.trigger || '未提供来源') + (source.config_path ? ' · ' + source.config_path : '') + (source.rule_id ? ' · 规则 ' + source.rule_id : '') + (source.event_id ? ' · 事件 ' + source.event_id : '') + (source.evidence_source ? ' · 证据：' + (evidence[source.evidence_source] || source.evidence_source) : ' · 无窗口证据');
+  }
+  const exported = {PanelError, createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange, sourceText};
   if (typeof module !== 'undefined' && module.exports) module.exports = exported;
   if (!root.document) return;
   const document = root.document, $ = id => document.getElementById(id);
@@ -270,6 +284,7 @@
   let pendingManualWake = null;
   let noticeSource = '';
   let pollFailures = 0, pollController = null;
+  let pendingGeneration = null, previewGeneration = '', historyCursor = 0, historyNextCursor = 0, historyLoaded = false, historySequence = 0;
   let summary = null, runningConfig = null, accounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
   const session = createSession(root.fetch.bind(root), clearView, undefined, apiBase(root.location));
   function el(tag, text, className) {
@@ -291,6 +306,8 @@
     expandedAccounts.clear();
     pendingQuotaQuery = null;
     pendingManualWake = null;
+    pendingGeneration = null; previewGeneration = ''; historyLoaded = false; historyCursor = 0; historyNextCursor = 0; historySequence++;
+    $('generation-preview').value = ''; $('generation-status').textContent = ''; $('history-status').textContent = ''; $('history-list').replaceChildren();
     $('workspace').hidden = true; $('login-section').hidden = false; $('management-key').value = ''; $('config-json').value = '';
     $('connection-status').textContent = '未连接'; $('connection-status').className = 'badge neutral'; $('disconnect').disabled = true;
     for (const id of ['metrics', 'schedule-info', 'hold-counts', 'account-list', 'daily-rules', 'capabilities-list', 'plan-list']) $(id).replaceChildren();
@@ -354,7 +371,7 @@
     for (const [reason, count] of counts) { const row = el('div', undefined, 'hold-row'); row.append(el('span', holds[reason] || reason), badge(count, 'neutral')); $('hold-counts').append(row); }
     const diagnostic = s.last_quota_diagnostic;
     $('last-error').textContent = (summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误') + (diagnostic ? '；最近额度失败：' + quotaFailure({last_error: diagnostic.code, diagnostic}) : '');
-    renderQuotaQuery(); renderSchedulePlan();
+    renderQuotaQuery(); renderSchedulePlan(); renderGeneration();
   }
   function quotaJob() {
     const job = summary?.scheduler?.quota_query || {};
@@ -406,6 +423,7 @@
       row.append(el('h3', (entry.kind === 'wake' ? '模型唤醒 · ' : '额度查询 · ') + (triggers[entry.trigger] || entry.trigger) + window), el('p', entry.account_id || '账号池目标' + (entry.rule_id ? ' · ' + entry.rule_id : ''), 'account-id'));
       const range = date(entry.earliest_at) + (entry.latest_at && entry.latest_at !== entry.earliest_at ? ' — ' + date(entry.latest_at) : '');
       row.append(el('p', range + (entry.repeat_every ? ' · 每 ' + entry.repeat_every + ' 循环' : '')), el('p', ({scheduled: '已分配时间', estimated: '预计时间 / 随机范围', blocked: '暂不可执行'}[entry.status] || entry.status) + (entry.model ? ' · 模型 ' + entry.model : ''), 'hint'), el('p', entry.detail, 'hint'));
+      renderSources(row, entry.sources || [{trigger: entry.trigger}]);
       $('plan-list').append(row);
     }
   }
@@ -429,6 +447,98 @@
     };
     $('bridge-help').textContent = help[capabilities.quota_bridge?.status] || '接口能力随页面数据刷新，可手动更新或开启自动刷新。若持续未就绪，请检查查询方式并查看 CPA 日志。';
   }
+  function renderSources(container, sources) {
+    for (const source of sources) {
+      container.append(el('p', '来源：' + sourceText(source) + (resetTime(source.evidence_at) !== null ? ' · 观测于 ' + date(source.evidence_at) : '') + (resetTime(source.reset_at) !== null ? ' · 原边界 ' + date(source.reset_at) : ''), 'hint task-source'));
+    }
+  }
+  function renderGeneration() {
+    const select = $('generation-account'), selected = select.value;
+    select.replaceChildren(el('option', '选择可用账号'));
+    select.children[0].value = '';
+    for (const [id, account] of Object.entries(accounts)) {
+      if (!account.Enabled || runningConfig?.account_overrides?.[id]?.paused) continue;
+      const option = el('option', id); option.value = id; select.append(option);
+    }
+    select.value = selected;
+    const job = summary?.scheduler?.prompt_generation;
+    if (pendingGeneration && job?.request?.request_id === pendingGeneration.request_id) pendingGeneration = null;
+    const phases = {queued: '等待生成', running: '正在核对账号额度', dispatched: '模型正在生成', completed: '生成完成，尚未应用到草稿', failed: '生成失败，不自动重试', skipped: '未发送，安全条件不满足', unknown: '送达不确定，不自动重试'};
+    $('generation-status').textContent = pendingGeneration ? '生成操作待确认，请更新页面数据核对；不会自动重试。' : job ? (phases[job.phase] || job.phase) + (job.error_code ? ' · ' + job.error_code : '') : '仅在点击并确认后调用一次模型；生成结果不会自动保存。';
+    const running = pendingGeneration || ['queued', 'running', 'dispatched'].includes(job?.phase);
+    $('generation-start').disabled = !session.connected() || actionBusy || !!running || summary?.host_enabled === false || !summary?.running || capabilities.QuotaAdapterReady !== true || capabilities.ExactAccountExecution !== true;
+    if (job?.phase === 'completed' && Array.isArray(job.candidates) && previewGeneration !== job.request.request_id) {
+      $('generation-preview').value = job.candidates.join('\n'); previewGeneration = job.request.request_id;
+    }
+    $('generation-apply').disabled = actionBusy || editor.rawDirty() || !previewGeneration || previewGeneration !== job?.request?.request_id || job?.phase !== 'completed' || !session.connected();
+  }
+  async function readHistory(cursor, signal) {
+    if (!session.connected()) return;
+    const generation = session.generation(), sequence = ++historySequence;
+    try {
+      const query = new URLSearchParams({limit: '50'});
+      if (cursor) query.set('cursor', String(cursor));
+      for (const [id, name] of [['history-account', 'account_id'], ['history-kind', 'kind'], ['history-result', 'status'], ['history-from', 'from'], ['history-until', 'until']]) {
+        const value = $(id).value.trim();
+        if (!value) continue;
+        if (['from', 'until'].includes(name) && !Number.isFinite(Date.parse(value))) throw new PanelError('invalid_config');
+        query.set(name, value);
+      }
+      const page = await session.request('/history?' + query, 'GET', undefined, signal);
+      if (generation !== session.generation() || signal?.aborted || sequence !== historySequence) return;
+      if (!validObject(page) || !Array.isArray(page.entries)) throw new PanelError('invalid_response');
+      historyLoaded = true; historyCursor = cursor; historyNextCursor = page.next_cursor || 0;
+      $('history-list').replaceChildren();
+      const statuses = {completed: '成功', failed: '失败', skipped: '跳过', dispatched: '已发送', verifying: '已发送待验证', verified: '已验证', unknown: '送达不确定'};
+      const kinds = {query: '额度查询', wake: '模型唤醒', generation: '内容生成', reset: '提前恢复事件'};
+      for (const entry of page.entries) {
+        const row = el('li', undefined, 'card plan-item plan-' + (entry.kind === 'wake' || entry.kind === 'generation' ? 'wake' : 'query'));
+        row.append(el('h3', (kinds[entry.kind] || entry.kind) + ' · ' + (statuses[entry.status] || entry.status)), el('p', entry.account_id, 'account-id'), el('p', date(entry.started_at) + (resetTime(entry.finished_at) !== null ? ' — ' + date(entry.finished_at) : ' · 结果尚未确认')));
+        if (entry.model) row.append(el('p', '模型：' + entry.model, 'hint'));
+        if (entry.prompt) row.append(el('p', '实际发送：' + entry.prompt, 'history-prompt'));
+        if (entry.error_code) row.append(el('p', '结果代码：' + entry.error_code, 'hint'));
+        if (entry.operation_id) row.append(el('p', '操作：' + entry.operation_id, 'hint'));
+        renderSources(row, entry.sources || []); $('history-list').append(row);
+      }
+      $('history-status').textContent = '保留 ' + page.retention_days + ' 天，最多 ' + page.maximum_entries + ' 条 · 本页 ' + page.entries.length + ' 条 · 重启后保留';
+      $('history-next').disabled = !historyNextCursor;
+      if (noticeSource === 'history') notice('');
+    } catch (error) { if (generation === session.generation()) report(error, 'history'); }
+  }
+  $('history-refresh').addEventListener('click', () => void readHistory(0));
+  $('history-next').addEventListener('click', () => { if (historyNextCursor) void readHistory(historyNextCursor); });
+  $('generation-start').addEventListener('click', async () => {
+    if ($('generation-start').disabled) return;
+    const accountID = $('generation-account').value, model = $('generation-model').value.trim() || runningConfig?.execution?.model?.trim(), count = Number($('generation-count').value);
+    const target = $('generation-target').value || 'default';
+    if (!accountID || !model || !Number.isInteger(count) || count < 5 || count > 50) { report(new PanelError('invalid_config')); return; }
+    if (!root.confirm('将使用账号 ' + accountID + ' 和模型 ' + model + ' 生成 ' + count + ' 条候选短句。这会发送真实模型请求、消耗额度，可能启动五小时窗口。生成后仍需预览并保存。继续？')) return;
+    const generation = session.generation();
+    pendingGeneration = {request_id: root.crypto?.randomUUID ? root.crypto.randomUUID() : 'prompt-' + Date.now() + '-' + Math.random().toString(16).slice(2), account_id: accountID, model, count, target};
+    busy(true); renderGeneration();
+    try {
+      await session.request('/prompt-generation', 'POST', pendingGeneration);
+      if (generation !== session.generation()) return;
+      notice('已安排内容生成。不会自动保存或启用其他规则；请更新页面数据查看结果。');
+      await readSnapshots();
+    } catch (error) {
+      if (generation !== session.generation()) return;
+      if (error.code !== 'write_unconfirmed') pendingGeneration = null;
+      report(error);
+    } finally { if (generation === session.generation()) { busy(false); renderGeneration(); } }
+  });
+  $('generation-apply').addEventListener('click', () => {
+    if ($('generation-apply').disabled) return;
+    try {
+      const job = summary?.scheduler?.prompt_generation;
+      if (job?.request?.request_id !== previewGeneration) throw new PanelError('invalid_config');
+      const pool = [...new Set($('generation-preview').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];
+      if (!pool.length || pool.length > 50 || pool.some(value => new TextEncoder().encode(value).length > 256)) throw new PanelError('invalid_config');
+      const path = {default: 'execution.prompt_pool', five_hour: 'reset_rules.five_hour.prompt_pool', weekly: 'reset_rules.weekly.prompt_pool'}[job.request.target];
+      if (!path) throw new PanelError('invalid_config');
+      editor.update(path, pool); renderForm(); notice('候选已替换对应短句池草稿；请检查后保存并应用，不会自动保存。');
+    } catch (error) { report(error); }
+  });
   function bridgeDescription() {
     return {host_callback: '宿主额度查询等待后台确认', missing_management_url: '未配置后台管理接口地址', missing_management_key_env: '未配置管理密钥环境变量名', missing_management_key: 'CPA 进程未读取到管理密钥环境变量', invalid_management_url: '后台管理接口地址配置无效', configured: '额度查询配置已具备，等待后台确认'}[capabilities.quota_bridge?.status] || '额度查询接口未就绪';
   }
@@ -531,7 +641,7 @@
     for (const input of document.querySelectorAll('[data-field]')) {
       const value = fieldValue(cfg, input.dataset.field);
       if (input.type === 'checkbox') input.checked = value === true;
-      else input.value = Array.isArray(value) ? value.join(', ') : value ?? '';
+      else input.value = Array.isArray(value) ? value.join(input.dataset.field.endsWith('.prompt_pool') ? '\n' : ', ') : value ?? '';
     }
     renderDaily(); draftChanged();
   }
@@ -595,6 +705,7 @@
     if (![nextSummary, nextAccounts, nextCapabilities].every(validObject)) throw new PanelError('invalid_response');
     summary = nextSummary; accounts = nextAccounts; capabilities = nextCapabilities; renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
     if (noticeSource === 'snapshots') notice('');
+    if (historyLoaded && !$('tab-plan').hidden) await readHistory(historyCursor, signal);
   }
   function schedulePoll() {
     if (pollTimer) root.clearTimeout(pollTimer);
@@ -695,6 +806,7 @@
     document.querySelectorAll('[data-tab]').forEach(tab => { const selected = tab === button; tab.classList.toggle('active', selected); tab.setAttribute('aria-selected', String(selected)); tab.tabIndex = selected ? 0 : -1; });
     for (const view of document.querySelectorAll('.view')) view.hidden = view.id !== 'tab-' + name;
     if (focus) button.focus();
+    if (name === 'plan' && session.connected()) void readHistory(0);
   }
   document.querySelectorAll('[data-tab]').forEach(button => {
     button.addEventListener('click', () => activateTab(button.dataset.tab));
@@ -716,6 +828,7 @@
       let value = input.type === 'checkbox' ? input.checked : input.type === 'number' ? Number(input.value) : input.value;
       if (input.type === 'number' && (!input.value.trim() || !Number.isFinite(value))) throw new PanelError('invalid_config');
       if (input.dataset.field === 'ordinary_rules.allowed_hours' || input.dataset.field.endsWith('.excluded_hours')) value = input.value.split(/[,，\n]/).map(x => x.trim()).filter(Boolean);
+      if (input.dataset.field.endsWith('.prompt_pool')) value = [...new Set(input.value.split(/\r?\n/).map(text => text.trim()).filter(Boolean))];
       editor.update(input.dataset.field, value); draftChanged(); renderAccounts();
     } catch (error) { report(error); const cfg = editor.value(); if (cfg) { const old = fieldValue(cfg, input.dataset.field); if (input.type === 'checkbox') input.checked = old === true; else input.value = Array.isArray(old) ? old.join(', ') : old ?? ''; } }
   });

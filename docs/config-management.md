@@ -25,6 +25,10 @@
 | `planning.horizon_days` | integer，`7` | 1–30 天；最多显示最早 256 项，周期查询以循环条目表示，窗口未知时不推算未来周期 |
 | `quota_query.manual` | boolean，`true` | 仅为兼容旧配置保留，解析时归一化为 true；手动查询始终允许，false 不再拒绝或取消查询 |
 | `quota_query.interval` | duration，`30s` | 普通定期查询间隔，允许 30 秒到 1 小时；完整被动额度也按此间隔推迟重复轮询 |
+| `quota_query.five_hour_recent_usage.enabled/lookback` | boolean / duration，`false/30m` | 只限制五小时到期自动查询；开启时要求整个账号池在回溯内有真实用户活动或尚在处理的用户请求。回溯允许 1m–7d，不与人数容量回溯混用；条件不满足不标记边界完成 |
+| `execution.prompt_mode` | string，`random` | `random` 从有效池选一次，发送前持久化；`fixed` 使用现有默认或专用消息。未配置模式默认随机，旧消息不迁移为随机候选 |
+| `execution.prompt_pool` | string array，内置 5 条短句 | 随机模式必需 1–50 条，各条非空、唯一、单行有效 UTF-8，最多 256 字节。固定模式允许空池 |
+| `reset_rules.five_hour/weekly.prompt_pool` | string array，`[]` | 独立随机池，留空继承默认池；每日唤醒继承五小时池，手动唤醒使用默认池。模型生成不自动修改这些配置 |
 | `quota_query.five_hour/weekly.periodic_enabled` | boolean，`true` | 本类额度是否参与定期查询；仍需 `quota_query.automatic` 总开关开启。两类均关闭则不定期查询，默认总开关仍关闭 |
 | `quota_query.five_hour/weekly.interval` | duration，`0s` | `0s` 继承公共间隔，否则为 30s–1h 且不得短于公共间隔；两类查询独立调度，同账号接口请求会合并 |
 | `quota_query.five_hour/weekly.expiry.excluded_hours` | string array，`[]` | 到期自动查询的每日排除时段；按 `timezone`，支持跨午夜、不重叠，全天排除写 `00:00-24:00`，留空不排除 |

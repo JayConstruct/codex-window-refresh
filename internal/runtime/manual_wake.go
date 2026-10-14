@@ -28,7 +28,7 @@ func (e *Engine) QueueManualWake(id core.AccountID) string {
 		}
 		return "busy"
 	}
-	if e.manualActive {
+	if e.manualActive || e.generationActive {
 		return "busy"
 	}
 	account, exists := e.Snapshot().Accounts[id]
@@ -58,6 +58,13 @@ func (e *Engine) startManualWake() {
 func (e *Engine) finishManualWake(phase, code string) {
 	e.manualWake.Phase, e.manualWake.LastError = phase, code
 	e.manualWake.FinishedAt = e.clock.Now()
+	if e.manualWake.EventID == "" && (phase == "blocked" || phase == "failed") {
+		status := "failed"
+		if phase == "blocked" {
+			status = "skipped"
+		}
+		core.AppendHistory(&e.state, core.HistoryEntry{Kind: "wake", AccountID: e.manualWake.AccountID, Generation: e.manualWake.Generation, Status: status, ErrorCode: code, StartedAt: e.manualWake.StartedAt, FinishedAt: e.manualWake.FinishedAt, Sources: []core.ActionSource{{Trigger: "manual_wake"}}})
+	}
 	e.queueMu.Lock()
 	e.manualWakeActive = false
 	e.queueMu.Unlock()

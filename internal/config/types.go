@@ -52,6 +52,7 @@ type ResetRule struct {
 	RandomDelay DelayRange `json:"random_delay"`
 	Model       string     `json:"model"`
 	Prompt      string     `json:"prompt"`
+	PromptPool  []string   `json:"prompt_pool"`
 }
 type WeeklyRule struct {
 	Enabled             bool       `json:"enabled"`
@@ -60,6 +61,7 @@ type WeeklyRule struct {
 	BypassAllowedHours  bool       `json:"bypass_allowed_hours"`
 	Model               string     `json:"model"`
 	Prompt              string     `json:"prompt"`
+	PromptPool          []string   `json:"prompt_pool"`
 }
 type ResetRules struct {
 	FiveHour ResetRule  `json:"five_hour"`
@@ -100,6 +102,8 @@ type Execution struct {
 	RequestTimeout           Duration   `json:"request_timeout"`
 	Model                    string     `json:"model"`
 	Prompt                   string     `json:"prompt"`
+	PromptMode               string     `json:"prompt_mode"`
+	PromptPool               []string   `json:"prompt_pool"`
 	MaxConcurrency           int        `json:"max_concurrency"`
 	MinDispatchSpacing       Duration   `json:"min_dispatch_spacing"`
 	QuotaMaxAgeBeforeSend    Duration   `json:"quota_max_age_before_send"`
@@ -110,13 +114,18 @@ type Execution struct {
 
 // QuotaQuery controls read-only polling independently from model wake rules.
 type QuotaQuery struct {
-	Automatic        bool        `json:"automatic"`
-	Manual           bool        `json:"manual"`
-	Interval         Duration    `json:"interval"`
-	OnFiveHourExpiry bool        `json:"on_five_hour_expiry"`
-	OnWeeklyExpiry   bool        `json:"on_weekly_expiry"`
-	FiveHour         WindowQuery `json:"five_hour"`
-	Weekly           WindowQuery `json:"weekly"`
+	Automatic           bool        `json:"automatic"`
+	Manual              bool        `json:"manual"`
+	Interval            Duration    `json:"interval"`
+	OnFiveHourExpiry    bool        `json:"on_five_hour_expiry"`
+	OnWeeklyExpiry      bool        `json:"on_weekly_expiry"`
+	FiveHour            WindowQuery `json:"five_hour"`
+	Weekly              WindowQuery `json:"weekly"`
+	FiveHourRecentUsage RecentUsage `json:"five_hour_recent_usage"`
+}
+type RecentUsage struct {
+	Enabled  bool     `json:"enabled"`
+	Lookback Duration `json:"lookback"`
 }
 type QueryTiming struct {
 	ExcludedHours []string   `json:"excluded_hours"`
@@ -159,12 +168,12 @@ type Config struct {
 func Defaults() Config {
 	delay := DelayRange{Min: 0, Max: Duration(10 * time.Minute)}
 	return Config{SchemaVersion: 1, Enabled: false, Timezone: "Asia/Shanghai",
-		QuotaQuery:    QuotaQuery{Automatic: false, Manual: true, Interval: Duration(30 * time.Second), FiveHour: defaultWindowQuery(), Weekly: defaultWindowQuery()},
+		QuotaQuery:    QuotaQuery{Automatic: false, Manual: true, Interval: Duration(30 * time.Second), FiveHour: defaultWindowQuery(), Weekly: defaultWindowQuery(), FiveHourRecentUsage: RecentUsage{Lookback: Duration(30 * time.Minute)}},
 		Planning:      Planning{Enabled: false, HorizonDays: 7},
-		ResetRules:    ResetRules{FiveHour: ResetRule{Enabled: true, RandomDelay: delay}, Weekly: WeeklyRule{Enabled: true, RandomDelay: delay, BypassActivityLimit: true, BypassAllowedHours: true}},
+		ResetRules:    ResetRules{FiveHour: ResetRule{Enabled: true, RandomDelay: delay, PromptPool: []string{}}, Weekly: WeeklyRule{Enabled: true, RandomDelay: delay, BypassActivityLimit: true, BypassAllowedHours: true, PromptPool: []string{}}},
 		Activity:      Activity{Lookback: Duration(30 * time.Minute), AccountsPerUser: 1, MaxAccounts: 10, IdentitySource: "host_caller_scope"},
 		OrdinaryRules: OrdinaryRules{DailyEnabled: true, AllowedHours: []string{"08:00-23:00"}, AllowOutsideHoursWhenUsersActive: true}, DailyRules: []DailyRule{},
-		Execution: Execution{QuotaReadTimeout: Duration(15 * time.Second), RequestTimeout: Duration(time.Minute), Prompt: "Reply OK.", MaxConcurrency: 1, MinDispatchSpacing: Duration(5 * time.Second), QuotaMaxAgeBeforeSend: Duration(30 * time.Second), VerifyDelays: []Duration{Duration(5 * time.Second), Duration(30 * time.Second), Duration(2 * time.Minute)}, VerificationCapacityHold: Duration(15 * time.Minute), CatchUp: true}, AccountOverrides: map[core.AccountID]AccountOverride{}}
+		Execution: Execution{QuotaReadTimeout: Duration(15 * time.Second), RequestTimeout: Duration(time.Minute), Prompt: "Reply OK.", PromptMode: "random", PromptPool: DefaultPromptPool(), MaxConcurrency: 1, MinDispatchSpacing: Duration(5 * time.Second), QuotaMaxAgeBeforeSend: Duration(30 * time.Second), VerifyDelays: []Duration{Duration(5 * time.Second), Duration(30 * time.Second), Duration(2 * time.Minute)}, VerificationCapacityHold: Duration(15 * time.Minute), CatchUp: true}, AccountOverrides: map[core.AccountID]AccountOverride{}}
 }
 
 func defaultWindowQuery() WindowQuery {

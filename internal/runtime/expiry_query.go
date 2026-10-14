@@ -22,6 +22,9 @@ func (e *Engine) windowExpiryQueryDue(account core.AccountState, weekly bool, no
 	if !enabled || !expiryDue(reset, queried, now) {
 		return false
 	}
+	if !weekly && !e.recentUsageAllowed(e.state, now) {
+		return false
+	}
 	timing := e.cfg.QuotaQuery.Window(weekly).Expiry
 	due := reset.Add(queryDelay(account, weekly, false, reset, timing.RandomDelay))
 	due, ok := nextQueryTime(e.cfg, timing.ExcludedHours, maxTime(now, due), maxTime(now, due).Add(48*time.Hour))

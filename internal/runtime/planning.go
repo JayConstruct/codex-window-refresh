@@ -13,17 +13,18 @@ import (
 const maximumPlanEntries = 256
 
 type PlannedAction struct {
-	Kind        string         `json:"kind"`
-	Trigger     string         `json:"trigger"`
-	AccountID   core.AccountID `json:"account_id,omitempty"`
-	RuleID      string         `json:"rule_id,omitempty"`
-	EarliestAt  time.Time      `json:"earliest_at"`
-	LatestAt    time.Time      `json:"latest_at"`
-	RepeatEvery string         `json:"repeat_every,omitempty"`
-	Window      string         `json:"window,omitempty"`
-	Status      string         `json:"status"`
-	Detail      string         `json:"detail"`
-	Model       string         `json:"model,omitempty"`
+	Kind        string              `json:"kind"`
+	Trigger     string              `json:"trigger"`
+	AccountID   core.AccountID      `json:"account_id,omitempty"`
+	RuleID      string              `json:"rule_id,omitempty"`
+	EarliestAt  time.Time           `json:"earliest_at"`
+	LatestAt    time.Time           `json:"latest_at"`
+	RepeatEvery string              `json:"repeat_every,omitempty"`
+	Window      string              `json:"window,omitempty"`
+	Status      string              `json:"status"`
+	Detail      string              `json:"detail"`
+	Model       string              `json:"model,omitempty"`
+	Sources     []core.ActionSource `json:"sources"`
 }
 
 type SchedulePlan struct {
@@ -81,6 +82,43 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 	add := func(action PlannedAction) {
 		if action.EarliestAt.IsZero() || action.EarliestAt.After(plan.Until) {
 			return
+		}
+		if len(action.Sources) == 0 {
+			account := state.Accounts[action.AccountID]
+			path := "reset_rules.five_hour"
+			weekly := action.Trigger == string(core.ReasonWeekly) || action.Window == "weekly"
+			if weekly {
+				path = "reset_rules.weekly"
+			}
+			if action.Kind == "query" {
+				window := "five_hour"
+				if weekly {
+					window = "weekly"
+				}
+				path = "quota_query." + window + ".expiry"
+				if action.Trigger == "periodic" {
+					path = "quota_query." + window + ".periodic"
+				}
+				if action.Trigger == "verification" {
+					path = "execution.verify_delays"
+				}
+			}
+			if action.Trigger == string(core.ReasonDaily) {
+				path = "daily_rules"
+			}
+			source := queryEvidenceSource(account, weekly, action.Trigger, path)
+			source.RuleID = action.RuleID
+			if account.Task != nil {
+				for _, intent := range account.Task.Intents {
+					if string(intent.Reason) == action.Trigger && intent.OriginalDueAt.Equal(source.ResetAt) {
+						source.EventID = intent.ID
+					}
+				}
+			}
+			action.Sources = []core.ActionSource{source}
+			if action.Trigger == "verification" && account.Task != nil {
+				action.Sources = append(action.Sources, wakeSources(account, account.Task.CoveredEventIDs)...)
+			}
 		}
 		action.EarliestAt = maxTime(action.EarliestAt, now)
 		if action.LatestAt.Before(action.EarliestAt) {
@@ -149,6 +187,12 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 					continue
 				}
 				status, detail := "estimated", "已知窗口到期后查询一次；应用随机延迟与排除时段，失败退避后重试"
+				if window.reason == core.ReasonFiveHour && !e.recentUsageAllowed(state, now) {
+					status, detail = "blocked", "等待账号池近期真实用户活动；未完成的到期边界保留"
+				}
+				if window.reason == core.ReasonFiveHour && e.cfg.QuotaQuery.FiveHourRecentUsage.Enabled {
+					detail += "；执行时重新检查账号池用户活动条件"
+				}
 				if !ok {
 					due, status, detail = maxTime(now, window.reset), "blocked", "计划范围内没有允许的到期查询时段"
 				}

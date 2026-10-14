@@ -18,6 +18,7 @@ func TestWakeRuleUsesItsOwnModelAndContent(t *testing.T) {
 				engine.QueueManualWake("a")
 			}
 			engine.cfg.ResetRules.FiveHour.Model, engine.cfg.ResetRules.FiveHour.Prompt = "five-hour-model", "Five hour message"
+			engine.cfg.Execution.PromptMode = "fixed"
 			engine.cfg.ResetRules.Weekly.Model, engine.cfg.ResetRules.Weekly.Prompt = "weekly-model", "Weekly message"
 			if scenario == "five_hour" {
 				addUser(engine, clock)

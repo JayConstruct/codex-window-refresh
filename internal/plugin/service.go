@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +27,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.13"
+const Version = "0.1.0-rc.14"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -431,10 +432,10 @@ func registration() any {
 }
 func managementRegistration() any {
 	routes := []map[string]string{}
-	for _, p := range []string{"/summary", "/accounts", "/config", "/config-editor", "/capabilities"} {
+	for _, p := range []string{"/summary", "/accounts", "/config", "/config-editor", "/capabilities", "/history"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
-	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check", "/manual-wake"} {
+	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check", "/manual-wake", "/prompt-generation"} {
 		routes = append(routes, map[string]string{"Method": "POST", "Path": ManagementPrefix + p})
 	}
 	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Authenticated scheduler panel."}, {"Path": "/panel.js"}, {"Path": "/panel.css"}}}
@@ -444,6 +445,7 @@ type managementRequest struct {
 	Method, Path string
 	Headers      http.Header
 	Body         []byte
+	Query        url.Values
 }
 type managementResponse struct {
 	StatusCode int
@@ -471,6 +473,16 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		return response(404, map[string]string{"error": "not found"}), nil
 	}
 	path := strings.TrimPrefix(req.Path, ManagementPrefix)
+	if strings.HasPrefix(path, "/history?") {
+		query, err := url.ParseQuery(strings.TrimPrefix(path, "/history?"))
+		if err != nil {
+			return response(400, map[string]string{"error": "invalid_history_filter"}), nil
+		}
+		if len(req.Query) > 0 {
+			return response(400, map[string]string{"error": "invalid_history_filter"}), nil
+		}
+		req.Query, path = query, "/history"
+	}
 	s.mu.RLock()
 	engine, wrapper, cfg, done, stopping, lastError := s.engine, s.wrapper, s.cfg, s.done, s.stopping, s.lastError
 	s.mu.RUnlock()
@@ -503,6 +515,10 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		return response(200, summary), nil
 	case "GET /accounts":
 		return response(200, engine.Snapshot().Accounts), nil
+	case "GET /history":
+		return historyResponse(engine, req.Query), nil
+	case "POST /prompt-generation":
+		return generationResponse(engine, wrapper, done, stopping, req.Body), nil
 	case "GET /config":
 		return response(200, cfg), nil
 	case "GET /config-editor":

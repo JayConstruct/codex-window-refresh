@@ -78,6 +78,23 @@ func (c Config) Validate() error {
 	}
 	duration("activity.lookback", c.Activity.Lookback, time.Minute, 24*time.Hour)
 	duration("quota_query.interval", c.QuotaQuery.Interval, 30*time.Second, time.Hour)
+	duration("quota_query.five_hour_recent_usage.lookback", c.QuotaQuery.FiveHourRecentUsage.Lookback, time.Minute, 7*24*time.Hour)
+	if c.Execution.PromptMode != "fixed" && c.Execution.PromptMode != "random" {
+		add("execution.prompt_mode", "INVALID_PROMPT_MODE", "must be fixed or random")
+	}
+	for _, pool := range []struct {
+		path     string
+		values   []string
+		required bool
+	}{
+		{"execution.prompt_pool", c.Execution.PromptPool, c.Execution.PromptMode == "random"},
+		{"reset_rules.five_hour.prompt_pool", c.ResetRules.FiveHour.PromptPool, false},
+		{"reset_rules.weekly.prompt_pool", c.ResetRules.Weekly.PromptPool, false},
+	} {
+		if err := ValidatePromptPool(pool.values, pool.required); err != nil {
+			add(pool.path, "INVALID_PROMPT_POOL", err.Error())
+		}
+	}
 	for _, window := range []struct {
 		path  string
 		query WindowQuery

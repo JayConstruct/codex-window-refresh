@@ -125,6 +125,10 @@ summary { cursor: pointer; font-weight: 600; }
 .account-footer button { font-size: 12px; padding: 8px 10px; }
 .empty { grid-column: 1 / -1; text-align: center; padding: 48px 24px; color: var(--muted); border: 1px dashed #ccd8d3; border-radius: 12px; }
 .form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px 28px; }
+.full-width { grid-column: 1 / -1; }
+.task-source, .history-prompt { overflow-wrap: anywhere; }
+#generation-status, #history-status { margin-top: 16px; }
+.card > .toolbar { margin-top: 16px; }
 .check-field { flex-direction: row; align-items: center; min-height: 43px; }
 .setting-list { display: grid; gap: 22px; }
 .setting-toggle { flex-direction: row; align-items: center; justify-content: space-between; gap: 24px; font-weight: 400; }

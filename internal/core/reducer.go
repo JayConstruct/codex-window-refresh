@@ -66,6 +66,35 @@ func ApplyObservation(s *CoreState, o QuotaObservation) bool {
 	accept := func(seq uint64, at time.Time) bool {
 		return (o.Class == ObservationExecution || o.ReadStartedSeq >= seq) && !o.ReceivedAt.Before(at)
 	}
+	earlyRecovery := o.Permission != nil && *o.Permission == PermissionAllowed && accept(a.PermissionAcceptedSeq, a.PermissionObservedAt) &&
+		bothFull(o.FiveHour, o.Weekly) && consumedFutureWindow(a.FiveHour, a.FiveHourBaseline, o.ReceivedAt) && consumedFutureWindow(a.Weekly, a.WeeklyBaseline, o.ReceivedAt) &&
+		accept(a.FiveHour.AcceptedSeq, a.FiveHour.ConfirmedAt) && accept(a.Weekly.AcceptedSeq, a.Weekly.ConfirmedAt)
+	if earlyRecovery {
+		oldShort, oldWeek := a.FiveHourBaseline, a.WeeklyBaseline
+		short, week := *o.FiveHour, *o.Weekly
+		short.State, short.CycleID, week.State, week.CycleID = WindowInactive, "", WindowInactive, ""
+		o.FiveHour, o.Weekly = &short, &week
+		a.FiveHourBaseline, a.WeeklyBaseline = WindowBaseline{}, WindowBaseline{}
+		a.EarlyRecoveryAt = o.ReceivedAt
+		if a.Task != nil {
+			covered := map[EventID]bool{}
+			if a.Task.OperationID != "" {
+				for _, event := range a.Task.CoveredEventIDs {
+					covered[event] = true
+				}
+			}
+			for index := range a.Task.Intents {
+				intent := &a.Task.Intents[index]
+				if intent.Status == IntentPending && !covered[intent.ID] && ((intent.Reason == ReasonFiveHour && intent.CycleID == oldShort.CycleID) || (intent.Reason == ReasonWeekly && intent.CycleID == oldWeek.CycleID)) {
+					intent.Status = IntentSuperseded
+				}
+			}
+		}
+		AppendHistory(s, HistoryEntry{Kind: "reset", AccountID: a.ID, Generation: a.Generation, StartedAt: o.ReceivedAt, FinishedAt: o.ReceivedAt, Status: "completed", Sources: []ActionSource{
+			{Trigger: "early_recovery", EvidenceSource: o.Source, EvidenceAt: o.ReceivedAt, ResetAt: oldShort.StableResetAt, CycleID: oldShort.CycleID},
+			{Trigger: "early_recovery", EvidenceSource: o.Source, EvidenceAt: o.ReceivedAt, ResetAt: oldWeek.StableResetAt, CycleID: oldWeek.CycleID},
+		}})
+	}
 	resetClassified := func(w *WindowEvidence) bool {
 		return w != nil && (w.State == WindowInactive || (w.State == WindowExpired && !w.ResetAt.IsZero() && !o.ReceivedAt.Before(w.ResetAt)))
 	}
@@ -156,6 +185,9 @@ func updateBaseline(b *WindowBaseline, w WindowEvidence, now time.Time) {
 		return
 	}
 	if b.StableResetAt.Equal(w.ResetAt) && b.CycleID != "" {
+		if w.State == WindowActive && w.Remaining != nil && w.Remaining.Unit == "percent" && w.Remaining.Value < 100 && w.Remaining.Value >= 0 {
+			b.LastConsumedAt = now
+		}
 		return
 	}
 	id := w.CycleID
@@ -163,6 +195,9 @@ func updateBaseline(b *WindowBaseline, w WindowEvidence, now time.Time) {
 		id = w.ResetAt.UTC().Format(time.RFC3339Nano)
 	}
 	*b = WindowBaseline{CycleID: id, StableResetAt: w.ResetAt}
+	if w.State == WindowActive && w.Remaining != nil && w.Remaining.Unit == "percent" && w.Remaining.Value < 100 && w.Remaining.Value >= 0 {
+		b.LastConsumedAt = now
+	}
 	// This is classification freshness, not an inferred upstream activation time.
 	_ = now
 }
@@ -456,6 +491,9 @@ func ReconcileVerification(s *CoreState, id AccountID, now time.Time) bool {
 			satisfied = newWindowForIntent(a.Weekly, *e, now) && a.FiveHour.State == WindowActive && now.Before(a.FiveHour.ResetAt) && !a.FiveHour.ConfirmedAt.Before(e.OriginalDueAt)
 		case ReasonDaily, ReasonManual:
 			satisfied = a.FiveHour.State == WindowActive && now.Before(a.FiveHour.ResetAt) && !a.FiveHour.ConfirmedAt.Before(e.RandomizedDueAt)
+		case ReasonGeneration:
+			satisfied = a.FiveHour.State == WindowActive && now.Before(a.FiveHour.ResetAt) && !a.FiveHour.ConfirmedAt.Before(e.RandomizedDueAt) && a.FiveHour.AcceptedSeq > t.DispatchReadSequence &&
+				(a.FiveHour.OperationID == t.OperationID || !a.FiveHour.ResetAt.Equal(t.GenerationBaselineResetAt))
 		}
 		if satisfied {
 			if !sending && now.Before(e.RandomizedDueAt) {

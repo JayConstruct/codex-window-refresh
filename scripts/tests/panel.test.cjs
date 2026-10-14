@@ -5,6 +5,60 @@ const {readFileSync} = require('node:fs');
 const {runInNewContext} = require('node:vm');
 const {createSession, createEditor, resetTime, countdown, windowCountdown, manualWakeReason, apiBase, readPanelKey, quotaFailure, dailyTimeRange} = require('../../internal/plugin/web/panel.js');
 const response = (value, status = 200, type = 'application/json') => ({ok: status >= 200 && status < 300, status, headers: {get: () => type}, json: async () => value});
+test('history endpoints allow only local read filters', async () => {
+  const calls=[], session=createSession(async (url,options)=>{calls.push({url,options});return response({entries:[]});});session.setKey('key');
+  await session.request('/history?account_id=%3Cimg%3E&limit=50');
+  assert.equal(calls.length,1);
+  for(const path of ['/history?url=https://evil.test','/history?limit=2&limit=3','/summary?cursor=1']) await assert.rejects(session.request(path),{code:'invalid_endpoint'});
+  await assert.rejects(session.request('/history?limit=1','POST'),{code:'invalid_endpoint'});
+  session.disconnect();
+});
+test('random prompt settings default for legacy drafts without preserving old messages', () => {
+  const editor=createEditor();editor.load({config:policy(),revision:'random'});
+  editor.update('execution.prompt_mode','random');editor.update('execution.prompt_pool',['Hello.','Ready.']);editor.update('reset_rules.weekly.prompt_pool',[]);
+  editor.update('quota_query.five_hour_recent_usage.enabled',true);editor.update('quota_query.five_hour_recent_usage.lookback','30m');
+  assert.deepEqual(editor.value().execution.prompt_pool,['Hello.','Ready.']);
+  assert.equal(editor.value().quota_query.automatic,false);
+  editor.replace(editor.value());
+  assert.throws(()=>editor.replace({...editor.value(),execution:{...editor.value().execution,prompt_pool:[null]}}),{code:'invalid_config'});
+});
+test('history timeline renders actual prompt and source as text without writes', async () => {
+  const now=new Date().toISOString();
+  const {lookup,requests,settle}=createPanelFixture(async(url,options,data)=>{
+    if(url.includes('/history?'))return response({entries:[{kind:'wake',account_id:'<img>',status:'verified',started_at:now,prompt:'<script>alert(1)</script>',sources:[{trigger:'daily_schedule',rule_id:'morning',evidence_source:'cpa_wham_usage',evidence_at:now}]}],next_cursor:12,retention_days:30,maximum_entries:10000});
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value='key';lookup('login-form').listeners.get('submit')({preventDefault(){}});await settle();
+  lookup('history-kind').value='wake';lookup('history-refresh').listeners.get('click')();await settle();
+  const row=lookup('history-list').children[0];
+  assert.ok(row.children.some(item=>item.textContent==='实际发送：<script>alert(1)</script>'));
+  assert.ok(row.children.some(item=>item.textContent.includes('每日规则')&&item.textContent.includes('morning')));
+  assert.equal(lookup('history-next').disabled,false);
+  lookup('history-next').listeners.get('click')();await settle();
+  assert.ok(requests.some(request=>request.url.includes('cursor=12')));
+  assert.equal(requests.some(request=>request.options.method==='POST'),false);
+  lookup('disconnect').listeners.get('click')();assert.equal(lookup('history-list').children.length,0);
+});
+test('model generated candidates require confirmation and explicit draft application', async () => {
+  let confirmed=false;const confirmations=[];
+  const {lookup,requests,settle}=createPanelFixture(async(url,options,data)=>{
+    data.summary.host_enabled=true;data.capabilities.ExactAccountExecution=true;data.accounts={a:{ID:'a',Enabled:true}};
+    if(url.endsWith('/prompt-generation')&&options.method==='POST'){
+      const request=JSON.parse(options.body);data.summary.scheduler.prompt_generation={request,phase:'completed',candidates:['Hello.','Hi.','Ready.','Yes.','OK.']};return response({status:'queued'},202);
+    }
+    return response(data[url.split('/').pop()]);
+  },message=>{confirmations.push(message);return confirmed;});
+  lookup('management-key').value='key';lookup('login-form').listeners.get('submit')({preventDefault(){}});await settle();
+  lookup('generation-account').value='a';lookup('generation-model').value='model';lookup('generation-count').value='5';lookup('generation-target').value='default';
+  lookup('generation-start').listeners.get('click')();await settle();assert.equal(requests.some(request=>request.options.method==='POST'),false);
+  confirmed=true;lookup('generation-start').listeners.get('click')();await settle();
+  const writes=requests.filter(request=>request.options.method==='POST');assert.equal(writes.length,1);assert.ok(writes[0].url.endsWith('/prompt-generation'));
+  assert.match(confirmations[0],/消耗额度/);assert.equal(lookup('generation-preview').value,'Hello.\nHi.\nReady.\nYes.\nOK.');
+  lookup('generation-apply').listeners.get('click')();
+  assert.deepEqual(JSON.parse(lookup('config-json').value).execution.prompt_pool,['Hello.','Hi.','Ready.','Yes.','OK.']);
+  assert.equal(requests.filter(request=>request.options.method==='POST').length,1);
+  lookup('disconnect').listeners.get('click')();
+});
 test('only confirmed active windows display a running countdown', () => {
   const now = Date.parse('2026-10-13T00:00:00Z');
   const fullWindow = {Kind: 'five_hour', State: 'unknown', Source: 'cpa_wham_usage', ResetAt: '2026-10-13T05:00:00Z', Remaining: {Value: 100, Unit: 'percent'}};
@@ -54,7 +108,7 @@ function createPanelFixture(fetcher, confirm = () => true, fields = []) {
   const data = {summary: {running: true, enabled: false, scheduler: {}}, accounts: {},
     capabilities: {QuotaAdapterReady: true}, config, 'config-editor': {config, revision: 'r1'}};
   runInNewContext(readFileSync(require.resolve('../../internal/plugin/web/panel.js'), 'utf8'), {
-    document, navigator, URL, AbortController, structuredClone, confirm,
+    document, navigator, URL, URLSearchParams, TextEncoder, AbortController, structuredClone, confirm,
     location: {origin: 'https://cpa.test', pathname: '/v0/resource/plugins/codex-window-refresh/status'},
     localStorage: {getItem: () => null}, addEventListener: (event, handler) => events.set(event, handler), setInterval() {},
     setTimeout: (callback, duration) => {const timer = ++nextTimer; timers.set(timer, {callback, duration}); return timer;},

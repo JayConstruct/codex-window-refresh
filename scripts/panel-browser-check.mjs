@@ -66,10 +66,17 @@ try {
       if (!req.url.startsWith(api)) { res.writeHead(404); res.end(); return; }
       if (req.method === 'GET') reads.push(req.url);
       if (unauthorized || req.headers.authorization !== `Bearer ${key}`) { json(res, 401, { error: 'unauthorized' }); return; }
-      const path = req.url.slice(api.length);
+      const parsed = new URL(req.url, 'http://127.0.0.1');
+      const path = parsed.pathname.slice(api.length);
       if (req.method === 'POST') {
         let body = ''; for await (const chunk of req) body += chunk;
         posts.push({ path, body });
+        if (path === 'prompt-generation') {
+          const request = JSON.parse(body);
+          assert.equal(request.account_id, 'fixture-account');
+          summary.scheduler.prompt_generation = {request, phase:'completed', candidates:['Hello.', 'Hi.', 'Ready.', 'Yes.', 'OK.']};
+          json(res,202,{status:'queued',request_id:request.request_id}); return;
+        }
         if (path === 'quota-connection-check') {
           assert.equal(body, '', 'Connection check received credential input');
           capabilities.quota_bridge.host_http_status = 'verified';
@@ -106,6 +113,9 @@ try {
         json(res, path === 'recheck' ? 202 : 200, { status: 'scheduled' }); return;
       }
       summary.scheduler.plan = {enabled: config.planning.enabled, horizon_days: config.planning.horizon_days, generated_at: now, until: new Date(Date.now()+config.planning.horizon_days*86400000).toISOString(), entries: config.planning.enabled && config.quota_query.on_five_hour_expiry ? [{kind:'query',trigger:'five_hour_reset',account_id:'fixture-account',earliest_at:reset,latest_at:reset,status:'estimated',detail:'Only quota, no model'}] : []};
+      if (path === 'history') {
+        json(res,200,{entries:[{id:1,kind:'wake',account_id:'fixture-account',started_at:now,status:'verified',prompt:'<script>text-only</script>',sources:[{trigger:'daily_schedule',rule_id:'morning',evidence_source:'cpa_wham_usage',evidence_at:now}]}],next_cursor:0,retention_days:30,maximum_entries:10000}); return;
+      }
       const values = { summary, accounts, config, capabilities, 'config-editor': { config, revision, disk_matches_running: true } };
       json(res, 200, values[path] ?? {});
     } catch (err) { errors.push(String(err)); json(res, 500, { error: 'fixture error' }); }
@@ -278,6 +288,16 @@ try {
   await waitFor(()=>evaluate('document.getElementById("plan-list").textContent.includes("fixture-account") && document.getElementById("plan-status").textContent.includes("未来 3 天")'),'Saved future plan did not display');
   assert.equal(await evaluate('document.querySelector("#plan-list .timeline-day") !== null && document.querySelector("#plan-list .plan-query") !== null'),true,'Plan timeline did not render query nodes');
   assert.ok(posts.every(post=>['quota-query','quota-connection-check','config'].includes(post.path)),'Planning dispatched unexpected operations');
+  await waitFor(()=>evaluate('document.getElementById("history-list").textContent.includes("每日规则") && document.getElementById("history-list").textContent.includes("<script>text-only</script>")'),'Task history or sources did not render');
+  assert.equal(await evaluate('document.querySelectorAll("#history-list script").length'),0,'History prompt was interpreted as markup');
+  await evaluate(`{document.querySelector('[data-tab=rules]').click();document.getElementById('generation-account').value='fixture-account';document.getElementById('generation-model').value='generator-fixture';document.getElementById('generation-count').value='5';document.getElementById('generation-start').click();}`);
+  await waitFor(()=>evaluate('document.getElementById("generation-preview").value.includes("Hello.")'),'Explicit content generation did not show candidate preview');
+  const generationWrites = posts.filter(post=>post.path==='prompt-generation');
+  assert.equal(generationWrites.length,1,'Generation repeated a model request');
+  const beforeCandidateApply = posts.length;
+  await evaluate('document.getElementById("generation-apply").click()');
+  assert.deepEqual(await evaluate('JSON.parse(document.getElementById("config-json").value).execution.prompt_pool'),['Hello.','Hi.','Ready.','Yes.','OK.'],'Candidates were not added to draft');
+  assert.equal(posts.length,beforeCandidateApply,'Applying candidates automatically saved or generated');
   conflict = true;
   await evaluate(`{ const ratio=document.getElementById('rule-ratio'); ratio.value='2'; ratio.dispatchEvent(new Event('change',{bubbles:true})); document.getElementById('config-save').click(); }`);
   await waitFor(() => posts.filter(p => p.path === 'config').length === 2, 'Conflict save was not sent');
@@ -303,7 +323,8 @@ try {
   assert.equal(reads.length, stoppedReads, 'Turning page refresh off did not stop polling');
   assert.equal(config.enabled,false,'Changing query settings enabled model wake');
   assert.equal(config.execution.model,'fixture-model','Query settings changed execution model');
-  assert.ok(posts.every(p=>['config','quota-query','quota-connection-check'].includes(p.path)),'Query controls called a model/scheduler operation');
+  assert.ok(posts.every(p=>['config','quota-query','quota-connection-check','prompt-generation'].includes(p.path)),'Query controls called an unexpected model/scheduler operation');
+  assert.equal(posts.filter(post=>post.path==='prompt-generation').length,1,'Query controls repeated content generation');
   await waitFor(()=>evaluate('document.getElementById("save-bar").hidden'),'Successful save did not clear pending changes');
   capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp,'panel-query-desktop.png'),Buffer.from(capture.data,'base64'));

@@ -17,18 +17,19 @@ type publishedStatus struct {
 	scheduler SchedulingSummary
 }
 type SchedulingSummary struct {
-	ObservedAt             time.Time             `json:"observed_at"`
-	RecentUsers            int                   `json:"recent_users"`
-	IdentitySource         string                `json:"identity_source"`
-	Capacity               core.Capacity         `json:"capacity"`
-	HoldCounts             map[string]int        `json:"hold_counts"`
-	QuotaUnknownAccounts   int                   `json:"quota_unknown_accounts"`
-	ForegroundBusyAccounts int                   `json:"foreground_busy_accounts"`
-	NextInventoryAt        time.Time             `json:"next_inventory_at"`
-	QuotaQuery             ManualQueryStatus     `json:"quota_query"`
-	ManualWake             ManualWakeStatus      `json:"manual_wake"`
-	Plan                   SchedulePlan          `json:"plan"`
-	LastQuotaDiagnostic    *core.QuotaDiagnostic `json:"last_quota_diagnostic,omitempty"`
+	ObservedAt             time.Time                 `json:"observed_at"`
+	RecentUsers            int                       `json:"recent_users"`
+	IdentitySource         string                    `json:"identity_source"`
+	Capacity               core.Capacity             `json:"capacity"`
+	HoldCounts             map[string]int            `json:"hold_counts"`
+	QuotaUnknownAccounts   int                       `json:"quota_unknown_accounts"`
+	ForegroundBusyAccounts int                       `json:"foreground_busy_accounts"`
+	NextInventoryAt        time.Time                 `json:"next_inventory_at"`
+	QuotaQuery             ManualQueryStatus         `json:"quota_query"`
+	ManualWake             ManualWakeStatus          `json:"manual_wake"`
+	Plan                   SchedulePlan              `json:"plan"`
+	LastQuotaDiagnostic    *core.QuotaDiagnostic     `json:"last_quota_diagnostic,omitempty"`
+	GenerationJob          *core.PromptGenerationJob `json:"prompt_generation,omitempty"`
 }
 
 func (e *Engine) publish(committed bool) {
@@ -44,6 +45,7 @@ func (e *Engine) publish(committed bool) {
 	summary.QuotaQuery = e.manualQuery
 	summary.Plan = e.schedulePlan(state, now)
 	summary.ManualWake = e.manualWake
+	summary.GenerationJob = state.GenerationJob
 	if summary.ManualWake.Phase == "verifying" {
 		account := state.Accounts[summary.ManualWake.AccountID]
 		if account.Task != nil {
@@ -110,6 +112,14 @@ func (e *Engine) SchedulerDiagnostics() any {
 	}
 	s := v.scheduler
 	s.Plan.Entries = append([]PlannedAction{}, s.Plan.Entries...)
+	for index := range s.Plan.Entries {
+		s.Plan.Entries[index].Sources = append([]core.ActionSource{}, s.Plan.Entries[index].Sources...)
+	}
+	if s.GenerationJob != nil {
+		job := *s.GenerationJob
+		job.Candidates = append([]string{}, job.Candidates...)
+		s.GenerationJob = &job
+	}
 	if s.LastQuotaDiagnostic != nil {
 		d := *s.LastQuotaDiagnostic
 		s.LastQuotaDiagnostic = &d
