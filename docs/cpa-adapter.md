@@ -32,7 +32,7 @@ host := cpa.NewHost(callback, quotaReader)
 
 代际是 `SHA256("codex-account-v1" + 分隔符 + 宿主 ID + 分隔符 + 实际 account_id)`。不使用 token、email、文件时间、`updated_at` 或 OAuth 刷新时间。OAuth 正常续期不会丢失窗口；同一宿主 ID 换成另一真实上游账号会阻止旧任务生成。
 
-`host.auth.get` 返回的凭据 JSON 只在调用栈里用于解码 allowlist 字段，随后清理原始字节。账号 token 不进入状态、配置、日志或错误。缺少 `account_id`、runtime-only 账号或无法核对绑定时返回 `account_identity_unavailable`，不会用名称或 email 猜测。宿主无法证明同一上游账号删除后重新添加的独立凭据生命周期；首版代际明确采用上游账号身份口径。
+`host.auth.get` 返回的凭据 JSON 只在调用栈里用于解码 allowlist 字段，随后清理原始字节。账号 token 不进入状态、配置、日志或错误。缺少 `account_id`、runtime-only 账号或无法核对绑定时返回 `account_identity_unavailable`，不会用名称或 email 猜测。清单发现中的单账号绑定错误会隔离为禁用占位账号，其代际使用独立不可用命名空间，旧额度和活动绑定失效；该账号不缓存可发送绑定、不能发送模型，手动查询返回固定身份错误。健康账号不受影响。重复宿主 ID 的冲突项全部禁用，缺少 ID 的条目跳过并记录安全诊断；全局清单读取失败、取消及超时仍使整个刷新失败，不发布部分清单。宿主无法证明同一上游账号删除后重新添加的独立凭据生命周期；首版代际明确采用上游账号身份口径。
 
 目前宿主没有与前台生成联合原子锁定的接口，`ForegroundGuard=false`。生成前核对无法彻底消除核对之后、真实宿主执行之前的账号修改或前台请求竞态。
 

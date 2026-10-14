@@ -124,5 +124,5 @@ func generationResponse(engine Engine, wrapper WrapperConfig, done <-chan struct
 	if status != "queued" && status != "already_queued" {
 		return response(409, map[string]string{"error": status})
 	}
-	return response(202, map[string]string{"status": status, "request_id": request.RequestID})
+	return response(202, map[string]string{"status": status, "request_id": request.RequestID, "job_id": request.RequestID})
 }

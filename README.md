@@ -56,6 +56,12 @@ curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/ma
 
 无需运行旧数据迁移程序，不导入旧消息或补造历史记录；历史从新版本实际执行的任务开始记录。安装保留现有账号绑定和发送抑制状态，不因更新清空安全状态。旧版不能直接读取新增字段后的状态，回退需停服务并恢复对应备份。以上变化随 [v0.1.0-rc.14 安装包](https://github.com/JayConstruct/codex-window-refresh/releases/tag/v0.1.0-rc.14) 升级并重启 CPA 后生效。
 
+## v0.1.0-rc.15 数据同步完善
+
+面板运行数据统一通过版本化 `/snapshot` 读取，按实例和快照序号拒绝旧响应，写操作后的旧刷新不会覆盖新结果。额度查询、手动唤醒和内容生成均按 `job_id` 自动跟踪，默认关闭页面持续刷新时也能显示执行结果；最近 64 个任务结果在内存保留，重启或记录淘汰会明确提示。单账号绑定错误不再阻塞健康账号，全局清单或能力故障会显示阻塞原因，并在调度检查发现任务开始后已过 2 分钟且仍阻塞时失败释放操作。模型送达不确定仍不自动重发。
+
+以上完善随 [v0.1.0-rc.15 安装包](https://github.com/JayConstruct/codex-window-refresh/releases/tag/v0.1.0-rc.15) 生效，替换插件并重启 CPA 后刷新管理网页。历史问题与方案见 [同步分析](docs/data-sync-analysis.md)。
+
 ## 设计文件
 
 - [用户规则与调度逻辑](docs/codex-refresh-design.md)
@@ -98,4 +104,4 @@ make panel-check
 
 首版实际生成并发为 1。没有上游窗口状态的正向证据时不会唤醒；零使用率和未来 reset 时间本身不足以确认窗口未启动。官方宿主目前也没有前台请求与后台唤醒之间的原子互斥接口，插件只能查询并观察后尽量避开。分布式执行尚未实现。
 
-发布流程由 `.github/workflows/prerelease.yml` 管理。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；修改工作流、脚本或脚本测试也会触发检查。全部通过才发布 Pre-release，已发布版本只做构建检查而不覆盖下载文件。需要手动重试时从 Actions 运行该工作流。
+发布流程由 `.github/workflows/prerelease.yml` 管理。提交前运行 `make release-check`，核对 `release/version.txt`、插件内置版本和对应发布说明；CI 与打包复用 `scripts/release_check.py`。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；修改工作流、脚本或脚本测试也会触发检查。全部通过才发布 Pre-release，已发布版本只做构建检查而不覆盖下载文件。需要手动重试时从 Actions 运行该工作流。

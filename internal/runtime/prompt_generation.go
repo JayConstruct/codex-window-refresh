@@ -38,10 +38,29 @@ func (e *Engine) QueuePromptGeneration(request core.PromptGenerationRequest) str
 		return "prompt_generation_unavailable"
 	}
 	e.queueMu.Lock()
-	defer e.queueMu.Unlock()
+	publishQueued := false
+	defer func() {
+		e.queueMu.Unlock()
+		if publishQueued {
+			e.publishQueuedJobs()
+		}
+	}()
 	state := e.Snapshot()
+	if e.queuePoisoned || e.lastPublishedCommitFailed() {
+		return "durable_commit_failed"
+	}
+	for _, previous := range e.jobs {
+		if previous.JobID == request.RequestID {
+			if previous.PromptGeneration != nil && previous.PromptGeneration.Request == request {
+				publishQueued = true
+				return "already_queued"
+			}
+			return "request_id_conflict"
+		}
+	}
 	if e.generationActive {
 		if e.generationRequest == request {
+			publishQueued = true
 			return "already_queued"
 		}
 		return "busy"
@@ -72,6 +91,9 @@ func (e *Engine) QueuePromptGeneration(request core.PromptGenerationRequest) str
 	}
 	e.generationRequest, e.generationAccountGeneration = request, account.Generation
 	e.generationRequested, e.generationActive = true, true
+	queued := core.PromptGenerationJob{Request: request, Generation: account.Generation, Phase: "queued", StartedAt: e.clock.Now(), Candidates: []string{}}
+	e.putJobLocked(JobStatus{JobID: request.RequestID, Kind: "prompt_generation", Phase: "queued", AccountID: request.AccountID, PromptGeneration: &queued})
+	publishQueued = true
 	e.Notify()
 	return "queued"
 }
@@ -99,6 +121,7 @@ func (e *Engine) finishPromptGeneration(phase, code string) {
 	if job.HistoryID == 0 {
 		job.HistoryID = core.AppendHistory(&e.state, core.HistoryEntry{Kind: "generation", AccountID: job.Request.AccountID, Generation: job.Generation, StartedAt: job.StartedAt, FinishedAt: job.FinishedAt, Status: phase, ErrorCode: code, Model: job.Request.Model, Sources: []core.ActionSource{{Trigger: "prompt_generation", ConfigPath: generationConfigPath(job.Request.Target)}}})
 	}
+	e.recordGenerationJob()
 	e.queueMu.Lock()
 	e.generationActive = false
 	e.queueMu.Unlock()
@@ -130,6 +153,8 @@ func (e *Engine) stepPromptGeneration(ctx context.Context) error {
 		return nil
 	}
 	job.Phase = "running"
+	e.recordGenerationJob()
+	e.publish(false)
 	fence := e.state.NextReadSequence
 	if err := e.observe(ctx, id, core.ActionSource{Trigger: "generation_preflight", ConfigPath: "execution.quota_read_timeout"}); err != nil {
 		e.finishPromptGeneration("failed", quotaReadErrorCode(err))
@@ -158,6 +183,7 @@ func (e *Engine) stepPromptGeneration(ctx context.Context) error {
 	account.Task.DispatchReadSequence = sequence
 	job.OperationID, job.Phase = operation, "dispatched"
 	job.HistoryID = core.AppendHistory(&e.state, core.HistoryEntry{Kind: "generation", AccountID: id, Generation: account.Generation, OperationID: operation, Model: job.Request.Model, Prompt: account.Task.SelectedPrompt, StartedAt: job.StartedAt, Status: "dispatched", CoveredEvents: []core.EventID{event.ID}, Sources: []core.ActionSource{{Trigger: "prompt_generation", ConfigPath: generationConfigPath(job.Request.Target), EventID: event.ID}}})
+	e.recordGenerationJob()
 	if err := e.commit(ctx); err != nil {
 		return err
 	}

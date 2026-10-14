@@ -5,18 +5,25 @@ import (
 	"errors"
 	"time"
 
+	"codex-window-refresh/internal/config"
 	"codex-window-refresh/internal/core"
 )
 
 // publishedStatus is immutable once stored. Network operations never hold the
 // reader's lock, and an unsuccessful commit cannot publish uncommitted state.
 type publishedStatus struct {
-	state     core.CoreState
-	caps      core.HostCapabilities
-	lastError string
-	scheduler SchedulingSummary
+	instanceID           string
+	snapshotSeq          uint64
+	config               config.Config
+	hostHTTPStatus       string
+	inventoryDiagnostics map[core.AccountID]string
+	state                core.CoreState
+	caps                 core.HostCapabilities
+	lastError            string
+	scheduler            SchedulingSummary
 }
 type SchedulingSummary struct {
+	Jobs                   []JobStatus               `json:"jobs"`
 	ObservedAt             time.Time                 `json:"observed_at"`
 	RecentUsers            int                       `json:"recent_users"`
 	IdentitySource         string                    `json:"identity_source"`
@@ -33,6 +40,11 @@ type SchedulingSummary struct {
 }
 
 func (e *Engine) publish(committed bool) {
+	e.publicationMu.Lock()
+	defer e.publicationMu.Unlock()
+	if committed {
+		e.confirmJobsCommitted()
+	}
 	previous := e.published.Load()
 	var state core.CoreState
 	if previous == nil || committed {
@@ -42,6 +54,7 @@ func (e *Engine) publish(committed bool) {
 	}
 	now := e.clock.Now()
 	summary := SchedulingSummary{ObservedAt: now, RecentUsers: core.ActiveUserCount(state, now, e.cfg.Activity.Lookback.Value()), IdentitySource: e.cfg.Activity.IdentitySource, Capacity: capacityFor(e.cfg, state, now, ""), HoldCounts: map[string]int{}, NextInventoryAt: e.nextInventory}
+	summary.Jobs = e.collectJobStatuses(state)
 	summary.QuotaQuery = e.manualQuery
 	summary.Plan = e.schedulePlan(state, now)
 	summary.ManualWake = e.manualWake
@@ -103,37 +116,37 @@ func (e *Engine) publish(committed bool) {
 			summary.HoldCounts[reason]++
 		}
 	}
-	e.published.Store(&publishedStatus{state: state, caps: e.caps, lastError: e.lastError, scheduler: summary})
+	var instanceID string
+	sequence := uint64(1)
+	if previous != nil {
+		instanceID, sequence = previous.instanceID, previous.snapshotSeq+1
+	} else {
+		instanceID = newSnapshotInstanceID()
+	}
+	httpStatus, inventoryDiagnostics := "", map[core.AccountID]string(nil)
+	if previous != nil {
+		httpStatus, inventoryDiagnostics = previous.hostHTTPStatus, previous.inventoryDiagnostics
+	}
+	if previous == nil || committed {
+		if checker, ok := e.host.(interface{ QuotaConnectionStatus() string }); ok {
+			httpStatus = checker.QuotaConnectionStatus()
+		}
+		if diagnostics, ok := e.host.(interface {
+			AccountInventoryDiagnostics() map[core.AccountID]string
+		}); ok {
+			inventoryDiagnostics = copyInventoryDiagnostics(diagnostics.AccountInventoryDiagnostics())
+		}
+	}
+	e.published.Store(&publishedStatus{instanceID: instanceID, snapshotSeq: sequence, config: copyConfig(e.cfg), state: state, caps: e.caps, lastError: e.lastError, scheduler: summary, hostHTTPStatus: httpStatus, inventoryDiagnostics: inventoryDiagnostics})
 }
 func (e *Engine) SchedulerDiagnostics() any {
 	v := e.published.Load()
 	if v == nil {
 		return SchedulingSummary{HoldCounts: map[string]int{}}
 	}
-	s := v.scheduler
-	s.Plan.Entries = append([]PlannedAction{}, s.Plan.Entries...)
-	for index := range s.Plan.Entries {
-		s.Plan.Entries[index].Sources = append([]core.ActionSource{}, s.Plan.Entries[index].Sources...)
-	}
-	if s.GenerationJob != nil {
-		job := *s.GenerationJob
-		job.Candidates = append([]string{}, job.Candidates...)
-		s.GenerationJob = &job
-	}
-	if s.LastQuotaDiagnostic != nil {
-		d := *s.LastQuotaDiagnostic
-		s.LastQuotaDiagnostic = &d
-	}
-	if s.QuotaQuery.Diagnostic != nil {
-		d := *s.QuotaQuery.Diagnostic
-		s.QuotaQuery.Diagnostic = &d
-	}
-	s.HoldCounts = make(map[string]int, len(v.scheduler.HoldCounts))
-	for k, n := range v.scheduler.HoldCounts {
-		s.HoldCounts[k] = n
-	}
-	return s
+	return cloneSchedulingSummary(v.scheduler)
 }
+
 func (e *Engine) readFailed(id core.AccountID) {
 	n := e.readFailures[id] + 1
 	e.readFailures[id] = min(n, 5)

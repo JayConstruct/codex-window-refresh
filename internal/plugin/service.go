@@ -27,7 +27,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.14"
+const Version = "0.1.0-rc.15"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -98,6 +98,8 @@ func (w WrapperConfig) quotaTransport() string {
 
 func (w WrapperConfig) hostEnabled() bool { return w.HostEnabled == nil || *w.HostEnabled }
 func (w WrapperConfig) effective(cfg config.Config) config.Config {
+	businessEnabled := cfg.Enabled
+	cfg.BusinessEnabled = &businessEnabled
 	cfg.Enabled = cfg.Enabled && w.hostEnabled()
 	cfg.ManualWakeDisabled = !w.hostEnabled()
 	return cfg
@@ -432,7 +434,7 @@ func registration() any {
 }
 func managementRegistration() any {
 	routes := []map[string]string{}
-	for _, p := range []string{"/summary", "/accounts", "/config", "/config-editor", "/capabilities", "/history"} {
+	for _, p := range []string{"/snapshot", "/summary", "/accounts", "/config", "/config-editor", "/capabilities", "/history"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
 	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check", "/manual-wake", "/prompt-generation"} {
@@ -490,6 +492,8 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		return response(503, map[string]string{"error": "scheduler not initialized"}), nil
 	}
 	switch req.Method + " " + path {
+	case "GET /snapshot":
+		return s.snapshotResponse(engine, wrapper, done, stopping, lastError), nil
 	case "GET /summary":
 		state := engine.Snapshot()
 		running := done != nil && !stopping
@@ -563,8 +567,15 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 				return response(503, map[string]string{"error": "quota_bridge_unavailable"}), nil
 			}
 		}
-		status := "already_queued"
-		if selected, ok := engine.(interface{ QueueQuotaQuery(core.AccountID) string }); ok {
+		status, jobID := "already_queued", ""
+		if selected, ok := engine.(interface {
+			QueueQuotaQueryJob(core.AccountID) (string, string)
+		}); ok {
+			status, jobID = selected.QueueQuotaQueryJob(target)
+			if status != "queued" && status != "already_queued" {
+				return response(409, map[string]string{"error": status}), nil
+			}
+		} else if selected, ok := engine.(interface{ QueueQuotaQuery(core.AccountID) string }); ok {
 			status = selected.QueueQuotaQuery(target)
 			if status == "busy" {
 				return response(409, map[string]string{"error": "quota_query_busy"}), nil
@@ -574,7 +585,7 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		} else if query.RequestQuotaQuery() {
 			status = "queued"
 		}
-		return response(202, map[string]any{"status": status, "account_id": target}), nil
+		return response(202, map[string]any{"status": status, "account_id": target, "job_id": jobID}), nil
 	case "GET /capabilities":
 		capabilities := core.HostCapabilities{}
 		if debug, ok := engine.(DiagnosticEngine); ok {
@@ -617,6 +628,9 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		err := checker.CheckQuotaConnection(checkCtx)
+		if publisher, ok := engine.(interface{ RefreshQuotaConnectionStatus() }); ok {
+			publisher.RefreshQuotaConnectionStatus()
+		}
 		result := map[string]string{"status": checker.QuotaConnectionStatus()}
 		if err != nil {
 			code := "quota_host_operation_failed"

@@ -61,9 +61,16 @@ func manualWakeResponse(engine Engine, wrapper WrapperConfig, cfg config.Config,
 	if !ok {
 		return response(501, map[string]string{"error": "manual_wake_unavailable"})
 	}
-	status := wake.QueueManualWake(target)
+	status, jobID := "", ""
+	if tracked, ok := engine.(interface {
+		QueueManualWakeJob(core.AccountID) (string, string)
+	}); ok {
+		status, jobID = tracked.QueueManualWakeJob(target)
+	} else {
+		status = wake.QueueManualWake(target)
+	}
 	if status != "queued" && status != "already_queued" {
 		return response(409, map[string]string{"error": status})
 	}
-	return response(202, map[string]string{"status": status, "account_id": string(target)})
+	return response(202, map[string]string{"status": status, "account_id": string(target), "job_id": jobID})
 }

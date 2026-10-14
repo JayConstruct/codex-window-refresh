@@ -121,15 +121,37 @@ function createPanelFixture(fetcher, confirm = () => true, fields = []) {
     createTextNode: text => ({textContent: text, children: [], dataset: {}}),
     addEventListener: (event, handler) => visibility.set(event, handler)};
   const config = {...policy(), quota_query: {automatic: false, manual: false, interval: '30s'}};
-  const data = {summary: {running: true, enabled: false, scheduler: {}}, accounts: {},
+  const data = {instance_id: 'fixture-instance', snapshot_seq: 0, summary: {running: true, enabled: false, scheduler: {}}, accounts: {},
     capabilities: {QuotaAdapterReady: true}, config, 'config-editor': {config, revision: 'r1'}};
+  const records = new Map();
+  Object.defineProperty(data, 'snapshot', {get() {
+    const snapshot = structuredClone({instance_id: data.instance_id, snapshot_seq: ++data.snapshot_seq, summary: data.summary, accounts: data.accounts, capabilities: data.capabilities, config: data.config});
+    if (!Array.isArray(snapshot.summary.scheduler.jobs)) snapshot.summary.scheduler.jobs = [...records.values()].map(record => {
+      const current = data.summary.scheduler[record.kind];
+      const detail = current && JSON.stringify(current) !== record.previous ? current : {phase: 'queued', account_id: record.target};
+      return {job_id: record.id, kind: record.kind, phase: detail.phase, account_id: detail.account_id || record.target || '', [record.kind]: detail};
+    });
+    return snapshot;
+  }});
   runInNewContext(readFileSync(require.resolve('../../internal/plugin/web/panel.js'), 'utf8'), {
     document, navigator, URL, URLSearchParams, TextEncoder, AbortController, structuredClone, confirm,
     location: {origin: 'https://cpa.test', pathname: '/v0/resource/plugins/codex-window-refresh/status'},
     localStorage: {getItem: () => null}, addEventListener: (event, handler) => events.set(event, handler), setInterval() {},
     setTimeout: (callback, duration) => {const timer = ++nextTimer; timers.set(timer, {callback, duration}); return timer;},
     clearTimeout: timer => timers.delete(timer),
-    fetch: async (url, options) => {requests.push({url, options}); return fetcher ? fetcher(url, options, data) : response(data[url.split('/').pop()] || {status: 'queued'});}
+    fetch: async (url, options) => {
+      requests.push({url, options});
+      const kind = {'quota-query': 'quota_query', 'manual-wake': 'manual_wake', 'prompt-generation': 'prompt_generation'}[url.split('/').pop()];
+      const previous = kind ? JSON.stringify(data.summary.scheduler[kind]) : '';
+      const result = await (fetcher ? fetcher(url, options, data) : response(data[url.split('/').pop()] || {status: 'queued'}));
+      if (kind && options.method === 'POST' && result.ok) {
+        const body = options.body ? JSON.parse(options.body) : {}, value = await result.json();
+        if (!Object.hasOwn(value, 'job_id')) value.job_id = body.request_id || 'fixture-job-' + requests.length;
+        records.set(value.job_id, {id: value.job_id, kind, target: body.account_id || '', previous});
+        return response(value, result.status);
+      }
+      return result;
+    }
   });
   const settle = () => new Promise(resolve => setImmediate(resolve));
   async function poll() {
@@ -368,10 +390,134 @@ test('page polling requires opt-in and legacy manual permission does not block q
   assert.equal(lookup('auto-refresh').checked, false);
   assert.equal(timers.size, 0);
 });
+test('manual queries track delayed snapshots through completion with page polling off', async () => {
+  for (const target of ['', 'account-a']) {
+    for (const failed of [false, true]) {
+      let phase = 'previous';
+      const previousStart = '2026-10-13T00:00:00Z';
+      const {lookup, timers, requests, settle, poll} = createPanelFixture(async (url, options, data) => {
+        data.accounts = {'account-a': {ID: 'account-a', Enabled: true, FiveHour: {Remaining: {Value: phase === 'completed' ? 73 : 80, Unit: 'percent'}}}};
+        data.summary.scheduler.quota_query = {account_id: target, phase: phase === 'previous' ? 'completed' : phase, started_at: phase === 'previous' ? previousStart : '2026-10-14T00:00:00Z', total: 1, completed: phase === 'completed' && !failed ? 1 : 0, failed: phase === 'completed' && failed ? 1 : 0, last_error: failed ? 'quota_credential_expired' : ''};
+        if (options.method === 'POST') return response({status: 'queued'}, 202);
+        return response(data[url.split('/').pop()]);
+      });
+      lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+      await settle();
+      assert.equal(timers.size, 0);
+      lookup('config-json').value = '{unsaved-query-draft'; lookup('config-json').listeners.get('input')();
+      const descendants = item => [item, ...item.children.flatMap(descendants)];
+      if (target) descendants(lookup('account-list')).find(item => item.dataset.quotaAccount === target).listeners.get('click')();
+      else lookup('quota-query').listeners.get('click')();
+      await settle();
+      assert.equal(lookup('auto-refresh').checked, false);
+      assert.equal(lookup('quota-query').disabled, true);
+      assert.match(lookup('quota-query-status').textContent, /等待查询/);
+      assert.match(lookup('refresh-status').textContent, /手动任务进行中/);
+      assert.equal(timers.size, 1);
+      await poll(); // The runtime has not published this request yet.
+      assert.match(lookup('quota-query-status').textContent, /等待查询/);
+      phase = 'running'; await poll();
+      assert.match(lookup('quota-query-status').textContent, /正在查询/);
+      phase = 'completed'; await poll();
+      assert.match(lookup('quota-query-status').textContent, failed ? /失败 1/ : /成功 1/);
+      assert.match(lookup('quota-query-status').textContent, /查询结束/);
+      assert.equal(lookup('quota-query').disabled, false);
+      const cards = descendants(lookup('account-list'));
+      assert.ok(cards.some(item => item.textContent.includes('73%')));
+      if (target) assert.ok(cards.some(item => item.textContent.includes(failed ? '查询失败，账号凭据已过期' : '查询完成')));
+      assert.equal(lookup('config-json').value, '{unsaved-query-draft');
+      assert.equal(lookup('auto-refresh').checked, false);
+      assert.equal(timers.size, 0, 'query tracking must stop at completion');
+      assert.equal(requests.filter(request => request.options.method === 'POST').length, 1);
+      lookup('disconnect').listeners.get('click')();
+    }
+  }
+});
+test('accepted manual queries recover from snapshot failures without resubmitting', async () => {
+  let accepted = false, failing = false, completed = false;
+  const {lookup, timers, requests, settle, poll} = createPanelFixture(async (url, options, data) => {
+    if (options.method === 'POST') { accepted = failing = true; return response({status: 'queued'}, 202); }
+    if (accepted && failing && url.endsWith('/snapshot')) throw new Error('temporary read failure');
+    if (completed) data.summary.scheduler.quota_query = {phase: 'completed', started_at: '2026-10-14T00:00:00Z', total: 1, completed: 1};
+    return response(data[url.split('/').pop()]);
+  });
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('quota-query').listeners.get('click')(); await settle();
+  assert.match(lookup('notice').textContent, /无法读取 CPA/);
+  assert.equal(lookup('quota-query').disabled, true);
+  await poll();
+  assert.equal([...timers.values()][0].duration, 10000);
+  failing = false; completed = true; await poll();
+  assert.match(lookup('quota-query-status').textContent, /查询结束/);
+  assert.equal(lookup('notice').hidden, true);
+  assert.equal(timers.size, 0);
+  assert.equal(requests.filter(request => request.options.method === 'POST').length, 1);
+  lookup('disconnect').listeners.get('click')();
+});
+test('manual query tracking stops on terminal states or a stopped scheduler', async () => {
+  for (const phase of ['cancelled', 'unavailable', 'stopped']) {
+    let finish = false;
+    const {lookup, timers, settle, poll} = createPanelFixture(async (url, options, data) => {
+      if (finish) {
+        data.summary.running = phase !== 'stopped';
+        data.summary.scheduler.quota_query = {phase: phase === 'stopped' ? 'queued' : phase, started_at: '2026-10-14T00:00:00Z'};
+      }
+      return response(data[url.split('/').pop()] || {status: 'queued'}, options.method === 'POST' ? 202 : 200);
+    });
+    lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+    await settle(); lookup('quota-query').listeners.get('click')(); await settle();
+    assert.equal(timers.size, 1);
+    finish = true; await poll();
+    assert.equal(timers.size, 0);
+    assert.match(lookup('quota-query-status').textContent, phase === 'stopped' ? /后台未运行/ : phase === 'cancelled' ? /已取消/ : /额度查询接口未就绪/);
+    lookup('disconnect').listeners.get('click')();
+  }
+});
+test('manual query tracking pauses while hidden or offline and resumes without page polling', async () => {
+  const {lookup, timers, requests, settle, document, navigator, visibility, events} = createPanelFixture();
+  lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await settle();
+  lookup('quota-query').listeners.get('click')(); await settle();
+  document.hidden = true; visibility.get('visibilitychange')();
+  assert.equal(timers.size, 0);
+  const hidden = requests.length;
+  events.get('focus')(); await settle(); assert.equal(requests.length, hidden);
+  document.hidden = false; visibility.get('visibilitychange')(); await settle();
+  assert.ok(requests.length > hidden);
+  assert.equal(timers.size, 1);
+  navigator.onLine = false; events.get('offline')();
+  assert.equal(timers.size, 0);
+  const offline = requests.length;
+  events.get('focus')(); await settle(); assert.equal(requests.length, offline);
+  navigator.onLine = true; events.get('online')(); await settle();
+  assert.ok(requests.length > offline);
+  assert.equal(lookup('auto-refresh').checked, false);
+  assert.equal(requests.filter(request => request.options.method === 'POST').length, 1);
+  lookup('disconnect').listeners.get('click')();
+  assert.equal(timers.size, 0);
+  events.get('focus')(); await settle(); assert.equal(timers.size, 0);
+});
+test('rejected manual queries and authentication failures stop query tracking', async () => {
+  for (const rejected of [true, false]) {
+    let accepted = false;
+    const {lookup, timers, requests, settle} = createPanelFixture(async (url, options, data) => {
+      if (options.method === 'POST') { accepted = !rejected; return response({}, rejected ? 409 : 202); }
+      return response(data[url.split('/').pop()], accepted ? 401 : 200);
+    });
+    lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
+    await settle();
+    lookup('quota-query').listeners.get('click')(); await settle();
+    assert.equal(timers.size, 0);
+    assert.match(lookup('notice').textContent, rejected ? /未能安排额度查询/ : /认证失败/);
+    assert.equal(requests.filter(request => request.options.method === 'POST').length, 1);
+    lookup('disconnect').listeners.get('click')();
+  }
+});
 test('long-running polling backs off failures and returns to five seconds without accumulating requests', async () => {
   let failing = false;
   const {lookup, timers, settle, poll, requests} = createPanelFixture(async (url, options, data) => {
-    if (failing && url.endsWith('/accounts')) throw new Error('temporary network failure');
+    if (failing && url.endsWith('/snapshot')) throw new Error('temporary network failure');
     return response(data[url.split('/').pop()]);
   });
   lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
@@ -434,8 +580,8 @@ test('background refresh is explicit and resumes after tab changes and offline p
 test('pausing an in-flight poll cancels only its reads and does not render late data', async () => {
   let pending = false, lateRead;
   const {lookup, timers, settle, poll, requests, document, visibility, events} = createPanelFixture(async (url, options, data) => {
-    if (pending && url.endsWith('/accounts')) {
-      return new Promise(resolve => {lateRead = () => resolve(response({late: {ID: 'late', Enabled: true}}));});
+    if (pending && url.endsWith('/snapshot')) {
+      return new Promise(resolve => {lateRead = () => resolve(response({...data.snapshot, accounts: {late: {ID: 'late', Enabled: true}}}));});
     }
     return response(data[url.split('/').pop()]);
   });
@@ -443,7 +589,7 @@ test('pausing an in-flight poll cancels only its reads and does not render late 
   await settle();
   lookup('auto-refresh').checked = true; lookup('auto-refresh').listeners.get('change')();
   pending = true; await poll();
-  const outstanding = requests.at(-2), count = requests.length;
+  const outstanding = requests.at(-1), count = requests.length;
   events.get('focus')(); events.get('online')();
   assert.equal(requests.length, count, 'parallel wake-up events duplicated an in-flight refresh');
   document.hidden = true; visibility.get('visibilitychange')();
@@ -491,7 +637,7 @@ test('successful snapshot reads hide recovered timeout and network errors', asyn
   for (const failure of ['timeout', 'network']) {
     let failing = false;
     const {lookup, timers, settle, poll} = createPanelFixture(async (url, options, data) => {
-      if (failing && url.endsWith('/accounts')) {
+      if (failing && url.endsWith('/snapshot')) {
         if (failure === 'network') throw new Error('private network failure');
         return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(new Error('aborted'))));
       }
@@ -521,9 +667,9 @@ test('successful snapshot reads hide recovered timeout and network errors', asyn
 test('snapshot recovery preserves a newer unrelated error', async () => {
   let mode = '', pendingRead;
   const {lookup, settle, poll} = createPanelFixture(async (url, options, data) => {
-    if (url.endsWith('/accounts')) {
+    if (url.endsWith('/snapshot')) {
       if (mode === 'failed') throw new Error('private network failure');
-      if (mode === 'pending') return new Promise(resolve => {pendingRead = () => resolve(response(data.accounts));});
+      if (mode === 'pending') return new Promise(resolve => {pendingRead = () => resolve(response(data.snapshot));});
     }
     return response(data[url.split('/').pop()]);
   });
@@ -581,6 +727,10 @@ test('quota errors show safe stages and distinguish management authentication fr
   assert.match(upstream, /上游拒绝访问/); assert.match(upstream, /上游响应 · HTTP 403/);
   assert.match(quotaFailure({last_error: 'quota_host_operation_failed'}), /接口兼容性/);
   assert.match(quotaFailure({last_error: 'quota_query_timeout'}), /查询超时/);
+  assert.match(quotaFailure({last_error: 'durable_commit_failed'}), /后台状态未能保存/);
+  assert.match(quotaFailure({last_error: 'account_inventory_unavailable'}), /账号清单暂不可用/);
+  assert.match(quotaFailure({last_error: 'account_read_failed'}), /账号清单读取失败/);
+  assert.match(quotaFailure({last_error: 'capability_read_failed'}), /宿主能力读取失败/);
   assert.equal(quotaFailure({last_error: 'private-token', diagnostic: {stage: 'private-proxy', http_status: 999, elapsed_ms: -1}}), '可手动重试');
   assert.equal(quotaFailure({last_error: '__proto__', diagnostic: {stage: 'constructor'}}), '可手动重试');
 });
@@ -763,4 +913,281 @@ test('reverse-proxy prefixes stay on the page origin, including malicious double
   assert.equal(apiBase({origin: 'https://cpa.test', pathname: '/v0/resource/plugins/codex-window-refresh/status'}), '/v0/management/codex-window-refresh');
   assert.throws(() => apiBase({origin: 'https://cpa.test', pathname: '//evil.invalid/v0/resource/plugins/codex-window-refresh/status'}), {code: 'invalid_endpoint'});
   assert.throws(() => apiBase({origin: 'https://cpa.test', pathname: '/wrong'}), {code: 'invalid_endpoint'});
+});
+
+const descendants = item => [item, ...item.children.flatMap(descendants)];
+async function loginFixture(fixture) {
+  fixture.lookup('management-key').value = 'key';
+  fixture.lookup('login-form').listeners.get('submit')({preventDefault() {}});
+  await fixture.settle();
+  assert.equal(fixture.lookup('workspace').hidden, false);
+}
+function trackedEnvelope(id, kind, phase, detail = {}) {
+  return {job_id: id, kind, phase, account_id: detail.account_id || detail.request?.account_id || '', [kind]: {...detail, phase}};
+}
+test('runtime refresh uses one complete snapshot and leaves the editor draft separate', async () => {
+  const fixture = createPanelFixture(); await loginFixture(fixture);
+  assert.deepEqual(fixture.requests.map(request => request.url.split('/').pop()), ['snapshot', 'config-editor']);
+  fixture.lookup('refresh').listeners.get('click')(); await fixture.settle();
+  assert.equal(fixture.requests.at(-1).url.split('/').pop(), 'snapshot');
+  assert.equal(fixture.requests.length, 3);
+});
+test('late polling results and errors cannot overwrite a newer accepted query snapshot', async () => {
+  for (const oldFails of [false, true]) {
+    let defer = false, release;
+    const fixture = createPanelFixture(async (url, options, data) => {
+      data.accounts.a ||= {ID: 'a', Enabled: true, FiveHour: {Remaining: {Value: 80, Unit: 'percent'}}};
+      if (url.endsWith('/snapshot') && defer) {
+        defer = false; const old = data.snapshot;
+        return new Promise((resolve, reject) => {release = () => oldFails ? reject(new Error('old failed read')) : resolve(response(old));});
+      }
+      if (options.method === 'POST') {
+        data.accounts.a.FiveHour.Remaining.Value = 73;
+        data.summary.scheduler.jobs = [trackedEnvelope('my-query', 'quota_query', 'completed', {total: 1, completed: 1})];
+        return response({status: 'queued', job_id: 'my-query'}, 202);
+      }
+      return response(data[url.split('/').pop()]);
+    });
+    await loginFixture(fixture);
+    fixture.lookup('auto-refresh').checked = true; fixture.lookup('auto-refresh').listeners.get('change')();
+    defer = true; await fixture.poll();
+    fixture.lookup('quota-query').listeners.get('click')(); await fixture.settle();
+    const notice = fixture.lookup('notice').textContent;
+    assert.match(fixture.lookup('quota-query-status').textContent, /查询结束/);
+    release(); await fixture.settle();
+    assert.ok(descendants(fixture.lookup('account-list')).some(item => item.textContent === '73%'));
+    assert.equal(fixture.lookup('notice').textContent, notice);
+    fixture.lookup('disconnect').listeners.get('click')();
+  }
+});
+test('a pre-save poll cannot revert an accepted config even when the followup snapshot fails', async () => {
+  for (const followupFails of [false, true]) {
+    let defer = false, accepted = false, release;
+    const fixture = createPanelFixture(async (url, options, data) => {
+      if (url.endsWith('/snapshot') && defer) {
+        defer = false; const old = data.snapshot;
+        return new Promise(resolve => {release = () => resolve(response(old));});
+      }
+      if (url.endsWith('/config') && options.method === 'POST') {
+        accepted = true; data.config = JSON.parse(options.body).config; data.summary.enabled = data.config.enabled;
+        return response({config: data.config, revision: 'saved'});
+      }
+      if (url.endsWith('/snapshot') && accepted && followupFails) throw new Error('followup read failed');
+      return response(data[url.split('/').pop()]);
+    });
+    await loginFixture(fixture);
+    fixture.lookup('auto-refresh').checked = true; fixture.lookup('auto-refresh').listeners.get('change')();
+    defer = true; await fixture.poll();
+    const config = JSON.parse(fixture.lookup('config-json').value); config.enabled = true;
+    fixture.lookup('config-json').value = JSON.stringify(config); fixture.lookup('config-json').listeners.get('input')(); fixture.lookup('json-apply').listeners.get('click')();
+    fixture.lookup('config-save').listeners.get('click')(); await fixture.settle();
+    assert.match(fixture.lookup('mode-title').textContent, /模型唤醒已开启/);
+    if (followupFails) assert.match(fixture.lookup('notice').textContent, /规则已保存并应用；状态暂未读取成功/);
+    release(); await fixture.settle();
+    assert.match(fixture.lookup('mode-title').textContent, /模型唤醒已开启/);
+    assert.equal(JSON.parse(fixture.lookup('config-json').value).enabled, true);
+    assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1);
+    fixture.lookup('disconnect').listeners.get('click')();
+  }
+});
+test('a retained task ID resolves its own result after another tab overwrites the latest job', async () => {
+  let completed = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    if (options.method === 'POST') return response({status: 'queued', job_id: 'mine'}, 202);
+    if (url.endsWith('/snapshot')) {
+      data.summary.scheduler.quota_query = {account_id: 'other-tab', phase: 'completed', completed: 8};
+      data.summary.scheduler.jobs = [trackedEnvelope('mine', 'quota_query', completed ? 'completed' : 'queued', {account_id: 'mine-account', total: 1, completed: completed ? 1 : 0}), trackedEnvelope('other', 'quota_query', 'completed', {account_id: 'other-tab', completed: 8})];
+    }
+    return response(data[url.split('/').pop()]);
+  });
+  // Initial state has a queued task from another tab: opt out of it before submitting ours.
+  completed = true; await loginFixture(fixture); completed = false;
+  fixture.lookup('quota-query').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('quota-query-status').textContent, /等待查询/);
+  completed = true; await fixture.poll();
+  assert.match(fixture.lookup('quota-query-status').textContent, /成功 1/);
+  assert.equal(fixture.timers.size, 0);
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1);
+});
+test('restart and evicted active task records end optimistic waiting explicitly', async () => {
+  for (const mode of ['restart', 'evicted']) {
+    let finish = false, submitted = false;
+    const fixture = createPanelFixture(async (url, options, data) => {
+      if (options.method === 'POST') {submitted = true; return response({status: 'queued', job_id: 'mine'}, 202);}
+      if (submitted) {
+        if (finish && mode === 'restart') data.instance_id = 'new-runtime';
+        data.summary.scheduler.jobs = finish ? [] : [trackedEnvelope('mine', 'quota_query', 'queued')];
+      }
+      return response(data[url.split('/').pop()]);
+    });
+    await loginFixture(fixture); fixture.lookup('quota-query').listeners.get('click')(); await fixture.settle();
+    assert.equal(fixture.timers.size, 1);
+    finish = true; await fixture.poll();
+    assert.match(fixture.lookup('quota-query-status').textContent, mode === 'restart' ? /后台已停止或重启/ : /任务记录已不可用/);
+    assert.equal(fixture.timers.size, 0);
+    assert.equal(fixture.lookup('quota-query').disabled, false);
+  }
+});
+test('wake tasks recover from accepted read failures and poll through verification with page refresh off', async () => {
+  let phase = '', failRead = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.accounts = {a: {ID: 'a', Enabled: true}};
+    data.capabilities.StableAccountIdentity = data.capabilities.ExactAccountExecution = true;
+    if (options.method === 'POST') {phase = 'queued'; failRead = true; return response({status: 'queued', job_id: 'wake'}, 202);}
+    if (url.endsWith('/snapshot') && failRead) throw new Error('read failure');
+    data.summary.scheduler.jobs = phase ? [trackedEnvelope('wake', 'manual_wake', phase, {account_id: 'a'})] : [];
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  descendants(fixture.lookup('account-list')).find(item => item.dataset.wakeAccount === 'a').listeners.get('click')(); await fixture.settle();
+  assert.equal(fixture.timers.size, 1); assert.match(fixture.lookup('notice').textContent, /无法读取 CPA/);
+  failRead = false;
+  for (const next of ['running', 'verifying']) {phase = next; await fixture.poll(); assert.equal(fixture.timers.size, 1);}
+  assert.ok(descendants(fixture.lookup('account-list')).some(item => item.textContent.includes('等待服务端窗口证据')));
+  phase = 'completed'; await fixture.poll();
+  assert.equal(fixture.timers.size, 0); assert.equal(fixture.lookup('auto-refresh').checked, false);
+  assert.ok(descendants(fixture.lookup('account-list')).some(item => item.textContent.includes('已确认窗口启动')));
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1);
+});
+test('generation tasks recover from accepted read failures and retain their preview after another generation', async () => {
+  let phase = '', failRead = false, request;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.accounts = {a: {ID: 'a', Enabled: true}}; data.capabilities.ExactAccountExecution = true;
+    if (options.method === 'POST') {request = JSON.parse(options.body); phase = 'queued'; failRead = true; return response({status: 'queued', job_id: request.request_id}, 202);}
+    if (url.endsWith('/snapshot') && failRead) throw new Error('read failure');
+    data.summary.scheduler.jobs = phase ? [trackedEnvelope(request.request_id, 'prompt_generation', phase, {request, candidates: ['Hello.', 'Ready.']})] : [];
+    data.summary.scheduler.prompt_generation = {phase: 'completed', request: {request_id: 'another-tab'}, candidates: ['Wrong.']};
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  fixture.lookup('generation-account').value = 'a'; fixture.lookup('generation-model').value = 'model'; fixture.lookup('generation-count').value = '5'; fixture.lookup('generation-target').value = 'default';
+  fixture.lookup('generation-start').listeners.get('click')(); await fixture.settle();
+  assert.equal(fixture.timers.size, 1);
+  failRead = false; phase = 'dispatched'; await fixture.poll(); assert.match(fixture.lookup('generation-status').textContent, /模型正在生成/);
+  phase = 'completed'; await fixture.poll();
+  assert.equal(fixture.lookup('generation-preview').value, 'Hello.\nReady.');
+  assert.equal(fixture.timers.size, 0); assert.equal(fixture.lookup('auto-refresh').checked, false);
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1);
+  fixture.lookup('generation-apply').listeners.get('click')();
+  assert.deepEqual(JSON.parse(fixture.lookup('config-json').value).execution.prompt_pool, ['Hello.', 'Ready.']);
+});
+test('invalid snapshots never partially replace applied config, accounts or drafts', async () => {
+  let invalid = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    if (url.endsWith('/snapshot') && invalid) return response({...data.snapshot, accounts: null, config: {...data.config, enabled: true}, summary: {...data.summary, enabled: true}});
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  fixture.lookup('config-json').value = '{unfinished draft'; fixture.lookup('config-json').listeners.get('input')();
+  invalid = true; fixture.lookup('refresh').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('mode-title').textContent, /仅查看与查询额度/);
+  assert.equal(fixture.lookup('config-json').value, '{unfinished draft');
+  assert.match(fixture.lookup('notice').textContent, /无法识别的数据/);
+});
+test('snapshot versions reject regressions and accept a new instance starting at a lower sequence', async () => {
+  let version = 10, instance = 'first', enabled = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    if (url.endsWith('/snapshot')) { const snapshot = data.snapshot; return response({...snapshot, instance_id: instance, snapshot_seq: version, summary: {...snapshot.summary, enabled}, config: {...snapshot.config, enabled}}); }
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  enabled = true; version = 9; fixture.lookup('refresh').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('mode-title').textContent, /仅查看与查询额度/);
+  instance = 'second'; version = 1; fixture.lookup('refresh').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('mode-title').textContent, /模型唤醒已开启/);
+  instance = 'first'; version = 99; enabled = false; fixture.lookup('refresh').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('mode-title').textContent, /模型唤醒已开启/);
+});
+test('accepted reload, recheck and connection checks remain accepted if their snapshot read fails', async () => {
+  for (const action of ['reload', 'recheck', 'quota-connection-check']) {
+    let accepted = false;
+    const fixture = createPanelFixture(async (url, options, data) => {
+      data.capabilities.quota_bridge = {mode: 'host'};
+      if (options.method === 'POST') {accepted = true; return response({status: 'scheduled'});}
+      if (accepted && url.endsWith('/snapshot')) throw new Error('followup snapshot unavailable');
+      return response(data[url.split('/').pop()]);
+    });
+    await loginFixture(fixture);
+    fixture.lookup(action).listeners.get('click')(); await fixture.settle();
+    assert.match(fixture.lookup('notice').textContent, action === 'quota-connection-check' ? /连通性检查已完成；状态暂未读取成功/ : /操作已接受；状态暂未读取成功/);
+    assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1);
+    assert.equal(fixture.lookup('workspace').hidden, false);
+  }
+});
+test('blocked tasks expose known retry reasons without reflecting arbitrary error codes', async () => {
+  let submitted = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    if (options.method === 'POST') {submitted = true; return response({job_id: 'blocked'}, 202);}
+    if (submitted) data.summary.scheduler.jobs = [{...trackedEnvelope('blocked', 'quota_query', 'queued'), blocked_reason: 'account_inventory_unavailable', retry_at: new Date(Date.now() + 5000).toISOString()}];
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture); fixture.lookup('quota-query').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('quota-query-status').textContent, /暂时阻塞：账号清单暂不可用.*下次检查/);
+  assert.equal(fixture.timers.size, 1);
+  fixture.lookup('disconnect').listeners.get('click')();
+});
+test('a task accepted by a restarted server resolves by ID and keeps its confirmed result across a later restart', async () => {
+  let submitted = false, completed = false, restartAgain = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    if (options.method === 'POST') {submitted = true; data.instance_id = 'new-after-post'; return response({job_id: 'accepted-new-instance'}, 202);}
+    if (submitted) data.summary.scheduler.jobs = restartAgain ? [] : [trackedEnvelope('accepted-new-instance', 'quota_query', completed ? 'completed' : 'queued', {completed: completed ? 1 : 0, total: 1})];
+    if (restartAgain) data.instance_id = 'next-instance';
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture); fixture.lookup('quota-query').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('quota-query-status').textContent, /等待查询/);
+  assert.equal(fixture.timers.size, 1);
+  completed = true; await fixture.poll();
+  assert.match(fixture.lookup('quota-query-status').textContent, /查询结束.*成功 1/);
+  restartAgain = true; fixture.lookup('refresh').listeners.get('click')(); await fixture.settle();
+  assert.match(fixture.lookup('quota-query-status').textContent, /查询结束.*成功 1/);
+  assert.equal(fixture.timers.size, 0);
+});
+test('reconnecting prefers retained terminal wake jobs over a legacy verifying status', async () => {
+  for (const phase of ['unknown', 'skipped', 'blocked']) {
+    let submitted = false, terminal = false;
+    const fixture = createPanelFixture(async (url, options, data) => {
+      data.accounts = {a: {ID: 'a', Enabled: true}}; data.capabilities.StableAccountIdentity = data.capabilities.ExactAccountExecution = true;
+      if (options.method === 'POST') {submitted = true; return response({job_id: 'wake-reconnect'}, 202);}
+      data.summary.scheduler.manual_wake = {phase: 'verifying', account_id: 'a'};
+      data.summary.scheduler.jobs = submitted ? [trackedEnvelope('wake-reconnect', 'manual_wake', terminal ? phase : 'verifying', {account_id: 'a', finished_at: terminal ? new Date().toISOString() : '', last_error: terminal ? 'send_not_sent' : ''})] : [];
+      if (!submitted) data.summary.scheduler.manual_wake = {};
+      return response(data[url.split('/').pop()]);
+    });
+    await loginFixture(fixture);
+    descendants(fixture.lookup('account-list')).find(item => item.dataset.wakeAccount === 'a').listeners.get('click')(); await fixture.settle();
+    assert.equal(fixture.timers.size, 1);
+    terminal = true; await fixture.poll();
+    assert.equal(fixture.timers.size, 0);
+    fixture.lookup('disconnect').listeners.get('click')(); await loginFixture(fixture);
+    assert.equal(fixture.timers.size, 0, 'legacy verifying state must not resume endless polling after reconnect');
+    const text = descendants(fixture.lookup('account-list')).map(item => item.textContent).join(' ');
+    assert.match(text, phase === 'unknown' ? /送达或窗口启动未确认，不自动重试/ : /未发送，安全条件不满足/);
+    assert.doesNotMatch(text, /请求已发送，等待服务端窗口证据/);
+    fixture.lookup('disconnect').listeners.get('click')();
+  }
+});
+test('newly accepted registry jobs are visible on connection even when legacy latest fields lag', async () => {
+  let finished = false;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.summary.scheduler.quota_query = {phase: 'completed', completed: 99, total: 99};
+    data.summary.scheduler.jobs = [trackedEnvelope('previous', 'quota_query', 'completed', {completed: 99, total: 99}), trackedEnvelope('newest', 'quota_query', finished ? 'completed' : 'queued', {completed: finished ? 1 : 0, total: 1})];
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  assert.match(fixture.lookup('quota-query-status').textContent, /等待查询/);
+  assert.equal(fixture.timers.size, 1);
+  finished = true; await fixture.poll();
+  assert.match(fixture.lookup('quota-query-status').textContent, /查询结束.*成功 1/);
+  assert.equal(fixture.timers.size, 0);
+});
+test('terminal failures cannot be rendered as temporary blocks with a future retry', async () => {
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.summary.scheduler.jobs = [{...trackedEnvelope('failed-job', 'quota_query', 'failed', {last_error: 'quota_query_timeout', finished_at: new Date().toISOString()}), blocked_reason: 'account_inventory_unavailable', retry_at: new Date(Date.now() + 10000).toISOString()}];
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  assert.match(fixture.lookup('quota-query-status').textContent, /任务失败，不自动重试.*额度查询超时/);
+  assert.doesNotMatch(fixture.lookup('quota-query-status').textContent, /暂时阻塞|下次检查/);
+  assert.equal(fixture.timers.size, 0);
 });

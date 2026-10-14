@@ -44,6 +44,11 @@ type Engine struct {
 	published                   atomic.Pointer[publishedStatus]
 	mu                          sync.Mutex
 	queueMu                     sync.Mutex
+	publicationMu               sync.Mutex
+	jobs                        []JobStatus // guarded by queueMu; bounded immutable copies
+	queuePoisoned               bool        // guarded by queueMu; refuses jobs after a failed commit
+	manualJobID                 string
+	manualWakeJobID             string
 	activity                    []core.ActivityEvent
 	observations                []core.QuotaObservation
 	wake                        chan struct{}
@@ -104,6 +109,9 @@ func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, 
 		s.GenerationJob.Phase, s.GenerationJob.ErrorCode, s.GenerationJob.FinishedAt = "unknown", "interrupted_no_retry", clock.Now()
 	}
 	e := &Engine{cfg: cfg, host: host, store: store, clock: clock, random: random, state: s, wake: make(chan struct{}, 1), nextRead: map[core.AccountID]time.Time{}, queryEpoch: clock.Now(), nextPreflight: map[core.AccountID]time.Time{}, readFailures: map[core.AccountID]int{}, activityEpoch: map[core.AccountID]uint64{}}
+	if s.GenerationJob != nil {
+		e.recordGenerationJob()
+	}
 	if err = e.commit(context.Background()); err != nil {
 		return nil, err
 	}
@@ -114,6 +122,10 @@ func copyConfig(c config.Config) config.Config {
 	var out config.Config
 	_ = json.Unmarshal(b, &out)
 	out.ManualWakeDisabled = c.ManualWakeDisabled
+	if c.BusinessEnabled != nil {
+		enabled := *c.BusinessEnabled
+		out.BusinessEnabled = &enabled
+	}
 	return out
 }
 func cloneState(s core.CoreState) core.CoreState {
@@ -226,6 +238,7 @@ func (e *Engine) commit(ctx context.Context) error {
 	if err != nil {
 		e.poisoned = true
 		e.lastError = "durable_commit_failed"
+		e.failUncommittedJobs()
 		return errors.New("durable_commit_failed")
 	}
 	e.state.Revision = r
@@ -364,15 +377,22 @@ func (e *Engine) Step(ctx context.Context) error {
 	}
 	e.drain()
 	e.pruneActivity(e.clock.Now())
-	caps, err := e.host.Capabilities(ctx)
+	capabilityCtx, cancelCapabilities := context.WithTimeout(ctx, e.cfg.Execution.QuotaReadTimeout.Value())
+	caps, err := e.host.Capabilities(capabilityCtx)
+	if err == nil && capabilityCtx.Err() != nil {
+		err = capabilityCtx.Err()
+	}
+	cancelCapabilities()
 	if err != nil {
 		e.lastError = "capability_read_failed"
+		e.blockManualJobs(e.lastError, e.clock.Now().Add(5*time.Second))
 		return e.failStep(ctx, before, e.lastError)
 	}
 	e.caps = caps
 	now := e.clock.Now()
 	if e.inventoryFailed && now.Before(e.nextInventory) {
 		e.lastError = "account_read_failed"
+		e.blockManualJobs(e.lastError, e.nextInventory)
 		return e.failStep(ctx, before, e.lastError)
 	}
 	if e.inventory == nil || !now.Before(e.nextInventory) {
@@ -387,6 +407,7 @@ func (e *Engine) Step(ctx context.Context) error {
 			e.inventoryFailed = true
 			e.nextInventory = e.clock.Now().Add(30 * time.Second)
 			e.lastError = "account_read_failed"
+			e.blockManualJobs(e.lastError, e.nextInventory)
 			return e.failStep(ctx, before, e.lastError)
 		}
 		e.inventoryFailed = false
@@ -394,6 +415,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		e.nextInventory = now.Add(30 * time.Second)
 	}
 	core.ReconcileAccounts(&e.state, e.inventory, now)
+	e.clearManualJobBlocks()
 	for id := range e.nextRead {
 		if _, ok := e.state.Accounts[id]; !ok {
 			delete(e.nextRead, id)
@@ -593,6 +615,9 @@ func (e *Engine) Step(ctx context.Context) error {
 func (e *Engine) commitChanged(ctx context.Context, before []byte) error {
 	after, _ := json.Marshal(e.state)
 	if bytes.Equal(before, after) {
+		// Query-only outcomes can be terminal without changing durable account
+		// state (for example, an unavailable adapter or an empty inventory).
+		e.confirmJobsCommitted()
 		return nil
 	}
 	return e.commit(ctx)

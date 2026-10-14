@@ -10,47 +10,69 @@ import (
 )
 
 type ManualWakeStatus struct {
-	AccountID  core.AccountID            `json:"account_id,omitempty"`
-	Generation core.CredentialGeneration `json:"-"`
-	Phase      string                    `json:"phase"`
-	LastError  string                    `json:"last_error,omitempty"`
-	EventID    core.EventID              `json:"event_id,omitempty"`
-	StartedAt  time.Time                 `json:"started_at"`
-	FinishedAt time.Time                 `json:"finished_at"`
+	JobID         string                    `json:"job_id,omitempty"`
+	BlockedReason string                    `json:"blocked_reason,omitempty"`
+	RetryAt       time.Time                 `json:"retry_at,omitempty"`
+	AccountID     core.AccountID            `json:"account_id,omitempty"`
+	Generation    core.CredentialGeneration `json:"-"`
+	Phase         string                    `json:"phase"`
+	LastError     string                    `json:"last_error,omitempty"`
+	EventID       core.EventID              `json:"event_id,omitempty"`
+	StartedAt     time.Time                 `json:"started_at"`
+	FinishedAt    time.Time                 `json:"finished_at"`
 }
 
 func (e *Engine) QueueManualWake(id core.AccountID) string {
+	status, _ := e.QueueManualWakeJob(id)
+	return status
+}
+
+func (e *Engine) QueueManualWakeJob(id core.AccountID) (string, string) {
 	e.queueMu.Lock()
-	defer e.queueMu.Unlock()
+	publishQueued := false
+	defer func() {
+		e.queueMu.Unlock()
+		if publishQueued {
+			e.publishQueuedJobs()
+		}
+	}()
 	if e.manualWakeActive {
 		if e.manualWakeTarget == id {
-			return "already_queued"
+			publishQueued = true
+			return "already_queued", e.manualWakeJobID
 		}
-		return "busy"
+		return "busy", ""
 	}
 	if e.manualActive || e.generationActive {
-		return "busy"
+		return "busy", ""
 	}
 	account, exists := e.Snapshot().Accounts[id]
 	if id == "" || !exists {
-		return "account_not_found"
+		return "account_not_found", ""
 	}
 	if account.Task != nil && account.Task.OperationID != "" {
-		return "delivery_evidence_pending"
+		return "delivery_evidence_pending", ""
+	}
+	if e.queuePoisoned || e.lastPublishedCommitFailed() {
+		return "durable_commit_failed", ""
 	}
 	e.manualWakeRequested, e.manualWakeActive = true, true
+	e.manualWakeJobID = newJobID()
 	e.manualWakeTarget, e.manualWakeGeneration = id, account.Generation
+	queued := ManualWakeStatus{JobID: e.manualWakeJobID, AccountID: id, Generation: account.Generation, Phase: "queued", StartedAt: e.clock.Now()}
+	e.putJobLocked(JobStatus{JobID: e.manualWakeJobID, Kind: "manual_wake", Phase: "queued", AccountID: id, ManualWake: &queued})
+	publishQueued = true
 	e.Notify()
-	return "queued"
+	return "queued", e.manualWakeJobID
 }
 
 func (e *Engine) startManualWake() {
 	e.queueMu.Lock()
-	requested, target, generation := e.manualWakeRequested, e.manualWakeTarget, e.manualWakeGeneration
+	requested, target, generation, jobID := e.manualWakeRequested, e.manualWakeTarget, e.manualWakeGeneration, e.manualWakeJobID
 	e.manualWakeRequested = false
 	e.queueMu.Unlock()
 	if requested {
-		e.manualWake = ManualWakeStatus{AccountID: target, Generation: generation, Phase: "queued", StartedAt: e.clock.Now()}
+		e.manualWake = ManualWakeStatus{JobID: jobID, AccountID: target, Generation: generation, Phase: "queued", StartedAt: e.clock.Now()}
 		e.nextInventory = time.Time{}
 	}
 }
@@ -58,6 +80,7 @@ func (e *Engine) startManualWake() {
 func (e *Engine) finishManualWake(phase, code string) {
 	e.manualWake.Phase, e.manualWake.LastError = phase, code
 	e.manualWake.FinishedAt = e.clock.Now()
+	e.manualWake.BlockedReason, e.manualWake.RetryAt = "", time.Time{}
 	if e.manualWake.EventID == "" && (phase == "blocked" || phase == "failed") {
 		status := "failed"
 		if phase == "blocked" {
@@ -65,6 +88,7 @@ func (e *Engine) finishManualWake(phase, code string) {
 		}
 		core.AppendHistory(&e.state, core.HistoryEntry{Kind: "wake", AccountID: e.manualWake.AccountID, Generation: e.manualWake.Generation, Status: status, ErrorCode: code, StartedAt: e.manualWake.StartedAt, FinishedAt: e.manualWake.FinishedAt, Sources: []core.ActionSource{{Trigger: "manual_wake"}}})
 	}
+	e.recordWakeJob()
 	e.queueMu.Lock()
 	e.manualWakeActive = false
 	e.queueMu.Unlock()
@@ -107,6 +131,8 @@ func (e *Engine) stepManualWake(ctx context.Context) error {
 		return nil
 	}
 	e.manualWake.Phase = "running"
+	e.recordWakeJob()
+	e.publish(false)
 	readFence := e.state.NextReadSequence
 	if err := e.observe(ctx, id); err != nil {
 		e.finishManualWake("failed", quotaReadErrorCode(err))

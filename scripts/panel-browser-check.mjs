@@ -15,6 +15,9 @@ const temp = await mkdtemp(join(tmpdir(), 'window-refresh-panel-browser-'));
 let browser, server, ws;
 const posts = [];
 const reads = [];
+let snapshotSequence = 0, jobSequence = 0;
+const jobs = new Map();
+function recordJob(kind, detail) { jobs.set(detail.job_id, {kind, detail}); summary.scheduler[kind] = detail; }
 let unauthorized = false, conflict = false, revision = 'a'.repeat(64);
 let config = {
   schema_version: 1, enabled: false, timezone: 'Asia/Shanghai',
@@ -74,8 +77,8 @@ try {
         if (path === 'prompt-generation') {
           const request = JSON.parse(body);
           assert.equal(request.account_id, 'fixture-account');
-          summary.scheduler.prompt_generation = {request, phase:'completed', candidates:['Hello.', 'Hi.', 'Ready.', 'Yes.', 'OK.']};
-          json(res,202,{status:'queued',request_id:request.request_id}); return;
+          recordJob('prompt_generation', {job_id:request.request_id, request, phase:'completed', candidates:['Hello.', 'Hi.', 'Ready.', 'Yes.', 'OK.']});
+          json(res,202,{status:'queued',request_id:request.request_id,job_id:request.request_id}); return;
         }
         if (path === 'quota-connection-check') {
           assert.equal(body, '', 'Connection check received credential input');
@@ -83,26 +86,29 @@ try {
           json(res, 200, {status:'verified'}); return;
         }
         if (path === 'quota-query') {
+          const jobID = 'browser-job-' + (++jobSequence);
+          recordJob('quota_query', {job_id:jobID, account_id: body ? JSON.parse(body).account_id : '', phase:'queued'});
           if (body) {
             const selected = JSON.parse(body);
             assert.deepEqual(Object.keys(selected), ['account_id'], 'Account query received model input');
             assert.ok(Object.hasOwn(accounts, selected.account_id), 'Wrong account selected');
             const accountID = selected.account_id, failed = accountID !== 'fixture-account';
-            // Do not publish immediately: the panel must retain its optimistic
-            // queued state until the runtime's next snapshot catches up.
+            // Publish acceptance immediately; execution completes asynchronously.
             setTimeout(() => {
-              summary.scheduler.quota_query = {account_id:accountID,phase:'completed',total:1,completed:failed?0:1,failed:failed?1:0,skipped:0,started_at:new Date().toISOString(),finished_at:new Date().toISOString()};
+              recordJob('quota_query', {job_id:jobID,account_id:accountID,phase:'completed',total:1,completed:failed?0:1,failed:failed?1:0,skipped:0,started_at:new Date().toISOString(),finished_at:new Date().toISOString()});
               if (!failed) {
                 accounts[accountID].FiveHour.Remaining.Value = 70;
                 accounts[accountID].FiveHour.Source = 'cpa_wham_usage';
               }
             }, 150);
-            json(res,202,{status:'queued',account_id:accountID});return;
+            json(res,202,{status:'queued',account_id:accountID,job_id:jobID});return;
           }
-          summary.scheduler.quota_query = {phase:'completed',total:2,completed:2,failed:0,skipped:0,started_at:new Date().toISOString(),finished_at:new Date().toISOString()};
-          accounts['fixture-account'].FiveHour.Remaining.Value = 71;
-          accounts['fixture-account'].FiveHour.Source = 'cpa_wham_usage';
-          json(res,202,{status:'queued'});return;
+          setTimeout(() => {
+            recordJob('quota_query', {job_id:jobID,phase:'completed',total:2,completed:2,failed:0,skipped:0,started_at:new Date().toISOString(),finished_at:new Date().toISOString()});
+            accounts['fixture-account'].FiveHour.Remaining.Value = 71;
+            accounts['fixture-account'].FiveHour.Source = 'cpa_wham_usage';
+          }, 150);
+          json(res,202,{status:'queued',job_id:jobID});return;
         }
         if (path === 'config') {
           const edit = JSON.parse(body);
@@ -116,7 +122,9 @@ try {
       if (path === 'history') {
         json(res,200,{entries:[{id:1,kind:'wake',account_id:'fixture-account',started_at:now,status:'verified',prompt:'<script>text-only</script>',sources:[{trigger:'daily_schedule',rule_id:'morning',evidence_source:'cpa_wham_usage',evidence_at:now}]}],next_cursor:0,retention_days:30,maximum_entries:10000}); return;
       }
-      const values = { summary, accounts, config, capabilities, 'config-editor': { config, revision, disk_matches_running: true } };
+      summary.enabled = config.enabled;
+      summary.scheduler.jobs = [...jobs.entries()].map(([job_id, {kind, detail}]) => ({job_id, kind, phase:detail.phase, account_id:detail.account_id || detail.request?.account_id || '', [kind]:detail}));
+      const values = { snapshot: {instance_id:'browser-instance',snapshot_seq:++snapshotSequence,summary,accounts,config,capabilities}, summary, accounts, config, capabilities, 'config-editor': { config, revision, disk_matches_running: true } };
       json(res, 200, values[path] ?? {});
     } catch (err) { errors.push(String(err)); json(res, 500, { error: 'fixture error' }); }
   });
@@ -133,8 +141,13 @@ try {
       try { port = (await readFile(join(temp, 'DevToolsActivePort'), 'utf8')).split('\n')[0]; return !!port; } catch { return false; }
     }, 'Chromium did not start', 30000);
   } catch (error) { console.error(browserLog); throw error; }
-  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-  ws = new WebSocket(targets.find(t => t.type === 'page').webSocketDebuggerUrl);
+  let pageTarget;
+  await waitFor(async () => {
+    const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+    pageTarget = targets.find(target => target.type === 'page');
+    return !!pageTarget;
+  }, 'Chromium did not create a page target');
+  ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
   await new Promise((r, j) => { ws.addEventListener('open', r, { once: true }); ws.addEventListener('error', j, { once: true }); });
   let serial = 0; const pending = new Map(), caughtExceptions = [];
   function cdp(method, params = {}) { return new Promise((r, j) => { const id = ++serial; const timer = setTimeout(() => { pending.delete(id); j(new Error(`CDP timeout: ${method}`)); }, 15000); pending.set(id, { r, j, timer }); ws.send(JSON.stringify({ id, method, params })); }); }
@@ -191,7 +204,7 @@ try {
       })()`);
       const beforeReload = reads.length;
       await cdp('Page.reload');
-      await waitFor(async () => reads.length >= beforeReload + 5 && await evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Saved CPA credentials did not auto-connect');
+      await waitFor(async () => reads.length >= beforeReload + 2 && await evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Saved CPA credentials did not auto-connect');
       assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(legacy ? 'managementKey' : 'cli-proxy-auth')})`), saved, 'Auto-connect modified host storage');
       assert.equal(await evaluate('document.getElementById("management-key").value'), '', 'Auto-connect exposed key in form');
       await evaluate('document.getElementById("disconnect").click()');
@@ -228,6 +241,8 @@ try {
   await evaluate('document.querySelector("[data-tab=accounts]").click()');
   assert.equal(await evaluate('document.querySelectorAll("[data-quota-account]").length'),2,'Account query buttons missing');
   assert.equal(await evaluate('Array.from(document.querySelectorAll("[data-quota-account]")).every(button=>!button.closest("details"))'),true,'Account query was hidden in diagnostics');
+  await evaluate('document.getElementById("auto-refresh").click()');
+  assert.equal(await evaluate('document.getElementById("auto-refresh").checked'),false,'Manual query regression requires page polling off');
   const singleQueryCount = posts.length;
   await evaluate(`{ const button=Array.from(document.querySelectorAll('[data-quota-account]')).find(item=>item.dataset.quotaAccount==='fixture-account'); button.click(); button.click(); }`);
   await waitFor(()=>posts.length===singleQueryCount+1,'Account query was not sent');
@@ -253,6 +268,11 @@ try {
   await waitFor(() => evaluate('document.getElementById("quota-query-status").textContent.includes("全部账号 · 查询结束") && document.getElementById("account-list").textContent.includes("71%")'), 'Current batch query result did not display');
   assert.equal(posts.filter(p=>p.path==='quota-query').length,3,'Manual query duplicated');
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("71%") && document.getElementById("account-list").textContent.includes("主动查询")'),true,'Manual quota did not update panel');
+  assert.equal(await evaluate('document.getElementById("auto-refresh").checked'),false,'Query tracking enabled continuous page polling');
+  const completedReads = reads.length;
+  await new Promise(resolve => setTimeout(resolve, 5500));
+  assert.equal(reads.length,completedReads,'Query tracking kept polling after completion');
+  await evaluate('document.getElementById("auto-refresh").click()');
   await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 960, deviceScaleFactor: 1, mobile: false });
   let capture = await cdp('Page.captureScreenshot');
   await writeFile(join(temp, 'panel-overview-desktop.png'), Buffer.from(capture.data, 'base64'));

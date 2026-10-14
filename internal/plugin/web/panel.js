@@ -13,7 +13,7 @@
     if (url.origin !== location.origin || !url.pathname.endsWith(API)) throw new PanelError('invalid_endpoint');
     return url.pathname;
   }
-  const paths = new Set(['/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query', '/quota-connection-check', '/manual-wake', '/prompt-generation', '/history']);
+  const paths = new Set(['/snapshot', '/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query', '/quota-connection-check', '/manual-wake', '/prompt-generation', '/history']);
   class PanelError extends Error {
     constructor(code, status) { super(code); this.name = 'PanelError'; this.code = code; this.status = status || 0; }
   }
@@ -260,6 +260,10 @@
       quota_management_http_failed: 'CPA 管理接口返回异常状态', quota_management_bridge_failed: '无法连接管理桥，请检查本地地址与服务状态',
       quota_management_bridge_missing: '管理桥地址或进程密钥未配置',
       account_identity_unavailable: '无法核对账号身份，请检查 CPA 账号凭据', account_binding_changed: '账号身份已更换，请重新查询',
+      account_inventory_unavailable: '账号清单暂不可用，请检查 CPA 账号状态',
+      account_read_failed: '账号清单读取失败，请检查 CPA 账号状态与宿主日志',
+      capability_read_failed: '宿主能力读取失败，请检查 CPA 插件接口与宿主日志',
+      durable_commit_failed: '后台状态未能保存，任务已停止；请检查存储与日志并重启后台',
       quota_read_failed: '可手动重试'
     };
     const stages = {credential: '读取凭据', proxy: '解析账号代理', operation_open: '创建宿主操作', operation_cancel: '取消宿主操作', host_http: '宿主请求', proxy_http: '账号代理请求', management_config: '管理桥配置', management_http: '管理接口', management_parse: '管理响应解析', upstream_http: '上游响应', parse: '额度解析', binding: '账号核对', query: '查询'};
@@ -283,6 +287,8 @@
   let pendingQuotaQuery = null;
   let pendingManualWake = null;
   let noticeSource = '';
+  let snapshotInstance = '', snapshotVersion = -1, readSequence = 0, appliedRead = 0, mutationEpoch = 0;
+  const retiredInstances = new Set();
   let pollFailures = 0, pollController = null;
   let pendingGeneration = null, previewGeneration = '', historyCursor = 0, historyNextCursor = 0, historyLoaded = false, historySequence = 0;
   let summary = null, runningConfig = null, accounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
@@ -302,6 +308,7 @@
     $('auto-refresh').checked = false;
     $('background-refresh').checked = false; $('background-refresh').disabled = true;
     $('refresh-status').textContent = '自动刷新已关闭';
+    snapshotInstance = ''; snapshotVersion = -1; readSequence++; appliedRead = readSequence; mutationEpoch++; retiredInstances.clear();
     summary = null; runningConfig = null; accounts = {}; capabilities = {}; editor.clear(); diskMatchesRunning = true;
     expandedAccounts.clear();
     pendingQuotaQuery = null;
@@ -337,6 +344,10 @@
     return messages[error.code] || '操作未完成，请检查规则或服务状态。';
   }
   function report(error, source) { if (!['stale', 'disconnected', 'cancelled'].includes(error.code)) notice(errorMessage(error), 'error', source); }
+  function reportAcceptedRead(error) {
+    if (error.code === 'authentication') report(error);
+    else if (!['stale', 'disconnected', 'cancelled'].includes(error.code)) notice('任务已接受；' + errorMessage(error), 'warning', 'snapshots');
+  }
   function badge(text, type) { return el('span', text, 'badge' + (type ? ' ' + type : '')); }
   function date(value) {
     const time = resetTime(value);
@@ -373,14 +384,50 @@
     $('last-error').textContent = (summary.last_error ? '最近诊断：' + summary.last_error : '最近诊断：无错误') + (diagnostic ? '；最近额度失败：' + quotaFailure({last_error: diagnostic.code, diagnostic}) : '');
     renderQuotaQuery(); renderSchedulePlan(); renderGeneration();
   }
-  function quotaJob() {
-    const job = summary?.scheduler?.quota_query || {};
-    if (pendingQuotaQuery) {
-      if (!summary?.running || ((job.account_id || '') === pendingQuotaQuery.target &&
-          (job.started_at !== pendingQuotaQuery.previousStart || ['queued', 'running'].includes(job.phase)))) pendingQuotaQuery = null;
-      else return {phase: 'queued', account_id: pendingQuotaQuery.target};
+  function activeJob(job) {
+    if (job?.phase === 'blocked' && resetTime(job.finished_at || job[job.kind]?.finished_at) !== null) return false;
+    return ['queued', 'running', 'blocked', 'dispatched', 'verifying'].includes(job?.phase);
+  }
+  function registryJob(job, kind) {
+    const detail = {...(job[kind] || {}), job_id: job.job_id, phase: job.phase, account_id: job.account_id || '', blocked_reason: job.blocked_reason, retry_at: job.retry_at};
+    if (detail.phase === 'blocked' && resetTime(detail.finished_at) !== null) detail.phase = 'skipped';
+    return detail;
+  }
+  function trackedJob(pending, kind) {
+    if (pending?.detail) return pending.detail;
+    const jobs = summary?.scheduler?.jobs || [];
+    for (let index = jobs.length - 1; index >= 0; index--) if (jobs[index].kind === kind) return registryJob(jobs[index], kind);
+    return summary?.scheduler?.[kind] || {};
+  }
+  function quotaJob() { return trackedJob(pendingQuotaQuery, 'quota_query'); }
+  function generationJob() { return trackedJob(pendingGeneration, 'prompt_generation'); }
+  function startTracking(target) {
+    return {target: target || '', instance_id: snapshotInstance, job_id: '', detail: {phase: 'queued', account_id: target || ''}};
+  }
+  function acceptedJob(pending, result) {
+    if (typeof result?.job_id !== 'string' || !result.job_id) {
+      pending.detail = {phase: 'unconfirmed', account_id: pending.target};
+      throw new PanelError('invalid_response');
     }
-    return job;
+    pending.job_id = result.job_id;
+    pending.detail = {phase: 'queued', account_id: pending.target};
+  }
+  function reconcileJob(pending, kind) {
+    if (!pending?.job_id) return;
+    const job = summary?.scheduler?.jobs?.find(item => item.job_id === pending.job_id && item.kind === kind);
+    if (job) {
+      pending.instance_id = snapshotInstance;
+      pending.detail = registryJob(job, kind);
+    } else if (activeJob(pending.detail)) pending.detail = {phase: pending.instance_id !== snapshotInstance ? 'interrupted' : 'lost', account_id: pending.target};
+    if (!summary.running && activeJob(pending.detail)) pending.detail = {phase: 'interrupted', account_id: pending.target};
+  }
+  function jobProblem(job) {
+    if (job.phase === 'interrupted') return '后台已停止或重启，任务已中断；请核对结果后再操作';
+    if (job.phase === 'lost') return '任务记录已不可用，请核对账号数据后再操作';
+    if (job.phase === 'unconfirmed') return '操作结果尚未确认，请手动更新页面核对；不会自动重试';
+    if (job.phase === 'failed') return '任务失败，不自动重试：' + quotaFailure({last_error: job.last_error || job.error_code || job.blocked_reason, diagnostic: job.diagnostic});
+    if (activeJob(job) && job.blocked_reason) return '暂时阻塞：' + ((Object.hasOwn(holds, job.blocked_reason) ? holds[job.blocked_reason] : '') || quotaFailure({last_error: job.blocked_reason})) + (resetTime(job.retry_at) !== null ? ' · 下次检查 ' + date(job.retry_at) : '');
+    return '';
   }
   function quotaQueryReason() {
     if (!summary?.running) return '后台未运行';
@@ -389,9 +436,9 @@
   }
   function renderQuotaQuery() {
     const query = runningConfig?.quota_query || {}, job = quotaJob();
-    const running = job.phase === 'queued' || job.phase === 'running';
+    const running = activeJob(job);
     const phases = {queued: '等待查询', running: '正在查询', completed: '查询结束', cancelled: '已取消', unavailable: '额度查询接口未就绪'};
-    const progress = job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' + (job.failed && job.last_error ? '；最近失败：' + quotaFailure(job) : '') : '尚未执行手动查询';
+    const progress = jobProblem(job) || (job.phase ? (job.account_id ? '单个账号 · ' : '全部账号 · ') + (phases[job.phase] || job.phase) + ' · 成功 ' + (job.completed || 0) + '，失败 ' + (job.failed || 0) + '，跳过 ' + (job.skipped || 0) + ' / 共 ' + (job.total || 0) + ' 个账号' + (job.failed && job.last_error ? '；最近失败：' + quotaFailure(job) : '') : '尚未执行手动查询');
     const reason = quotaQueryReason();
     const periodic = [['five_hour', '5 小时'], ['weekly', '7 天']].filter(([window]) => query[window]?.periodic_enabled !== false).map(([window, label]) => label + '（' + (query[window]?.interval && query[window].interval !== '0s' ? query[window].interval : query.interval || '30s') + '）');
     $('quota-query-status').textContent = '定期查询：' + (query.automatic ? periodic.join(' / ') || '无参与策略' : '关闭') + ' · 5 小时到期查询：' + (query.on_five_hour_expiry ? '开启' : '关闭') + ' · 周到期查询：' + (query.on_weekly_expiry ? '开启' : '关闭') + ' · ' + (reason || progress);
@@ -461,11 +508,10 @@
       const option = el('option', id); option.value = id; select.append(option);
     }
     select.value = selected;
-    const job = summary?.scheduler?.prompt_generation;
-    if (pendingGeneration && job?.request?.request_id === pendingGeneration.request_id) pendingGeneration = null;
+    const job = generationJob();
     const phases = {queued: '等待生成', running: '正在核对账号额度', dispatched: '模型正在生成', completed: '生成完成，尚未应用到草稿', failed: '生成失败，不自动重试', skipped: '未发送，安全条件不满足', unknown: '送达不确定，不自动重试'};
-    $('generation-status').textContent = pendingGeneration ? '生成操作待确认，请更新页面数据核对；不会自动重试。' : job ? (phases[job.phase] || job.phase) + (job.error_code ? ' · ' + job.error_code : '') : '仅在点击并确认后调用一次模型；生成结果不会自动保存。';
-    const running = pendingGeneration || ['queued', 'running', 'dispatched'].includes(job?.phase);
+    $('generation-status').textContent = jobProblem(job) || (job.phase ? (phases[job.phase] || '生成状态待确认') + (job.error_code ? ' · ' + quotaFailure({last_error: job.error_code}) : '') : '仅在点击并确认后调用一次模型；生成结果不会自动保存。');
+    const running = activeJob(job);
     $('generation-start').disabled = !session.connected() || actionBusy || !!running || summary?.host_enabled === false || !summary?.running || capabilities.QuotaAdapterReady !== true || capabilities.ExactAccountExecution !== true;
     if (job?.phase === 'completed' && Array.isArray(job.candidates) && previewGeneration !== job.request.request_id) {
       $('generation-preview').value = job.candidates.join('\n'); previewGeneration = job.request.request_id;
@@ -514,23 +560,28 @@
     if (!accountID || !model || !Number.isInteger(count) || count < 5 || count > 50) { report(new PanelError('invalid_config')); return; }
     if (!root.confirm('将使用账号 ' + accountID + ' 和模型 ' + model + ' 生成 ' + count + ' 条候选短句。这会发送真实模型请求、消耗额度，可能启动五小时窗口。生成后仍需预览并保存。继续？')) return;
     const generation = session.generation();
-    pendingGeneration = {request_id: root.crypto?.randomUUID ? root.crypto.randomUUID() : 'prompt-' + Date.now() + '-' + Math.random().toString(16).slice(2), account_id: accountID, model, count, target};
+    const request = {request_id: root.crypto?.randomUUID ? root.crypto.randomUUID() : 'prompt-' + Date.now() + '-' + Math.random().toString(16).slice(2), account_id: accountID, model, count, target};
+    pendingGeneration = startTracking(accountID); pendingGeneration.job_id = request.request_id;
+    let accepted = false;
     busy(true); renderGeneration();
     try {
-      await session.request('/prompt-generation', 'POST', pendingGeneration);
+      const result = await session.request('/prompt-generation', 'POST', request);
       if (generation !== session.generation()) return;
-      notice('已安排内容生成。不会自动保存或启用其他规则；请更新页面数据查看结果。');
+      mutationEpoch++; accepted = true; acceptedJob(pendingGeneration, result);
+      notice('已安排内容生成。正在更新进度；生成结果需要预览并保存。');
       await readSnapshots();
     } catch (error) {
+      if (error.code === 'authentication') { report(error); return; }
       if (generation !== session.generation()) return;
-      if (error.code !== 'write_unconfirmed') pendingGeneration = null;
-      report(error);
-    } finally { if (generation === session.generation()) { busy(false); renderGeneration(); } }
+      if (!accepted && error.code !== 'write_unconfirmed') pendingGeneration = null;
+      else if (!accepted) pendingGeneration.detail.phase = 'unconfirmed';
+      if (accepted) reportAcceptedRead(error); else report(error);
+    } finally { if (generation === session.generation()) { busy(false); renderGeneration(); schedulePoll(); } }
   });
   $('generation-apply').addEventListener('click', () => {
     if ($('generation-apply').disabled) return;
     try {
-      const job = summary?.scheduler?.prompt_generation;
+      const job = generationJob();
       if (job?.request?.request_id !== previewGeneration) throw new PanelError('invalid_config');
       const pool = [...new Set($('generation-preview').value.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];
       if (!pool.length || pool.length > 50 || pool.some(value => new TextEncoder().encode(value).length > 256)) throw new PanelError('invalid_config');
@@ -587,19 +638,19 @@
       header.append(name, badge(accountStatus, paused || pauseChanged || !a.Enabled ? 'warning' : '')); card.append(header);
       const windows = el('div', undefined, 'window-grid'); windows.append(windowCell('5 小时额度', a.FiveHour), windowCell('周额度', a.Weekly)); card.append(windows);
       const queryRow = el('div', undefined, 'account-query'), job = quotaJob();
-      const querying = ['queued', 'running'].includes(job.phase), selected = job.account_id === id;
+      const querying = activeJob(job), selected = job.account_id === id;
       const reason = quotaQueryReason();
       const queryButton = el('button', querying && selected ? '正在查询…' : '查询此账号额度', 'quiet');
       queryButton.type = 'button'; queryButton.dataset.quotaAccount = id;
-      queryButton.disabled = !session.connected() || actionBusy || !!reason || querying || ['queued', 'running'].includes(manualWakeJob().phase);
+      queryButton.disabled = !session.connected() || actionBusy || !!reason || querying || activeJob(manualWakeJob());
       queryButton.title = reason || (querying ? '请等待当前手动查询结束' : '只访问此账号的额度接口，不发送模型请求');
       queryButton.addEventListener('click', () => { if (!queryButton.disabled) void requestQuotaQuery(id); });
       let queryText = reason || '仅查询额度，不发送模型请求';
-      if (selected && job.phase) queryText = ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，' + quotaFailure(job) : job.skipped ? '未查询：账号已移除或绑定不存在' : '查询完成 · ' + date(job.finished_at));
+      if (selected && job.phase) queryText = jobProblem(job) || ({queued: '已排队，等待查询', running: '正在读取此账号额度', cancelled: '查询已取消', unavailable: '额度查询接口未就绪'}[job.phase]) || (job.failed ? '查询失败，' + quotaFailure(job) : job.skipped ? '未查询：账号已移除或绑定不存在' : '查询完成 · ' + date(job.finished_at));
       const queryStatus = el('span', queryText, 'hint'); queryStatus.setAttribute('role', 'status');
       queryRow.append(queryButton, queryStatus); card.append(queryRow);
       const wakeRow = el('div', undefined, 'account-query'), wake = manualWakeJob();
-      const waking = ['queued', 'running'].includes(wake.phase), wakeSelected = wake.account_id === id;
+      const waking = activeJob(wake), wakeSelected = wake.account_id === id;
       const wakeReason = manualWakeReason(a, runningConfig, summary, capabilities);
       const wakeButton = el('button', waking && wakeSelected ? '正在唤醒…' : '手动唤醒此账号', 'quiet');
       wakeButton.type = 'button'; wakeButton.dataset.wakeAccount = id;
@@ -608,8 +659,8 @@
       wakeButton.addEventListener('click', () => { if (!wakeButton.disabled) void requestManualWake(id); });
       let wakeText = wakeReason || '发送真实模型请求 · 消耗额度 · 需确认';
       if (wakeSelected && wake.phase) {
-        const phases = {queued: '已排队，等待手动唤醒', running: '正在核对额度并唤醒', verifying: '请求已发送，等待服务端窗口证据', completed: '已确认窗口启动'};
-        wakeText = phases[wake.phase] || '未完成唤醒：' + (holds[wake.last_error] || ({model_required: '请填写并保存唤醒模型', host_capability_unavailable: '宿主接口未就绪', dispatch_spacing: '发送间隔未到，请稍后重试', send_not_sent: '模型请求未送达，请稍后重试', credential_changed: '账号凭据已更换，请重新查询'}[wake.last_error]) || quotaFailure({last_error: wake.last_error}));
+        const phases = {queued: '已排队，等待手动唤醒', running: '正在核对额度并唤醒', verifying: '请求已发送，等待服务端窗口证据', completed: '已确认窗口启动', unknown: '送达或窗口启动未确认，不自动重试', skipped: '未发送，安全条件不满足'};
+        wakeText = jobProblem(wake) || phases[wake.phase] || '未完成唤醒：' + (holds[wake.last_error] || ({model_required: '请填写并保存唤醒模型', host_capability_unavailable: '宿主接口未就绪', dispatch_spacing: '发送间隔未到，请稍后重试', send_not_sent: '模型请求未送达，请稍后重试', credential_changed: '账号凭据已更换，请重新查询'}[wake.last_error]) || quotaFailure({last_error: wake.last_error}));
       }
       const wakeStatus = el('span', wakeText, 'hint'); wakeStatus.setAttribute('role', 'status');
       wakeRow.append(wakeButton, wakeStatus); card.append(wakeRow);
@@ -694,28 +745,40 @@
   }
   function busy(value) {
     actionBusy = value;
+    if (value) mutationEpoch++;
     for (const id of ['recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = value;
     for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button')) field.disabled = value || field.dataset.fixed === 'true';
     updateDraftBadge(); renderAccounts(); renderQuotaQuery(); renderCapabilities(); renderGeneration();
   }
   async function readSnapshots(signal) {
-    const generation = session.generation();
-    const [nextSummary, nextAccounts, nextCapabilities] = await Promise.all([session.request('/summary', 'GET', undefined, signal), session.request('/accounts', 'GET', undefined, signal), session.request('/capabilities', 'GET', undefined, signal)]);
-    if (generation !== session.generation() || signal?.aborted) return;
-    if (![nextSummary, nextAccounts, nextCapabilities].every(validObject)) throw new PanelError('invalid_response');
-    summary = nextSummary; accounts = nextAccounts; capabilities = nextCapabilities; renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
+    const generation = session.generation(), sequence = ++readSequence, epoch = mutationEpoch;
+    let snapshot;
+    try { snapshot = await session.request('/snapshot', 'GET', undefined, signal); }
+    catch (error) { if (error.code !== 'authentication' && (generation !== session.generation() || signal?.aborted || epoch !== mutationEpoch || sequence < appliedRead)) return false; throw error; }
+    if (generation !== session.generation() || signal?.aborted || epoch !== mutationEpoch || sequence < appliedRead) return false;
+    if (!validObject(snapshot) || typeof snapshot.instance_id !== 'string' || !snapshot.instance_id || !Number.isSafeInteger(snapshot.snapshot_seq) || snapshot.snapshot_seq < 0 || ![snapshot.summary, snapshot.accounts, snapshot.capabilities, snapshot.config].every(validObject) || !Array.isArray(snapshot.summary.scheduler?.jobs)) throw new PanelError('invalid_response');
+    if (retiredInstances.has(snapshot.instance_id) || (snapshot.instance_id === snapshotInstance && snapshot.snapshot_seq < snapshotVersion)) return false;
+    if (snapshotInstance && snapshotInstance !== snapshot.instance_id) retiredInstances.add(snapshotInstance);
+    snapshotInstance = snapshot.instance_id; snapshotVersion = snapshot.snapshot_seq; appliedRead = sequence;
+    summary = snapshot.summary; accounts = snapshot.accounts; capabilities = snapshot.capabilities; runningConfig = snapshot.config;
+    reconcileJob(pendingQuotaQuery, 'quota_query'); reconcileJob(pendingManualWake, 'manual_wake'); reconcileJob(pendingGeneration, 'prompt_generation');
+    renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
     if (noticeSource === 'snapshots') notice('');
     if (historyLoaded && !$('tab-plan').hidden) await readHistory(historyCursor, signal);
+    return true;
+  }
+  function shouldPoll() {
+    return $('auto-refresh').checked || (summary?.running === true && [quotaJob(), manualWakeJob(), generationJob(), ...(summary?.scheduler?.jobs || [])].some(activeJob));
   }
   function schedulePoll() {
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null;
     $('background-refresh').disabled = !$('auto-refresh').checked;
-    if (!session.connected() || !$('auto-refresh').checked) { $('refresh-status').textContent = '自动刷新已关闭'; return; }
+    if (!session.connected() || !shouldPoll()) { $('refresh-status').textContent = '自动刷新已关闭'; return; }
     if (root.navigator?.onLine === false) { $('refresh-status').textContent = '网络离线 · 联网后自动继续'; return; }
     if (document.hidden && !$('background-refresh').checked) { $('refresh-status').textContent = '标签页隐藏 · 返回后自动继续'; return; }
     const delay = Math.min(5000 * 2 ** Math.min(pollFailures, 4), 60000);
-    $('refresh-status').textContent = pollFailures ? '读取暂未恢复 · ' + delay / 1000 + ' 秒后自动重试，保留已有数据' : '持续刷新已开启' + ($('background-refresh').checked ? '（含后台标签页）' : '') + ' · 每 5 秒读取状态';
+    $('refresh-status').textContent = pollFailures ? '读取暂未恢复 · ' + delay / 1000 + ' 秒后自动重试，保留已有数据' : !$('auto-refresh').checked ? '手动任务进行中 · 每 5 秒更新进度，结束后停止' : '持续刷新已开启' + ($('background-refresh').checked ? '（含后台标签页）' : '') + ' · 每 5 秒读取状态';
     if (!pollBusy) pollTimer = root.setTimeout(() => refreshSnapshots(false), delay);
   }
   function stopAutomaticPoll() {
@@ -725,22 +788,22 @@
     schedulePoll();
   }
   function resumeAutomaticPoll() {
-    if (!session.connected() || !$('auto-refresh').checked || (document.hidden && !$('background-refresh').checked) || root.navigator?.onLine === false) { schedulePoll(); return; }
+    if (!session.connected() || !shouldPoll() || (document.hidden && !$('background-refresh').checked) || root.navigator?.onLine === false) { schedulePoll(); return; }
     if (pollBusy) return;
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null;
     void refreshSnapshots(false);
   }
   async function refreshSnapshots(manual) {
-    if (!session.connected() || pollBusy || (!manual && ((document.hidden && !$('background-refresh').checked) || !$('auto-refresh').checked || root.navigator?.onLine === false))) return;
+    if (!session.connected() || pollBusy || (!manual && ((document.hidden && !$('background-refresh').checked) || !shouldPoll() || root.navigator?.onLine === false))) return;
     if (pollTimer) root.clearTimeout(pollTimer);
     pollTimer = null;
     const generation = session.generation(); pollBusy = true; $('refresh').disabled = true;
     const controller = new AbortController();
     if (!manual) pollController = controller;
     try {
-      await readRunningConfig(controller.signal); await readSnapshots(controller.signal);
-      if (generation !== session.generation() || controller.signal.aborted) return;
+      const applied = await readSnapshots(controller.signal);
+      if (generation !== session.generation() || controller.signal.aborted || !applied) return;
       pollFailures = 0;
       if (manual) notice('状态快照已更新。');
     } catch (error) {
@@ -753,15 +816,9 @@
       if (generation === session.generation()) { if (pollController === controller) pollController = null; pollBusy = false; $('refresh').disabled = false; schedulePoll(); }
     }
   }
-  async function readRunningConfig(signal) {
-    const generation = session.generation(), config = await session.request('/config', 'GET', undefined, signal);
-    if (generation !== session.generation() || signal?.aborted) return;
-    if (!validObject(config)) throw new PanelError('invalid_response');
-    runningConfig = config;
-  }
   async function loadEditor() {
-    const generation = session.generation(), envelope = await session.request('/config-editor');
-    if (generation !== session.generation()) return;
+    const generation = session.generation(), epoch = mutationEpoch, version = editor.version(), envelope = await session.request('/config-editor');
+    if (generation !== session.generation() || epoch !== mutationEpoch || version !== editor.version()) return;
     editor.load(envelope, true); diskMatchesRunning = envelope.disk_matches_running !== false; renderForm(); renderAccounts();
   }
   async function connectPanel(key, automatic) {
@@ -775,13 +832,11 @@
       $('connection-status').textContent = '正在连接';
     }
     try {
-      // CPA counts failed authentication per request. Probe once before parallel reads.
-      const nextSummary = await session.request('/summary');
-      const [nextAccounts, caps, envelope, runtimeConfig] = await Promise.all([session.request('/accounts'), session.request('/capabilities'), session.request('/config-editor'), session.request('/config')]);
+      // Probe once: CPA counts rejected authentication per request.
+      await readSnapshots();
       if (generation !== session.generation()) return;
-      if (![nextSummary, nextAccounts, caps, runtimeConfig].every(validObject)) throw new PanelError('invalid_response');
-      editor.load(envelope, true); diskMatchesRunning = envelope.disk_matches_running !== false;
-      summary = nextSummary; accounts = nextAccounts; capabilities = caps; runningConfig = runtimeConfig;
+      await loadEditor();
+      if (generation !== session.generation()) return;
       $('workspace').hidden = false; $('login-section').hidden = true; $('connection-status').textContent = '已连接'; $('connection-status').className = 'badge'; $('disconnect').disabled = false;
       renderForm(); renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '读取于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
       if (!diskMatchesRunning) notice('服务器规则文件尚未应用。这里显示的是文件草稿；运行概览中的启用状态来自当前调度器。', 'warning');
@@ -844,9 +899,9 @@
     if (!session.connected() || actionBusy || editor.rawDirty() || (!editor.dirty() && diskMatchesRunning)) return;
     const config = editor.value();
     if (!root.confirm(config.enabled ? '保存并应用这些规则？模型唤醒已开启，调度器可能发送真实模型请求。' : '保存并应用规则？模型唤醒保持关闭，额度查询按独立设置运行；已发出的请求仍可能完成。')) return;
-    const generation = session.generation(), version = editor.version(); busy(true);
-    try { const envelope = await session.request('/config', 'POST', {config, revision: editor.revision()}); if (generation !== session.generation()) return; editor.saved(envelope, version); diskMatchesRunning = envelope.disk_matches_running !== false; renderForm(); renderAccounts(); notice('规则已保存并应用。'); await readRunningConfig(); await readSnapshots(); }
-    catch (error) { report(error); }
+    const generation = session.generation(), version = editor.version(); let accepted = false; busy(true);
+    try { const envelope = await session.request('/config', 'POST', {config, revision: editor.revision()}); if (generation !== session.generation()) return; mutationEpoch++; accepted = true; editor.saved(envelope, version); runningConfig = {...envelope.config, enabled: envelope.config.enabled === true && summary?.host_enabled !== false}; if (summary) summary.enabled = runningConfig.enabled; diskMatchesRunning = envelope.disk_matches_running !== false; renderForm(); renderOverview(); renderAccounts(); notice('规则已保存并应用。'); await readSnapshots(); }
+    catch (error) { if (error.code === 'authentication') report(error); else if (generation === session.generation()) { if (accepted && error.code !== 'authentication') notice('规则已保存并应用；状态暂未读取成功，请更新页面数据核对。', 'warning', 'snapshots'); else report(error); } }
     finally { if (generation === session.generation()) busy(false); }
   });
   $('draft-restore').addEventListener('click', async () => {
@@ -860,68 +915,73 @@
     if (actionBusy || !session.connected()) return;
     if (id === 'reload' && editor.dirty() && !root.confirm('重新读取规则会丢弃当前未保存的草稿。继续？')) return;
     if (!root.confirm(text)) return;
-    const generation = session.generation(); busy(true);
-    try { await session.request(path, 'POST'); if (generation !== session.generation()) return; if (id === 'reload') { await loadEditor(); await readRunningConfig(); } await readSnapshots(); notice(id === 'reload' ? '规则文件已重新读取并应用。' : '已通知调度器重新检查，后续执行由规则决定。'); }
-    catch (error) { report(error); }
+    const generation = session.generation(); let accepted = false; busy(true);
+    try { await session.request(path, 'POST'); if (generation !== session.generation()) return; mutationEpoch++; accepted = true; if (id === 'reload') { await loadEditor(); } await readSnapshots(); notice(id === 'reload' ? '规则文件已重新读取并应用。' : '已通知调度器重新检查，后续执行由规则决定。'); }
+    catch (error) { if (error.code === 'authentication') report(error); else if (generation === session.generation()) { if (accepted && error.code !== 'authentication') notice('操作已接受；状态暂未读取成功，请更新页面数据核对。', 'warning', 'snapshots'); else report(error); } }
     finally { if (generation === session.generation()) busy(false); }
   });
   $('refresh').addEventListener('click', () => refreshSnapshots(true));
   $('auto-refresh').addEventListener('change', () => { if (!$('auto-refresh').checked) { $('background-refresh').checked = false; stopAutomaticPoll(); } else { pollFailures = 0; schedulePoll(); } });
   $('background-refresh').addEventListener('change', () => { if (document.hidden && !$('background-refresh').checked) stopAutomaticPoll(); else resumeAutomaticPoll(); });
-  function manualWakeJob() {
-    const job = summary?.scheduler?.manual_wake || {};
-    if (pendingManualWake) {
-      if (!summary?.running || (job.account_id === pendingManualWake.target && job.started_at !== pendingManualWake.previousStart)) pendingManualWake = null;
-      else return {account_id: pendingManualWake.target, phase: 'queued'};
-    }
-    return job;
-  }
+  function manualWakeJob() { return trackedJob(pendingManualWake, 'manual_wake'); }
   async function requestManualWake(accountID) {
     if (actionBusy || !session.connected()) return;
     if (!root.confirm('手动唤醒账号“' + accountID + '”？将使用已保存的模型和消息发送真实模型请求并消耗额度，不会开启自动唤醒。仅查询额度不会启动倒计时，窗口启动以服务端证据为准。')) return;
     const generation = session.generation();
-    pendingManualWake = {target: accountID, previousStart: summary?.scheduler?.manual_wake?.started_at};
+    pendingManualWake = startTracking(accountID);
+    let accepted = false;
     busy(true);
     try {
       const result = await session.request('/manual-wake', 'POST', {account_id: accountID});
       if (generation !== session.generation()) return;
+      mutationEpoch++; accepted = true; acceptedJob(pendingManualWake, result);
       notice(result.status === 'already_queued' ? '已有此账号的手动唤醒任务，请等待结果。' : '已安排此账号的手动唤醒；将核对额度后发送模型请求。');
       await readSnapshots();
     } catch (error) {
+      if (error.code === 'authentication') { report(error); return; }
       if (generation !== session.generation()) return;
-      if (error.code !== 'write_unconfirmed') pendingManualWake = null;
-      if (['conflict', 'invalid_config', 'http_error'].includes(error.code)) notice('未能安排手动唤醒。请检查已保存模型、账号暂停状态、后台能力及待验证请求；不会自动重试。', 'error');
+      if (!accepted && error.code !== 'write_unconfirmed') pendingManualWake = null;
+      else if (!accepted) pendingManualWake.detail.phase = 'unconfirmed';
+      if (accepted) reportAcceptedRead(error);
+      else if (['conflict', 'invalid_config', 'http_error'].includes(error.code)) notice('未能安排手动唤醒。请检查已保存模型、账号暂停状态、后台能力及待验证请求；不会自动重试。', 'error');
       else report(error);
-    } finally { if (generation === session.generation()) busy(false); }
+    } finally { if (generation === session.generation()) { busy(false); schedulePoll(); } }
   }
   async function requestQuotaQuery(accountID) {
     if (actionBusy || !session.connected()) return;
     const generation = session.generation();
-    pendingQuotaQuery = {target: accountID || '', previousStart: summary?.scheduler?.quota_query?.started_at};
+    let accepted = false;
+    pendingQuotaQuery = startTracking(accountID);
     busy(true); renderQuotaQuery();
     try {
       const result = await session.request('/quota-query', 'POST', accountID ? {account_id: accountID} : undefined);
       if (generation !== session.generation()) return;
+      mutationEpoch++; accepted = true; acceptedJob(pendingQuotaQuery, result);
       notice(result.status === 'already_queued' ? '已有相同的额度查询任务，正在等待结果。' : accountID ? '已安排此账号的额度查询，不发送模型请求。' : '已安排全部账号的额度查询，不发送模型请求。');
       await readSnapshots();
     } catch (error) {
-      if (generation === session.generation()) pendingQuotaQuery = null;
-      if (['conflict', 'invalid_config', 'http_error'].includes(error.code)) notice('未能安排额度查询。请检查账号和后台状态；已有查询任务时请等待结束后重试。', 'error');
-      else report(error);
+      if (error.code === 'authentication') { report(error); return; }
+      if (generation !== session.generation()) return;
+      if (!accepted && error.code !== 'write_unconfirmed') pendingQuotaQuery = null;
+      else if (!accepted) pendingQuotaQuery.detail.phase = 'unconfirmed';
+      if (!accepted && ['conflict', 'invalid_config', 'http_error'].includes(error.code)) notice('未能安排额度查询。请检查账号和后台状态；已有查询任务时请等待结束后重试。', 'error');
+      else if (accepted) reportAcceptedRead(error); else report(error);
     }
-    finally { if (generation === session.generation()) { busy(false); renderQuotaQuery(); } }
+    finally { if (generation === session.generation()) { busy(false); renderQuotaQuery(); schedulePoll(); } }
   }
   $('quota-query').addEventListener('click', () => { if (!$('quota-query').disabled) void requestQuotaQuery(); });
   $('quota-connection-check').addEventListener('click', async () => {
     if ($('quota-connection-check').disabled) return;
     const generation = session.generation();
+    let accepted = false;
     busy(true);
     try {
       const result = await session.request('/quota-connection-check', 'POST');
       if (generation !== session.generation()) return;
+      mutationEpoch++; accepted = true;
       notice(result.error ? quotaFailure({last_error: result.error}) : '宿主查询操作创建与取消检查通过；上游连通性请通过账号额度查询确认。', result.error ? 'error' : undefined);
       await readSnapshots();
-    } catch (error) { if (generation === session.generation()) report(error); }
+    } catch (error) { if (error.code === 'authentication') report(error); else if (generation === session.generation()) { if (accepted) notice('连通性检查已完成；状态暂未读取成功，请更新页面数据核对。', 'warning', 'snapshots'); else report(error); } }
     finally { if (generation === session.generation()) busy(false); }
   });
   $('account-search').addEventListener('input', renderAccounts); $('account-filter').addEventListener('change', renderAccounts);

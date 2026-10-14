@@ -13,6 +13,8 @@ import struct
 import subprocess
 import tarfile
 
+from release_check import check_release
+
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -40,6 +42,10 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"v\d+\.\d+\.\d+-rc\.[1-9]\d*", args.version):
         parser.error("version must be a release candidate such as v0.1.0-rc.1")
+    try:
+        check_release(ROOT, args.version)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     commit = args.commit or command("git", "rev-parse", "HEAD")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         parser.error("commit must be a full Git SHA")

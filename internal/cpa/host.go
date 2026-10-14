@@ -56,6 +56,9 @@ func (h *Host) readBinding(ctx context.Context, id core.AccountID, index string)
 	}
 	var runtime authRuntime
 	if err := h.callback.Call(ctx, "host.auth.get_runtime", authRequest{index}, &runtime); err != nil {
+		if err := inventoryContextError(ctx, err); err != nil {
+			return AuthBinding{}, false, err
+		}
 		return AuthBinding{}, false, ErrHostCallback
 	}
 	if runtime.Auth.ID != string(id) || runtime.Auth.AuthIndex != index || provider(runtime.Auth) != "codex" {
@@ -67,6 +70,9 @@ func (h *Host) readBinding(ctx context.Context, id core.AccountID, index string)
 	var raw authGet
 	defer func() { clear(raw.JSON) }()
 	if err := h.callback.Call(ctx, "host.auth.get", authRequest{index}, &raw); err != nil {
+		if err := inventoryContextError(ctx, err); err != nil {
+			return AuthBinding{}, false, err
+		}
 		return AuthBinding{}, false, ErrBindingUnavailable
 	}
 	// Decode only the allowlisted account_id; secrets are never retained or logged.
@@ -79,40 +85,90 @@ func (h *Host) readBinding(ctx context.Context, id core.AccountID, index string)
 	}
 	return AuthBinding{AccountID: id, AuthIndex: index, UpstreamAccountID: metadata.AccountID, Generation: generation(string(id), metadata.AccountID)}, enabled(runtime.Auth), nil
 }
+
+func inventoryContextError(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
+}
+
+func unavailableGeneration(id core.AccountID) core.CredentialGeneration {
+	// This is deliberately outside the validated credential namespace. Replacing
+	// a known binding with this placeholder invalidates all prior quota evidence.
+	sum := sha256.Sum256([]byte("codex-account-unavailable-v1\x00" + string(id)))
+	return core.CredentialGeneration(hex.EncodeToString(sum[:]))
+}
+
 func (h *Host) Accounts(ctx context.Context) ([]core.HostAccount, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if h.callback == nil {
 		return nil, ErrHostCallback
 	}
 	var list authList
 	if err := h.callback.Call(ctx, "host.auth.list", struct{}{}, &list); err != nil {
+		if err := inventoryContextError(ctx, err); err != nil {
+			return nil, err
+		}
 		return nil, ErrHostCallback
 	}
 	bindings := map[core.AccountID]AuthBinding{}
 	accounts := map[core.AccountID]core.HostAccount{}
+	diagnostics := map[core.AccountID]string{}
 	result := []core.HostAccount{}
+	counts := map[core.AccountID]int{}
 	for _, entry := range list.Files {
+		if provider(entry) == "codex" {
+			counts[core.AccountID(entry.ID)]++
+		}
+	}
+	for _, entry := range list.Files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if provider(entry) != "codex" {
 			continue
 		}
 		id := core.AccountID(entry.ID)
-		if id == "" || entry.AuthIndex == "" {
-			return nil, ErrBindingUnavailable
+		if strings.TrimSpace(string(id)) == "" {
+			diagnostics[""] = ErrBindingUnavailable.Error()
+			continue
 		}
 		if _, ok := accounts[id]; ok {
-			return nil, ErrBindingUnavailable
+			continue
 		}
-		b, active, err := h.readBinding(ctx, id, entry.AuthIndex)
-		if err != nil {
-			return nil, err
+		a := core.HostAccount{ID: id, Generation: unavailableGeneration(id)}
+		if counts[id] > 1 {
+			diagnostics[id] = "account_identity_ambiguous"
+		} else if strings.TrimSpace(entry.AuthIndex) == "" || entry.RuntimeOnly {
+			diagnostics[id] = ErrBindingUnavailable.Error()
+		} else {
+			b, active, err := h.readBinding(ctx, id, entry.AuthIndex)
+			if contextErr := inventoryContextError(ctx, err); contextErr != nil {
+				return nil, contextErr
+			}
+			if err != nil {
+				diagnostics[id] = err.Error()
+			} else {
+				a.Generation, a.Enabled = b.Generation, active
+				bindings[id] = b
+			}
 		}
-		a := core.HostAccount{ID: id, Generation: b.Generation, Enabled: active}
-		bindings[id] = b
 		accounts[id] = a
 		result = append(result, a)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	h.mu.Lock()
 	h.bindings = bindings
 	h.accounts = accounts
+	h.inventoryDiagnostics = diagnostics
 	h.mu.Unlock()
 	return result, nil
 }

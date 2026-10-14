@@ -83,7 +83,7 @@ func TestPolicyEditorSaveFormatsAndMetadata(t *testing.T) {
 			}
 			engine.mu.Lock()
 			defer engine.mu.Unlock()
-			if !reflect.DeepEqual(engine.updated, cfg) {
+			if !reflect.DeepEqual(engine.updated, s.wrapper.effective(cfg)) {
 				t.Fatal("engine not hot updated")
 			}
 			var reply struct {

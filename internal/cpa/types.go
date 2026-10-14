@@ -28,12 +28,13 @@ type AuthBinding struct {
 	Generation        core.CredentialGeneration
 }
 type Host struct {
-	callback  Callback
-	reader    QuotaReader
-	mu        sync.RWMutex
-	bindings  map[core.AccountID]AuthBinding
-	accounts  map[core.AccountID]core.HostAccount
-	baselines map[core.AccountID]core.AccountState
+	callback             Callback
+	reader               QuotaReader
+	mu                   sync.RWMutex
+	bindings             map[core.AccountID]AuthBinding
+	accounts             map[core.AccountID]core.HostAccount
+	inventoryDiagnostics map[core.AccountID]string
+	baselines            map[core.AccountID]core.AccountState
 }
 
 func NewHost(callback Callback, reader QuotaReader) *Host {
@@ -53,7 +54,24 @@ func (h *Host) ActivityAccounts() map[core.AccountID]core.HostAccount {
 	defer h.mu.RUnlock()
 	result := make(map[core.AccountID]core.HostAccount, len(h.accounts))
 	for id, a := range h.accounts {
+		// An inventory placeholder has no validated identity and cannot be used
+		// to attribute activity or response evidence to a credential.
+		if _, ok := h.bindings[id]; !ok {
+			continue
+		}
 		result[id] = a
+	}
+	return result
+}
+
+// AccountInventoryDiagnostics returns only stable, allowlisted error codes.
+// A blank ID identifies an entry that cannot safely be represented as an account.
+func (h *Host) AccountInventoryDiagnostics() map[core.AccountID]string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	result := make(map[core.AccountID]string, len(h.inventoryDiagnostics))
+	for id, code := range h.inventoryDiagnostics {
+		result[id] = code
 	}
 	return result
 }

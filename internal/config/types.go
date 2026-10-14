@@ -151,18 +151,21 @@ type AccountOverride struct {
 	AllowOutsideHoursWhenUsersActive *bool       `json:"allow_outside_hours_when_users_active,omitempty"`
 }
 type Config struct {
-	ManualWakeDisabled bool                               `json:"-"`
-	SchemaVersion      int                                `json:"schema_version"`
-	Enabled            bool                               `json:"enabled"`
-	Timezone           string                             `json:"timezone"`
-	ResetRules         ResetRules                         `json:"reset_rules"`
-	Activity           Activity                           `json:"activity"`
-	OrdinaryRules      OrdinaryRules                      `json:"ordinary_rules"`
-	DailyRules         []DailyRule                        `json:"daily_rules"`
-	Execution          Execution                          `json:"execution"`
-	QuotaQuery         QuotaQuery                         `json:"quota_query"`
-	Planning           Planning                           `json:"planning"`
-	AccountOverrides   map[core.AccountID]AccountOverride `json:"account_overrides"`
+	ManualWakeDisabled bool `json:"-"`
+	// BusinessEnabled retains the host-independent switch in runtime snapshots.
+	// It is supplied by the plugin wrapper and is never read from a policy file.
+	BusinessEnabled  *bool                              `json:"-"`
+	SchemaVersion    int                                `json:"schema_version"`
+	Enabled          bool                               `json:"enabled"`
+	Timezone         string                             `json:"timezone"`
+	ResetRules       ResetRules                         `json:"reset_rules"`
+	Activity         Activity                           `json:"activity"`
+	OrdinaryRules    OrdinaryRules                      `json:"ordinary_rules"`
+	DailyRules       []DailyRule                        `json:"daily_rules"`
+	Execution        Execution                          `json:"execution"`
+	QuotaQuery       QuotaQuery                         `json:"quota_query"`
+	Planning         Planning                           `json:"planning"`
+	AccountOverrides map[core.AccountID]AccountOverride `json:"account_overrides"`
 }
 
 func Defaults() Config {

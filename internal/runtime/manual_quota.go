@@ -9,16 +9,19 @@ import (
 )
 
 type ManualQueryStatus struct {
-	AccountID  core.AccountID        `json:"account_id,omitempty"`
-	Phase      string                `json:"phase"`
-	Total      int                   `json:"total"`
-	Completed  int                   `json:"completed"`
-	Failed     int                   `json:"failed"`
-	Skipped    int                   `json:"skipped"`
-	LastError  string                `json:"last_error,omitempty"`
-	Diagnostic *core.QuotaDiagnostic `json:"diagnostic,omitempty"`
-	StartedAt  time.Time             `json:"started_at"`
-	FinishedAt time.Time             `json:"finished_at"`
+	JobID         string                `json:"job_id,omitempty"`
+	BlockedReason string                `json:"blocked_reason,omitempty"`
+	RetryAt       time.Time             `json:"retry_at,omitempty"`
+	AccountID     core.AccountID        `json:"account_id,omitempty"`
+	Phase         string                `json:"phase"`
+	Total         int                   `json:"total"`
+	Completed     int                   `json:"completed"`
+	Failed        int                   `json:"failed"`
+	Skipped       int                   `json:"skipped"`
+	LastError     string                `json:"last_error,omitempty"`
+	Diagnostic    *core.QuotaDiagnostic `json:"diagnostic,omitempty"`
+	StartedAt     time.Time             `json:"started_at"`
+	FinishedAt    time.Time             `json:"finished_at"`
 }
 
 // RequestQuotaQuery queues one coalesced query-only sweep. The HTTP callback
@@ -30,33 +33,50 @@ func (e *Engine) RequestQuotaQuery() bool {
 // QueueQuotaQuery selects exactly one account, or a sweep when id is empty.
 // Different targets cannot silently join or widen a running query.
 func (e *Engine) QueueQuotaQuery(id core.AccountID) string {
+	status, _ := e.QueueQuotaQueryJob(id)
+	return status
+}
+
+// QueueQuotaQueryJob returns the accepted/coalesced identity under the same lock.
+func (e *Engine) QueueQuotaQueryJob(id core.AccountID) (string, string) {
 	e.queueMu.Lock()
-	if e.manualWakeActive || e.generationActive {
+	publishQueued := false
+	defer func() {
 		e.queueMu.Unlock()
-		return "busy"
+		if publishQueued {
+			e.publishQueuedJobs()
+		}
+	}()
+	if e.manualWakeActive || e.generationActive {
+		return "busy", ""
 	}
 	if e.manualActive {
-		same := e.manualTarget == id
-		e.queueMu.Unlock()
-		if same {
-			return "already_queued"
+		if e.manualTarget == id {
+			publishQueued = true
+			return "already_queued", e.manualJobID
 		}
-		return "busy"
+		return "busy", ""
+	}
+	if e.queuePoisoned || e.lastPublishedCommitFailed() {
+		return "durable_commit_failed", ""
 	}
 	e.manualRequested, e.manualActive = true, true
-	e.manualTarget = id
-	e.queueMu.Unlock()
+	e.manualTarget, e.manualJobID = id, newJobID()
+	queued := ManualQueryStatus{JobID: e.manualJobID, AccountID: id, Phase: "queued", StartedAt: e.clock.Now()}
+	e.putJobLocked(JobStatus{JobID: e.manualJobID, Kind: "quota_query", Phase: "queued", AccountID: id, QuotaQuery: &queued})
+	publishQueued = true
 	e.Notify()
-	return "queued"
+	return "queued", e.manualJobID
 }
+
 func (e *Engine) startManualQuery() {
 	e.queueMu.Lock()
 	requested := e.manualRequested
-	target := e.manualTarget
+	target, jobID := e.manualTarget, e.manualJobID
 	e.manualRequested = false
 	e.queueMu.Unlock()
 	if requested {
-		e.manualQuery = ManualQueryStatus{AccountID: target, Phase: "queued", StartedAt: e.clock.Now()}
+		e.manualQuery = ManualQueryStatus{JobID: jobID, AccountID: target, Phase: "queued", StartedAt: e.clock.Now()}
 		e.manualIDs = nil
 		e.manualIndex = 0
 		// Synchronize inventory once for this sweep, including newly added accounts.
@@ -65,7 +85,9 @@ func (e *Engine) startManualQuery() {
 }
 func (e *Engine) finishManualQuery(phase string) {
 	e.manualQuery.Phase, e.manualQuery.FinishedAt = phase, e.clock.Now()
+	e.manualQuery.BlockedReason, e.manualQuery.RetryAt = "", time.Time{}
 	e.manualIDs = nil
+	e.recordQuotaJob()
 	e.queueMu.Lock()
 	e.manualActive = false
 	e.queueMu.Unlock()
@@ -86,6 +108,8 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 		sort.Slice(e.manualIDs, func(i, j int) bool { return e.manualIDs[i] < e.manualIDs[j] })
 		e.manualQuery.Total, e.manualQuery.Phase = len(e.manualIDs), "running"
 	}
+	e.recordQuotaJob()
+	e.publish(false)
 	for n := 0; n < 4 && e.manualIndex < len(e.manualIDs) && ctx.Err() == nil; n++ {
 		id := e.manualIDs[e.manualIndex]
 		e.manualIndex++
@@ -112,6 +136,8 @@ func (e *Engine) stepManualQuery(ctx context.Context) {
 		} else {
 			e.manualQuery.Completed++
 		}
+		e.recordQuotaJob()
+		e.publish(false)
 	}
 	if e.manualIndex >= len(e.manualIDs) {
 		e.finishManualQuery("completed")

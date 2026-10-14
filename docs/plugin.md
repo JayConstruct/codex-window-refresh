@@ -45,7 +45,8 @@ plugins:
 | GET `/v0/management/codex-window-refresh/capabilities` | 运行时宿主能力及 quota_bridge 本地配置诊断；不测试上游连通性，不返回管理密钥或地址 |
 | POST `/v0/management/codex-window-refresh/reload` | 读取外部配置、验证后更新 |
 | POST `/v0/management/codex-window-refresh/recheck` | 通知协调器重新检查；不能绕过窗口、用户名额、时间段或送达抑制规则 |
-| POST `/v0/management/codex-window-refresh/quota-query` | 无请求体或 `{}` 时批量查询；可选 `{ "account_id": "账号 ID" }` 仅查询该账号。手动查询始终允许，仍需要后台运行及额度桥就绪，返回 202 和 queued/already_queued；不同目标忙碌时返回 409，未知账号返回 404；不创建唤醒任务或派发模型，进度位于摘要 scheduler.quota_query |
+| GET `/v0/management/codex-window-refresh/snapshot` | 统一的已发布运行视图：`instance_id/snapshot_seq/summary/accounts/capabilities/config`；面板运行数据只读取此接口，配置文件草稿另读 config-editor |
+| POST `/v0/management/codex-window-refresh/quota-query` | 无请求体或 `{}` 时批量查询；可选 `{ "account_id": "账号 ID" }` 仅查询该账号。手动查询始终允许，仍需要后台运行及额度桥就绪，返回 202、queued/already_queued 和稳定 `job_id`；不同目标忙碌时返回 409，未知账号返回 404；不创建唤醒任务或派发模型，进度位于摘要 scheduler.quota_query |
 | POST `/v0/management/codex-window-refresh/manual-wake` | 必须传 `{ "account_id": "账号 ID" }`，仅排队该账号一次模型唤醒；使用已保存的模型与消息，不接受模型覆盖或批量请求。自动唤醒可关闭，但 CPA 插件必须运行、账号未暂停、已保存模型且宿主能力就绪。返回 202，未知账号 404，参数错误 400，忙碌或待验证请求 409；进度位于 scheduler.manual_wake |
 | POST `/v0/management/codex-window-refresh/quota-connection-check` | 宿主模式下显式创建并取消本地 HTTP 操作，不读凭据、不执行 HTTP 或模型。返回 200 和固定 status，可带脱敏 error；管理桥模式返回 409，不支持检查的适配器返回 501 |
 
@@ -56,6 +57,14 @@ CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/co
 调度汇总从协调器发布的快照读取；查看管理状态不等待正在进行的额度查询或模型请求。`observed_at` 用于判断快照是否仍然新鲜。字段通过可选 `SchedulerDiagnostics() any` 接口提供，其他 Engine 实现可继续使用原有接口；未提供该接口时摘要不包含 `scheduler`。
 
 `scheduler.quota_query.diagnostic` 提供本次手动任务最近失败的 `code/stage/http_status/elapsed_ms`；`scheduler.last_quota_diagnostic` 提供运行期间最近一次额度查询失败。两者不持久化，仅包含固定分类及本地耗时；返回的快照不会暴露可变的内部诊断对象。`/capabilities` 的 `quota_bridge.host_http_status` 是已有宿主接口检查结果，读取它不会主动检查网络。
+
+### 快照与任务同步协议
+
+`/snapshot` 从同一次原子加载取得已发布账号、调度摘要、任务、能力及生效配置；不包含用户活动身份、请求元数据或凭据。`instance_id` 在每个运行时实例新建时变化，`snapshot_seq` 在该实例内随配置、接受任务、进度、诊断或提交发布递增，区别于持久化状态 revision 和配置文件 revision。`config.enabled` 是宿主开关约束后的生效值，`summary.business_enabled` 保留业务开关，草稿仍来自 `/config-editor`。旧的 summary/accounts/config/capabilities 接口保留兼容用途，不能跨接口假定同一版本。
+
+额度查询和手动唤醒的 202 响应包含 `job_id`；内容生成的 `job_id` 等于已有 `request_id`。接受的任务在返回前可从 `summary.scheduler.jobs` 读取；该数组保留最近 64 个任务，元素包含 `job_id/kind/phase/account_id/updated_at` 及 `quota_query`、`manual_wake` 或 `prompt_generation` 详细结果。清单/能力暂时不可用时带 `blocked_reason/retry_at`，任务开始后达到 2 分钟仍被阻塞时，在调度检查中失败结束。已发送操作的验证和安全抑制不受该未发送等待期限控制；送达未知为 unknown，不自动重发。任务记录不跨重启恢复，已持久化的模型派发保护继续有效。
+
+面板按 job_id 读取对应结果，收到其他账号的新任务也不替换本地跟踪的任务；实例变化或记录淘汰会明确显示。所有运行数据统一应用，使用读取序号、写操作版本与快照版本阻止旧响应覆盖，读取失败保留已知结果与未保存草稿。
 
 ## 观测回调和生命周期
 
