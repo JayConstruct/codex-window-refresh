@@ -42,6 +42,85 @@ func TestOverdueWakeKeepsDeadlineSeparateFromMovingChecks(t *testing.T) {
 	}
 }
 
+func TestWakePlanShowsSampledDeadlineAndCurrentRuleRangeIndependently(t *testing.T) {
+	for _, reason := range []core.Reason{core.ReasonFiveHour, core.ReasonWeekly} {
+		for _, retained := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/retained=%t", reason, retained), func(t *testing.T) {
+				e, host, _, clock := fixture(t, false, reason == core.ReasonWeekly)
+				rng := &dailyTestRandom{}
+				e.random = rng
+				reset := clock.now.Add(-time.Hour)
+				deadline := reset.Add(3*time.Minute + 27*time.Second)
+				delay := config.DelayRange{Min: config.Duration(2 * time.Minute), Max: config.Duration(10 * time.Minute)}
+				e.cfg.ResetRules.FiveHour.RandomDelay, e.cfg.ResetRules.Weekly.RandomDelay = delay, delay
+				a := e.state.Accounts["a"]
+				a.FiveHourBaseline, a.WeeklyBaseline = core.WindowBaseline{}, core.WindowBaseline{}
+				if !retained {
+					if reason == core.ReasonFiveHour {
+						a.FiveHourBaseline = core.WindowBaseline{CycleID: "cycle", StableResetAt: reset}
+					} else {
+						a.WeeklyBaseline = core.WindowBaseline{CycleID: "cycle", StableResetAt: reset}
+					}
+				}
+				a.Task = &core.MergedTask{State: core.TaskWaiting, HoldReason: core.HoldQuotaUnknown, Intents: []core.Intent{{ID: "stored", Reason: reason, OriginalDueAt: reset, RandomizedDueAt: deadline, Status: core.IntentPending}}}
+				e.state.Accounts["a"] = a
+				before, _ := json.Marshal(e.state)
+				for index := 0; index < 3; index++ {
+					e.nextPreflight["a"] = clock.now.Add(time.Minute)
+					wake := e.schedulePlan(e.state, clock.now).NextWakes["a"]
+					if wake.ScheduledAt == nil || !wake.ScheduledAt.Equal(deadline) || wake.RangeStartAt == nil || !wake.RangeStartAt.Equal(reset.Add(2*time.Minute)) || wake.RangeEndAt == nil || !wake.RangeEndAt.Equal(reset.Add(10*time.Minute)) {
+						t.Fatalf("deadline and rule range were collapsed or moved by retry: %+v", wake)
+					}
+					clock.now = clock.now.Add(time.Minute)
+				}
+				after, _ := json.Marshal(e.state)
+				if string(before) != string(after) || rng.calls != 0 || host.reads != 0 || len(host.sends) != 0 {
+					t.Fatal("range preview changed state, sampled a new deadline or performed upstream work")
+				}
+			})
+		}
+	}
+}
+
+func TestFutureWakeRangeDoesNotPretendToHaveSampledDeadline(t *testing.T) {
+	e, _, _, clock := fixture(t, false, false)
+	reset := clock.now.Add(time.Hour)
+	a := e.state.Accounts["a"]
+	a.FiveHourBaseline = core.WindowBaseline{CycleID: "future", StableResetAt: reset}
+	e.state.Accounts["a"] = a
+	e.cfg.ResetRules.FiveHour.RandomDelay = config.DelayRange{Min: config.Duration(time.Minute), Max: config.Duration(10 * time.Minute)}
+	wake := e.schedulePlan(e.state, clock.now).NextWakes["a"]
+	if wake.ScheduledAt != nil || wake.Status != "estimated" || wake.RangeStartAt == nil || !wake.RangeStartAt.Equal(reset.Add(time.Minute)) || wake.RangeEndAt == nil || !wake.RangeEndAt.Equal(reset.Add(10*time.Minute)) {
+		t.Fatalf("future range invented an exact sampled time: %+v", wake)
+	}
+}
+
+func TestAssignedDailyWakeShowsItsRuleRangeAndFixedPoint(t *testing.T) {
+	for _, hours := range []string{"09:00-09:10", "09:00-09:00"} {
+		t.Run(hours, func(t *testing.T) {
+			e, _, _, clock := fixture(t, false, false)
+			e.cfg.DailyRules = []config.DailyRule{{ID: "daily", Enabled: true, RandomTimeRange: hours}}
+			a := e.state.Accounts["a"]
+			a.FiveHourBaseline = core.WindowBaseline{}
+			start := clock.now.Add(-time.Hour)
+			due := start.Add(3 * time.Minute)
+			if hours == "09:00-09:00" {
+				due = start
+			}
+			a.Task = &core.MergedTask{Intents: []core.Intent{{ID: "daily", RuleID: "daily", Reason: core.ReasonDaily, CycleID: clock.now.Format("2006-01-02"), OriginalDueAt: start, RandomizedDueAt: due, Status: core.IntentPending}}}
+			e.state.Accounts["a"] = a
+			wake := e.schedulePlan(e.state, clock.now).NextWakes["a"]
+			end := start
+			if hours == "09:00-09:10" {
+				end = start.Add(10 * time.Minute)
+			}
+			if wake.ScheduledAt == nil || !wake.ScheduledAt.Equal(due) || wake.RangeStartAt == nil || !wake.RangeStartAt.Equal(start) || wake.RangeEndAt == nil || !wake.RangeEndAt.Equal(end) {
+				t.Fatalf("daily deadline was used in place of its saved rule range: %+v", wake)
+			}
+		})
+	}
+}
+
 func TestExpiredFiveHourWakeWaitsForDemandWithoutResampling(t *testing.T) {
 	e, host, _, clock := fixture(t, false, false)
 	e.cfg.QuotaQuery.Automatic = false

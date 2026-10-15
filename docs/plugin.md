@@ -105,3 +105,5 @@ cp /tmp/codex-window-refresh.so /tmp/codex-window-refresh-vtest.so
 原生结构声明参考官方 MIT 示例，来源许可保存在 `cmd/plugin/NOTICE`；规则、服务和运行时实现为本项目代码。
 
 `summary.scheduler.plan.next_wakes` 按账号 ID 返回各账号最早的下一次唤醒安排，包含时间或预计范围。该摘要不依赖 `planning.enabled`，不受详细 `entries` 的 256 条上限影响；不包含查询任务、暂不可执行的时间或尚未分配账号的每日池任务。它只读取现有规则和状态，不创建意图或发送请求，未知时间由面板显示原因。
+
+rc.27 的 `scheduler.plan` 账号唤醒记录新增可选 `range_start_at/range_end_at`，表示当前已保存规则的时间范围，独立于 `scheduled_at` 的已抽定结果以及 `earliest_at/latest_at` 的执行预估。未抽定时不提供 `scheduled_at`；读取计划不会提前抽取随机数或创建任务。

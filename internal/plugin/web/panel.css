@@ -293,14 +293,14 @@ button.danger { color: var(--danger); }
 .wake-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
 .wake-table th, .wake-table td { padding: 10px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; overflow-wrap: anywhere; }
 .wake-table thead th { color: var(--muted); background: #f3f6f4; font-weight: 500; }
-.wake-table th:first-child { width: 42%; }
+.wake-table th:first-child { width: 32%; }
 .wake-table tbody th { font-weight: 500; }
 .wake-table tbody tr:last-child > * { border-bottom: 0; }
 .wake-table tbody tr:hover { background: #f7faf8; }
-.wake-time { font-variant-numeric: tabular-nums; }
+.wake-time { font-variant-numeric: tabular-nums; line-height: 1.45; }
 .wake-unset { color: var(--muted); }
 .plan-footnote { margin-top: 12px; }
 @media (max-width: 600px) {
   .wake-table th, .wake-table td { padding: 9px 10px; font-size: 12px; }
-  .wake-table th:first-child { width: 38%; }
+  .wake-table th:first-child { width: 28%; }
 }

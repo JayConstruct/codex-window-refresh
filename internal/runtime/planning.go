@@ -13,21 +13,23 @@ import (
 const maximumPlanEntries = 256
 
 type PlannedAction struct {
-	Kind        string              `json:"kind"`
-	Trigger     string              `json:"trigger"`
-	AccountID   core.AccountID      `json:"account_id,omitempty"`
-	RuleID      string              `json:"rule_id,omitempty"`
-	EarliestAt  time.Time           `json:"earliest_at"`
-	LatestAt    time.Time           `json:"latest_at"`
-	ScheduledAt *time.Time          `json:"scheduled_at,omitempty"`
-	NextCheckAt *time.Time          `json:"next_check_at,omitempty"`
-	WaitReason  core.HoldReason     `json:"wait_reason,omitempty"`
-	RepeatEvery string              `json:"repeat_every,omitempty"`
-	Window      string              `json:"window,omitempty"`
-	Status      string              `json:"status"`
-	Detail      string              `json:"detail"`
-	Model       string              `json:"model,omitempty"`
-	Sources     []core.ActionSource `json:"sources"`
+	Kind         string              `json:"kind"`
+	Trigger      string              `json:"trigger"`
+	AccountID    core.AccountID      `json:"account_id,omitempty"`
+	RuleID       string              `json:"rule_id,omitempty"`
+	EarliestAt   time.Time           `json:"earliest_at"`
+	LatestAt     time.Time           `json:"latest_at"`
+	ScheduledAt  *time.Time          `json:"scheduled_at,omitempty"`
+	RangeStartAt *time.Time          `json:"range_start_at,omitempty"`
+	RangeEndAt   *time.Time          `json:"range_end_at,omitempty"`
+	NextCheckAt  *time.Time          `json:"next_check_at,omitempty"`
+	WaitReason   core.HoldReason     `json:"wait_reason,omitempty"`
+	RepeatEvery  string              `json:"repeat_every,omitempty"`
+	Window       string              `json:"window,omitempty"`
+	Status       string              `json:"status"`
+	Detail       string              `json:"detail"`
+	Model        string              `json:"model,omitempty"`
+	Sources      []core.ActionSource `json:"sources"`
 }
 
 type SchedulePlan struct {
@@ -193,7 +195,14 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 				due = maxTime(due, account.FiveHourBaseline.StableResetAt)
 				if allowed, ok := nextAllowedTime(e.cfg, id, due, plan.Until); ok {
 					deadline := intent.RandomizedDueAt
-					add(PlannedAction{Kind: "wake", Trigger: string(core.ReasonDaily), AccountID: id, RuleID: intent.RuleID, EarliestAt: allowed, LatestAt: allowed, ScheduledAt: &deadline, Status: "scheduled", Detail: "已分配至账号；仍需额度与容量核对"})
+					action := PlannedAction{Kind: "wake", Trigger: string(core.ReasonDaily), AccountID: id, RuleID: intent.RuleID, EarliestAt: allowed, LatestAt: allowed, ScheduledAt: &deadline, Status: "scheduled", Detail: "已分配至账号；仍需额度与容量核对"}
+					for _, rule := range e.cfg.DailyRules {
+						if rule.ID == intent.RuleID {
+							action = e.dailyWakeRange(action, rule, intent)
+							break
+						}
+					}
+					add(action)
 				}
 			}
 		}
@@ -239,7 +248,7 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 							continue
 						}
 						deadline := intent.RandomizedDueAt
-						action := e.resetWakePlan(account, window.reason, deadline, deadline, &deadline, "scheduled", now, plan.Until)
+						action := e.resetWakePlan(account, window.reason, intent.OriginalDueAt, deadline, deadline, &deadline, "scheduled", now, plan.Until)
 						action.Sources = []core.ActionSource{{Trigger: string(window.reason), ConfigPath: "reset_rules.five_hour", EventID: intent.ID, ResetAt: intent.OriginalDueAt, CycleID: intent.CycleID, EvidenceSource: account.FiveHour.Source, EvidenceAt: account.FiveHour.ConfirmedAt}}
 						if window.reason == core.ReasonWeekly {
 							action.Sources[0].ConfigPath = "reset_rules.weekly"
@@ -289,7 +298,7 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 					continue
 				}
 			}
-			add(e.resetWakePlan(account, window.reason, earliest, latest, scheduledAt, status, now, plan.Until))
+			add(e.resetWakePlan(account, window.reason, window.reset, earliest, latest, scheduledAt, status, now, plan.Until))
 		}
 	}
 	if plan.Enabled && e.cfg.Enabled && e.cfg.OrdinaryRules.DailyEnabled {
@@ -338,7 +347,7 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 	return plan
 }
 
-func (e *Engine) resetWakePlan(account core.AccountState, reason core.Reason, earliest, latest time.Time, scheduledAt *time.Time, status string, now, until time.Time) PlannedAction {
+func (e *Engine) resetWakePlan(account core.AccountState, reason core.Reason, reset, earliest, latest time.Time, scheduledAt *time.Time, status string, now, until time.Time) PlannedAction {
 	earliest = maxTime(earliest, maxTime(now, maxTime(account.BackoffUntil, e.nextPreflight[account.ID])))
 	detail := "需发送前额度核对；已有活跃窗口或待验证请求不会发送"
 	if reason == core.ReasonFiveHour {
@@ -351,7 +360,32 @@ func (e *Engine) resetWakePlan(account core.AccountState, reason core.Reason, ea
 		detail += "；仍需人数容量满足"
 	}
 	model, _ := e.cfg.WakeContent(reason)
-	return PlannedAction{Kind: "wake", Trigger: string(reason), AccountID: account.ID, EarliestAt: earliest, LatestAt: latest, ScheduledAt: scheduledAt, Status: status, Detail: detail, Model: model}
+	policy := e.cfg.Account(account.ID)
+	delay := policy.FiveHourRandomDelay
+	if reason == core.ReasonWeekly {
+		delay = policy.WeeklyRandomDelay
+	}
+	start, end := reset.Add(delay.Min.Value()), reset.Add(delay.Max.Value())
+	return PlannedAction{Kind: "wake", Trigger: string(reason), AccountID: account.ID, EarliestAt: earliest, LatestAt: latest, ScheduledAt: scheduledAt, RangeStartAt: &start, RangeEndAt: &end, Status: status, Detail: detail, Model: model}
+}
+
+// Ranges describe the currently saved rule, independently of an immutable
+// sampled deadline and any later admission delay. Reading a plan never samples.
+func (e *Engine) dailyWakeRange(action PlannedAction, rule config.DailyRule, intent core.Intent) PlannedAction {
+	rangeValue, err := rule.MinuteRange()
+	if err != nil {
+		return action
+	}
+	date := intent.CycleID
+	if date == "" {
+		date = intent.RandomizedDueAt.In(e.cfg.Location()).Format("2006-01-02")
+	}
+	start, startErr := resolveDailyWallTime(date, time.Duration(rangeValue.Start)*time.Minute, e.cfg.Location())
+	end, endErr := resolveDailyWallTime(date, time.Duration(rangeValue.End)*time.Minute, e.cfg.Location())
+	if startErr == nil && endErr == nil && !end.Before(start) {
+		action.RangeStartAt, action.RangeEndAt = &start, &end
+	}
+	return action
 }
 
 func nextAllowedTime(settings config.Config, id core.AccountID, from, until time.Time) (time.Time, bool) {

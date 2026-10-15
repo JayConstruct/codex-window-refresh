@@ -746,24 +746,31 @@
     for (const {id, entry, unavailable} of rows) {
       const row = el('tr'); row.dataset.planAccount = id;
       const name = el('th', id); name.setAttribute('scope', 'row');
-      let time = unavailable;
+      let time = unavailable, range = '—';
       if (entry) {
         const assigned = resetTime(entry.scheduled_at) !== null;
-        const ranged = !assigned && resetTime(entry.latest_at) !== null && resetTime(entry.latest_at) > resetTime(entry.earliest_at);
-        const start = date(assigned ? entry.scheduled_at : entry.earliest_at), end = ranged ? date(entry.latest_at) : '';
-        const compactEnd = end.split(' ')[0] === start.split(' ')[0] ? end.split(' ').slice(1).join(' ') : end;
-        time = (assigned || entry.status === 'scheduled' ? '' : '预计 ') + start + (ranged ? ' — ' + compactEnd : '');
+        time = assigned || entry.status === 'scheduled' ? date(assigned ? entry.scheduled_at : entry.earliest_at) : '待抽定 · 预计最早 ' + date(entry.earliest_at);
+        const explicitRange = resetTime(entry.range_start_at) !== null && resetTime(entry.range_end_at) !== null && resetTime(entry.range_end_at) >= resetTime(entry.range_start_at);
+        const legacyRange = resetTime(entry.latest_at) !== null && resetTime(entry.latest_at) > resetTime(entry.earliest_at);
+        if (explicitRange || legacyRange) {
+          const start = date(explicitRange ? entry.range_start_at : entry.earliest_at);
+          const end = date(explicitRange ? entry.range_end_at : entry.latest_at);
+          const compactEnd = end.split(' ')[0] === start.split(' ')[0] ? end.split(' ').slice(1).join(' ') : end;
+          range = start === end ? start + '（固定）' : start + ' — ' + compactEnd;
+        } else {
+          range = '未提供';
+        }
         if (assigned && entry.status === 'waiting') {
           time = '原定 ' + time + ' · 已到期，' + (holds[entry.wait_reason] || '等待调度核对');
           if (resetTime(entry.next_check_at) !== null) time += ' · 下次核对 ' + date(entry.next_check_at);
         }
       }
-      row.append(name, el('td', time, entry ? 'wake-time' : 'wake-unset'));
+      row.append(name, el('td', time, entry ? 'wake-time' : 'wake-unset'), el('td', range, entry ? 'wake-time' : 'wake-unset'));
       list.append(row);
     }
     if (!rows.length) {
       const row = el('tr'), cell = el('td', '暂无账号，等待读取 CPA 账号清单。', 'wake-unset');
-      cell.setAttribute('colspan', '2'); row.append(cell); list.append(row);
+      cell.setAttribute('colspan', '3'); row.append(cell); list.append(row);
     }
   }
   function renderCapabilities() {
