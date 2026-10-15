@@ -257,13 +257,15 @@ try {
   await evaluate('document.querySelector(".account-disclosure").open=true');
   await waitFor(()=>evaluate('document.querySelector(".account-disclosure").open'),'Account details did not open');
   await evaluate('window.retainedAccountCard=document.querySelector(".account-card");window.retainedAccountButton=window.retainedAccountCard.querySelector("[data-quota-account]");window.retainedAccountButton.focus()');
+  const accountInteractionState = () => evaluate('({active:document.activeElement?.outerHTML,retained:window.retainedAccountCard?.dataset.accountId,retainedConnected:window.retainedAccountCard?.isConnected,retainedOpen:window.retainedAccountCard?.querySelector(".account-disclosure")?.open,cards:Array.from(document.querySelectorAll(".account-card")).map(card=>({id:card.dataset.accountId,open:card.querySelector(".account-disclosure").open,retained:card===window.retainedAccountCard,focused:card.contains(document.activeElement)}))})');
+  console.log('Account interaction before polling:', JSON.stringify(await accountInteractionState()));
   const otherAccount = '<img src=x onerror=alert(1)>', originalOtherWindow = structuredClone(accounts[otherAccount].FiveHour);
   accounts[otherAccount].FiveHour = {...originalOtherWindow, Remaining: {Value: 1, Unit: 'percent'}};
   accounts['fixture-account'].FiveHour.Remaining.Value = 72;
   const pollStarted = Date.now();
   await waitFor(() => evaluate('document.getElementById("account-list").textContent.includes("72%")'), 'Passive quota did not appear on automatic panel polling');
   assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
-  assert.equal(await evaluate('document.querySelector(".account-disclosure").open'),true,'Polling collapsed open account diagnostics');
+  assert.equal(await evaluate('document.querySelector(".account-disclosure").open'),true,'Polling collapsed open account diagnostics: '+JSON.stringify(await accountInteractionState()));
   assert.equal(await evaluate('document.activeElement===window.retainedAccountButton && document.querySelector(".account-card")===window.retainedAccountCard'),true,'Passive refresh replaced the focused account or moved its sort position');
   await evaluate('window.retainedAccountCard.querySelector(".account-disclosure").open=false;document.getElementById("account-layout").dispatchEvent(new Event("change"))');
   assert.equal(await evaluate('!window.retainedAccountCard.querySelector(".account-disclosure").open'),true,'Synchronous refresh reopened user-collapsed diagnostics');
