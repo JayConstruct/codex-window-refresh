@@ -88,6 +88,15 @@ func (h *Host) ActivityAccounts() map[core.AccountID]core.HostAccount {
 	return result
 }
 
+// QuotaAccountStatus returns status already read by this account's credential
+// checks. It performs no callbacks, quota reads or full inventory refreshes.
+func (h *Host) QuotaAccountStatus(id core.AccountID) (core.HostAccount, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	account, ok := h.accounts[id]
+	return account, ok
+}
+
 // AccountInventoryDiagnostics returns only stable, allowlisted error codes.
 // A blank ID identifies an entry that cannot safely be represented as an account.
 func (h *Host) AccountInventoryDiagnostics() map[core.AccountID]string {

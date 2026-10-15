@@ -99,13 +99,12 @@ func (e *Engine) reconcileSelectedAccount(account core.HostAccount) {
 	if !found {
 		e.inventory = append(e.inventory, account)
 	}
-	core.ReconcileAccounts(&e.state, e.inventory, e.clock.Now())
-	for accountID, state := range e.state.Accounts {
-		policy := e.cfg.Account(accountID)
-		state.Enabled = state.Enabled && !policy.Paused
-		state.OrdinaryParticipant, state.WeeklyEnabled = policy.OrdinaryParticipant, policy.WeeklyEnabled
-		e.state.Accounts[accountID] = state
-	}
+	core.ReconcileAccount(&e.state, account)
+	state := e.state.Accounts[id]
+	policy := e.cfg.Account(id)
+	state.Enabled = state.Enabled && !policy.Paused
+	state.OrdinaryParticipant, state.WeeklyEnabled = policy.OrdinaryParticipant, policy.WeeklyEnabled
+	e.state.Accounts[id] = state
 }
 
 func (e *Engine) manualQueryWaiting() bool {

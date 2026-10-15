@@ -264,6 +264,23 @@ func (h *Host) validateBinding(ctx context.Context, id core.AccountID, gen core.
 	if err != nil {
 		return AuthBinding{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return AuthBinding{}, err
+	}
+	h.mu.Lock()
+	// Publish only a successfully read identity and never overwrite a binding
+	// replaced by a concurrent inventory refresh while the callback was running.
+	if current, ok := h.bindings[id]; !ok || current != old {
+		h.mu.Unlock()
+		return AuthBinding{}, ErrBindingChanged
+	}
+	h.bindings[id] = b
+	h.accounts[id] = core.HostAccount{ID: id, Generation: b.Generation, Enabled: status == core.AccountAvailable, Availability: status}
+	delete(h.inventoryDiagnostics, id)
+	if baseline, ok := h.baselines[id]; ok && baseline.Generation != b.Generation {
+		delete(h.baselines, id)
+	}
+	h.mu.Unlock()
 	if b.Generation != gen || old.Generation != gen {
 		return AuthBinding{}, ErrBindingChanged
 	}
@@ -282,11 +299,14 @@ func (h *Host) ObserveQuota(ctx context.Context, read core.QuotaRead) (core.Quot
 	}
 	raw, err := h.reader.Read(ctx, b)
 	defer clear(raw)
+	// A failed upstream query can still coincide with a CPA disable/recovery.
+	// Keep its original quota error while refreshing local status when possible.
+	_, bindingErr := h.validateBinding(ctx, read.AccountID, read.Generation, false)
 	if err != nil {
 		return core.QuotaObservation{}, err
 	}
-	if _, err = h.validateBinding(ctx, read.AccountID, read.Generation, false); err != nil {
-		return core.QuotaObservation{}, err
+	if bindingErr != nil {
+		return core.QuotaObservation{}, bindingErr
 	}
 	h.mu.RLock()
 	baseline := h.baselines[read.AccountID]

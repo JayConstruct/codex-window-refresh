@@ -17,25 +17,7 @@ func ReconcileAccounts(s *CoreState, hosts []HostAccount, now time.Time) {
 			continue
 		}
 		seen[h.ID] = true
-		a, found := s.Accounts[h.ID]
-		if !found || a.Generation != h.Generation {
-			releaseAccount(s, h.ID)
-			a = AccountState{ID: h.ID, Generation: h.Generation, OrdinaryParticipant: true, WeeklyEnabled: true, Permission: PermissionUnknown}
-		}
-		a.Enabled = h.Enabled
-		a.Availability = h.Availability
-		if !a.Enabled && a.Task != nil {
-			a.Task.State = TaskSuspended
-			releaseAccount(s, h.ID)
-		}
-		if a.Enabled && a.Task != nil && a.Task.State == TaskSuspended {
-			if a.Task.OperationID != "" {
-				a.Task.State = TaskAwaitingEvidence
-			} else {
-				a.Task.State = TaskPending
-			}
-		}
-		s.Accounts[h.ID] = a
+		ReconcileAccount(s, h)
 	}
 	for id := range s.Accounts {
 		if !seen[id] {
@@ -45,6 +27,35 @@ func ReconcileAccounts(s *CoreState, hosts []HostAccount, now time.Time) {
 		}
 	}
 	_ = now
+}
+
+// ReconcileAccount applies authoritative identity/status for one account only.
+// Unlike a full inventory it cannot remove or change unrelated accounts.
+func ReconcileAccount(s *CoreState, h HostAccount) {
+	if h.ID == "" || h.Generation == "" {
+		return
+	}
+	if s.Accounts == nil {
+		s.Accounts = make(map[AccountID]AccountState)
+	}
+	a, found := s.Accounts[h.ID]
+	if !found || a.Generation != h.Generation {
+		releaseAccount(s, h.ID)
+		a = AccountState{ID: h.ID, Generation: h.Generation, OrdinaryParticipant: true, WeeklyEnabled: true, Permission: PermissionUnknown}
+	}
+	a.Enabled, a.Availability = h.Enabled, h.Availability
+	if !a.Enabled && a.Task != nil {
+		a.Task.State = TaskSuspended
+		releaseAccount(s, h.ID)
+	}
+	if a.Enabled && a.Task != nil && a.Task.State == TaskSuspended {
+		if a.Task.OperationID != "" {
+			a.Task.State = TaskAwaitingEvidence
+		} else {
+			a.Task.State = TaskPending
+		}
+	}
+	s.Accounts[h.ID] = a
 }
 
 // NextSequence allocates query-start and field-acceptance fences in the same

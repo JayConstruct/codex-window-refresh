@@ -324,6 +324,13 @@ func (e *Engine) observe(ctx context.Context, id core.AccountID, sources ...core
 		err = readCtx.Err()
 	}
 	cancel()
+	if source, ok := e.host.(interface {
+		QuotaAccountStatus(core.AccountID) (core.HostAccount, bool)
+	}); ok {
+		if account, found := source.QuotaAccountStatus(id); found && account.ID == id && account.Generation != "" {
+			e.reconcileSelectedAccount(account)
+		}
+	}
 	e.drain()
 	e.nextRead[id] = e.clock.Now().Add(e.cfg.QuotaQuery.Interval.Value())
 	if err != nil {
