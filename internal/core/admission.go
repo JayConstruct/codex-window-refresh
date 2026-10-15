@@ -83,7 +83,6 @@ func DecideAdmission(in AdmissionInput) Admission {
 	}
 	var due []EventID
 	weekly, fiveHour, daily, manual := false, false, false, false
-	knownFiveHourReset := false
 	seen := make(map[EventID]bool)
 	for _, event := range in.Task.Intents {
 		if event.ID == "" || event.Status != IntentPending || event.RandomizedDueAt.IsZero() || in.Now.Before(event.RandomizedDueAt) || seen[event.ID] {
@@ -94,7 +93,6 @@ func DecideAdmission(in AdmissionInput) Admission {
 			weekly = true
 		case ReasonFiveHour:
 			fiveHour = true
-			knownFiveHourReset = knownFiveHourReset || (!event.OriginalDueAt.IsZero() && event.OriginalDueAt.Equal(in.FiveHourBaselineResetAt))
 		case ReasonDaily:
 			daily = true
 		case ReasonManual:
@@ -141,7 +139,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 	default:
 		return deny(HoldQuotaUnknown)
 	}
-	fullAfterReset := knownFiveHourReset && FullFiveHourAfterReset(in.FiveHour, in.FiveHourBaselineResetAt, in.Now)
+	fullAfterReset := FullFiveHourForResetTask(in.FiveHour, in.FiveHourBaselineResetAt, &in.Task, in.Now)
 	if in.FiveHour.State != WindowInactive && in.FiveHour.State != WindowExpired && !(manual && FullFiveHourPlaceholder(in.FiveHour)) && !fullAfterReset {
 		return deny(HoldQuotaUnknown)
 	}
@@ -193,4 +191,26 @@ func FullFiveHourPlaceholder(window WindowEvidence) bool {
 // must have ended before this observation was made.
 func FullFiveHourAfterReset(window WindowEvidence, reset, now time.Time) bool {
 	return !reset.IsZero() && !now.Before(reset) && !window.ConfirmedAt.Before(reset) && FullFiveHourPlaceholder(window)
+}
+
+// FullFiveHourForResetTask also accepts the immutable boundary retained by an
+// existing reset intent after verified joint reset cleared the short baseline.
+// It never invents a first cycle, revives a retired intent, or overrides a newer
+// nonempty baseline. Permission, freshness and other admission gates still apply.
+func FullFiveHourForResetTask(window WindowEvidence, baseline time.Time, task *MergedTask, now time.Time) bool {
+	if task == nil || task.OperationID != "" {
+		return false
+	}
+	for _, event := range task.Intents {
+		if event.ID == "" || event.Reason != ReasonFiveHour || event.Status != IntentPending || event.RandomizedDueAt.IsZero() || now.Before(event.RandomizedDueAt) {
+			continue
+		}
+		if !baseline.IsZero() && !baseline.Equal(event.OriginalDueAt) {
+			continue
+		}
+		if FullFiveHourAfterReset(window, event.OriginalDueAt, now) {
+			return true
+		}
+	}
+	return false
 }

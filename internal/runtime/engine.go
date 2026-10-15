@@ -576,7 +576,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		}
 		// Failed/ambiguous evidence is retried by the bounded observation poll,
 		// rather than by every scheduler tick. Every admitted send still reads anew.
-		if now.Before(e.nextRead[id]) && (a.Permission != core.PermissionAllowed || (a.FiveHour.State != core.WindowInactive && a.FiveHour.State != core.WindowExpired && !core.FullFiveHourAfterReset(a.FiveHour, a.FiveHourBaseline.StableResetAt, now))) {
+		if now.Before(e.nextRead[id]) && (a.Permission != core.PermissionAllowed || (a.FiveHour.State != core.WindowInactive && a.FiveHour.State != core.WindowExpired && !core.FullFiveHourForResetTask(a.FiveHour, a.FiveHourBaseline.StableResetAt, a.Task, now))) {
 			e.hold(id, core.HoldQuotaUnknown)
 			continue
 		}

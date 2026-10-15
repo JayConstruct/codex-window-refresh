@@ -19,15 +19,27 @@ func ordinaryInput() AdmissionInput {
 }
 
 func TestFullQuotaCanWakeKnownExpiredFiveHourCycle(t *testing.T) {
-	for _, scenario := range []string{"reset", "missing baseline", "future baseline", "unrelated intent", "before reset observation", "missing percentage", "partial quota", "short countdown", "stale", "blocked", "no demand", "outside hours", "foreground", "pending delivery", "weekly unconfirmed"} {
+	for _, scenario := range []string{"reset", "cleared baseline with retained intent", "missing baseline and reset intent", "retired intent", "random delay pending", "daily only", "future baseline", "unrelated intent", "before reset observation", "missing percentage", "partial quota", "short countdown", "stale", "blocked", "no demand", "outside hours", "foreground", "pending delivery", "weekly unconfirmed"} {
 		t.Run(scenario, func(t *testing.T) {
 			in := ordinaryInput()
 			in.FiveHourBaselineResetAt = in.Now.Add(-time.Minute)
 			in.Task.Intents[0].OriginalDueAt = in.FiveHourBaselineResetAt
 			in.FiveHour = WindowEvidence{Kind: FiveHour, State: WindowUnknown, ResetAt: in.Now.Add(5 * time.Hour), ConfirmedAt: in.Now, Source: "cpa_wham_usage", Remaining: &QuotaAmount{Value: 100, Unit: "percent"}}
 			switch scenario {
-			case "missing baseline":
+			case "cleared baseline with retained intent":
 				in.FiveHourBaselineResetAt = time.Time{}
+			case "missing baseline and reset intent":
+				in.FiveHourBaselineResetAt = time.Time{}
+				in.Task.Intents[0].OriginalDueAt = time.Time{}
+			case "retired intent":
+				in.FiveHourBaselineResetAt = time.Time{}
+				in.Task.Intents[0].Status = IntentSatisfied
+			case "random delay pending":
+				in.FiveHourBaselineResetAt = time.Time{}
+				in.Task.Intents[0].RandomizedDueAt = in.Now.Add(time.Minute)
+			case "daily only":
+				in.FiveHourBaselineResetAt = time.Time{}
+				in.Task.Intents[0].Reason = ReasonDaily
 			case "future baseline":
 				in.FiveHourBaselineResetAt = in.Now.Add(time.Hour)
 			case "unrelated intent":
@@ -59,7 +71,7 @@ func TestFullQuotaCanWakeKnownExpiredFiveHourCycle(t *testing.T) {
 				in.Task.Intents = append(in.Task.Intents, Intent{ID: "week", Reason: ReasonWeekly, Status: IntentPending, RandomizedDueAt: in.Now})
 			}
 			got := DecideAdmission(in)
-			if got.Allowed != (scenario == "reset") {
+			if got.Allowed != (scenario == "reset" || scenario == "cleared baseline with retained intent") {
 				t.Fatalf("unexpected admission: %+v", got)
 			}
 		})

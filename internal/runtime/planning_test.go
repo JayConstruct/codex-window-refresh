@@ -118,6 +118,40 @@ func TestUnknownWindowsDoNotCreateFutureExpiryCycles(t *testing.T) {
 	}
 }
 
+func TestPendingFiveHourWakeSurvivesClearedBaselineAndFutureWeeklyPlan(t *testing.T) {
+	e, host, _, clock := fixture(t, false, true)
+	a := e.state.Accounts["a"]
+	due := clock.now.Add(-time.Minute)
+	a.FiveHourBaseline = core.WindowBaseline{}
+	a.FiveHour = core.WindowEvidence{Kind: core.FiveHour, State: core.WindowUnknown, ResetAt: clock.now.Add(5 * time.Hour), ConfirmedAt: clock.now, Source: "cpa_wham_usage", Remaining: &core.QuotaAmount{Value: 100, Unit: "percent"}}
+	a.WeeklyBaseline = core.WindowBaseline{CycleID: "week-current", StableResetAt: clock.now.Add(24 * time.Hour)}
+	a.Task = &core.MergedTask{AccountID: "a", Generation: "g", State: core.TaskWaiting, HoldReason: core.HoldNoCapacity, Intents: []core.Intent{{ID: "pending-short", Reason: core.ReasonFiveHour, CycleID: "old-short", OriginalDueAt: due, RandomizedDueAt: due, Status: core.IntentPending}}}
+	e.state.Accounts["a"] = a
+	before, _ := json.Marshal(e.state)
+	for _, detailed := range []bool{false, true} {
+		e.cfg.Planning.Enabled = detailed
+		plan := e.schedulePlan(e.state, clock.now)
+		wake := plan.NextWakes["a"]
+		if wake.Trigger != string(core.ReasonFiveHour) || wake.ScheduledAt == nil || !wake.ScheduledAt.Equal(due) || wake.Status != "waiting" {
+			t.Fatalf("future weekly plan hid a pending five-hour wake: %+v", wake)
+		}
+		if detailed && (len(wake.Sources) != 1 || wake.Sources[0].EventID != "pending-short" || !wake.Sources[0].ResetAt.Equal(due)) {
+			t.Fatalf("plan lost the retained task's original evidence: %+v", wake.Sources)
+		}
+	}
+	after, _ := json.Marshal(e.state)
+	if string(before) != string(after) || host.reads != 0 || len(host.sends) != 0 {
+		t.Fatal("reading a retained task changed state or performed network work")
+	}
+	for _, status := range []core.IntentStatus{core.IntentSatisfied, core.IntentSuperseded} {
+		a.Task.Intents[0].Status = status
+		e.state.Accounts["a"] = a
+		if wake := e.schedulePlan(e.state, clock.now).NextWakes["a"]; wake.Trigger != string(core.ReasonWeekly) {
+			t.Fatalf("retired five-hour task was revived: %+v", wake)
+		}
+	}
+}
+
 func TestPlanUsesPersistedDeadlinesAndDailyPoints(t *testing.T) {
 	engine, _, _, clock := fixture(t, false, false)
 	engine.cfg.Planning.Enabled = true

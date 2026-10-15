@@ -106,3 +106,63 @@ func TestAutomaticFullQuotaDoesNotVerifyOrRepeatUnconfirmedSend(t *testing.T) {
 		}
 	}
 }
+
+func TestRetainedFiveHourWakeWithClearedBaselineDoesNotWaitForNextWeek(t *testing.T) {
+	e, host, _, clock := manualWakeFixture(t)
+	e.cfg.Enabled = true
+	a := e.state.Accounts["a"]
+	reset := a.FiveHourBaseline.StableResetAt
+	a.WeeklyBaseline = core.WindowBaseline{CycleID: "expired-week", StableResetAt: clock.now.Add(-time.Second)}
+	a.Task = &core.MergedTask{AccountID: "a", Generation: "g", State: core.TaskPending, Intents: []core.Intent{{ID: "retained-reset", Reason: core.ReasonFiveHour, CycleID: "old-short", OriginalDueAt: reset, RandomizedDueAt: reset, Status: core.IntentPending}}}
+	e.state.Accounts["a"] = a
+	permission := core.PermissionAllowed
+	// Reproduce the real reducer transition: verified joint reset retires the
+	// short baseline but keeps the ordinary intent without a mature replacement.
+	core.ApplyObservation(&e.state, core.QuotaObservation{AccountID: "a", Generation: "g", Class: core.ObservationQuery, ReadStartedSeq: core.NextSequence(&e.state), ReceivedAt: clock.now, Permission: &permission,
+		FiveHour: &core.WindowEvidence{State: core.WindowInactive, ResetAt: clock.now.Add(5 * time.Hour)},
+		Weekly:   &core.WindowEvidence{State: core.WindowInactive, ResetAt: clock.now.Add(7 * 24 * time.Hour)}})
+	if !e.state.Accounts["a"].FiveHourBaseline.StableResetAt.IsZero() || e.state.Accounts["a"].Task.Intents[0].Status != core.IntentPending {
+		t.Fatal("joint reset did not produce a retained ordinary task")
+	}
+	core.ApplyObservation(&e.state, core.QuotaObservation{AccountID: "a", Generation: "g", Class: core.ObservationQuery, ReadStartedSeq: core.NextSequence(&e.state), ReceivedAt: clock.now,
+		Weekly: &core.WindowEvidence{State: core.WindowActive, ResetAt: clock.now.Add(24 * time.Hour), CycleID: "next-week"}})
+	e.QueueQuotaQuery("a")
+	if err := e.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	addUser(e, clock)
+	if err := e.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.sends) != 1 || host.sends[0].AccountID != "a" {
+		t.Fatalf("retained five-hour reset could not dispatch without its cleared baseline: %+v", e.Snapshot().Accounts["a"].Task)
+	}
+}
+
+func TestFullQuotaWithoutFiveHourHistoryDoesNotInventResetWake(t *testing.T) {
+	e, host, _, clock := manualWakeFixture(t)
+	e.cfg.Enabled = true
+	e.cfg.ResetRules.Weekly.Enabled = true
+	a := e.state.Accounts["a"]
+	a.FiveHourBaseline = core.WindowBaseline{}
+	a.WeeklyBaseline = core.WindowBaseline{CycleID: "future-week", StableResetAt: clock.now.Add(24 * time.Hour)}
+	a.Task = nil
+	e.state.Accounts["a"] = a
+	addUser(e, clock)
+	for index := 0; index < 2; index++ {
+		e.QueueQuotaQuery("a")
+		if err := e.Step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if len(host.sends) != 0 || !e.Snapshot().Accounts["a"].FiveHourBaseline.StableResetAt.IsZero() {
+			t.Fatal("a first full placeholder invented five-hour reset history or sent a model")
+		}
+		if wake := e.SchedulerDiagnostics().(SchedulingSummary).Plan.NextWakes["a"]; wake.Trigger != string(core.ReasonWeekly) {
+			t.Fatalf("unknown five-hour history changed the known weekly plan: %+v", wake)
+		}
+		clock.now = clock.now.Add(time.Minute)
+	}
+}

@@ -230,6 +230,24 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 			{core.ReasonWeekly, account.WeeklyBaseline.StableResetAt, account.WeeklyExpiryQueried, e.cfg.QuotaQuery.OnWeeklyExpiry, policy.WeeklyEnabled, policy.WeeklyRandomDelay},
 		} {
 			if window.reset.IsZero() {
+				// A joint reset can clear a baseline while retaining an ordinary
+				// reset intent. Its immutable deadline remains a real plan even
+				// when only the next weekly baseline is currently known.
+				if e.cfg.Enabled && window.wake && account.Task != nil {
+					for _, intent := range account.Task.Intents {
+						if intent.Reason != window.reason || intent.Status != core.IntentPending || intent.OriginalDueAt.IsZero() || intent.RandomizedDueAt.IsZero() {
+							continue
+						}
+						deadline := intent.RandomizedDueAt
+						action := e.resetWakePlan(account, window.reason, deadline, deadline, &deadline, "scheduled", now, plan.Until)
+						action.Sources = []core.ActionSource{{Trigger: string(window.reason), ConfigPath: "reset_rules.five_hour", EventID: intent.ID, ResetAt: intent.OriginalDueAt, CycleID: intent.CycleID, EvidenceSource: account.FiveHour.Source, EvidenceAt: account.FiveHour.ConfirmedAt}}
+						if window.reason == core.ReasonWeekly {
+							action.Sources[0].ConfigPath = "reset_rules.weekly"
+							action.Sources[0].EvidenceSource, action.Sources[0].EvidenceAt = account.Weekly.Source, account.Weekly.ConfirmedAt
+						}
+						add(action)
+					}
+				}
 				continue
 			}
 			if plan.Enabled && window.query && !window.reset.Equal(window.queried) {
@@ -271,19 +289,7 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 					continue
 				}
 			}
-			earliest = maxTime(earliest, maxTime(now, maxTime(account.BackoffUntil, e.nextPreflight[id])))
-			detail := "需发送前额度核对；已有活跃窗口或待验证请求不会发送"
-			if window.reason == core.ReasonFiveHour {
-				allowed, ok := nextAllowedTime(e.cfg, id, earliest, plan.Until)
-				if !ok {
-					status, detail = "blocked", "计划范围内没有允许的五小时唤醒时段"
-				} else {
-					earliest = allowed
-				}
-				detail += "；仍需人数容量满足"
-			}
-			model, _ := e.cfg.WakeContent(window.reason)
-			add(PlannedAction{Kind: "wake", Trigger: string(window.reason), AccountID: id, EarliestAt: earliest, LatestAt: latest, ScheduledAt: scheduledAt, Status: status, Detail: detail, Model: model})
+			add(e.resetWakePlan(account, window.reason, earliest, latest, scheduledAt, status, now, plan.Until))
 		}
 	}
 	if plan.Enabled && e.cfg.Enabled && e.cfg.OrdinaryRules.DailyEnabled {
@@ -330,6 +336,22 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 	plan.Entries = append(plan.Entries, (*entries)...)
 	sort.Slice(plan.Entries, func(first, second int) bool { return actionBefore(plan.Entries[first], plan.Entries[second]) })
 	return plan
+}
+
+func (e *Engine) resetWakePlan(account core.AccountState, reason core.Reason, earliest, latest time.Time, scheduledAt *time.Time, status string, now, until time.Time) PlannedAction {
+	earliest = maxTime(earliest, maxTime(now, maxTime(account.BackoffUntil, e.nextPreflight[account.ID])))
+	detail := "需发送前额度核对；已有活跃窗口或待验证请求不会发送"
+	if reason == core.ReasonFiveHour {
+		allowed, ok := nextAllowedTime(e.cfg, account.ID, earliest, until)
+		if !ok {
+			status, detail = "blocked", "计划范围内没有允许的五小时唤醒时段"
+		} else {
+			earliest = allowed
+		}
+		detail += "；仍需人数容量满足"
+	}
+	model, _ := e.cfg.WakeContent(reason)
+	return PlannedAction{Kind: "wake", Trigger: string(reason), AccountID: account.ID, EarliestAt: earliest, LatestAt: latest, ScheduledAt: scheduledAt, Status: status, Detail: detail, Model: model}
 }
 
 func nextAllowedTime(settings config.Config, id core.AccountID, from, until time.Time) (time.Time, bool) {
