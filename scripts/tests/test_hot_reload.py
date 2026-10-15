@@ -1,12 +1,15 @@
 import argparse
 import contextlib
 import copy
+import ctypes
 import hashlib
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import struct
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -17,6 +20,29 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("hot_installer", ROOT / "scripts/install.py")
 installer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(installer)
+
+
+def watch_config(test, path):
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    test.assertGreaterEqual(fd, 0)
+    test.addCleanup(os.close, fd)
+    # Match CPA's file-based watcher and the config events it actually handles.
+    test.assertGreaterEqual(libc.inotify_add_watch(fd, os.fsencode(path), 0x00000fff), 0)
+
+    def modified():
+        try:
+            raw = os.read(fd, 65536)
+        except BlockingIOError:
+            return False
+        offset, changed = 0, False
+        while offset < len(raw):
+            _, mask, _, length = struct.unpack_from("iIII", raw, offset)
+            changed = changed or bool(mask & (0x2 | 0x100 | 0x800))
+            offset += 16 + length
+        return changed
+
+    return modified
 
 
 def runtime_report(plan, version, library):
@@ -145,6 +171,36 @@ class HotInstallTests(unittest.TestCase):
         self.assertEqual(set(installer.managed_libraries(record, self.plan)), {self.lib, self.target})
         self.assertFalse((self.root / "window-refresh.env").exists())
 
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux inotify")
+    def test_real_file_watch_sees_all_three_configuration_round_trips(self):
+        modified = watch_config(self, self.config)
+        inode = self.config.stat().st_ino
+        updates = []
+
+        def read_when_notified(plan):
+            if modified():
+                updates.append(True)
+                return self.get(plan)
+            return self.actual_read(plan)
+
+        with mock.patch.object(installer, "local_runtime", side_effect=read_when_notified):
+            self.assertIn("热重载成功", self.install())
+        self.assertEqual(len(updates), 3)
+        self.assertEqual(self.config.stat().st_ino, inode)
+
+    @unittest.skipUnless(sys.platform == "linux", "requires Linux inotify")
+    def test_failed_activation_keeps_original_watch_for_a_later_upgrade(self):
+        modified = watch_config(self, self.config)
+        inode = self.config.stat().st_ino
+        self.mode = "failed-load"
+        with self.assertRaisesRegex(installer.InstallError, "旧版已恢复"):
+            self.install()
+        self.assertTrue(modified())
+        self.assertEqual(self.config.stat().st_ino, inode)
+        before = self.config.read_bytes()
+        installer.write_watched_config(self.config, before + b"# later configuration\n", before)
+        self.assertTrue(modified())
+
     def test_same_version_is_noop_without_config_or_binary_writes(self):
         self.args.version = self.record["version"]
         (self.unpacked / "codex-window-refresh.so").write_bytes(self.lib.read_bytes())
@@ -224,15 +280,25 @@ class HotInstallTests(unittest.TestCase):
 
     def test_existing_running_file_cannot_replace_live_configuration_acknowledgement(self):
         self.mode = "ignore-config"
-        with self.assertRaisesRegex(installer.InstallError, "无法确认旧版恢复"):
+        with self.assertRaisesRegex(installer.InstallError, "无法确认旧版恢复") as error:
             self.install()
+        self.assertIn("失败步骤：确认旧版读取配置", str(error.exception))
+        self.assertIn("最后观测版本 0.1.0-rc.21，阶段 running", str(error.exception))
+        self.assertIn("本次配置确认未收到", str(error.exception))
         self.assertFalse(self.target.exists())
         self.assertEqual(self.checker.read_bytes(), b"original-checker")
 
     def test_new_instance_must_acknowledge_a_second_configuration_round_trip(self):
         self.mode = "first-ack-only"
-        with self.assertRaisesRegex(installer.InstallError, "无法确认旧版恢复"):
+        with self.assertRaisesRegex(installer.InstallError, "无法确认旧版恢复") as error:
             self.install()
+        diagnostic = str(error.exception)
+        self.assertIn("失败步骤：确认新版再次读取配置", diagnostic)
+        self.assertIn("最后观测版本 0.1.0-rc.22，阶段 running", diagnostic)
+        self.assertIn("本次配置确认未收到", diagnostic)
+        self.assertIn("实例已变化", diagnostic)
+        self.assertNotIn(self.first_target_token, diagnostic)
+        self.assertNotIn("fixture-private", diagnostic)
         self.assertTrue(self.target.is_file())
         self.assertEqual(self.report["version"], "0.1.0-rc.22")
 
@@ -274,3 +340,71 @@ class HotInstallTests(unittest.TestCase):
             self.version_file.chmod(0o600)
             with self.assertRaises(installer.LocalVersionError) as error: self.actual_read(self.plan)
             self.assertNotIn("fixture-private-secret", str(error.exception))
+
+
+class WatchedConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = pathlib.Path(self.temp.name) / "config.yaml"
+        self.original = b"port: 8317\n# original long comment\nplugins: {}\n"
+        self.path.write_bytes(self.original)
+        self.path.chmod(0o640)
+
+    def test_shorter_write_and_rollback_preserve_inode_permissions_and_owner(self):
+        before = self.path.stat()
+        backup = self.path.parent / "backup"
+        backup.mkdir()
+        with mock.patch.object(installer.os, "fchown", return_value=None):
+            transaction = installer.Transaction(backup)
+            transaction.write_watched(self.path, b"plugins: {}\n", self.original)
+            self.assertEqual(self.path.read_bytes(), b"plugins: {}\n")
+            transaction.rollback()
+        after = self.path.stat()
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual((after.st_dev, after.st_ino, after.st_mode, after.st_uid, after.st_gid),
+                         (before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_gid))
+
+    def test_changed_contents_symlink_and_hardlink_are_rejected_without_writes(self):
+        with self.assertRaises(installer.InstallError):
+            installer.write_watched_config(self.path, b"new", b"different configuration")
+        link = self.path.parent / "link"
+        link.symlink_to(self.path)
+        with self.assertRaises(installer.InstallError):
+            installer.write_watched_config(link, b"new", self.original)
+        link.unlink()
+        os.link(self.path, link)
+        with self.assertRaises(installer.InstallError):
+            installer.write_watched_config(self.path, b"new", self.original)
+        self.assertEqual(self.path.read_bytes(), self.original)
+
+    def test_partial_write_failure_restores_original_without_replacing_inode(self):
+        inode = self.path.stat().st_ino
+        actual_write, attempts = os.write, []
+
+        def interrupted(fd, data):
+            attempts.append(True)
+            if len(attempts) == 1:
+                return actual_write(fd, data[:4])
+            if len(attempts) == 2:
+                raise OSError("fixture disk failure containing private data")
+            return actual_write(fd, data)
+
+        with mock.patch.object(installer.os, "write", side_effect=interrupted):
+            with self.assertRaises(OSError):
+                installer.write_watched_config(self.path, b"plugins:\n  enabled: true\n", self.original)
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(self.path.stat().st_ino, inode)
+
+    def test_failed_watched_transaction_does_not_fall_back_to_atomic_rollback(self):
+        inode = self.path.stat().st_ino
+        backup = self.path.parent / "backup"
+        backup.mkdir()
+        with mock.patch.object(installer.os, "fchown", return_value=None):
+            transaction = installer.Transaction(backup)
+            with mock.patch.object(installer, "write_watched_config", side_effect=OSError("fixture failure")):
+                with self.assertRaises(OSError):
+                    transaction.write_watched(self.path, b"plugins: {}\n", self.original)
+            transaction.rollback()
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(self.path.stat().st_ino, inode)

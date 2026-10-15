@@ -552,11 +552,52 @@ def atomic_write(path, data, mode, uid=0, gid=0):
             os.unlink(temporary)
 
 
+def write_watched_config(path, data, expected):
+    """Preserve CPA's inode-based file watch, as its own config writer does."""
+    path = safe_path(path)
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        current = path.stat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                and (info.st_dev, info.st_ino) == (current.st_dev, current.st_ino),
+                "CPA 配置文件类型或身份已变化；未写入。")
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            original = stream.read(len(expected) + 1)
+        require(original == expected, "CPA 配置被其他进程修改；未覆盖。")
+
+        def replace_contents(content):
+            os.lseek(fd, 0, os.SEEK_SET)
+            remaining = memoryview(content)
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError("configuration write incomplete")
+                remaining = remaining[written:]
+            os.ftruncate(fd, len(content))
+            os.fsync(fd)
+
+        try:
+            replace_contents(data)
+        except BaseException:
+            try:
+                replace_contents(original)
+            except BaseException:
+                raise InstallError("CPA 配置写入失败且原内容未能恢复；请从安装备份恢复，未重启 CPA。") from None
+            raise
+        current = path.stat()
+        require((info.st_dev, info.st_ino) == (current.st_dev, current.st_ino),
+                "CPA 配置在写入期间被其他进程替换；未覆盖新文件，请检查备份。")
+    finally:
+        os.close(fd)
+
+
 class Transaction:
     def __init__(self, backup):
         self.backup = backup
         self.originals = {}
         self.index = []
+        self.watched_expected = {}
 
     def remember(self, path):
         path = safe_path(path)
@@ -580,6 +621,12 @@ class Transaction:
         self.remember(path)
         atomic_write(path, data, mode, uid, gid)
 
+    def write_watched(self, path, data, expected):
+        self.remember(path)
+        self.watched_expected[path] = expected
+        write_watched_config(path, data, expected)
+        self.watched_expected[path] = data
+
     def remove(self, path):
         self.remember(path)
         if path.exists():
@@ -591,7 +638,10 @@ class Transaction:
                 if path.exists():
                     path.unlink()
             else:
-                atomic_write(path, *original)
+                if path in self.watched_expected:
+                    write_watched_config(path, original[0], self.watched_expected[path])
+                else:
+                    atomic_write(path, *original)
 
 
 def directory(path, mode, uid, gid, strict=False):
@@ -914,6 +964,8 @@ def hot_install(args, plan, unpacked):
     transaction = Transaction(backup)
     expected = plan["text"]
     staging = False
+    stage = "确认旧版读取配置"
+    last_observation = "尚未取得本次确认"
 
     def select(version, instance=None, changed=False):
         nonlocal expected
@@ -926,13 +978,23 @@ def hot_install(args, plan, unpacked):
         store.update({"version": version.removeprefix("v"), "release-tag": version, "local-reload-token": token})
         wrapper["store"] = store
         updated = replace_plugins(expected, data["plugins"])
-        info = plan["config"].stat()
-        transaction.write(plan["config"], updated.encode(), stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
+        transaction.write_watched(plan["config"], updated.encode(), expected.encode())
         expected = updated
         return hot_wait(lambda: running(version, changed, token, instance), "运行插件回写本次版本选择")
 
     def running(version, changed=False, token=None, instance=None):
-        status = local_runtime(plan)
+        nonlocal last_observation
+        try:
+            status = local_runtime(plan)
+        except LocalVersionError:
+            last_observation = "本机版本文件读取或校验失败"
+            raise
+        # Report only validated receipt fields and comparisons, never the token,
+        # configuration, credentials or an arbitrary exception's contents.
+        acknowledged = token is None or status["reload_token"] == token
+        last_observation = (f"最后观测版本 {status['version']}，阶段 {status['phase']}；"
+                            f"本次配置确认{'已收到' if acknowledged else '未收到'}；"
+                            f"实例{'已变化' if status['instance_id'] != before['instance_id'] else '未变化'}")
         return status if (status.get("phase") == "running"
                 and status.get("version") == version.removeprefix("v")
                 and status["library_path"] == str(plan["plugin_dir"] / f"{PLUGIN}-{version}.so")
@@ -944,6 +1006,7 @@ def hot_install(args, plan, unpacked):
         # Confirm CPA has read the old pin before creating a discoverable new
         # library. Merely staging a higher version must not trigger activation.
         select(current, instance=before["instance_id"])
+        stage = "准备新版文件与安装记录"
         transaction.write(target, (unpacked / "codex-window-refresh.so").read_bytes(), 0o644)
         staging = True
         # Prepare all local installation bookkeeping before switching. After a
@@ -957,13 +1020,17 @@ def hot_install(args, plan, unpacked):
         record["installed_hashes"].update({str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                                            for path in [target, checker]})
         transaction.write(record_file, json.dumps(record, indent=2).encode(), 0o600)
+        stage = "等待新版接管"
         ready = select(args.version, changed=True)
         # A second configuration round trip acknowledges the same instance
         # after the serialized host replacement has completed, not just during
         # its initial plugin.register callback.
+        stage = "确认新版再次读取配置"
         select(args.version, instance=ready["instance_id"], changed=True)
+        stage = "核对最终配置"
         require(plan["config"].read_text() == expected, "CPA 配置已被其他进程修改，请检查当前插件状态。")
     except BaseException as failure:
+        activation_diagnostic = f"失败步骤：{stage}；{last_observation}"
         try:
             if staging:
                 # CPA itself resumes the old instance when registration fails.
@@ -986,8 +1053,8 @@ def hot_install(args, plan, unpacked):
                 restored["installed_hashes"][str(target)] = hashlib.sha256(target.read_bytes()).hexdigest()
                 atomic_write(record_file, json.dumps(restored, indent=2).encode(), 0o600)
         except BaseException:
-            raise InstallError(f"热重载未完成，且无法确认旧版恢复；未重启 CPA。保留版本文件及备份：{backup}；请检查插件日志和 runtime-version.json。") from None
-        raise InstallError(f"热重载失败，旧版已恢复；未重启 CPA。已尝试的版本文件保留且不会选中，重试该版本须重启安装。备份：{backup}") from failure
+            raise InstallError(f"热重载未完成，且无法确认旧版恢复；未重启 CPA。{activation_diagnostic}。保留版本文件及备份：{backup}；请检查插件日志和 runtime-version.json。") from None
+        raise InstallError(f"热重载失败，旧版已恢复；未重启 CPA。{activation_diagnostic}。已尝试的版本文件保留且不会选中，重试该版本须重启安装。备份：{backup}") from failure
     print(f"热重载成功：{current} → {args.version}；已核对新版实例运行，CPA 未重启。备份：{backup}")
 
 
