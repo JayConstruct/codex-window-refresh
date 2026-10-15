@@ -22,12 +22,13 @@ import (
 	"codex-window-refresh/internal/config"
 	"codex-window-refresh/internal/core"
 	"codex-window-refresh/internal/cpa"
+	scheduler "codex-window-refresh/internal/runtime"
 	"codex-window-refresh/internal/storage"
 	"gopkg.in/yaml.v3"
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.19"
+const Version = "0.1.0-rc.20"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -80,13 +81,14 @@ type Options struct {
 type WrapperConfig struct {
 	// CPA injects these host-owned loader controls into ConfigYAML. They do not
 	// belong to business policy and do not change plumbing identity.
-	HostEnabled      *bool  `yaml:"enabled" json:"-"`
-	HostPriority     *int   `yaml:"priority" json:"-"`
-	ConfigFile       string `yaml:"config_file" json:"config_file"`
-	StateDir         string `yaml:"state_dir" json:"state_dir"`
-	QuotaTransport   string `yaml:"quota_transport" json:"quota_transport,omitempty"`
-	ManagementURL    string `yaml:"management_url" json:"management_url,omitempty"`
-	ManagementKeyEnv string `yaml:"management_key_env" json:"management_key_env,omitempty"`
+	HostEnabled      *bool     `yaml:"enabled" json:"-"`
+	HostPriority     *int      `yaml:"priority" json:"-"`
+	HostStore        yaml.Node `yaml:"store" json:"-"`
+	ConfigFile       string    `yaml:"config_file" json:"config_file"`
+	StateDir         string    `yaml:"state_dir" json:"state_dir"`
+	QuotaTransport   string    `yaml:"quota_transport" json:"quota_transport,omitempty"`
+	ManagementURL    string    `yaml:"management_url" json:"management_url,omitempty"`
+	ManagementKeyEnv string    `yaml:"management_key_env" json:"management_key_env,omitempty"`
 }
 
 func (w WrapperConfig) quotaTransport() string {
@@ -109,6 +111,7 @@ func (w WrapperConfig) samePlumbing(other WrapperConfig) bool {
 }
 
 type Service struct {
+	calls         sync.RWMutex
 	lifecycle     sync.Mutex
 	mu            sync.RWMutex
 	callback      cpa.Callback
@@ -121,6 +124,7 @@ type Service struct {
 	cancel        context.CancelFunc
 	done          chan struct{}
 	stopping      bool
+	quiesced      bool
 	lastError     string
 	policyOps     *policyFileOps
 	responseQuota cpa.ResponseQuotaObserver
@@ -178,13 +182,24 @@ func (s *Service) Handle(ctx context.Context, method string, payload []byte) (ra
 	return raw
 }
 func (s *Service) handle(ctx context.Context, method string, payload []byte) (any, error) {
+	// Lifecycle writers drain management operations and observational hooks before
+	// releasing a host or store. Acquire this gate before the lifecycle mutex.
+	if method != "plugin.register" && method != "plugin.reconfigure" && method != "plugin.quiesce" && method != "plugin.shutdown" {
+		s.calls.RLock()
+		defer s.calls.RUnlock()
+	}
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
-		if err := s.configure(payload); err != nil {
+		if err := s.configureContext(ctx, payload); err != nil {
 			return nil, err
 		}
 		return registration(), nil
-	case "plugin.quiesce", "plugin.shutdown":
+	case "plugin.quiesce":
+		if err := s.Quiesce(ctx); err != nil {
+			return nil, err
+		}
+		return struct{}{}, nil
+	case "plugin.shutdown":
 		if err := s.Shutdown(ctx); err != nil {
 			return nil, err
 		}
@@ -279,10 +294,15 @@ func parseWrapper(payload []byte) (WrapperConfig, error) {
 	return wrapper, nil
 }
 func (s *Service) configure(payload []byte) error {
+	return s.configureContext(context.Background(), payload)
+}
+func (s *Service) configureContext(lifecycleContext context.Context, payload []byte) error {
 	wrapper, err := parseWrapper(payload)
 	if err != nil {
 		return err
 	}
+	s.calls.Lock()
+	defer s.calls.Unlock()
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
 	cfg, err := s.options.LoadConfig(wrapper.ConfigFile)
@@ -296,15 +316,23 @@ func (s *Service) configure(payload []byte) error {
 		return errors.New("identity_source_not_supported_by_cpa_adapter")
 	}
 	s.mu.RLock()
-	existing, previous, stopping := s.engine, s.wrapper, s.stopping
+	existing, previous, stopping, quiesced := s.engine, s.wrapper, s.stopping, s.quiesced
 	s.mu.RUnlock()
-	if stopping {
+	if stopping && !quiesced {
 		return errors.New("plugin is stopping; process restart required")
 	}
-	if existing != nil {
-		if !wrapper.samePlumbing(previous) {
-			return errors.New("wrapper plumbing changes require process restart")
+	if existing != nil && !wrapper.samePlumbing(previous) {
+		return errors.New("wrapper plumbing changes require process restart")
+	}
+	if quiesced {
+		// Rollback may arrive after a timed-out quiesce. Drain before reopening
+		// the same state directory, and refuse a second writer while still busy.
+		if err := s.stopRuntime(lifecycleContext); err != nil {
+			return err
 		}
+		existing = nil
+	}
+	if existing != nil {
 		if err := existing.UpdateConfig(wrapper.effective(cfg)); err != nil {
 			return errors.New("configuration update failed")
 		}
@@ -351,6 +379,8 @@ func (s *Service) configure(payload []byte) error {
 	s.store = store
 	s.cancel = cancel
 	s.done = done
+	s.stopping, s.quiesced, s.lastError = false, false, ""
+	s.responseQuota = cpa.ResponseQuotaObserver{}
 	s.mu.Unlock()
 	committed = true
 	hostCommitted = true
@@ -377,11 +407,38 @@ func (s *Service) configure(payload []byte) error {
 // activity is refused. Native shutdown must subsequently call WaitForShutdown
 // before its host frees the callback context or unloads the dynamic library.
 func (s *Service) Shutdown(ctx context.Context) error {
+	s.calls.Lock()
+	defer s.calls.Unlock()
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
 	s.mu.Lock()
+	s.quiesced = false
+	s.mu.Unlock()
+	return s.stopRuntime(ctx)
+}
+
+// Quiesce releases exclusive resources but can be reversed by reconfigure if
+// CPA cannot register the replacement library. Final shutdown is irreversible.
+func (s *Service) Quiesce(ctx context.Context) error {
+	s.calls.Lock()
+	defer s.calls.Unlock()
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	s.mu.Lock()
+	if s.stopping && !s.quiesced {
+		s.mu.Unlock()
+		return errors.New("plugin is shut down")
+	}
+	s.quiesced = true
+	s.mu.Unlock()
+	return s.stopRuntime(ctx)
+}
+
+// Caller owns calls and lifecycle, so callbacks cannot outlive store ownership.
+func (s *Service) stopRuntime(ctx context.Context) error {
+	s.mu.Lock()
 	s.stopping = true
-	cancel, done, store, host := s.cancel, s.done, s.store, s.host
+	cancel, done, store, host, engine, quiesced := s.cancel, s.done, s.store, s.host, s.engine, s.quiesced
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -392,9 +449,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return errors.New("shutdown interrupted; process restart required")
+			return errors.New("lifecycle interrupted; state remains locked")
 		case <-timer.C:
-			return errors.New("shutdown waiting for host callback; process restart required")
+			return errors.New("lifecycle waiting for host callback; state remains locked")
+		}
+	}
+	if quiesced && store != nil {
+		if preparer, ok := engine.(interface{ PrepareHotReload(context.Context) error }); ok {
+			if err := preparer.PrepareHotReload(ctx); err != nil {
+				return errors.New("hot reload state handoff failed")
+			}
 		}
 	}
 	closeHostConnections(host)
@@ -407,6 +471,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	s.store = nil
 	s.cancel = nil
 	s.done = nil
+	s.host = nil
 	s.mu.Unlock()
 	return nil
 }
@@ -415,6 +480,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 // error return and cannot safely permit unloading when a C callback is still
 // running. A nonreturning host callback therefore delays native shutdown.
 func (s *Service) WaitForShutdown() {
+	s.calls.Lock()
+	defer s.calls.Unlock()
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
 	s.mu.RLock()
@@ -431,6 +498,7 @@ func (s *Service) WaitForShutdown() {
 	s.store = nil
 	s.cancel = nil
 	s.done = nil
+	s.host = nil
 	s.mu.Unlock()
 }
 
@@ -449,7 +517,7 @@ func registration() any {
 }
 func managementRegistration() any {
 	routes := []map[string]string{}
-	for _, p := range []string{"/snapshot", "/summary", "/accounts", "/config", "/config-editor", "/capabilities", "/history"} {
+	for _, p := range []string{"/snapshot", "/summary", "/accounts", "/config", "/config-editor", "/capabilities", "/history", "/lifecycle"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
 	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check", "/manual-wake", "/prompt-generation", "/refresh-accounts"} {
@@ -503,6 +571,24 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 	s.mu.RLock()
 	engine, wrapper, cfg, done, stopping, lastError := s.engine, s.wrapper, s.cfg, s.done, s.stopping, s.lastError
 	s.mu.RUnlock()
+	if req.Method == "GET" && path == "/lifecycle" {
+		s.mu.RLock()
+		quiesced := s.quiesced
+		s.mu.RUnlock()
+		phase := "stopped"
+		if quiesced {
+			phase = "quiesced"
+		} else if schedulerRunning(done, stopping) {
+			phase = "running"
+		}
+		instance := ""
+		if reader, ok := engine.(interface {
+			ManagementSnapshot() scheduler.ManagementSnapshot
+		}); ok {
+			instance = reader.ManagementSnapshot().InstanceID
+		}
+		return response(200, map[string]any{"version": Version, "hot_reload_protocol": 1, "phase": phase, "instance_id": instance}), nil
+	}
 	if engine == nil {
 		return response(503, map[string]string{"error": "scheduler not initialized"}), nil
 	}

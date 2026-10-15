@@ -204,6 +204,55 @@ class InstallIntegrationTests(unittest.TestCase):
         self.assertNotIn('fixture-management-secret', output.getvalue())
         self.assertNotIn('fixture-private-value', output.getvalue())
 
+    def package_version(self, version):
+        with tarfile.open(self.archive, 'r:gz') as tar:
+            files = {pathlib.PurePosixPath(item.name).name: tar.extractfile(item).read() for item in tar}
+        metadata = json.loads(files['BUILD-INFO.json'])
+        metadata.update(release=version, hot_reload_protocol=1)
+        files['BUILD-INFO.json'] = json.dumps(metadata).encode()
+        files['codex-window-refresh.so'] += version.encode()
+        name = f'codex-window-refresh_{version}_linux_{self.arch}'
+        self.archive = self.root / (name + '.tar.gz')
+        with tarfile.open(self.archive, 'w:gz') as tar:
+            for path, data in files.items():
+                item = tarfile.TarInfo(name + '/' + path)
+                item.size = len(data)
+                tar.addfile(item, io.BytesIO(data))
+        self.checksums.write_text(hashlib.sha256(self.archive.read_bytes()).hexdigest() + '  ' + self.archive.name + '\n')
+        self.args.version = version
+        self.args.package = str(self.archive)
+        self.plan = installer.infer(self.args)
+
+    def test_bootstrap_installs_versioned_file_and_restart_upgrade_uninstalls_all_owned_versions(self):
+        self.install() # Existing pre-hot-reload stable installation.
+        self.package_version('v0.1.0-rc.20')
+        self.install()
+        wrapper = yaml.safe_load(self.config.read_text())['plugins']['configs'][installer.PLUGIN]
+        self.assertEqual(wrapper['store']['version'], '0.1.0-rc.20')
+        current = self.plan['plugin_dir'] / 'codex-window-refresh-v0.1.0-rc.20.so'
+        self.assertTrue(current.is_file())
+        record = json.loads((self.plan['record'] / 'installed.json').read_text())
+        self.assertEqual(record['library'], str(current))
+        # CPA may clean the unselected stable file on its next process startup.
+        (self.plan['plugin_dir'] / 'codex-window-refresh.so').unlink()
+        self.package_version('v0.1.0-rc.21')
+        self.install()
+        newest = self.plan['plugin_dir'] / 'codex-window-refresh-v0.1.0-rc.21.so'
+        self.assertTrue(newest.is_file() and current.is_file())
+        self.plan = installer.infer(self.args)
+        with contextlib.redirect_stdout(io.StringIO()):
+            installer.uninstall(self.args, self.plan)
+        self.assertFalse(newest.exists() or current.exists())
+        self.assertTrue(self.plan['policy'].is_file() and self.plan['state'].is_dir())
+
+    def test_first_hot_capable_install_uses_versioned_file_and_pin(self):
+        self.package_version('v0.1.0-rc.20')
+        self.install()
+        self.assertFalse((self.plan['plugin_dir'] / 'codex-window-refresh.so').exists())
+        self.assertTrue((self.plan['plugin_dir'] / 'codex-window-refresh-v0.1.0-rc.20.so').is_file())
+        wrapper = yaml.safe_load(self.config.read_text())['plugins']['configs'][installer.PLUGIN]
+        self.assertEqual(wrapper['store']['release-tag'], 'v0.1.0-rc.20')
+
     def test_install_upgrade_uninstall_preserve_policy_and_state(self):
         self.install()
         data = yaml.safe_load(self.config.read_text())

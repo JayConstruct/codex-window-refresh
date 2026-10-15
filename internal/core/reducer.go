@@ -583,8 +583,18 @@ func ExpireActivityRequests(s *CoreState, now time.Time, maxInFlight, retention 
 // RecoverAfterRestart clears process-local foreground occupancy and preserves
 // durable send uncertainty. It must be persisted before scheduling new work.
 func RecoverAfterRestart(s *CoreState, now time.Time) {
+	recoverAfterStart(s, now, false)
+}
+
+// RecoverAfterReload retains known foreground requests in the same CPA process.
+// Model dispatch recovery remains identical to a restart: never resend unknown.
+func RecoverAfterReload(s *CoreState, now time.Time) {
+	recoverAfterStart(s, now, true)
+}
+
+func recoverAfterStart(s *CoreState, now time.Time, preserveRequests bool) {
 	for id, r := range s.Requests {
-		if !r.Completed {
+		if !preserveRequests && !r.Completed {
 			r.Completed = true
 			s.Requests[id] = r
 		}

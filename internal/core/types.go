@@ -203,6 +203,7 @@ type UserActivity struct {
 }
 
 type CoreState struct {
+	HotReloadProcess   string `json:",omitempty"`
 	Revision           uint64
 	NextReadSequence   uint64
 	Accounts           map[AccountID]AccountState

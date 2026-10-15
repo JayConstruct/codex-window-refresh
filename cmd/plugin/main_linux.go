@@ -5,6 +5,9 @@
 package main
 
 /*
+#cgo LDFLAGS: -ldl
+#cgo CFLAGS: -D_GNU_SOURCE
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +36,17 @@ extern void cliproxyPluginShutdown(void);
 static int copy_host_api(const cliproxy_host_api* host,cliproxy_host_api* copy) {
  if(!host || !copy || host->abi_version != 1 || !host->host_ctx || !host->call || !host->free_buffer) return 1;
  *copy=*host; return 0;
+}
+// Go's c-shared runtime may retain native threads after plugin shutdown. Keep
+// executable mappings resident when CPA retires/dlcloses this version. Versioned
+// paths still get isolated plugin instances; process exit reclaims the mappings.
+static int retain_plugin_mapping(void) {
+ Dl_info info;
+ if(!dladdr((void*)&copy_host_api,&info) || !info.dli_fname) return 1;
+ void* handle=dlopen(info.dli_fname,RTLD_NOW|RTLD_LOCAL|RTLD_NODELETE);
+ if(!handle) return 1;
+ dlclose(handle);
+ return 0;
 }
 static int call_host(cliproxy_host_api* host,const char* method,const uint8_t* request,size_t len,cliproxy_buffer* response) {
  return host->call(host->host_ctx,method,request,len,response);
@@ -97,6 +111,9 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, api *C.cliproxy_plugin_api)
 	}
 	var copied C.cliproxy_host_api
 	if C.copy_host_api(host, &copied) != 0 {
+		return
+	}
+	if C.retain_plugin_mapping() != 0 {
 		return
 	}
 	callback = &nativeCallback{api: copied}
@@ -178,8 +195,8 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 func cliproxyPluginShutdown() {
 	defer func() { _ = recover() }()
 	nativeMu.Lock()
+	defer nativeMu.Unlock()
 	current, cb := service, callback
-	nativeMu.Unlock()
 	if cb != nil {
 		cb.stopped.Store(true)
 	}
@@ -188,6 +205,7 @@ func cliproxyPluginShutdown() {
 			current.WaitForShutdown()
 		}
 	}
+	service, callback = nil, nil
 	// The host may free its context and dlclose only after this function
 	// returns; all engine callbacks have drained. New callbacks are stopped.
 }

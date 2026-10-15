@@ -88,7 +88,7 @@ bash "$1" "${@:2}"
             self.assertEqual(record.read_text().splitlines()[-len(options):], options)
 
     def test_read_only_modes_and_no_restart_do_not_request_restart(self):
-        for option in ["--dry-run", "--check-model", "--no-restart", "--uninstall"]:
+        for option in ["--dry-run", "--check-model", "--no-restart", "--uninstall", "--hot-reload"]:
             with self.subTest(option=option), tempfile.TemporaryDirectory() as directory:
                 result, record, _ = self.run_script(directory, [option])
                 self.assertEqual(result.returncode, 0, result.stderr)

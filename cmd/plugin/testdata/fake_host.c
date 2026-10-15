@@ -45,7 +45,7 @@ static int call_checked(plugin_api*api,const char*method,const char*request,cons
 }
 static int call(plugin_api*api,const char*method,const char*request,const char*expect){return call_checked(api,method,request,expect,1);}
 int main(int argc,char**argv){
- if(argc!=3){fprintf(stderr,"usage: fake_host plugin.so lifecycle.json\n");return 2;}
+ if(argc!=4){fprintf(stderr,"usage: fake_host plugin.so lifecycle.json replacement.so\n");return 2;}
  void*lib=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!lib){fprintf(stderr,"%s\n",dlerror());return 2;}
  plugin_init init=(plugin_init)dlsym(lib,"cliproxy_plugin_init");if(!init)return 3;
  plugin_api api={0};int context=73;host_api host={1,&context,callback,host_free};
@@ -56,7 +56,6 @@ int main(int argc,char**argv){
  memset(&host,0,sizeof(host));
  FILE*f=fopen(argv[2],"rb");if(!f)return 7;fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);char*register_request=calloc((size_t)size+1,1);if(fread(register_request,1,(size_t)size,f)!=(size_t)size)return 8;fclose(f);
  if(!call(&api,"plugin.register",register_request,"\"schema_version\":6"))return 9;
- free(register_request);
  for(int i=0;i<100 && atomic_load(&quota_calls)==0;i++)usleep(10000);
  if(atomic_load(&quota_calls)==0){fprintf(stderr,"native quota did not use copied host API\n");return 19;}
  // A network callback can finish before its account snapshot is committed.
@@ -85,11 +84,34 @@ int main(int argc,char**argv){
  out=(buffer){0};if(api.call("request.complete",NULL,1,&out)==0)return 14;api.free_buffer(out.ptr,out.len);
  out=(buffer){0};if(api.call("request.complete",NULL,((size_t)64<<20)+1,&out)==0)return 15;api.free_buffer(out.ptr,out.len);
  if(!call(&api,"plugin.quiesce","{}","\"ok\":true"))return 16;
+ if(!call(&api,"plugin.quiesce","{}","\"ok\":true"))return 28;
+ if(!call(&api,"plugin.reconfigure",register_request,"\"schema_version\":6"))return 29;
+ void*replacement=dlopen(argv[3],RTLD_NOW|RTLD_LOCAL);if(!replacement)return 30;
+ plugin_init init_next=(plugin_init)dlsym(replacement,"cliproxy_plugin_init");
+ plugin_api next={0};host=(host_api){1,&context,callback,host_free};
+ if(!init_next || init_next(&host,&next)!=0)return 31;
+ // A replacement must fail while the old version owns the durable state lock.
+ if(!call(&next,"plugin.register",register_request,"state store initialization failed"))return 32;
+ next.shutdown();
+ if(init_next(&host,&next)!=0)return 33;
+ if(!call(&api,"plugin.quiesce","{}","\"ok\":true"))return 34;
+ if(!call(&next,"plugin.register",register_request,"\"schema_version\":6"))return 35;
+ if(!call(&api,"plugin.reconfigure",register_request,"state store initialization failed"))return 36;
+ // Replacement failure cleanup releases its lock before CPA resumes the old version.
+ next.shutdown();
+ if(dlclose(replacement)!=0)return 37;
+ if(!call(&api,"plugin.reconfigure",register_request,"\"schema_version\":6"))return 38;
  api.shutdown();
+ if(dlclose(lib)!=0)return 39;
+ // RTLD_NODELETE retains Go executable mappings; reopening the same path must
+ // nevertheless create a fresh service and acquire the released state lock.
+ lib=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);if(!lib)return 40;
+ init=(plugin_init)dlsym(lib,"cliproxy_plugin_init");
+ if(!init || init(&host,&api)!=0)return 41;
+ if(!call(&api,"plugin.register",register_request,"\"schema_version\":6"))return 42;
+ api.shutdown();dlclose(lib);free(register_request);
  if(model_calls){fprintf(stderr,"unexpected model requests: %d\n",model_calls);return 17;}
  if(callbacks!=free_calls){fprintf(stderr,"host buffers leaked: calls=%d freed=%d\n",callbacks,free_calls);return 18;}
- // Go c-shared code is not hot-unloaded in this harness. Host shutdown drained
- // every callback; process exit releases the shared runtime mapping.
- printf("ABI 1 / schema 6 handshake passed; host_calls=%d buffers_freed=%d quota_queries=%d model_calls=0\n",callbacks,free_calls,quota_calls);
+ printf("ABI 1 / schema 6 hot reload, lock handoff, rollback and reopen passed; host_calls=%d buffers_freed=%d quota_queries=%d model_calls=0\n",callbacks,free_calls,quota_calls);
  return 0;
 }

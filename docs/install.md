@@ -90,6 +90,28 @@ python3 /tmp/codex-window-refresh-install.py \
 
 离线安装须同时传入固定版本，例如 `--version v0.1.0-rc.2 --package /path/package.tar.gz --checksums /path/SHA256SUMS`，不查询 GitHub。自动安装依赖 Python 3 与 `python3-yaml`，不依赖 Go 或 C 编译器。含 YAML 锚点、重复键或符号链接目标的配置需先整理或使用手动安装方式。
 
+## 热重载升级
+
+rc.20 起使用 `codex-window-refresh-v版本号.so` 和 `plugins.configs.codex-window-refresh.store.version` 固定版本。首次从 rc.19 或更早版本升级，先按普通安装流程升级到 rc.20 并重启 CPA 一次；旧插件无法由新安装器补上可恢复的暂停和原生映射保护。之后升级到更新版本时：
+
+```sh
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh --hot-reload --key-file /root/cpa-management-key
+```
+
+沿用原来的路径、用户、服务参数。密钥文件是 root 拥有、权限 `0600` 的纯文本 CPA 管理原始密钥，不能使用 API Key 或 bcrypt 哈希；交互运行 Python 安装器也可临时输入。管理查询仅核对本地插件接口，不测试模型或查询上游额度，临时密钥不写入环境文件。后台仍按已有策略运行。
+
+先用 `--hot-reload --dry-run` 查看路径；固定版本使用 `--version vX.Y.Z-rc.N`，离线包仍需准确版本与校验和。`--hot-reload` 与 `--restart`、`--uninstall`、`--check-model` 互斥，统一 shell 入口在此模式下不会自动加 `--restart`。默认普通安装仍会重启，不会自动选择热重载。
+
+要求 CPA ABI 1 / RPC schema 6，并具有版本文件发现、`plugin.quiesce`、注册失败清理及 `plugin.reconfigure` 恢复机制（实现参考 CPA `3de4e248f6bb12fc7dfafb183404f3b248578922`）。管理地址需提供 `/v0/management/plugins`、`/plugins/<id>/config` 和插件 `/codex-window-refresh/lifecycle`。仅有 v8 管理入口时此安装器模式不适用；TLS 部署须明确指定 `--management-url https://主机:端口/v0/management`，保持证书验证。Docker 容器需同时能看到主配置与整个插件目录的变更，宜在容器内操作，单文件绑定挂载不适用此原子替换流程。
+
+安装器先核对已有安装记录、运行版本、路径和配置，再确认 CPA 读到旧版固定选择，放入独立新版文件并切换选择。只有 `/lifecycle` 返回目标版本、`phase: running` 且 `instance_id` 改变才确认成功。策略、状态目录、宿主查询方式和密钥环境保持不变。不会覆盖正在映射的旧库，也不因失败执行服务重启。新插件启动后继续原有自动规则。
+
+新版注册失败时，CPA 先同步清理失败实例并恢复旧实例；安装器确认旧版运行后重新固定旧版。已尝试的版本文件会保留，避免复用宿主尚未释放的原生映射；同版本重试须走普通安装并重启，或发布更高版本。如果无法确认接管或恢复，保留文件、当前版本选择和备份，明确报告状态未知，请检查 CPA 日志及 `/lifecycle`，不要手动删库或清空状态。主配置被并发修改时停止，不覆盖外部更改。
+
+Go `c-shared` 的旧映射通过 `RTLD_NODELETE` 保留到 CPA 进程退出，每次升级会增加驻留映射；这是在线切换而非回收全部动态库内存。频繁升级后可择机重启回收。切换会等待正在执行的插件回调，可能有短暂的观测交接窗口，不承诺所有前台回调零延迟或无遗漏；CPA 本身不会被安装器重启。已知前台占用和送达未知记录跨实例保留，真正进程重启会清理旧占用。
+
+仍可用普通安装加 `--restart` 更新版本化安装。CPA 可能在下一次进程启动时清理未选中的旧文件，安装记录允许这些历史文件已被清理；卸载核对并移除仍存在的安装器所属版本文件，保留业务策略、窗口状态和备份。
+
 ## 1. 下载与校验
 
 执行 `uname -m`：`x86_64` 使用 `amd64`，`aarch64` 使用 `arm64`。以下为 x86_64 示例；ARM 服务器将文件名中的 `amd64` 换成 `arm64`。
@@ -122,7 +144,7 @@ sudoedit /opt/cpa/window-refresh.yaml
 sudo -u cpa ./window-refresh check /opt/cpa/window-refresh.yaml
 ```
 
-状态目录必须由 CPA 运行用户拥有，权限为 `0700`，不能多进程共用。首次复制策略；升级时保留现有策略和状态，替换 `.so` 后通过进程重启生效。
+状态目录必须由 CPA 运行用户拥有，权限为 `0700`，不能多进程共用。首次复制策略；普通手动升级保留现有策略和状态，替换 `.so` 后通过进程重启生效。需要热重载时使用上文安装器流程；不要覆盖当前映射的库或只添加高版本文件却不固定选择。
 
 ## 3. 配置 CPA
 

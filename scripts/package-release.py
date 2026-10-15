@@ -77,6 +77,7 @@ def main():
         "source_epoch": epoch,
         "host_abi": 1,
         "rpc_schema": 6,
+        "hot_reload_protocol": 1,
         "real_account_validation": False,
     }
     installer = (ROOT / "scripts/install.py").read_text()

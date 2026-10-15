@@ -74,9 +74,13 @@ CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/co
 
 初始化复制完整 host API 结构，不保存宿主传入的临时结构指针。每次 host callback 同步读取完整响应、验证长度与 Envelope，再按宿主提供的 free_buffer 释放；失败响应的已分配缓冲区也释放。入口验证 ABI、空指针及 64 MiB 缓冲上限；RPC 和后台运行的 Go panic 归类为错误，不能穿过 C ABI。
 
-`plugin.quiesce` / `plugin.shutdown` 的 RPC 先停止收集活动、取消运行时，并最多等待五秒。若宿主 callback 尚未返回，RPC 返回未完成错误并保留状态锁，不报告关闭成功。**原生 void shutdown 返回前始终等待运行时 callback 结束**，随后关闭存储；宿主才能释放 callback context 并卸载动态库。
+`plugin.quiesce` 可恢复地暂停：排空已进入的管理操作和观测钩子，取消后台任务，等待运行时结束，提交剩余观测与同进程交接标记，再关闭宿主连接和释放状态锁。后台 callback 等待上限五秒；超时或提交失败保留锁，不报告暂停成功，重新配置会再次等待排空。CPA 注册替换版本失败后可调用旧实例的 `plugin.reconfigure`，创建新的宿主连接、存储及运行时，恢复原配置。宿主拥有的 `store` 版本选择字段被接受但不作为业务规则或路径迁移参数。
 
-本地 Context 无法直接中断已经进入的 C host callback。宿主 callback 的 HTTP/模型超时与取消协议负责实际请求终止；若宿主永久不返回，原生 shutdown 会继续等待，不能同时承诺有界卸载和未返回 callback 的安全性。此实现不做额外 self-dlopen/pin，也不声称 Go c-shared 可在任意宿主中安全反复热卸载；推荐通过进程重启更换二进制。
+`plugin.shutdown` 是最终关闭，不能通过重新配置复活同一 service。**原生 void shutdown 返回前始终等待运行时 callback 结束**，随后关闭存储；宿主才能释放 callback context 并关闭动态库句柄。原生最终关闭后再次初始化同一保留映射会创建新的 service；禁止同一映射同时绑定多个宿主实例。
+
+本地 Context 无法直接中断已经进入的 C host callback。宿主 callback 的 HTTP/模型超时与取消协议负责实际请求终止；若宿主永久不返回，原生 shutdown 会继续等待。Linux 初始化通过 self-dlopen 设置 `RTLD_NODELETE`，保持 Go `c-shared` 执行映射有效，直至进程退出；不会在旧 Go 线程仍存活时回收代码。不同版本必须使用不同路径，旧版可以由 CPA 保留为 retired，不能反复将已 retired 的同一路径当成全新实例初始化。
+
+认证 GET `/v0/management/codex-window-refresh/lifecycle` 返回 `version`、`hot_reload_protocol: 1`、`phase`（running/quiesced/stopped）及 `instance_id`，不触发宿主或上游请求。热重载通过 Linux boot ID、PID 和进程启动时间判断同进程交接，保留已知前台请求；真实进程重启不继承旧的忙碌状态。已派发模型仍按未知送达恢复，禁止自动重发。操作步骤和首次重启要求见 [安装说明](install.md#热重载升级)。
 
 当前协调器按串行方式执行网络操作，实际生成并发为 1（不会超过配置上限）；管理摘要明确报告 `effective_concurrency`。真实前台生成的原子防护能力以 `/capabilities` 为准。
 
@@ -84,14 +88,15 @@ CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/co
 
 `internal/plugin` mock 测试覆盖注册、严格包装配置、原样拦截器、账号活动解析、管理认证路径隔离、可选调度汇总及活动身份不外泄、重新读取配置与通知，以及等待 callback 完成前不关闭存储。
 
-`cmd/plugin/testdata/fake_host.c` 仅用测试回调，通过 dlopen 验证 ABI/schema 握手、临时 API 结构被覆盖后的正确调用、方法与长度守卫、缓冲区释放和 quiesce/shutdown。测试策略关闭生成，fake host 不发送真实请求，也不连接外网。构建示例：
+`cmd/plugin/testdata/fake_host.c` 仅用测试回调，通过 dlopen 验证 ABI/schema 握手、临时 API 结构被覆盖后的正确调用、方法与长度守卫、缓冲区释放、重复暂停、两个独立映射间的状态锁交接、失败恢复，以及 dlclose 后重新打开。测试策略关闭生成，fake host 不发送真实请求，也不连接外网。构建示例：
 
 ```sh
 cc -Wall -Wextra -Werror -o /tmp/codex-window-refresh-fake-host cmd/plugin/testdata/fake_host.c -ldl
-/tmp/codex-window-refresh-fake-host /tmp/codex-window-refresh.so /tmp/codex-window-refresh-lifecycle.json
+cp /tmp/codex-window-refresh.so /tmp/codex-window-refresh-vtest.so
+/tmp/codex-window-refresh-fake-host /tmp/codex-window-refresh.so /tmp/codex-window-refresh-lifecycle.json /tmp/codex-window-refresh-vtest.so
 ```
 
-生命周期 JSON 需含 schema_version 6 和 base64 编码的包装 YAML 字节；模拟真实 CPA 的包装 YAML 还应含 `enabled: true`、`priority: 0`（官方字段 `config_yaml` 是 `[]byte`）。fake host 在进程退出时释放映射，不模拟生产宿主的热卸载。
+生命周期 JSON 需含 schema_version 6 和 base64 编码的包装 YAML 字节；模拟真实 CPA 的包装 YAML 还应含 `enabled: true`、`priority: 0`（官方字段 `config_yaml` 是 `[]byte`）。此测试覆盖原生映射与生命周期，不代替真实 CPA 配置 watcher、前台流量和生产账号联调。
 
 原生结构声明参考官方 MIT 示例，来源许可保存在 `cmd/plugin/NOTICE`；规则、服务和运行时实现为本项目代码。
 

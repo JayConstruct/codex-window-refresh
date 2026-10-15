@@ -101,7 +101,12 @@ func New(cfg config.Config, host core.Host, store core.Store, clock core.Clock, 
 	if err != nil {
 		return nil, err
 	}
-	core.RecoverAfterRestart(&s, clock.Now())
+	if identity := hotReloadProcessIdentity(); identity != "" && s.HotReloadProcess == identity {
+		core.RecoverAfterReload(&s, clock.Now())
+	} else {
+		core.RecoverAfterRestart(&s, clock.Now())
+	}
+	s.HotReloadProcess = ""
 	for index := range s.History {
 		if s.History[index].Status == "dispatched" {
 			s.History[index].Status = "unknown"
@@ -231,11 +236,10 @@ func (e *Engine) commit(ctx context.Context) error {
 	e.reconcileHistory(e.clock.Now())
 	// Once a transition exists, cancellation stops network work but must not
 	// discard durable delivery evidence. The store is local and remains bounded.
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-	}
+	// Detach before starting: cancellation can arrive during the file fsync as
+	// well as before it. A normal quiesce must not poison a healthy state store.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	commitStarted := time.Now()
 	r, err := e.store.Commit(ctx, e.state.Revision, e.state)
 	e.measureManualCommit(time.Since(commitStarted))

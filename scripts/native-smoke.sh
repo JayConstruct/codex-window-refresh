@@ -11,4 +11,5 @@ wrapper=f'enabled: true\npriority: 0\nconfig_file: {policy}\nstate_dir: {root / 
 (root/'lifecycle.json').write_text(json.dumps({'schema_version':6,'config_yaml':base64.b64encode(wrapper.encode()).decode()}))
 PY
 cc -Wall -Wextra -Werror -o "$task_tmp/fake-host" cmd/plugin/testdata/fake_host.c -ldl
-"$task_tmp/fake-host" "$(pwd)/bin/codex-window-refresh.so" "$task_tmp/lifecycle.json"
+cp bin/codex-window-refresh.so "$task_tmp/codex-window-refresh-vtest.so"
+"$task_tmp/fake-host" "$(pwd)/bin/codex-window-refresh.so" "$task_tmp/lifecycle.json" "$task_tmp/codex-window-refresh-vtest.so"
