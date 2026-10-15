@@ -270,7 +270,7 @@ button.danger { color: var(--danger); }
   .window-title { flex-direction: column; gap: 2px; }
   .remaining { font-size: 26px; }
   .card-heading { align-items: flex-start; }
-  .query-action .card-heading { flex-direction: column; gap: 12px; }
+  .query-action .card-heading { flex-direction: column-reverse; align-items: stretch; gap: 12px; }
   .query-action .primary { width: 100%; }
   .card-links { flex-direction: column; }
   .save-bar { flex-direction: column; align-items: stretch; padding: 15px; bottom: 8px; gap: 12px; }

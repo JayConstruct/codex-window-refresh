@@ -425,8 +425,11 @@
       if (!selected && current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
       return;
     }
-    for (const attribute of Array.from(current.attributes || [])) if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
-    for (const attribute of Array.from(next.attributes || [])) if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
+    // Expanded diagnostics belong to the retained DOM node. Snapshot markup
+    // must not overwrite a user toggle while its async toggle event is pending.
+    const userAttribute = name => current.nodeName === 'DETAILS' && name === 'open';
+    for (const attribute of Array.from(current.attributes || [])) if (!userAttribute(attribute.name) && !next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+    for (const attribute of Array.from(next.attributes || [])) if (!userAttribute(attribute.name) && current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
     const children = Array.from(next.childNodes);
     for (let index = 0; index < children.length; index++) {
       const previous = current.childNodes[index];

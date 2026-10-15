@@ -265,6 +265,10 @@ try {
   assert.ok(Date.now() - pollStarted < 8000, 'Panel polling did not use the faster snapshot interval');
   assert.equal(await evaluate('document.querySelector(".account-disclosure").open'),true,'Polling collapsed open account diagnostics');
   assert.equal(await evaluate('document.activeElement===window.retainedAccountButton && document.querySelector(".account-card")===window.retainedAccountCard'),true,'Passive refresh replaced the focused account or moved its sort position');
+  await evaluate('window.retainedAccountCard.querySelector(".account-disclosure").open=false;document.getElementById("account-layout").dispatchEvent(new Event("change"))');
+  assert.equal(await evaluate('!window.retainedAccountCard.querySelector(".account-disclosure").open'),true,'Synchronous refresh reopened user-collapsed diagnostics');
+  await evaluate('window.retainedAccountCard.querySelector(".account-disclosure").open=true;document.getElementById("account-layout").dispatchEvent(new Event("change"));window.retainedAccountButton.focus()');
+  assert.equal(await evaluate('window.retainedAccountCard.querySelector(".account-disclosure").open'),true,'Synchronous refresh collapsed user-expanded diagnostics');
   await evaluate('window.retainedAccountText=window.retainedAccountCard.querySelector(".account-id").firstChild;const range=document.createRange();range.selectNodeContents(window.retainedAccountText);getSelection().removeAllRanges();getSelection().addRange(range)');
   accounts['fixture-account'].FiveHour.Remaining.Value = 71;
   await evaluate('document.getElementById("refresh").click()');
