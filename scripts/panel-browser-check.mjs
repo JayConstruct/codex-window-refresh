@@ -18,6 +18,7 @@ const reads = [];
 let snapshotSequence = 0, jobSequence = 0, quotaCompletedAt = 0;
 const jobs = new Map();
 function recordJob(kind, detail) { jobs.set(detail.job_id, {kind, detail}); summary.scheduler[kind] = detail; }
+let previewAccountWakes = false;
 let unauthorized = false, conflict = false, revision = 'a'.repeat(64);
 let config = {
   schema_version: 1, enabled: false, timezone: 'Asia/Shanghai',
@@ -125,6 +126,10 @@ try {
       }
       summary.enabled = config.enabled;
       summary.scheduler.jobs = [...jobs.entries()].map(([job_id, {kind, detail}]) => ({job_id, kind, phase:detail.phase, account_id:detail.account_id || detail.request?.account_id || '', [kind]:detail}));
+      if (previewAccountWakes) summary.scheduler.plan.next_wakes = {
+        'fixture-account': {kind:'wake',account_id:'fixture-account',earliest_at:reset,latest_at:reset,status:'scheduled'},
+        '<img src=x onerror=alert(1)>': {kind:'wake',account_id:'<img src=x onerror=alert(1)>',earliest_at:new Date(Date.parse(reset)+600000).toISOString(),latest_at:new Date(Date.parse(reset)+1200000).toISOString(),status:'estimated'}
+      };
       const values = { snapshot: {instance_id:'browser-instance',snapshot_seq:++snapshotSequence,summary,accounts,config,capabilities}, summary, accounts, config, capabilities, 'config-editor': { config, revision, disk_matches_running: true } };
       json(res, 200, values[path] ?? {});
     } catch (err) { errors.push(String(err)); json(res, 500, { error: 'fixture error' }); }
@@ -381,7 +386,22 @@ try {
   assert.deepEqual(config.planning,{enabled:true,horizon_days:3},'Plan settings did not save');
   await evaluate('document.querySelector("[data-tab=plan]").click()');
   await waitFor(()=>evaluate('document.getElementById("plan-list").textContent.includes("fixture-account") && document.getElementById("plan-status").textContent.includes("未来 3 天")'),'Saved future plan did not display');
-  assert.equal(await evaluate('document.querySelector("#plan-list .timeline-day") !== null && document.querySelector("#plan-list .plan-query") !== null'),true,'Plan timeline did not render query nodes');
+  assert.equal(await evaluate('document.querySelectorAll("#plan-list tr").length === 2 && document.querySelectorAll("#plan-list tr:first-child > *").length === 2 && document.querySelector("#plan-list .plan-query") === null'),true,'Account schedule did not render compact rows');
+  previewAccountWakes = true; config.enabled = true;
+  await evaluate('document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('document.getElementById("plan-list").textContent.includes("预计")'), 'Account wake times did not render');
+  assert.equal(await evaluate('document.querySelector("#plan-list tr th").textContent'), 'fixture-account', 'Account wake rows were not sorted by time');
+  assert.ok(await evaluate('Array.from(document.querySelectorAll("#plan-list tr")).every(row => row.getBoundingClientRect().height <= 52)'), 'Account schedule rows are too tall on desktop');
+  capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp, 'panel-next-wake-desktop.png'), Buffer.from(capture.data, 'base64'));
+  await cdp('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:true});
+  assert.ok(await evaluate('document.documentElement.scrollWidth <= innerWidth + 1'), 'Account schedule overflowed on mobile');
+  capture = await cdp('Page.captureScreenshot');
+  await writeFile(join(temp, 'panel-next-wake-mobile.png'), Buffer.from(capture.data, 'base64'));
+  await cdp('Emulation.setDeviceMetricsOverride', {width:1280,height:960,deviceScaleFactor:1,mobile:false});
+  previewAccountWakes = false; config.enabled = false;
+  await evaluate('document.getElementById("refresh").click()');
+  await waitFor(()=>evaluate('document.getElementById("plan-list").textContent.includes("自动唤醒未开启")'), 'Account wake rows did not reflect disabled rules');
   assert.ok(posts.every(post=>['quota-query','quota-connection-check','config'].includes(post.path)),'Planning dispatched unexpected operations');
   await evaluate('document.getElementById("plan-view-history").click()');
   await waitFor(()=>evaluate('document.getElementById("history-list").textContent.includes("每日规则") && document.getElementById("history-list").textContent.includes("<script>text-only</script>")'),'Task history or sources did not render');

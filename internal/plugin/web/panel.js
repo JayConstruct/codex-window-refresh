@@ -14,7 +14,7 @@
     if (url.origin !== location.origin || !url.pathname.endsWith(API)) throw new PanelError('invalid_endpoint');
     return url.pathname;
   }
-  const paths = new Set(['/snapshot', '/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query', '/quota-connection-check', '/manual-wake', '/prompt-generation', '/history']);
+  const paths = new Set(['/snapshot', '/refresh-accounts', '/summary', '/accounts', '/capabilities', '/config-editor', '/config', '/reload', '/recheck', '/quota-query', '/quota-connection-check', '/manual-wake', '/prompt-generation', '/history']);
   class PanelError extends Error {
     constructor(code, status) { super(code); this.name = 'PanelError'; this.code = code; this.status = status || 0; }
   }
@@ -140,10 +140,10 @@
       if (signal) signal.addEventListener('abort', cancelRequest, {once: true});
       let timedOut = false;
       let timer;
-      const readOnly = method === 'GET' || path === '/quota-connection-check';
+      const readOnly = method === 'GET' || path === '/quota-connection-check' || path === '/refresh-accounts';
       try {
         if (signal?.aborted) throw new PanelError('cancelled');
-        timer = timers.setTimeout(() => { timedOut = true; controller.abort(); }, readOnly ? 15000 : 120000);
+        timer = timers.setTimeout(() => { timedOut = true; controller.abort(); }, readOnly && path !== '/refresh-accounts' ? 15000 : 120000);
         const headers = {'Authorization': 'Bearer ' + key, 'Accept': 'application/json'};
         if (body !== undefined) headers['Content-Type'] = 'application/json';
         const result = await fetcher(base + path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: 'omit', redirect: 'error', cache: 'no-store', signal: controller.signal});
@@ -539,7 +539,7 @@
   let pollFailures = 0, pollController = null, taskPollKey = '', taskPollStartedAt = 0;
   let pendingGeneration = null, previewGeneration = '', historyCursor = 0, historyNextCursor = 0, historyLoaded = false, historySequence = 0;
   let planView = 'upcoming', historyPreviousCursors = [];
-  let summary = null, runningConfig = null, accounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
+  let summary = null, runningConfig = null, accounts = {}, generationAccounts = {}, capabilities = {}, pollTimer = null, pollBusy = false, actionBusy = false, diskMatchesRunning = true;
   const session = createSession(root.fetch.bind(root), clearView, undefined, apiBase(root.location));
   function el(tag, text, className) {
     const item = document.createElement(tag);
@@ -559,7 +559,7 @@
     $('quota-freshness').textContent = ''; $('quota-freshness-warning').hidden = true;
     $('config-changes').replaceChildren(); $('changes-preview').open = false;
     snapshotInstance = ''; snapshotVersion = -1; readSequence++; appliedRead = readSequence; mutationEpoch++; retiredInstances.clear();
-    summary = null; runningConfig = null; accounts = {}; capabilities = {}; editor.clear(); diskMatchesRunning = true;
+    summary = null; runningConfig = null; accounts = {}; generationAccounts = {}; capabilities = {}; editor.clear(); diskMatchesRunning = true;
     expandedAccounts.clear();
     accountNodes.clear(); renderedAccountOrder = [];
     pendingQuotaQuery = null;
@@ -570,6 +570,7 @@
     $('generation-preview').value = ''; $('generation-status').textContent = ''; $('history-status').textContent = ''; $('history-list').replaceChildren();
     $('workspace').hidden = true; $('login-section').hidden = false; $('management-key').value = ''; $('config-json').value = '';
     $('connection-status').textContent = '未连接'; $('connection-status').className = 'badge neutral'; $('disconnect').disabled = true;
+    $('refresh-cpa').hidden = true; $('refresh-cpa').disabled = true; $('refresh-cpa').textContent = '从 CPA 刷新';
     for (const id of ['metrics', 'schedule-info', 'hold-counts', 'account-list', 'daily-rules', 'capabilities-list', 'plan-list']) $(id).replaceChildren();
     $('plan-status').textContent = '';
     for (const input of document.querySelectorAll('[data-field]')) { if (input.type === 'checkbox') input.checked = false; else input.value = ''; input.disabled = input.dataset.fixed === 'true'; }
@@ -716,32 +717,45 @@
   }
   function renderSchedulePlan() {
     const plan = summary?.scheduler?.plan;
-    $('plan-list').replaceChildren();
-    if (!plan?.enabled) {
-      $('plan-status').textContent = '自动生成未来计划已关闭。开启并保存后展示生效配置的计划；不会因此开启查询或模型请求。';
-      return;
+    const list = $('plan-list');
+    list.replaceChildren();
+    // Older hosts only expose the detailed plan. Never use query or unassigned
+    // pool events as an account's next wake, nor treat a blocked time as due.
+    const next = new Map();
+    const candidates = plan?.next_wakes ? Object.values(plan.next_wakes) : plan?.entries || [];
+    for (const entry of candidates) {
+      if (entry.kind !== 'wake' || !entry.account_id || entry.status === 'blocked' || resetTime(entry.earliest_at) === null) continue;
+      const previous = next.get(entry.account_id);
+      if (!previous || resetTime(entry.earliest_at) < resetTime(previous.earliest_at)) next.set(entry.account_id, entry);
     }
-    $('plan-status').textContent = '已应用配置 · 生成于 ' + date(plan.generated_at) + ' · 未来 ' + plan.horizon_days + ' 天，至 ' + date(plan.until) + (plan.truncated ? ' · 仅显示最早 256 项' : '') + ' · 预计计划随额度证据更新，不保证实际执行';
-    if (!Array.isArray(plan.entries) || !plan.entries.length) {
-      $('plan-list').append(el('p', '当前没有可展示计划。请检查独立开关或先查询账号；未知窗口不会推算新的五小时或周周期。', 'hint'));
-      return;
-    }
-    const triggers = {periodic: '定期额度查询', five_hour_reset: '5 小时到期', weekly_reset: '周额度到期', daily_schedule: '每日时间点 / 随机时段', verification: '发送后窗口核实'};
-    let lastDay = '';
-    const entries = [...plan.entries].sort((first, second) => new Date(first.earliest_at) - new Date(second.earliest_at));
-    for (const entry of entries) {
-      const day = date(entry.earliest_at).split(' ')[0];
-      if (day !== lastDay) {
-        $('plan-list').append(el('li', day, 'timeline-day'));
-        lastDay = day;
+    const rows = Object.entries(accounts).map(([id, account]) => {
+      let unavailable = '';
+      if (!summary?.running || summary.host_enabled === false) unavailable = '后台未运行';
+      else if (runningConfig?.account_overrides?.[id]?.paused) unavailable = '已暂停唤醒';
+      else if (!account.Enabled) unavailable = 'CPA 账号不可用';
+      else if (account.Task?.OperationID) unavailable = '等待上次唤醒验证';
+      else if (!runningConfig?.enabled) unavailable = '自动唤醒未开启';
+      const entry = unavailable ? null : next.get(id);
+      if (!entry && !unavailable) unavailable = '暂无可确定时间';
+      return {id, entry, unavailable};
+    }).sort((a, b) => (a.entry ? resetTime(a.entry.earliest_at) : Infinity) - (b.entry ? resetTime(b.entry.earliest_at) : Infinity) || a.id.localeCompare(b.id));
+    $('plan-status').textContent = rows.length + ' 个账号 · ' + (runningConfig?.timezone || '规则时区') + ' · 未来 ' + (plan?.horizon_days || runningConfig?.planning?.horizon_days || 7) + ' 天';
+    for (const {id, entry, unavailable} of rows) {
+      const row = el('tr'); row.dataset.planAccount = id;
+      const name = el('th', id); name.setAttribute('scope', 'row');
+      let time = unavailable;
+      if (entry) {
+        const ranged = resetTime(entry.latest_at) !== null && resetTime(entry.latest_at) > resetTime(entry.earliest_at);
+        const start = date(entry.earliest_at), end = ranged ? date(entry.latest_at) : '';
+        const compactEnd = end.split(' ')[0] === start.split(' ')[0] ? end.split(' ').slice(1).join(' ') : end;
+        time = (entry.status === 'scheduled' ? '' : '预计 ') + start + (ranged ? ' — ' + compactEnd : '');
       }
-      const row = el('li', undefined, 'card plan-item plan-' + (entry.kind === 'wake' ? 'wake' : 'query') + (entry.status === 'blocked' ? ' plan-blocked' : ''));
-      const window = {five_hour: ' · 5 小时', weekly: ' · 7 天'}[entry.window] || '';
-      row.append(el('h3', (entry.kind === 'wake' ? '模型唤醒 · ' : '额度查询 · ') + (triggers[entry.trigger] || entry.trigger) + window), el('p', entry.account_id || '账号池目标' + (entry.rule_id ? ' · ' + entry.rule_id : ''), 'account-id'));
-      const range = date(entry.earliest_at) + (entry.latest_at && entry.latest_at !== entry.earliest_at ? ' — ' + date(entry.latest_at) : '');
-      row.append(el('p', range + (entry.repeat_every ? ' · 每 ' + entry.repeat_every + ' 循环' : '')), el('p', ({scheduled: '已分配时间', estimated: '预计时间 / 随机范围', blocked: '暂不可执行'}[entry.status] || entry.status) + (entry.model ? ' · 模型 ' + entry.model : ''), 'hint'), el('p', entry.detail, 'hint'));
-      renderSources(row, entry.sources || [{trigger: entry.trigger}]);
-      $('plan-list').append(row);
+      row.append(name, el('td', time, entry ? 'wake-time' : 'wake-unset'));
+      list.append(row);
+    }
+    if (!rows.length) {
+      const row = el('tr'), cell = el('td', '暂无账号，等待读取 CPA 账号清单。', 'wake-unset');
+      cell.setAttribute('colspan', '2'); row.append(cell); list.append(row);
     }
   }
   function renderCapabilities() {
@@ -775,14 +789,20 @@
     select.children[0].value = '';
     for (const [id, account] of Object.entries(accounts)) {
       if (!account.Enabled || runningConfig?.account_overrides?.[id]?.paused) continue;
-      const option = el('option', id); option.value = id; select.append(option);
+      const option = el('option', 'Codex · ' + id); option.value = id; select.append(option);
+    }
+    for (const [id, account] of Object.entries(generationAccounts)) {
+      if (account.provider !== 'antigravity' || !account.enabled) continue;
+      const option = el('option', '反重力 · ' + id); option.value = id; select.append(option);
     }
     select.value = selected;
+    const antigravity = generationAccounts[select.value]?.provider === 'antigravity';
+    $('generation-model').placeholder = antigravity ? '输入此反重力账号在 CPA 中可用的模型名' : '留空使用已保存的默认模型';
     const job = generationJob();
-    const phases = {queued: '等待生成', running: '正在核对账号额度', dispatched: '模型正在生成', completed: '生成完成，尚未应用到草稿', failed: '生成失败，不自动重试', skipped: '未发送，安全条件不满足', unknown: '送达不确定，不自动重试'};
+    const phases = {queued: '等待生成', running: job.request?.provider === 'antigravity' ? '正在核对 CPA 账号' : '正在核对账号额度', dispatched: '模型正在生成', completed: '生成完成，尚未应用到草稿', failed: '生成失败，不自动重试', skipped: '未发送，安全条件不满足', unknown: '送达不确定，不自动重试'};
     $('generation-status').textContent = jobProblem(job) || (job.phase ? (phases[job.phase] || '生成状态待确认') + (job.error_code ? ' · ' + quotaFailure({last_error: job.error_code}) : '') : '仅在点击并确认后调用一次模型；生成结果不会自动保存。');
     const running = activeJob(job);
-    $('generation-start').disabled = !session.connected() || actionBusy || !!running || summary?.host_enabled === false || !summary?.running || capabilities.QuotaAdapterReady !== true || capabilities.ExactAccountExecution !== true;
+    $('generation-start').disabled = !session.connected() || actionBusy || !!running || summary?.host_enabled === false || !summary?.running || (!antigravity && capabilities.QuotaAdapterReady !== true) || capabilities.ExactAccountExecution !== true;
     if (job?.phase === 'completed' && Array.isArray(job.candidates) && previewGeneration !== job.request.request_id) {
       $('generation-preview').value = job.candidates.join('\n'); previewGeneration = job.request.request_id;
     }
@@ -873,12 +893,15 @@
   $('history-next').addEventListener('click', () => { if (historyNextCursor) void readHistory(historyNextCursor); });
   $('generation-start').addEventListener('click', async () => {
     if ($('generation-start').disabled) return;
-    const accountID = $('generation-account').value, model = $('generation-model').value.trim() || runningConfig?.execution?.model?.trim(), count = Number($('generation-count').value);
+    const accountID = $('generation-account').value, antigravity = generationAccounts[accountID]?.provider === 'antigravity';
+    const model = $('generation-model').value.trim() || (!antigravity && runningConfig?.execution?.model?.trim()), count = Number($('generation-count').value);
     const target = $('generation-target').value || 'default';
+    if (antigravity && !model) { notice('请输入所选反重力账号在 CPA 中可用的模型名。', 'error'); return; }
     if (!accountID || !model || !Number.isInteger(count) || count < 5 || count > 50) { report(new PanelError('invalid_config')); return; }
-    if (!root.confirm('将使用账号 ' + accountID + ' 和模型 ' + model + ' 生成 ' + count + ' 条候选短句。这会发送真实模型请求、消耗额度，可能启动五小时窗口。生成后仍需预览并保存。继续？')) return;
+    if (!root.confirm('将使用' + (antigravity ? '反重力' : ' Codex ') + '账号 ' + accountID + ' 和模型 ' + model + ' 生成 ' + count + ' 条候选短句。这会发送真实模型请求、消耗额度' + (antigravity ? '。' : '，可能启动五小时窗口。') + '生成后仍需预览并保存。继续？')) return;
     const generation = session.generation();
     const request = {request_id: root.crypto?.randomUUID ? root.crypto.randomUUID() : 'prompt-' + Date.now() + '-' + Math.random().toString(16).slice(2), account_id: accountID, model, count, target};
+    if (antigravity) request.provider = 'antigravity';
     pendingGeneration = startTracking(accountID); pendingGeneration.job_id = request.request_id;
     let accepted = false;
     busy(true); renderGeneration();
@@ -896,6 +919,7 @@
       if (accepted) reportAcceptedRead(error); else report(error);
     } finally { if (generation === session.generation()) { busy(false); renderGeneration(); schedulePoll(); } }
   });
+  $('generation-account').addEventListener('change', renderGeneration);
   $('generation-apply').addEventListener('click', () => {
     if ($('generation-apply').disabled) return;
     try {
@@ -974,7 +998,6 @@
       const pauseChanged = paused !== Boolean(runningPaused);
       const accountStatus = pauseChanged ? (paused ? '待保存：暂停唤醒' : '待保存：恢复唤醒') : paused ? '唤醒已暂停' : ({disabled: 'CPA 账号已禁用', unavailable: 'CPA 账号暂时不可用', binding_unavailable: 'CPA 账号绑定不可用'}[a.Availability] || (a.Enabled ? '账号已启用' : 'CPA 账号不可用'));
       header.append(name, badge(accountStatus, paused || pauseChanged || !a.Enabled ? 'warning' : '')); card.append(header);
-      if (!a.Enabled && !runningPaused) card.append(el('p', 'CPA 状态约每 30 秒检查；页面自动刷新默认关闭。额度查询不解除 CPA 禁用或暂时不可用，手动唤醒会重新核对。', 'hint'));
       const windows = el('div', undefined, 'window-grid'); windows.append(windowCell('5 小时额度', a.FiveHour), windowCell('周额度', a.Weekly)); card.append(windows);
       const queryRow = el('div', undefined, 'account-query'), job = quotaJob();
       const querying = activeJob(job), selected = job.account_id === id;
@@ -1172,21 +1195,21 @@
   function busy(value) {
     actionBusy = value;
     if (value) mutationEpoch++;
-    for (const id of ['recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = value;
+    for (const id of ['refresh-cpa', 'recheck', 'reload', 'draft-restore', 'json-apply', 'json-format', 'daily-add']) $(id).disabled = value;
     for (const field of document.querySelectorAll('#workspace [data-field], #config-json, #daily-rules button, #daily-rules input, #daily-rules select')) field.disabled = value || field.dataset.fixed === 'true';
     updateDraftBadge(); renderAccounts(); renderQuotaQuery(); renderCapabilities(); renderGeneration();
   }
-  async function readSnapshots(signal) {
+  async function readSnapshots(signal, refreshAccounts = false) {
     const generation = session.generation(), sequence = ++readSequence, epoch = mutationEpoch;
     let snapshot;
-    try { snapshot = await session.request('/snapshot', 'GET', undefined, signal); }
+    try { snapshot = await session.request(refreshAccounts ? '/refresh-accounts' : '/snapshot', refreshAccounts ? 'POST' : 'GET', undefined, signal); }
     catch (error) { if (error.code !== 'authentication' && (generation !== session.generation() || signal?.aborted || epoch !== mutationEpoch || sequence < appliedRead)) return false; throw error; }
     if (generation !== session.generation() || signal?.aborted || epoch !== mutationEpoch || sequence < appliedRead) return false;
-    if (!validObject(snapshot) || typeof snapshot.instance_id !== 'string' || !snapshot.instance_id || !Number.isSafeInteger(snapshot.snapshot_seq) || snapshot.snapshot_seq < 0 || ![snapshot.summary, snapshot.accounts, snapshot.capabilities, snapshot.config].every(validObject) || !Array.isArray(snapshot.summary.scheduler?.jobs)) throw new PanelError('invalid_response');
+    if (!validObject(snapshot) || typeof snapshot.instance_id !== 'string' || !snapshot.instance_id || !Number.isSafeInteger(snapshot.snapshot_seq) || snapshot.snapshot_seq < 0 || ![snapshot.summary, snapshot.accounts, snapshot.capabilities, snapshot.config].every(validObject) || (snapshot.generation_accounts != null && !validObject(snapshot.generation_accounts)) || !Array.isArray(snapshot.summary.scheduler?.jobs)) throw new PanelError('invalid_response');
     if (retiredInstances.has(snapshot.instance_id) || (snapshot.instance_id === snapshotInstance && snapshot.snapshot_seq < snapshotVersion)) return false;
     if (snapshotInstance && snapshotInstance !== snapshot.instance_id) retiredInstances.add(snapshotInstance);
     snapshotInstance = snapshot.instance_id; snapshotVersion = snapshot.snapshot_seq; appliedRead = sequence;
-    summary = snapshot.summary; accounts = snapshot.accounts; capabilities = snapshot.capabilities; runningConfig = snapshot.config;
+    summary = snapshot.summary; accounts = snapshot.accounts; generationAccounts = snapshot.generation_accounts || {}; capabilities = snapshot.capabilities; runningConfig = snapshot.config;
     reconcileJob(pendingQuotaQuery, 'quota_query'); reconcileJob(pendingManualWake, 'manual_wake'); reconcileJob(pendingGeneration, 'prompt_generation');
     renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '页面更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
     if (noticeSource === 'snapshots') notice('');
@@ -1271,6 +1294,7 @@
       await loadEditor();
       if (generation !== session.generation()) return;
       $('workspace').hidden = false; $('login-section').hidden = true; $('connection-status').textContent = '已连接'; $('connection-status').className = 'badge'; $('disconnect').disabled = false;
+      $('refresh-cpa').hidden = false; $('refresh-cpa').disabled = false;
       const accountView = accountPreferences.value(); $('account-sort').value = accountView.sort; $('account-layout').value = accountView.layout;
       renderForm(); renderOverview(); renderAccounts(); renderCapabilities(); $('updated-at').textContent = '页面更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12: false});
       if (!diskMatchesRunning) notice('服务器规则文件尚未应用。这里显示的是文件草稿；运行概览中的启用状态来自当前调度器。', 'warning');
@@ -1390,6 +1414,19 @@
     try { await session.request(path, 'POST'); if (generation !== session.generation()) return; mutationEpoch++; accepted = true; if (id === 'reload') { await loadEditor(); } await readSnapshots(); notice(id === 'reload' ? '规则文件已重新读取并应用。' : '已通知调度器重新检查，后续执行由规则决定。'); }
     catch (error) { if (error.code === 'authentication') report(error); else if (generation === session.generation()) { if (accepted && error.code !== 'authentication') notice('操作已接受；状态暂未读取成功，请更新页面数据核对。', 'warning', 'snapshots'); else report(error); } }
     finally { if (generation === session.generation()) busy(false); }
+  });
+  $('refresh-cpa').addEventListener('click', async () => {
+    if (actionBusy || !session.connected()) return;
+    const generation = session.generation(); busy(true); $('refresh-cpa').textContent = '正在同步…';
+    try {
+      const applied = await readSnapshots(undefined, true);
+      if (generation === session.generation() && applied) notice('已从 CPA 同步账号清单、禁用及可用状态；未连接上游。');
+    } catch (error) {
+      if (error.code === 'authentication') report(error);
+      else if (generation === session.generation()) notice('从 CPA 刷新失败，已保留页面数据。' + errorMessage(error), 'error');
+    } finally {
+      if (generation === session.generation()) { $('refresh-cpa').textContent = '从 CPA 刷新'; busy(false); schedulePoll(); }
+    }
   });
   $('refresh').addEventListener('click', () => refreshSnapshots(true));
   $('auto-refresh').addEventListener('change', () => {

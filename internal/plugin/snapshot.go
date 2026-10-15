@@ -74,8 +74,9 @@ func (s *Service) snapshotResponse(engine Engine, wrapper WrapperConfig, done <-
 			"reservations": len(view.State.Reservations), "last_error": lastError,
 			"effective_concurrency": 1, "scheduler": view.Scheduler,
 		},
-		"accounts":     view.State.Accounts,
-		"capabilities": snapshotCapabilities(view, wrapper),
-		"config":       view.Config,
+		"accounts":            view.State.Accounts,
+		"generation_accounts": view.State.GenerationAccounts,
+		"capabilities":        snapshotCapabilities(view, wrapper),
+		"config":              view.Config,
 	})
 }

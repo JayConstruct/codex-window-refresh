@@ -53,6 +53,7 @@ type QuotaRead struct {
 }
 
 type ExactRequest struct {
+	Provider       string
 	AccountID      AccountID
 	Generation     CredentialGeneration
 	OperationID    OperationID

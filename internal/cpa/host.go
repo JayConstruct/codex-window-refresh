@@ -131,9 +131,13 @@ func (h *Host) Accounts(ctx context.Context) ([]core.HostAccount, error) {
 	result := []core.HostAccount{}
 	counts := map[core.AccountID]int{}
 	for _, entry := range list.Files {
-		if provider(entry) == "codex" {
+		if provider(entry) == "codex" || provider(entry) == "antigravity" {
 			counts[core.AccountID(entry.ID)]++
 		}
+	}
+	generationAccounts, generationBindings, err := h.readGenerationAccounts(ctx, list.Files, counts)
+	if err != nil {
+		return nil, err
 	}
 	for _, entry := range list.Files {
 		if err := ctx.Err(); err != nil {
@@ -177,6 +181,7 @@ func (h *Host) Accounts(ctx context.Context) ([]core.HostAccount, error) {
 	h.bindings = bindings
 	h.accounts = accounts
 	h.inventoryDiagnostics = diagnostics
+	h.generationAccounts, h.generationBindings = generationAccounts, generationBindings
 	for id, baseline := range h.baselines {
 		binding, ok := bindings[id]
 		if !ok || baseline.Generation != binding.Generation {

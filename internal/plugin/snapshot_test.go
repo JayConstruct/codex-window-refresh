@@ -77,6 +77,25 @@ func TestUnifiedSnapshotUsesOnePublishedViewAndExcludesPrivateState(t *testing.T
 	}
 }
 
+func TestSnapshotExposesGenerationCatalogSeparatelyFromCodexAccounts(t *testing.T) {
+	s, base, _, _ := setupService(t)
+	s.engine = &atomicSnapshotEngine{fakeEngine: base, view: scheduler.ManagementSnapshot{
+		InstanceID: "generation-catalog", SnapshotSeq: 1, Config: config.Defaults(),
+		State: core.CoreState{GenerationAccounts: map[core.AccountID]core.GenerationAccount{
+			"ag": {ID: "ag", Provider: "antigravity", Generation: "identity-digest", Enabled: true},
+		}},
+	}}
+	r := managementCall(t, s, "GET", ManagementPrefix+"/snapshot")
+	var body struct {
+		Accounts           map[core.AccountID]core.AccountState
+		GenerationAccounts map[core.AccountID]core.GenerationAccount `json:"generation_accounts"`
+		Summary            struct{ Accounts int }
+	}
+	if r.StatusCode != 200 || json.Unmarshal(r.Body, &body) != nil || len(body.Accounts) != 0 || body.Summary.Accounts != 0 || !body.GenerationAccounts["ag"].Enabled || body.GenerationAccounts["ag"].Provider != "antigravity" {
+		t.Fatalf("generation catalog was lost or included in the Codex pool: %s", r.Body)
+	}
+}
+
 type identifiedQuotaEngine struct{ *manualQueryEngine }
 
 func (e *identifiedQuotaEngine) QueueQuotaQueryJob(id core.AccountID) (string, string) {

@@ -15,7 +15,17 @@ func (h *Host) SendExact(ctx context.Context, req core.ExactRequest) (core.SendR
 }
 
 func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *generationText) (core.SendResult, error) {
-	if _, err := h.validate(ctx, req.AccountID, req.Generation); err != nil {
+	provider, exitProtocol := "codex", "codex"
+	var bindingErr error
+	if req.Provider == "antigravity" && text != nil {
+		provider, exitProtocol = "antigravity", "openai-response"
+		bindingErr = h.validateGenerationAccount(ctx, req.AccountID, req.Generation)
+	} else if req.Provider != "" && req.Provider != "codex" {
+		bindingErr = ErrBindingUnavailable
+	} else {
+		_, bindingErr = h.validate(ctx, req.AccountID, req.Generation)
+	}
+	if err := bindingErr; err != nil {
 		return core.SendResult{Disposition: core.SendDefinitelyNotSent, ErrorCode: err.Error()}, nil
 	}
 	if req.OperationID == "" || req.Model == "" || req.Prompt == "" {
@@ -25,7 +35,7 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 	if err != nil {
 		return core.SendResult{Disposition: core.SendDefinitelyNotSent, ErrorCode: "invalid_exact_request"}, nil
 	}
-	request := modelRequest{EntryProtocol: "openai-response", ExitProtocol: "codex", Model: req.Model, Stream: true, Body: body, ForcedProvider: "codex", AuthID: string(req.AccountID), Headers: map[string][]string{"Content-Type": {"application/json"}}, Query: map[string][]string{}}
+	request := modelRequest{EntryProtocol: "openai-response", ExitProtocol: exitProtocol, Model: req.Model, Stream: true, Body: body, ForcedProvider: provider, AuthID: string(req.AccountID), Headers: map[string][]string{"Content-Type": {"application/json"}}, Query: map[string][]string{}}
 	var opened streamResponse
 	if err := h.callback.Call(ctx, "host.model.execute_stream", request, &opened); err != nil {
 		// A transport may decode the successful stream handle and then report a
@@ -76,8 +86,10 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 		}
 		return out
 	}
-	if o, err := ParseQuota(quotaHeaders(opened.Headers), read, time.Now().UTC(), core.ObservationExecution, baseline); err == nil {
-		remember(o)
+	if provider == "codex" {
+		if o, err := ParseQuota(quotaHeaders(opened.Headers), read, time.Now().UTC(), core.ObservationExecution, baseline); err == nil {
+			remember(o)
+		}
 	}
 	completed := false
 	streamFailed := false
@@ -105,8 +117,10 @@ func (h *Host) sendExact(ctx context.Context, req core.ExactRequest, text *gener
 		case "error", "response.failed", "response.incomplete":
 			streamFailed = true
 		case "codex.rate_limits":
-			if o, err := ParseQuota(data, read, time.Now().UTC(), core.ObservationExecution, baseline); err == nil {
-				remember(o)
+			if provider == "codex" {
+				if o, err := ParseQuota(data, read, time.Now().UTC(), core.ObservationExecution, baseline); err == nil {
+					remember(o)
+				}
 			}
 		}
 	}

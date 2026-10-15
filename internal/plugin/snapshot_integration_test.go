@@ -17,7 +17,10 @@ import (
 	"codex-window-refresh/internal/storage"
 )
 
-type snapshotIntegrationCallback struct{ modelCalls atomic.Int32 }
+type snapshotIntegrationCallback struct {
+	modelCalls atomic.Int32
+	disabled   atomic.Bool
+}
 
 func (callback *snapshotIntegrationCallback) Call(_ context.Context, method string, request, response any) error {
 	if strings.Contains(method, "model") {
@@ -38,7 +41,7 @@ func (callback *snapshotIntegrationCallback) Call(_ context.Context, method stri
 		if selected.Index == "broken-index" {
 			id = "broken"
 		}
-		value = map[string]any{"auth": map[string]any{"id": id, "auth_index": selected.Index, "provider": "codex", "runtime_only": id == "broken"}}
+		value = map[string]any{"auth": map[string]any{"id": id, "auth_index": selected.Index, "provider": "codex", "runtime_only": id == "broken", "disabled": callback.disabled.Load()}}
 	case "host.auth.get":
 		value = map[string]any{"auth_index": "healthy-index", "json": map[string]any{"type": "codex", "account_id": "test-upstream"}}
 	default:

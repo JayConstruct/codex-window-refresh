@@ -203,16 +203,17 @@ type UserActivity struct {
 }
 
 type CoreState struct {
-	Revision         uint64
-	NextReadSequence uint64
-	Accounts         map[AccountID]AccountState
-	DailyIntents     []PoolDailyIntent
-	Reservations     []Reservation
-	Activity         map[UserIdentity]UserActivity
-	Requests         map[RequestID]RequestActivity
-	LastDispatchAt   time.Time
-	History          []HistoryEntry
-	GenerationJob    *PromptGenerationJob
+	Revision           uint64
+	NextReadSequence   uint64
+	Accounts           map[AccountID]AccountState
+	DailyIntents       []PoolDailyIntent
+	Reservations       []Reservation
+	Activity           map[UserIdentity]UserActivity
+	Requests           map[RequestID]RequestActivity
+	LastDispatchAt     time.Time
+	History            []HistoryEntry
+	GenerationJob      *PromptGenerationJob
+	GenerationAccounts map[AccountID]GenerationAccount
 }
 
 // Completed bindings are tombstones: repeated finish callbacks cannot count a

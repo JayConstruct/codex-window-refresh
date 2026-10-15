@@ -94,3 +94,5 @@ cc -Wall -Wextra -Werror -o /tmp/codex-window-refresh-fake-host cmd/plugin/testd
 生命周期 JSON 需含 schema_version 6 和 base64 编码的包装 YAML 字节；模拟真实 CPA 的包装 YAML 还应含 `enabled: true`、`priority: 0`（官方字段 `config_yaml` 是 `[]byte`）。fake host 在进程退出时释放映射，不模拟生产宿主的热卸载。
 
 原生结构声明参考官方 MIT 示例，来源许可保存在 `cmd/plugin/NOTICE`；规则、服务和运行时实现为本项目代码。
+
+`summary.scheduler.plan.next_wakes` 按账号 ID 返回各账号最早的下一次唤醒安排，包含时间或预计范围。该摘要不依赖 `planning.enabled`，不受详细 `entries` 的 256 条上限影响；不包含查询任务、暂不可执行的时间或尚未分配账号的每日池任务。它只读取现有规则和状态，不创建意图或发送请求，未知时间由面板显示原因。

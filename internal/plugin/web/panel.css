@@ -238,7 +238,7 @@ button.danger { color: var(--danger); }
 }
 @media (max-width: 620px) {
   .shell { padding: 0 16px; }
-  .topbar { padding: 18px 0; }
+  .topbar { padding: 18px 0; flex-wrap: wrap; }
   .brand { font-size: 13px; }
   .brand-mark { width: 34px; height: 34px; font-size: 25px; }
   .brand small { font-size: 10px; }
@@ -287,3 +287,20 @@ button.danger { color: var(--danger); }
 /* Field validation stays adjacent to the input and remains visible across refreshes. */
 .validation-error{display:block;color:var(--danger,#b42318);font-size:.82rem;line-height:1.5;margin-top:5px;overflow-wrap:anywhere}
 .validation-error[hidden]{display:none}
+
+/* One compact schedule row per account, without timeline cards. */
+.wake-schedule { overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: white; }
+.wake-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+.wake-table th, .wake-table td { padding: 10px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; overflow-wrap: anywhere; }
+.wake-table thead th { color: var(--muted); background: #f3f6f4; font-weight: 500; }
+.wake-table th:first-child { width: 42%; }
+.wake-table tbody th { font-weight: 500; }
+.wake-table tbody tr:last-child > * { border-bottom: 0; }
+.wake-table tbody tr:hover { background: #f7faf8; }
+.wake-time { font-variant-numeric: tabular-nums; }
+.wake-unset { color: var(--muted); }
+.plan-footnote { margin-top: 12px; }
+@media (max-width: 600px) {
+  .wake-table th, .wake-table td { padding: 9px 10px; font-size: 12px; }
+  .wake-table th:first-child { width: 38%; }
+}

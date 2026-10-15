@@ -23,6 +23,12 @@ func generationConfigPath(target string) string {
 }
 
 func (e *Engine) QueuePromptGeneration(request core.PromptGenerationRequest) string {
+	if request.Provider == "codex" {
+		request.Provider = ""
+	}
+	if request.Provider != "" && request.Provider != "antigravity" {
+		return "invalid_generation_parameters"
+	}
 	for _, character := range request.RequestID {
 		if !(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') && !(character >= '0' && character <= '9') && character != '-' && character != '_' {
 			return "invalid_generation_parameters"
@@ -80,6 +86,16 @@ func (e *Engine) QueuePromptGeneration(request core.PromptGenerationRequest) str
 		return "busy"
 	}
 	account, exists := state.Accounts[request.AccountID]
+	if request.Provider == "antigravity" {
+		candidate, found := state.GenerationAccounts[request.AccountID]
+		exists = found && candidate.Provider == request.Provider
+		account = core.AccountState{ID: candidate.ID, Generation: candidate.Generation, Enabled: candidate.Enabled}
+		for _, entry := range state.History {
+			if entry.Kind == "generation" && entry.Provider == request.Provider && entry.AccountID == request.AccountID && entry.Generation == account.Generation && (entry.Status == "dispatched" || entry.Status == "unknown") {
+				return "delivery_evidence_pending"
+			}
+		}
+	}
 	if !exists {
 		return "account_not_found"
 	}
@@ -119,7 +135,7 @@ func (e *Engine) finishPromptGeneration(phase, code string) {
 		}
 	}
 	if job.HistoryID == 0 {
-		job.HistoryID = core.AppendHistory(&e.state, core.HistoryEntry{Kind: "generation", AccountID: job.Request.AccountID, Generation: job.Generation, StartedAt: job.StartedAt, FinishedAt: job.FinishedAt, Status: phase, ErrorCode: code, Model: job.Request.Model, Sources: []core.ActionSource{{Trigger: "prompt_generation", ConfigPath: generationConfigPath(job.Request.Target)}}})
+		job.HistoryID = core.AppendHistory(&e.state, core.HistoryEntry{Kind: "generation", Provider: job.Request.Provider, AccountID: job.Request.AccountID, Generation: job.Generation, StartedAt: job.StartedAt, FinishedAt: job.FinishedAt, Status: phase, ErrorCode: code, Model: job.Request.Model, Sources: []core.ActionSource{{Trigger: "prompt_generation", ConfigPath: generationConfigPath(job.Request.Target)}}})
 	}
 	e.recordGenerationJob()
 	e.queueMu.Lock()
@@ -129,6 +145,9 @@ func (e *Engine) finishPromptGeneration(phase, code string) {
 
 func (e *Engine) stepPromptGeneration(ctx context.Context) error {
 	job := e.state.GenerationJob
+	if job.Request.Provider == "antigravity" {
+		return e.stepAntigravityGeneration(ctx)
+	}
 	id, now := job.Request.AccountID, e.clock.Now()
 	account, exists := e.state.Accounts[id]
 	blocked := ""

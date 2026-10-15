@@ -35,6 +35,8 @@ type Host struct {
 	accounts             map[core.AccountID]core.HostAccount
 	inventoryDiagnostics map[core.AccountID]string
 	baselines            map[core.AccountID]core.AccountState
+	generationAccounts   map[core.AccountID]core.GenerationAccount
+	generationBindings   map[core.AccountID]string
 }
 
 func NewHost(callback Callback, reader QuotaReader) *Host {
@@ -78,6 +80,11 @@ func (h *Host) ActivityAccounts() map[core.AccountID]core.HostAccount {
 		}
 		result[id] = a
 	}
+	for id, account := range h.generationAccounts {
+		if _, valid := h.generationBindings[id]; valid {
+			result[id] = core.HostAccount{ID: id, Generation: account.Generation, Enabled: account.Enabled, Availability: account.Availability}
+		}
+	}
 	return result
 }
 
@@ -94,6 +101,8 @@ func (h *Host) AccountInventoryDiagnostics() map[core.AccountID]string {
 }
 
 type authEntry struct {
+	Email       string `json:"email"`
+	ProjectID   string `json:"project_id"`
 	ID          string `json:"id"`
 	AuthIndex   string `json:"auth_index"`
 	Provider    string `json:"provider"`

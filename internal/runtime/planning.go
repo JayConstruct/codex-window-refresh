@@ -28,12 +28,13 @@ type PlannedAction struct {
 }
 
 type SchedulePlan struct {
-	Enabled     bool            `json:"enabled"`
-	HorizonDays int             `json:"horizon_days"`
-	GeneratedAt time.Time       `json:"generated_at"`
-	Until       time.Time       `json:"until"`
-	Entries     []PlannedAction `json:"entries"`
-	Truncated   bool            `json:"truncated"`
+	Enabled     bool                             `json:"enabled"`
+	HorizonDays int                              `json:"horizon_days"`
+	GeneratedAt time.Time                        `json:"generated_at"`
+	Until       time.Time                        `json:"until"`
+	Entries     []PlannedAction                  `json:"entries"`
+	NextWakes   map[core.AccountID]PlannedAction `json:"next_wakes"`
+	Truncated   bool                             `json:"truncated"`
 }
 
 type planHeap []PlannedAction
@@ -73,14 +74,30 @@ func (entries *planHeap) Pop() any {
 }
 
 func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan {
-	plan := SchedulePlan{Enabled: e.cfg.Planning.Enabled, HorizonDays: e.cfg.Planning.HorizonDays, GeneratedAt: now, Entries: []PlannedAction{}}
-	if !plan.Enabled {
-		return plan
-	}
+	plan := SchedulePlan{Enabled: e.cfg.Planning.Enabled, HorizonDays: e.cfg.Planning.HorizonDays, GeneratedAt: now, Entries: []PlannedAction{}, NextWakes: map[core.AccountID]PlannedAction{}}
 	plan.Until = now.In(e.cfg.Location()).AddDate(0, 0, plan.HorizonDays)
 	entries := &planHeap{}
 	add := func(action PlannedAction) {
 		if action.EarliestAt.IsZero() || action.EarliestAt.After(plan.Until) {
+			return
+		}
+		// Keep one account wake independently of the detailed timeline limit.
+		// Pool-wide daily rules have no assigned account and cannot supply an
+		// individual wake time. Reading this summary does not create intents.
+		action.EarliestAt = maxTime(action.EarliestAt, now)
+		if action.LatestAt.Before(action.EarliestAt) {
+			action.LatestAt = action.EarliestAt
+		}
+		if action.LatestAt.After(plan.Until) {
+			action.LatestAt = plan.Until
+		}
+		if action.Kind == "wake" && action.AccountID != "" && action.Status != "blocked" {
+			previous, exists := plan.NextWakes[action.AccountID]
+			if !exists || actionBefore(action, previous) {
+				plan.NextWakes[action.AccountID] = action
+			}
+		}
+		if !plan.Enabled {
 			return
 		}
 		if len(action.Sources) == 0 {
@@ -120,13 +137,6 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 				action.Sources = append(action.Sources, wakeSources(account, account.Task.CoveredEventIDs)...)
 			}
 		}
-		action.EarliestAt = maxTime(action.EarliestAt, now)
-		if action.LatestAt.Before(action.EarliestAt) {
-			action.LatestAt = action.EarliestAt
-		}
-		if action.LatestAt.After(plan.Until) {
-			action.LatestAt = plan.Until
-		}
 		if entries.Len() < maximumPlanEntries {
 			heap.Push(entries, action)
 		} else {
@@ -146,7 +156,29 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 		if !account.Enabled || policy.Paused {
 			continue
 		}
-		if e.cfg.QuotaQuery.Automatic {
+		if e.cfg.Enabled && e.cfg.OrdinaryRules.DailyEnabled && policy.OrdinaryParticipant && account.Task != nil {
+			for _, intent := range account.Task.Intents {
+				if intent.Reason != core.ReasonDaily || intent.Status != core.IntentPending {
+					continue
+				}
+				enabled := false
+				for _, rule := range e.cfg.DailyRules {
+					if rule.ID == intent.RuleID && rule.Enabled {
+						enabled = true
+						break
+					}
+				}
+				if !enabled {
+					continue
+				}
+				due := maxTime(intent.RandomizedDueAt, maxTime(now, maxTime(account.BackoffUntil, e.nextPreflight[id])))
+				due = maxTime(due, account.FiveHourBaseline.StableResetAt)
+				if allowed, ok := nextAllowedTime(e.cfg, id, due, plan.Until); ok {
+					add(PlannedAction{Kind: "wake", Trigger: string(core.ReasonDaily), AccountID: id, RuleID: intent.RuleID, EarliestAt: allowed, LatestAt: allowed, Status: "scheduled", Detail: "已分配至账号；仍需额度与容量核对"})
+				}
+			}
+		}
+		if plan.Enabled && e.cfg.QuotaQuery.Automatic {
 			for _, weekly := range []bool{false, true} {
 				query := e.cfg.QuotaQuery.Window(weekly)
 				if !query.PeriodicEnabled {
@@ -181,22 +213,21 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 			if window.reset.IsZero() {
 				continue
 			}
-			if window.query && !window.reset.Equal(window.queried) {
+			if plan.Enabled && window.query && !window.reset.Equal(window.queried) {
 				due, ok := e.queryTime(account, window.reason == core.ReasonWeekly, false, window.reset, now, plan.Until)
-				if due.After(plan.Until) {
-					continue
+				if !due.After(plan.Until) {
+					status, detail := "estimated", "已知窗口到期后查询一次；应用随机延迟与排除时段，失败退避后重试"
+					if window.reason == core.ReasonFiveHour && !e.recentUsageAllowed(state, now) {
+						status, detail = "blocked", "等待账号池近期真实用户活动；未完成的到期边界保留"
+					}
+					if window.reason == core.ReasonFiveHour && e.cfg.QuotaQuery.FiveHourRecentUsage.Enabled {
+						detail += "；执行时重新检查账号池用户活动条件"
+					}
+					if !ok {
+						due, status, detail = maxTime(now, window.reset), "blocked", "计划范围内没有允许的到期查询时段"
+					}
+					add(PlannedAction{Kind: "query", Trigger: string(window.reason), AccountID: id, EarliestAt: due, Status: status, Detail: detail})
 				}
-				status, detail := "estimated", "已知窗口到期后查询一次；应用随机延迟与排除时段，失败退避后重试"
-				if window.reason == core.ReasonFiveHour && !e.recentUsageAllowed(state, now) {
-					status, detail = "blocked", "等待账号池近期真实用户活动；未完成的到期边界保留"
-				}
-				if window.reason == core.ReasonFiveHour && e.cfg.QuotaQuery.FiveHourRecentUsage.Enabled {
-					detail += "；执行时重新检查账号池用户活动条件"
-				}
-				if !ok {
-					due, status, detail = maxTime(now, window.reset), "blocked", "计划范围内没有允许的到期查询时段"
-				}
-				add(PlannedAction{Kind: "query", Trigger: string(window.reason), AccountID: id, EarliestAt: due, Status: status, Detail: detail})
 			}
 			if !e.cfg.Enabled || !window.wake {
 				continue
@@ -233,7 +264,7 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 			add(PlannedAction{Kind: "wake", Trigger: string(window.reason), AccountID: id, EarliestAt: earliest, LatestAt: latest, Status: status, Detail: detail, Model: model})
 		}
 	}
-	if e.cfg.Enabled && e.cfg.OrdinaryRules.DailyEnabled {
+	if plan.Enabled && e.cfg.Enabled && e.cfg.OrdinaryRules.DailyEnabled {
 		startDate := now.In(e.cfg.Location())
 		for offset := 0; offset <= plan.HorizonDays; offset++ {
 			date := startDate.AddDate(0, 0, offset).Format("2006-01-02")

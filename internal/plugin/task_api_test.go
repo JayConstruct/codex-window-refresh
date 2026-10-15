@@ -66,6 +66,11 @@ func TestGenerationAPIRejectsDuplicateUnknownNullAndTrailingFields(t *testing.T)
 	if result := generationResponse(engine, WrapperConfig{}, done, false, body); result.StatusCode != 202 || engine.request != request {
 		t.Fatal("generation request not passed intact")
 	}
+	request.Provider, request.AccountID, request.Model = "antigravity", "ag-account", "ag-model"
+	body, _ = json.Marshal(request)
+	if result := generationResponse(engine, WrapperConfig{}, done, false, body); result.StatusCode != 202 || engine.request != request {
+		t.Fatal("Antigravity provider/account/model not passed intact")
+	}
 	close(done)
 	if result := generationResponse(engine, WrapperConfig{}, done, false, body); result.StatusCode != 409 {
 		t.Fatal("stopped scheduler queued model request")

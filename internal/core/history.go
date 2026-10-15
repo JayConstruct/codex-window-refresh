@@ -17,6 +17,7 @@ type ActionSource struct {
 }
 
 type HistoryEntry struct {
+	Provider      string               `json:"provider,omitempty"`
 	ID            uint64               `json:"id"`
 	Kind          string               `json:"kind"`
 	AccountID     AccountID            `json:"account_id"`
@@ -33,6 +34,7 @@ type HistoryEntry struct {
 }
 
 type PromptGenerationRequest struct {
+	Provider  string    `json:"provider,omitempty"`
 	RequestID string    `json:"request_id"`
 	AccountID AccountID `json:"account_id"`
 	Model     string    `json:"model"`
@@ -50,6 +52,16 @@ type PromptGenerationJob struct {
 	StartedAt   time.Time               `json:"started_at"`
 	FinishedAt  time.Time               `json:"finished_at,omitempty"`
 	ErrorCode   string                  `json:"error_code,omitempty"`
+}
+
+// GenerationAccount is a generation-only credential, outside the Codex quota
+// and automatic wake pool. It contains no tokens or raw identity metadata.
+type GenerationAccount struct {
+	ID           AccountID            `json:"id"`
+	Provider     string               `json:"provider"`
+	Generation   CredentialGeneration `json:"generation"`
+	Enabled      bool                 `json:"enabled"`
+	Availability string               `json:"availability"`
 }
 
 func AppendHistory(state *CoreState, entry HistoryEntry) uint64 {

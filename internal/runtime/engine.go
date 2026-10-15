@@ -427,23 +427,8 @@ func (e *Engine) Step(ctx context.Context) error {
 		e.inventory = append([]core.HostAccount{}, hs...)
 		e.nextInventory = now.Add(30 * time.Second)
 	}
-	core.ReconcileAccounts(&e.state, e.inventory, now)
+	e.reconcileInventory(now)
 	e.clearManualJobBlocks()
-	for id := range e.nextRead {
-		if _, ok := e.state.Accounts[id]; !ok {
-			delete(e.nextRead, id)
-			delete(e.nextPreflight, id)
-			delete(e.readFailures, id)
-			delete(e.activityEpoch, id)
-		}
-	}
-	for id, a := range e.state.Accounts {
-		p := e.cfg.Account(id)
-		a.Enabled = a.Enabled && !p.Paused
-		a.OrdinaryParticipant = p.OrdinaryParticipant
-		a.WeeklyEnabled = p.WeeklyEnabled
-		e.state.Accounts[id] = a
-	}
 	e.drain()
 	core.ReleaseExpiredReservations(&e.state, now)
 	// A manual sweep uses an exclusively read-only path. Do not create model

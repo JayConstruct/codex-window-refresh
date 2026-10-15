@@ -128,3 +128,9 @@ host := cpa.NewHost(callback, quotaReader)
 ## 已验证
 
 配置与代际测试覆盖 OAuth 刷新、真实账号替换、精确 `auth_id`、模型格式映射、终端 completion、分片 SSE、异常流显式关闭、管理密钥缺失、token substitution、主次窗口互换、零用量占位、活动排除和正常请求内容原样返回。额度一致性测试覆盖矛盾别名、矛盾重置时间、各窗口的倒计时上界、等值别名及采样延迟，确保畸形响应不会提供到期或 permission 证据。
+
+## 反重力短句生成
+
+反重力账号仅加入独立的生成账号目录，Codex 的 `Accounts` 清单保持专用于额度和唤醒调度。目录复用 `host.auth.list` 与 `host.auth.get_runtime` 本地回调，以稳定宿主 ID、邮箱及项目 ID 的摘要校验绑定，不读取或保存反重力原始凭据。元数据字段参照本地固定宿主快照的 `HostAuthFileEntry`。
+
+生成通过 `host.model.execute_stream` 固定 `forced_provider: antigravity` 和所选 `auth_id`；`entry_protocol` 与 `exit_protocol` 均为 `openai-response`，使用宿主转换后的 Responses 文本事件复用现有候选解析。模型名原样交给 CPA，只能使用所选账号在宿主中已注册且可路由的模型。流读取、取消、关闭和完成事件校验沿用原有宿主回调生命周期，不自行连接上游。

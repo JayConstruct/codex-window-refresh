@@ -59,6 +59,47 @@ test('model generated candidates require confirmation and explicit draft applica
   assert.equal(requests.filter(request=>request.options.method==='POST').length,1);
   lookup('disconnect').listeners.get('click')();
 });
+test('Antigravity candidates use an explicit model and preserve the preview/apply workflow', async () => {
+  const confirmations = [];
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.capabilities.ExactAccountExecution = true;
+    data.capabilities.QuotaAdapterReady = false;
+    data.generation_accounts = {
+      ag: {id: 'ag', provider: 'antigravity', enabled: true},
+      disabled: {id: 'disabled', provider: 'antigravity', enabled: false}
+    };
+    if (url.endsWith('/prompt-generation') && options.method === 'POST') {
+      const request = JSON.parse(options.body);
+      data.summary.scheduler.prompt_generation = {request, phase: 'completed', candidates: ['Hello.', 'Hi.', 'Ready.', 'Yes.', 'OK.']};
+      return response({status: 'queued'}, 202);
+    }
+    return response(data[url.split('/').pop()]);
+  }, message => { confirmations.push(message); return true; });
+  await loginFixture(fixture);
+  const select = fixture.lookup('generation-account');
+  assert.ok(select.children.some(item => item.value === 'ag' && item.textContent === '反重力 · ag'));
+  assert.equal(select.children.some(item => item.value === 'disabled'), false);
+  assert.equal(descendants(fixture.lookup('account-list')).some(item => item.textContent === 'ag'), false);
+  select.value = 'ag'; select.listeners.get('change')();
+  assert.equal(fixture.lookup('generation-start').disabled, false, 'Antigravity generation does not require the Codex quota adapter');
+  assert.match(fixture.lookup('generation-model').placeholder, /反重力/);
+  fixture.lookup('generation-count').value = '5'; fixture.lookup('generation-target').value = 'weekly';
+  fixture.lookup('generation-start').listeners.get('click')(); await fixture.settle();
+  assert.equal(confirmations.length, 0); assert.match(fixture.lookup('notice').textContent, /请输入.*反重力.*模型名/);
+  fixture.lookup('generation-model').value = 'registered-ag-model';
+  fixture.lookup('generation-start').listeners.get('click')(); await fixture.settle();
+  const writes = fixture.requests.filter(request => request.options.method === 'POST');
+  assert.equal(writes.length, 1);
+  const request = JSON.parse(writes[0].options.body);
+  assert.equal(request.provider, 'antigravity'); assert.equal(request.account_id, 'ag'); assert.equal(request.model, 'registered-ag-model');
+  assert.match(confirmations[0], /反重力账号 ag.*registered-ag-model/);
+  assert.doesNotMatch(confirmations[0], /五小时窗口/);
+  assert.equal(fixture.lookup('generation-preview').value, 'Hello.\nHi.\nReady.\nYes.\nOK.');
+  fixture.lookup('generation-apply').listeners.get('click')();
+  assert.deepEqual(JSON.parse(fixture.lookup('config-json').value).reset_rules.weekly.prompt_pool, ['Hello.', 'Hi.', 'Ready.', 'Yes.', 'OK.']);
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1, 'Applying candidates must only change the local draft');
+  fixture.lookup('disconnect').listeners.get('click')();
+});
 test('saving settings immediately restores the generation button without requiring polling', async () => {
   const {lookup,settle}=createPanelFixture(async(url,options,data)=>{
     data.summary.host_enabled=true;data.capabilities.ExactAccountExecution=true;data.accounts={a:{ID:'a',Enabled:true}};
@@ -133,7 +174,7 @@ function createPanelFixture(fetcher, confirm = () => true, fields = [], options 
     capabilities: {QuotaAdapterReady: true}, config, 'config-editor': {config, revision: 'r1'}};
   const records = new Map();
   Object.defineProperty(data, 'snapshot', {get() {
-    const snapshot = structuredClone({instance_id: data.instance_id, snapshot_seq: ++data.snapshot_seq, summary: data.summary, accounts: data.accounts, capabilities: data.capabilities, config: data.config});
+    const snapshot = structuredClone({instance_id: data.instance_id, snapshot_seq: ++data.snapshot_seq, summary: data.summary, accounts: data.accounts, generation_accounts: data.generation_accounts, capabilities: data.capabilities, config: data.config});
     if (!Array.isArray(snapshot.summary.scheduler.jobs)) snapshot.summary.scheduler.jobs = [...records.values()].map(record => {
       const current = data.summary.scheduler[record.kind];
       const detail = current && JSON.stringify(current) !== record.previous ? current : {phase: 'queued', account_id: record.target};
@@ -539,39 +580,51 @@ test('query policy form parses excluded hours and saves separate windows as one 
   assert.equal(saved.quota_query.automatic, false);
   lookup('disconnect').listeners.get('click')();
 });
-test('timeline sorts events and groups days in configured timezone without writes', async () => {
+test('next wake table shows one row per account and excludes queries and pool events', async () => {
   const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
-    data.config.timezone = 'Asia/Shanghai';
+    data.config.timezone = 'Asia/Shanghai'; data.config.enabled = true;
+    data.accounts = Object.fromEntries(['a', 'b', 'unknown'].map(id => [id, {ID: id, Enabled: true}]));
     data.summary.scheduler.plan = {enabled: true, horizon_days: 3, entries: [
-      {kind: 'wake', trigger: 'weekly_reset', earliest_at: '2026-10-14T16:00:00Z', latest_at: '2026-10-14T16:00:00Z', status: 'blocked', detail: 'blocked'},
-      {kind: 'query', trigger: 'periodic', window: 'five_hour', earliest_at: '2026-10-13T16:00:00Z', latest_at: '2026-10-13T16:00:00Z', repeat_every: '30s', status: 'estimated', detail: 'query'}
+      {kind: 'wake', account_id: 'a', earliest_at: '2026-10-15T16:00:00Z', status: 'scheduled'},
+      {kind: 'wake', account_id: 'a', earliest_at: '2026-10-14T16:00:00Z', latest_at: '2026-10-14T16:10:00Z', status: 'estimated'},
+      {kind: 'wake', account_id: 'b', earliest_at: '2026-10-13T16:00:00Z', status: 'scheduled'},
+      {kind: 'wake', account_id: 'unknown', earliest_at: '2026-10-12T16:00:00Z', status: 'blocked'},
+      {kind: 'wake', trigger: 'daily_schedule', earliest_at: '2026-10-12T16:00:00Z', status: 'scheduled'},
+      {kind: 'query', account_id: 'a', earliest_at: '2026-10-12T16:00:00Z', status: 'scheduled'}
     ]};
     return response(data[url.split('/').pop()]);
   });
   lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
   await settle();
   const rows = lookup('plan-list').children;
-  assert.equal(rows.length, 4);
-  assert.match(rows[0].textContent, /2026\/10\/14/);
-  assert.match(rows[1].children[0].textContent, /5 小时/);
-  assert.match(rows[1].children[2].textContent, /每 30s 循环/);
-  assert.match(rows[2].textContent, /2026\/10\/15/);
-  assert.equal(rows[3].className, 'card plan-item plan-wake plan-blocked');
+  assert.equal(rows.length, 3);
+  assert.deepEqual(rows.map(row => row.children[0].textContent), ['b', 'a', 'unknown']);
+  assert.match(rows[0].children[1].textContent, /2026\/10\/14/);
+  assert.match(rows[1].children[1].textContent, /预计.*2026\/10\/15.*—/);
+  assert.equal(rows[2].children[1].textContent, '暂无可确定时间');
+  assert.ok(rows.every(row => row.children.length === 2));
   assert.equal(requests.some(request => request.options.method === 'POST'), false);
   lookup('disconnect').listeners.get('click')();
 });
-test('future plan renders server state safely without dispatching operations', async () => {
-  const now = new Date().toISOString();
+test('next wake summary works without full planning and renders account names safely', async () => {
+  const id = '<img src=x onerror=alert(1)>', now = new Date().toISOString();
   const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
-    data.summary.scheduler.plan = {enabled: true, horizon_days: 3, generated_at: now, until: now, entries: [{kind: 'query', trigger: 'weekly_reset', account_id: '<img src=x onerror=alert(1)>', earliest_at: now, latest_at: now, status: 'estimated', detail: 'Only quota'}]};
+    data.config.enabled = true;
+    data.accounts = {[id]: {ID: id, Enabled: true}, disabled: {ID: 'disabled', Enabled: false}, pending: {ID: 'pending', Enabled: true, Task: {OperationID: 'op'}}, paused: {ID: 'paused', Enabled: true}};
+    data.config.account_overrides = {paused: {paused: true}};
+    data.summary.scheduler.plan = {enabled: false, horizon_days: 3, entries: [], next_wakes: {[id]: {kind: 'wake', account_id: id, earliest_at: now, latest_at: now, status: 'scheduled'}}};
     return response(data[url.split('/').pop()]);
   });
   lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
   await settle();
-  const row = lookup('plan-list').children[1];
-  assert.equal(lookup('plan-list').children[0].className, 'timeline-day');
-  assert.equal(row.className, 'card plan-item plan-query');
-  assert.ok(row.children.some(item => item.textContent === '<img src=x onerror=alert(1)>'));
+  const rows = lookup('plan-list').children;
+  assert.equal(rows.length, 4);
+  assert.equal(rows[0].children[0].textContent, id);
+  assert.equal(rows[0].children[0].children.length, 0);
+  const values = Object.fromEntries(rows.map(row => row.children.map(cell => cell.textContent)));
+  assert.equal(values.disabled, 'CPA 账号不可用');
+  assert.equal(values.pending, '等待上次唤醒验证');
+  assert.equal(values.paused, '已暂停唤醒');
   assert.match(lookup('plan-status').textContent, /未来 3 天/);
   assert.equal(requests.some(request => request.options.method === 'POST'), false);
   lookup('disconnect').listeners.get('click')();
@@ -1228,6 +1281,77 @@ test('runtime refresh uses one complete snapshot and leaves the editor draft sep
   fixture.lookup('refresh').listeners.get('click')(); await fixture.settle();
   assert.equal(fixture.requests.at(-1).url.split('/').pop(), 'snapshot');
   assert.equal(fixture.requests.length, 3);
+});
+test('CPA refresh synchronizes disabled state once and preserves an unfinished draft', async () => {
+  let release; const confirmations = [];
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.accounts.a ||= {ID: 'a', Enabled: true, Availability: 'available'};
+    if (url.endsWith('/refresh-accounts')) {
+      assert.equal(options.method, 'POST');
+      assert.equal(options.body, undefined);
+      return new Promise(resolve => { release = () => {
+        data.accounts.a.Enabled = false; data.accounts.a.Availability = 'disabled';
+        resolve(response(data.snapshot));
+      }; });
+    }
+    return response(data[url.split('/').pop()]);
+  }, message => {confirmations.push(message); return true;});
+  await loginFixture(fixture);
+  const button = fixture.lookup('refresh-cpa');
+  assert.equal(button.hidden, false); assert.equal(button.disabled, false);
+  fixture.lookup('config-json').value = '{unfinished draft'; fixture.lookup('config-json').listeners.get('input')();
+  button.listeners.get('click')(); button.listeners.get('click')();
+  assert.equal(button.disabled, true); assert.equal(button.textContent, '正在同步…');
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1);
+  release(); await fixture.settle();
+  assert.ok(descendants(fixture.lookup('account-list')).some(item => item.textContent === 'CPA 账号已禁用'));
+  assert.equal(fixture.lookup('config-json').value, '{unfinished draft');
+  assert.match(fixture.lookup('notice').textContent, /已从 CPA 同步.*未连接上游/);
+  assert.equal(button.disabled, false); assert.equal(button.textContent, '从 CPA 刷新');
+  assert.equal(fixture.requests.length, 3, 'Refresh must not reload policy or submit quota/wake work');
+  assert.equal(confirmations.length, 0, 'Local CPA refresh must not require confirmation');
+  assert.equal(fixture.lookup('auto-refresh').checked, false);
+  fixture.lookup('disconnect').listeners.get('click')();
+  assert.equal(button.hidden, true); assert.equal(button.disabled, true);
+});
+test('failed CPA refresh keeps displayed accounts and restores its button without retries', async () => {
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.accounts.a ||= {ID: 'a', Enabled: true};
+    if (url.endsWith('/refresh-accounts')) return response({}, 503);
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  const content = () => descendants(fixture.lookup('account-list')).map(item => item.textContent).join('|');
+  const before = content();
+  fixture.lookup('refresh-cpa').listeners.get('click')(); await fixture.settle();
+  assert.equal(content(), before);
+  assert.equal(fixture.lookup('refresh-cpa').disabled, false);
+  assert.match(fixture.lookup('notice').textContent, /从 CPA 刷新失败，已保留页面数据/);
+  assert.equal(fixture.requests.filter(request => request.options.method === 'POST').length, 1);
+  assert.equal(fixture.timers.size, 0);
+});
+test('a pre-refresh poll cannot overwrite the synchronized CPA status', async () => {
+  let delayPoll = false, release;
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.accounts.a ||= {ID: 'a', Enabled: true, Availability: 'available'};
+    if (url.endsWith('/snapshot') && delayPoll) {
+      delayPoll = false; const old = data.snapshot;
+      return new Promise(resolve => {release = () => resolve(response(old));});
+    }
+    if (url.endsWith('/refresh-accounts')) {
+      data.accounts.a.Enabled = false; data.accounts.a.Availability = 'disabled';
+      return response(data.snapshot);
+    }
+    return response(data[url.split('/').pop()]);
+  });
+  await loginFixture(fixture);
+  fixture.lookup('auto-refresh').checked = true; fixture.lookup('auto-refresh').listeners.get('change')();
+  delayPoll = true; await fixture.poll();
+  fixture.lookup('refresh-cpa').listeners.get('click')(); await fixture.settle();
+  release(); await fixture.settle();
+  assert.ok(descendants(fixture.lookup('account-list')).some(item => item.textContent === 'CPA 账号已禁用'));
+  assert.match(fixture.lookup('notice').textContent, /已从 CPA 同步/);
+  fixture.lookup('disconnect').listeners.get('click')();
 });
 test('late polling results and errors cannot overwrite a newer accepted query snapshot', async () => {
   for (const oldFails of [false, true]) {

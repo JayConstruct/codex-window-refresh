@@ -145,3 +145,84 @@ func TestAllowedPlanTimesHandleBothOccurrencesOfRepeatedDSTHour(t *testing.T) {
 		}
 	}
 }
+
+func TestNextWakesRemainCompleteWithoutDetailedPlan(t *testing.T) {
+	engine, host, _, clock := fixture(t, false, true)
+	engine.cfg.Planning.Enabled = false
+	engine.cfg.Planning.HorizonDays = 7
+	engine.state.Accounts = map[core.AccountID]core.AccountState{}
+	count := maximumPlanEntries + 20
+	for index := 0; index < count; index++ {
+		id := core.AccountID(fmt.Sprintf("account-%03d", index))
+		engine.state.Accounts[id] = core.AccountState{ID: id, Enabled: true, FiveHourBaseline: core.WindowBaseline{StableResetAt: clock.now.Add(time.Hour)}, WeeklyBaseline: core.WindowBaseline{StableResetAt: clock.now.Add(24 * time.Hour)}}
+	}
+	before, _ := json.Marshal(engine.state)
+	plan := engine.schedulePlan(engine.state, clock.now)
+	if plan.Enabled || len(plan.Entries) != 0 || len(plan.NextWakes) != count {
+		t.Fatalf("incomplete compact summary: %d wakes, %d entries", len(plan.NextWakes), len(plan.Entries))
+	}
+	for id, wake := range plan.NextWakes {
+		if wake.AccountID != id || wake.Kind != "wake" || wake.Trigger != string(core.ReasonFiveHour) {
+			t.Fatalf("not the earliest account wake: %+v", wake)
+		}
+	}
+	engine.cfg.Planning.Enabled = true
+	detailed := engine.schedulePlan(engine.state, clock.now)
+	if !detailed.Truncated || !reflect.DeepEqual(detailed.NextWakes, plan.NextWakes) {
+		t.Fatal("full timeline truncation changed account summary")
+	}
+	after, _ := json.Marshal(engine.state)
+	if string(before) != string(after) || host.reads != 0 || len(host.sends) != 0 {
+		t.Fatal("summary changed state or sent requests")
+	}
+	engine.publish(true)
+	summary := engine.SchedulerDiagnostics().(SchedulingSummary)
+	delete(summary.Plan.NextWakes, "account-000")
+	if len(engine.SchedulerDiagnostics().(SchedulingSummary).Plan.NextWakes) != count {
+		t.Fatal("summary mutation escaped snapshot")
+	}
+}
+
+func TestNextWakeSummaryOmitsUnavailableAndUnassignedTimes(t *testing.T) {
+	for _, scenario := range []string{"disabled", "paused", "verifying", "unknown", "wake_off", "blocked_hours", "daily_pool_only", "stored_deadline", "assigned_daily"} {
+		t.Run(scenario, func(t *testing.T) {
+			engine, _, _, clock := fixture(t, false, true)
+			engine.cfg.Planning.Enabled = false
+			a := engine.state.Accounts["a"]
+			a.FiveHourBaseline.StableResetAt = clock.now.Add(time.Hour)
+			a.WeeklyBaseline = core.WindowBaseline{}
+			switch scenario {
+			case "disabled":
+				a.Enabled = false
+			case "paused":
+				paused := true
+				engine.cfg.AccountOverrides["a"] = config.AccountOverride{Paused: &paused}
+			case "verifying":
+				a.Task = &core.MergedTask{OperationID: "sent"}
+			case "unknown", "daily_pool_only":
+				a.FiveHourBaseline = core.WindowBaseline{}
+			case "wake_off":
+				engine.cfg.Enabled = false
+			case "blocked_hours":
+				engine.cfg.OrdinaryRules.AllowedHours = nil
+			case "assigned_daily":
+				engine.cfg.OrdinaryRules.DailyEnabled = true
+				engine.cfg.DailyRules = []config.DailyRule{{ID: "point", Enabled: true, RandomTimeRange: "11:00-11:00", MinimumReadyAccounts: 1}}
+				a.FiveHourBaseline = core.WindowBaseline{}
+				a.Task = &core.MergedTask{Intents: []core.Intent{{Reason: core.ReasonDaily, RuleID: "point", RandomizedDueAt: clock.now.Add(2 * time.Hour), Status: core.IntentPending}}}
+			case "stored_deadline":
+				a.Task = &core.MergedTask{Intents: []core.Intent{{Reason: core.ReasonFiveHour, OriginalDueAt: a.FiveHourBaseline.StableResetAt, RandomizedDueAt: clock.now.Add(2 * time.Hour), Status: core.IntentPending}}}
+			}
+			engine.state.Accounts["a"] = a
+			plan := engine.schedulePlan(engine.state, clock.now)
+			if scenario == "stored_deadline" || scenario == "assigned_daily" {
+				wake := plan.NextWakes["a"]
+				if wake.Status != "scheduled" || !wake.EarliestAt.Equal(clock.now.Add(2*time.Hour)) || !wake.LatestAt.Equal(wake.EarliestAt) {
+					t.Fatalf("lost assigned deadline: %+v", wake)
+				}
+			} else if len(plan.NextWakes) != 0 {
+				t.Fatalf("invented account wake: %+v", plan.NextWakes)
+			}
+		})
+	}
+}

@@ -18,7 +18,7 @@ func (e *Engine) recentUsageAllowed(state core.CoreState, now time.Time) bool {
 func (e *Engine) reconcileHistory(now time.Time) {
 	entries := e.state.History[:0]
 	for _, entry := range e.state.History {
-		if entry.OperationID != "" && (entry.Status == "dispatched" || entry.Status == "verifying" || entry.Status == "unknown") {
+		if entry.Provider != "antigravity" && entry.OperationID != "" && (entry.Status == "dispatched" || entry.Status == "verifying" || entry.Status == "unknown") {
 			account, exists := e.state.Accounts[entry.AccountID]
 			if !exists || account.Generation != entry.Generation {
 				entry.Status, entry.ErrorCode = "unknown", "account_binding_changed"

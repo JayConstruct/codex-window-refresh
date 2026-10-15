@@ -27,7 +27,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.18"
+const Version = "0.1.0-rc.19"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -452,7 +452,7 @@ func managementRegistration() any {
 	for _, p := range []string{"/snapshot", "/summary", "/accounts", "/config", "/config-editor", "/capabilities", "/history"} {
 		routes = append(routes, map[string]string{"Method": "GET", "Path": ManagementPrefix + p})
 	}
-	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check", "/manual-wake", "/prompt-generation"} {
+	for _, p := range []string{"/reload", "/recheck", "/config", "/quota-query", "/quota-connection-check", "/manual-wake", "/prompt-generation", "/refresh-accounts"} {
 		routes = append(routes, map[string]string{"Method": "POST", "Path": ManagementPrefix + p})
 	}
 	return map[string]any{"Routes": routes, "Resources": []map[string]string{{"Path": "/status", "Menu": "Codex Window Refresh", "Description": "Authenticated scheduler panel."}, {"Path": "/panel.js"}, {"Path": "/panel.css"}}}
@@ -508,6 +508,25 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 	}
 	switch req.Method + " " + path {
 	case "GET /snapshot":
+		return s.snapshotResponse(engine, wrapper, done, stopping, lastError), nil
+	case "POST /refresh-accounts":
+		// Keep the host callback and store alive until this synchronous read and
+		// publication finish, including when shutdown races the request.
+		s.lifecycle.Lock()
+		defer s.lifecycle.Unlock()
+		s.mu.RLock()
+		engine, wrapper, done, stopping, lastError = s.engine, s.wrapper, s.done, s.stopping, s.lastError
+		s.mu.RUnlock()
+		if !schedulerRunning(done, stopping) {
+			return response(409, map[string]string{"error": "scheduler stopping"}), nil
+		}
+		refresher, ok := engine.(interface{ RefreshAccounts(context.Context) error })
+		if !ok {
+			return response(501, map[string]string{"error": "account_refresh_unavailable"}), nil
+		}
+		if err := refresher.RefreshAccounts(ctx); err != nil {
+			return response(503, map[string]string{"error": "account_refresh_failed"}), nil
+		}
 		return s.snapshotResponse(engine, wrapper, done, stopping, lastError), nil
 	case "GET /summary":
 		state := engine.Snapshot()

@@ -21,8 +21,8 @@
 | `quota_query.automatic` | boolean，`false` | 普通定期额度查询默认关闭，需用户手动开启并保存；不发送模型请求，关闭仍保留被动额度、独立启用的唤醒前核对和已有操作验证 |
 | `quota_query.on_five_hour_expiry` | boolean，`false` | 已确认的五小时窗口到期后查询一次，独立于普通定期查询和模型唤醒；失败或缺少窗口字段按间隔及退避重试；成功边界标记持久化 |
 | `quota_query.on_weekly_expiry` | boolean，`false` | 已确认的周窗口到期后查询一次，规则同上；两种窗口同时到期合并为一次账号额度查询 |
-| `planning.enabled` | boolean，`false` | 自动生成未来查询及唤醒预览；只读计算，不开启或增加请求，不重新抽取已分配的随机时间 |
-| `planning.horizon_days` | integer，`7` | 1–30 天；最多显示最早 256 项，周期查询以循环条目表示，窗口未知时不推算未来周期 |
+| `planning.enabled` | boolean，`false` | 生成完整查询及唤醒计划数据；每账号下一次唤醒摘要始终计算。只读计算，不开启或增加请求，不重新抽取已分配的随机时间 |
+| `planning.horizon_days` | integer，`7` | 1–30 天；摘要与完整计划共用此范围。完整计划最多保留最早 256 项，账号下一次唤醒摘要不受此上限影响；窗口未知时不推算未来周期 |
 | `quota_query.manual` | boolean，`true` | 仅为兼容旧配置保留，解析时归一化为 true；手动查询始终允许，false 不再拒绝或取消查询 |
 | `quota_query.interval` | duration，`30s` | 普通定期查询间隔，允许 30 秒到 1 小时；完整被动额度也按此间隔推迟重复轮询 |
 | `quota_query.five_hour_recent_usage.enabled/lookback` | boolean / duration，`false/30m` | 只限制五小时到期自动查询；开启时要求整个账号池在回溯内有真实用户活动或尚在处理的用户请求。回溯允许 1m–7d，不与人数容量回溯混用；条件不满足不标记边界完成 |
