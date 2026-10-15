@@ -748,10 +748,15 @@
       const name = el('th', id); name.setAttribute('scope', 'row');
       let time = unavailable;
       if (entry) {
-        const ranged = resetTime(entry.latest_at) !== null && resetTime(entry.latest_at) > resetTime(entry.earliest_at);
-        const start = date(entry.earliest_at), end = ranged ? date(entry.latest_at) : '';
+        const assigned = resetTime(entry.scheduled_at) !== null;
+        const ranged = !assigned && resetTime(entry.latest_at) !== null && resetTime(entry.latest_at) > resetTime(entry.earliest_at);
+        const start = date(assigned ? entry.scheduled_at : entry.earliest_at), end = ranged ? date(entry.latest_at) : '';
         const compactEnd = end.split(' ')[0] === start.split(' ')[0] ? end.split(' ').slice(1).join(' ') : end;
-        time = (entry.status === 'scheduled' ? '' : '预计 ') + start + (ranged ? ' — ' + compactEnd : '');
+        time = (assigned || entry.status === 'scheduled' ? '' : '预计 ') + start + (ranged ? ' — ' + compactEnd : '');
+        if (assigned && entry.status === 'waiting') {
+          time = '原定 ' + time + ' · 已到期，' + (holds[entry.wait_reason] || '等待调度核对');
+          if (resetTime(entry.next_check_at) !== null) time += ' · 下次核对 ' + date(entry.next_check_at);
+        }
       }
       row.append(name, el('td', time, entry ? 'wake-time' : 'wake-unset'));
       list.append(row);

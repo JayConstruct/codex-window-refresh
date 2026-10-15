@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -10,6 +11,67 @@ import (
 	"codex-window-refresh/internal/config"
 	"codex-window-refresh/internal/core"
 )
+
+func TestOverdueWakeKeepsDeadlineSeparateFromMovingChecks(t *testing.T) {
+	for _, reason := range []core.Reason{core.ReasonFiveHour, core.ReasonWeekly, core.ReasonDaily} {
+		t.Run(string(reason), func(t *testing.T) {
+			e, _, _, clock := fixture(t, false, reason == core.ReasonWeekly)
+			due := clock.now.Add(-2 * time.Minute)
+			a := e.state.Accounts["a"]
+			a.FiveHourBaseline = core.WindowBaseline{CycleID: "expired", StableResetAt: due}
+			a.WeeklyBaseline = core.WindowBaseline{}
+			if reason == core.ReasonWeekly {
+				a.FiveHourBaseline = core.WindowBaseline{}
+				a.WeeklyBaseline = core.WindowBaseline{CycleID: "expired", StableResetAt: due}
+			}
+			if reason == core.ReasonDaily {
+				a.FiveHourBaseline = core.WindowBaseline{}
+				e.cfg.DailyRules = []config.DailyRule{{ID: "point", Enabled: true, RandomTimeRange: "09:00-09:00"}}
+			}
+			a.Task = &core.MergedTask{State: core.TaskWaiting, HoldReason: core.HoldQuotaUnknown, Intents: []core.Intent{{ID: "stored", Reason: reason, RuleID: "point", OriginalDueAt: due, RandomizedDueAt: due, Status: core.IntentPending}}}
+			e.state.Accounts["a"] = a
+			for index := 0; index < 3; index++ {
+				e.nextPreflight["a"] = clock.now.Add(30 * time.Second)
+				wake := e.schedulePlan(e.state, clock.now).NextWakes["a"]
+				if wake.ScheduledAt == nil || !wake.ScheduledAt.Equal(due) || wake.Status != "waiting" || wake.WaitReason != core.HoldQuotaUnknown || wake.NextCheckAt == nil || !wake.NextCheckAt.Equal(e.nextPreflight["a"]) {
+					t.Fatalf("retry replaced persisted deadline or lost wait reason: %+v", wake)
+				}
+				clock.now = clock.now.Add(time.Minute)
+			}
+		})
+	}
+}
+
+func TestExpiredFiveHourWakeWaitsForDemandWithoutResampling(t *testing.T) {
+	e, host, _, clock := fixture(t, false, false)
+	e.cfg.QuotaQuery.Automatic = false
+	var deadline time.Time
+	for index := 0; index < 3; index++ {
+		if err := e.Step(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		wake := e.SchedulerDiagnostics().(SchedulingSummary).Plan.NextWakes["a"]
+		if wake.ScheduledAt == nil || wake.Status != "waiting" || wake.WaitReason != core.HoldNoCapacity {
+			t.Fatalf("missing demand wait explanation: %+v", wake)
+		}
+		if deadline.IsZero() {
+			deadline = *wake.ScheduledAt
+		} else if !wake.ScheduledAt.Equal(deadline) {
+			t.Fatal("waiting for users postponed the persisted wake")
+		}
+		clock.now = clock.now.Add(time.Minute)
+	}
+	if host.reads != 0 || len(host.sends) != 0 {
+		t.Fatal("showing a waiting plan performed upstream work")
+	}
+	addUser(e, clock)
+	if err := e.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.sends) != 1 {
+		t.Fatal("persisted overdue wake failed to run when demand arrived")
+	}
+}
 
 func TestFuturePlanHasIndependentQueriesAndWakesWithoutChangingState(t *testing.T) {
 	engine, host, _, clock := fixture(t, false, true)

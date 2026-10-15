@@ -576,7 +576,7 @@ func (e *Engine) Step(ctx context.Context) error {
 		}
 		// Failed/ambiguous evidence is retried by the bounded observation poll,
 		// rather than by every scheduler tick. Every admitted send still reads anew.
-		if now.Before(e.nextRead[id]) && (a.Permission != core.PermissionAllowed || (a.FiveHour.State != core.WindowInactive && a.FiveHour.State != core.WindowExpired)) {
+		if now.Before(e.nextRead[id]) && (a.Permission != core.PermissionAllowed || (a.FiveHour.State != core.WindowInactive && a.FiveHour.State != core.WindowExpired && !core.FullFiveHourAfterReset(a.FiveHour, a.FiveHourBaseline.StableResetAt, now))) {
 			e.hold(id, core.HoldQuotaUnknown)
 			continue
 		}
@@ -620,7 +620,7 @@ func (e *Engine) Step(ctx context.Context) error {
 			}
 		}
 		cap = e.capacity(now, id)
-		ad := core.DecideAdmission(core.AdmissionInput{Now: now, Enabled: a.Enabled, AccountID: id, Generation: a.Generation, Task: task, FiveHour: a.FiveHour, QuotaPermission: a.Permission, QuotaObservedAt: a.PermissionObservedAt, QuotaMaxAge: e.cfg.Runtime().EvidenceMaxAge, Weekly: week, WeeklyObservedAt: a.Weekly.ConfirmedAt, ForegroundBusy: core.ForegroundBusy(e.state, id, a.Generation), BackoffUntil: a.BackoffUntil, WithinAllowedHours: e.cfg.WithinAllowedHours(now, id), RecentUsers: core.ActiveUserCount(e.state, now, e.cfg.Runtime().ActivityLookback), AllowActiveUsersOutsideHours: p.AllowOutsideHoursWhenUsersActive, OrdinarySlotsAvailable: cap.Missing, ConcurrencySlotAvailable: true})
+		ad := core.DecideAdmission(core.AdmissionInput{Now: now, Enabled: a.Enabled, AccountID: id, Generation: a.Generation, Task: task, FiveHour: a.FiveHour, FiveHourBaselineResetAt: a.FiveHourBaseline.StableResetAt, QuotaPermission: a.Permission, QuotaObservedAt: a.PermissionObservedAt, QuotaMaxAge: e.cfg.Runtime().EvidenceMaxAge, Weekly: week, WeeklyObservedAt: a.Weekly.ConfirmedAt, ForegroundBusy: core.ForegroundBusy(e.state, id, a.Generation), BackoffUntil: a.BackoffUntil, WithinAllowedHours: e.cfg.WithinAllowedHours(now, id), RecentUsers: core.ActiveUserCount(e.state, now, e.cfg.Runtime().ActivityLookback), AllowActiveUsersOutsideHours: p.AllowOutsideHoursWhenUsersActive, OrdinarySlotsAvailable: cap.Missing, ConcurrencySlotAvailable: true})
 		if !ad.Allowed {
 			e.hold(id, ad.Hold)
 			switch ad.Hold {

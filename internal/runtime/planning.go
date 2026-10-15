@@ -19,6 +19,9 @@ type PlannedAction struct {
 	RuleID      string              `json:"rule_id,omitempty"`
 	EarliestAt  time.Time           `json:"earliest_at"`
 	LatestAt    time.Time           `json:"latest_at"`
+	ScheduledAt *time.Time          `json:"scheduled_at,omitempty"`
+	NextCheckAt *time.Time          `json:"next_check_at,omitempty"`
+	WaitReason  core.HoldReason     `json:"wait_reason,omitempty"`
 	RepeatEvery string              `json:"repeat_every,omitempty"`
 	Window      string              `json:"window,omitempty"`
 	Status      string              `json:"status"`
@@ -90,6 +93,21 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 		}
 		if action.LatestAt.After(plan.Until) {
 			action.LatestAt = plan.Until
+		}
+		// Keep the persisted deadline separate from the earliest possible retry.
+		// A waiting account must not appear to receive a new random deadline on
+		// every publication. These fields report existing state without scheduling.
+		if action.Kind == "wake" && action.ScheduledAt != nil && !now.Before(*action.ScheduledAt) {
+			if action.Status != "blocked" {
+				action.Status = "waiting"
+			}
+			if task := state.Accounts[action.AccountID].Task; task != nil && task.HoldReason != core.HoldNotDue {
+				action.WaitReason = task.HoldReason
+			}
+			if action.EarliestAt.After(now) {
+				check := action.EarliestAt
+				action.NextCheckAt = &check
+			}
 		}
 		if action.Kind == "wake" && action.AccountID != "" && action.Status != "blocked" {
 			previous, exists := plan.NextWakes[action.AccountID]
@@ -174,7 +192,8 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 				due := maxTime(intent.RandomizedDueAt, maxTime(now, maxTime(account.BackoffUntil, e.nextPreflight[id])))
 				due = maxTime(due, account.FiveHourBaseline.StableResetAt)
 				if allowed, ok := nextAllowedTime(e.cfg, id, due, plan.Until); ok {
-					add(PlannedAction{Kind: "wake", Trigger: string(core.ReasonDaily), AccountID: id, RuleID: intent.RuleID, EarliestAt: allowed, LatestAt: allowed, Status: "scheduled", Detail: "已分配至账号；仍需额度与容量核对"})
+					deadline := intent.RandomizedDueAt
+					add(PlannedAction{Kind: "wake", Trigger: string(core.ReasonDaily), AccountID: id, RuleID: intent.RuleID, EarliestAt: allowed, LatestAt: allowed, ScheduledAt: &deadline, Status: "scheduled", Detail: "已分配至账号；仍需额度与容量核对"})
 				}
 			}
 		}
@@ -234,6 +253,7 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 			}
 			earliest, latest := window.reset.Add(window.delay.Min.Value()), window.reset.Add(window.delay.Max.Value())
 			status := "estimated"
+			var scheduledAt *time.Time
 			if account.Task != nil {
 				retired := false
 				for _, intent := range account.Task.Intents {
@@ -242,6 +262,8 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 							retired = true
 						} else {
 							earliest, latest, status = intent.RandomizedDueAt, intent.RandomizedDueAt, "scheduled"
+							deadline := intent.RandomizedDueAt
+							scheduledAt = &deadline
 						}
 					}
 				}
@@ -261,7 +283,7 @@ func (e *Engine) schedulePlan(state core.CoreState, now time.Time) SchedulePlan 
 				detail += "；仍需人数容量满足"
 			}
 			model, _ := e.cfg.WakeContent(window.reason)
-			add(PlannedAction{Kind: "wake", Trigger: string(window.reason), AccountID: id, EarliestAt: earliest, LatestAt: latest, Status: status, Detail: detail, Model: model})
+			add(PlannedAction{Kind: "wake", Trigger: string(window.reason), AccountID: id, EarliestAt: earliest, LatestAt: latest, ScheduledAt: scheduledAt, Status: status, Detail: detail, Model: model})
 		}
 	}
 	if plan.Enabled && e.cfg.Enabled && e.cfg.OrdinaryRules.DailyEnabled {

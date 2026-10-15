@@ -629,6 +629,30 @@ test('next wake summary works without full planning and renders account names sa
   assert.equal(requests.some(request => request.options.method === 'POST'), false);
   lookup('disconnect').listeners.get('click')();
 });
+test('overdue wake keeps its original deadline while quota checks move forward', async () => {
+  let check = '2026-10-15T10:00:03Z', waitReason = 'quota_unknown';
+  const fixture = createPanelFixture(async (url, options, data) => {
+    data.config.enabled = true;
+    data.accounts = {a: {ID: 'a', Enabled: true}};
+    data.summary.scheduler.plan = {enabled: false, horizon_days: 3, next_wakes: {a: {
+      kind: 'wake', account_id: 'a', earliest_at: check, latest_at: check,
+      scheduled_at: '2026-10-15T09:55:00Z', next_check_at: check, status: 'waiting', wait_reason: waitReason
+    }}};
+    return response(data[url.split('/').pop()]);
+  });
+  const {lookup, settle, requests} = fixture;
+  await loginFixture(fixture);
+  let text = lookup('plan-list').children[0].children[1].textContent;
+  assert.match(text, /原定 2026\/10\/15 17:55:00 · 已到期，额度证据未知/);
+  assert.match(text, /下次核对 2026\/10\/15 18:00:03/);
+  check = '2026-10-15T10:00:09Z'; waitReason = 'target_satisfied';
+  lookup('refresh').listeners.get('click')(); await settle();
+  text = lookup('plan-list').children[0].children[1].textContent;
+  assert.match(text, /原定 2026\/10\/15 17:55:00 · 已到期，人数比例容量已满足/);
+  assert.match(text, /下次核对 2026\/10\/15 18:00:09/);
+  assert.equal(requests.some(request => request.options.method === 'POST'), false);
+  lookup('disconnect').listeners.get('click')();
+});
 test('daily UI switches between a point and a random range without removing the rule', async () => {
   const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
     data.config.daily_rules = [{id: 'point', enabled: true, random_time_range: '09:00-09:00', minimum_ready_accounts: 1, catch_up: true}];

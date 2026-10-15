@@ -18,6 +18,54 @@ func ordinaryInput() AdmissionInput {
 	}
 }
 
+func TestFullQuotaCanWakeKnownExpiredFiveHourCycle(t *testing.T) {
+	for _, scenario := range []string{"reset", "missing baseline", "future baseline", "unrelated intent", "before reset observation", "missing percentage", "partial quota", "short countdown", "stale", "blocked", "no demand", "outside hours", "foreground", "pending delivery", "weekly unconfirmed"} {
+		t.Run(scenario, func(t *testing.T) {
+			in := ordinaryInput()
+			in.FiveHourBaselineResetAt = in.Now.Add(-time.Minute)
+			in.Task.Intents[0].OriginalDueAt = in.FiveHourBaselineResetAt
+			in.FiveHour = WindowEvidence{Kind: FiveHour, State: WindowUnknown, ResetAt: in.Now.Add(5 * time.Hour), ConfirmedAt: in.Now, Source: "cpa_wham_usage", Remaining: &QuotaAmount{Value: 100, Unit: "percent"}}
+			switch scenario {
+			case "missing baseline":
+				in.FiveHourBaselineResetAt = time.Time{}
+			case "future baseline":
+				in.FiveHourBaselineResetAt = in.Now.Add(time.Hour)
+			case "unrelated intent":
+				in.Task.Intents[0].OriginalDueAt = in.Now.Add(-time.Hour)
+			case "before reset observation":
+				in.FiveHourBaselineResetAt = in.Now.Add(-time.Second)
+				in.Task.Intents[0].OriginalDueAt = in.FiveHourBaselineResetAt
+				in.FiveHour.ConfirmedAt = in.Now.Add(-2 * time.Second)
+			case "missing percentage":
+				in.FiveHour.Remaining = nil
+			case "partial quota":
+				in.FiveHour.Remaining.Value = 99
+			case "short countdown":
+				in.FiveHour.State = WindowActive
+				in.FiveHour.ResetAt = in.Now.Add(5*time.Hour - time.Second)
+			case "stale":
+				in.FiveHour.ConfirmedAt = in.Now.Add(-time.Minute)
+			case "blocked":
+				in.QuotaPermission = PermissionBlocked
+			case "no demand":
+				in.OrdinarySlotsAvailable = 0
+			case "outside hours":
+				in.WithinAllowedHours = false
+			case "foreground":
+				in.ForegroundBusy = true
+			case "pending delivery":
+				in.Task.State = TaskAwaitingEvidence
+			case "weekly unconfirmed":
+				in.Task.Intents = append(in.Task.Intents, Intent{ID: "week", Reason: ReasonWeekly, Status: IntentPending, RandomizedDueAt: in.Now})
+			}
+			got := DecideAdmission(in)
+			if got.Allowed != (scenario == "reset") {
+				t.Fatalf("unexpected admission: %+v", got)
+			}
+		})
+	}
+}
+
 func TestAdmissionConstraints(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -83,6 +83,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 	}
 	var due []EventID
 	weekly, fiveHour, daily, manual := false, false, false, false
+	knownFiveHourReset := false
 	seen := make(map[EventID]bool)
 	for _, event := range in.Task.Intents {
 		if event.ID == "" || event.Status != IntentPending || event.RandomizedDueAt.IsZero() || in.Now.Before(event.RandomizedDueAt) || seen[event.ID] {
@@ -93,6 +94,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 			weekly = true
 		case ReasonFiveHour:
 			fiveHour = true
+			knownFiveHourReset = knownFiveHourReset || (!event.OriginalDueAt.IsZero() && event.OriginalDueAt.Equal(in.FiveHourBaselineResetAt))
 		case ReasonDaily:
 			daily = true
 		case ReasonManual:
@@ -115,7 +117,7 @@ func DecideAdmission(in AdmissionInput) Admission {
 		}
 		return deny(HoldActiveFiveHour)
 	}
-	if manual && in.FiveHour.State == WindowUnknown && in.Now.Before(in.FiveHourBaselineResetAt) {
+	if in.FiveHour.State == WindowUnknown && in.Now.Before(in.FiveHourBaselineResetAt) {
 		return deny(HoldActiveFiveHour)
 	}
 	if in.ForegroundBusy {
@@ -139,7 +141,8 @@ func DecideAdmission(in AdmissionInput) Admission {
 	default:
 		return deny(HoldQuotaUnknown)
 	}
-	if in.FiveHour.State != WindowInactive && in.FiveHour.State != WindowExpired && !(manual && FullFiveHourPlaceholder(in.FiveHour)) {
+	fullAfterReset := knownFiveHourReset && FullFiveHourAfterReset(in.FiveHour, in.FiveHourBaselineResetAt, in.Now)
+	if in.FiveHour.State != WindowInactive && in.FiveHour.State != WindowExpired && !(manual && FullFiveHourPlaceholder(in.FiveHour)) && !fullAfterReset {
 		return deny(HoldQuotaUnknown)
 	}
 	// Expired classifications must have a past reset boundary; an inactive
@@ -182,4 +185,12 @@ func FullFiveHourPlaceholder(window WindowEvidence) bool {
 	}
 	duration := window.ResetAt.Sub(window.ConfirmedAt)
 	return duration >= 5*time.Hour-time.Minute && duration <= 5*time.Hour+time.Minute
+}
+
+// FullFiveHourAfterReset permits a due reset wake to consume freshly restored
+// quota. The full-length placeholder remains unknown/unstarted: it is neither
+// activation evidence nor a new reset boundary. An existing confirmed window
+// must have ended before this observation was made.
+func FullFiveHourAfterReset(window WindowEvidence, reset, now time.Time) bool {
+	return !reset.IsZero() && !now.Before(reset) && !window.ConfirmedAt.Before(reset) && FullFiveHourPlaceholder(window)
 }
