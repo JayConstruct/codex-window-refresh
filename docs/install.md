@@ -8,22 +8,24 @@
 
 ### 一行全自动安装或更新
 
-已有 CPA 的 Debian 12/13 服务器执行同一行即可首次安装或更新：
+已有 CPA 且插件为 rc.21 或更新版的 Debian 12/13 服务器，直接执行以下命令更新，默认热重载：
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh
 ```
 
-root 会话可省略 `sudo`。此命令要求已有 `curl`，缺失时先执行 `sudo apt-get update && sudo apt-get install -y ca-certificates curl`。完整下载成功后才执行脚本，不使用边下载边执行的管道。统一入口自动安装缺少的 `ca-certificates curl python3 python3-yaml`，默认使用 `--version latest --quota-transport host --defer-model --yes --restart`；识别、校验、备份和文件回滚仍由同一个 Python 安装器负责，不复制安装逻辑。旧 `cpa-quota-upgrade.sh` 委托该入口，旧 `cpa-quota-fix.sh` 仅供可选管理桥密钥修复，默认安装不运行它。
+root 会话可省略 `sudo`。此命令要求已有 `curl`，缺失时先执行 `sudo apt-get update && sudo apt-get install -y ca-certificates curl`。完整下载成功后才执行脚本，不使用边下载边执行的管道。统一入口自动安装缺少的 `ca-certificates curl python3 python3-yaml`，默认使用 `--version latest --quota-transport host --defer-model --yes --hot-reload`；识别、校验、备份和文件回滚仍由同一个 Python 安装器负责，不复制安装逻辑。旧 `cpa-quota-upgrade.sh` 委托该入口，旧 `cpa-quota-fix.sh` 仅供可选管理桥密钥修复，默认安装不运行它。
 
 首次没有 `--model` 时跳过模型识别，不询问管理密钥，不猜测模型；策略为 `enabled: false`、`execution.model: ""`，自动查询默认关闭，手动查询始终允许。随后在面板填写并保存支持的模型，即可按账号确认手动唤醒；自动查询、自动唤醒需分别手动开启并保存。也可在一行命令末尾加 `--model 实际模型名`，首次写入该模型但仍不自动开启唤醒。已有策略、模型、窗口状态和旧密钥文件在更新时保留，`--defer-model` 不会关闭已开启的模型唤醒。直接使用 Python 安装器且不加此参数时，保留原有交互/模型识别行为。
 
-默认会重启已核实的 systemd 服务，可能短暂中断正在处理的请求。无法唯一识别 CPA 路径、用户、服务或配置时停止并提示补充参数，不盲目重启。非 systemd 直接运行时追加 `--no-restart` 并在完成后按原方式手动重启；Docker 使用手动挂载流程。可在命令末尾追加参数，例如：
+默认热重载，不重启 CPA，也不需要管理 key。首次安装、rc.20 及更早版本或缺少本机版本文件时，显式追加 `--restart`，普通安装后重启已核实的服务一次；热重载失败不会自动转为重启。已是目标版本且插件文件一致时，不重复安装或重启。无法唯一识别路径、用户、服务或配置时停止并提示参数。非 systemd 直接运行且需要首次生效时使用 `--no-restart`，再按原方式手动重启；Docker 使用手动挂载流程。参数示例：
 
 ```sh
 # 明确指定 root 的 CPA 用户服务
 sudo bash /tmp/codex-window-refresh-install.sh --cpa-dir /root/cliproxyapi --user-service --service cliproxyapi.service --user root
-# 预览路径或推迟重启
+# 首次安装或旧版首次启用本机版本文件（会重启核实的服务）
+sudo bash /tmp/codex-window-refresh-install.sh --restart
+# 预览默认热重载，或选择普通安装但不重启
 sudo bash /tmp/codex-window-refresh-install.sh --dry-run
 sudo bash /tmp/codex-window-refresh-install.sh --no-restart
 ```
@@ -94,15 +96,15 @@ python3 /tmp/codex-window-refresh-install.py \
 
 rc.21 起通过本机版本文件确认热重载，**无需管理 key、密钥文件或管理地址**。插件在现有状态目录自动生成 `runtime-version.json`，不需要用户创建或填写。
 
-rc.20 及更早版本不会生成此文件。首次升级到 rc.21，先用普通安装命令并重启 CPA 一次；之后升级到兼容新版时：
+rc.20 及更早版本不会生成此文件。首次升级到支持版本文件的版本，先用一键命令加 `--restart` 完成普通安装并重启 CPA 一次；之后脚本默认热重载，升级到兼容新版时直接执行：
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh --hot-reload
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh
 ```
 
 沿用原来的路径、用户、服务及额度查询方式参数。已有管理桥配置不因热重载而改变；此模式不读取桥密钥，也不连接管理 HTTP 接口。下载公开 Release 和校验和仍需访问 GitHub，离线安装使用固定版本、安装包和校验和参数。
 
-先用 `--hot-reload --dry-run` 查看路径；固定版本使用 `--version vX.Y.Z-rc.N`。`--hot-reload` 与 `--restart`、`--uninstall`、`--check-model` 互斥，统一 shell 入口在此模式下不会自动加 `--restart`。默认普通安装仍会重启，不会自动选择热重载。
+先用 `--hot-reload --dry-run` 查看路径；固定版本使用 `--version vX.Y.Z-rc.N`。一键脚本默认 `--hot-reload`，不自动加 `--restart`。显式 `--restart` 选择普通安装并重启；`--no-restart` 选择普通安装但不重启、不执行热重载确认。三种生效方式互斥。模型诊断和卸载不会继承默认热重载，卸载只有显式 `--restart` 才重启。直接调用 Python 安装器时，仍用 `--hot-reload` 显式选择热重载。
 
 要求 CPA ABI 1 / RPC schema 6，并具有版本文件发现、`plugin.quiesce`、注册失败清理及 `plugin.reconfigure` 恢复机制（参考 CPA `3de4e248f6bb12fc7dfafb183404f3b248578922`）。安装器与 CPA 必须可见相同文件、PID 命名空间和 `/proc`；Docker 宜在容器内操作，配置文件和整个插件目录须支持原子替换，单文件绑定挂载不适用。确认过程不依赖 v0/v8 管理路由、管理端口或 TLS 配置。
 

@@ -835,7 +835,7 @@ def local_runtime(plan):
     except LocalVersionError:
         raise
     except (OSError, ValueError, KeyError, TypeError):
-        raise LocalVersionError("无法读取有效的本机插件版本文件；旧版本须普通升级并重启一次，版本文件由插件自动生成。") from None
+        raise LocalVersionError("无法读取有效的本机插件版本文件；旧版请在一键命令后加 --restart，普通升级并重启一次，版本文件由插件自动生成。") from None
 
 
 def hot_wait(predicate, description, timeout=30):
@@ -875,13 +875,13 @@ def managed_libraries(record, plan):
 def hot_install(args, plan, unpacked):
     require(not args.restart and not args.uninstall and not args.check_model,
             "--hot-reload 不能与 --restart、--uninstall 或 --check-model 同时使用。")
-    require(plan["policy"].is_file(), "热重载仅用于已有安装；首次安装请使用普通安装并重启 CPA。")
+    require(plan["policy"].is_file(), "热重载仅用于已有安装；首次安装请在一键命令后加 --restart。")
     require(plan.get("quota_transport", "host") == plan["wrapper"].get("quota_transport", "host"),
             "热重载不能修改额度查询方式，请使用原安装参数。")
     metadata = json.loads((unpacked / "BUILD-INFO.json").read_text())
     require(metadata.get("hot_reload_protocol") == 2, "目标安装包不支持本机版本文件确认；请使用普通安装并重启 CPA。")
     record_file = plan["record"] / "installed.json"
-    require(record_file.is_file(), "热重载需要本安装器的已有安装记录；手动安装请参照 docs/install.md。")
+    require(record_file.is_file(), "热重载需要已有安装记录；首次请在一键命令后加 --restart，手动安装请参照 docs/install.md。")
     previous = json.loads(private_file(record_file).read_text())
     require(previous.get("config") == str(plan["config"])
             and previous.get("checker") == str(plan["directory"] / "window-refresh"),
@@ -896,10 +896,16 @@ def hot_install(args, plan, unpacked):
             "实际运行版本与安装记录不一致；请先完成上次升级或重启。")
     require(pathlib.Path(previous["library"]).name == f"{PLUGIN}-{current}.so",
             "热重载需要版本化安装；请先普通安装支持版本并重启 CPA 一次。")
-    require(version_key(args.version) > version_key(current), "热重载仅支持升级到更新版本；相同版本或降级请重启安装。")
     require(plan["plugins"].get("enabled") is True and plan["wrapper"].get("enabled", True) is True
             and before["library_path"] == previous["library"],
             "运行中的 CPA 插件目录、文件或启用状态与安装记录不一致。")
+    require(version_key(args.version) >= version_key(current), "热重载不支持降级；请显式使用普通安装并重启。")
+    if args.version == current:
+        require(hashlib.sha256((unpacked / "codex-window-refresh.so").read_bytes()).hexdigest() ==
+                previous["installed_hashes"][previous["library"]],
+                "版本号相同但安装包中的插件不同；未覆盖运行中的库，请显式使用普通安装并重启。")
+        print(f"已是 {current}，无需更新；未修改部署文件或重启 CPA。")
+        return
     target = safe_path(plan["plugin_dir"] / f"{PLUGIN}-{args.version}.so")
     require(not target.exists(), "目标版本文件已存在；为避免覆盖映射中的库，未执行热重载。")
     run(str(unpacked / "window-refresh"), "check", str(plan["policy"]))

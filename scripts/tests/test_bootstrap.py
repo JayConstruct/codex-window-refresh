@@ -66,7 +66,7 @@ bash "$1" "${@:2}"
                 self.assertEqual(result.returncode, 0, result.stderr)
                 values = record.read_text().splitlines()
                 self.assertEqual(values[1:], ["--version", "latest", "--quota-transport", "host",
-                                              "--defer-model", "--yes", "--restart"])
+                                              "--defer-model", "--yes", "--hot-reload"])
                 self.assertEqual(pathlib.Path(values[0]), ROOT / "scripts/install.py")
                 self.assertFalse(operations.exists())
 
@@ -95,6 +95,27 @@ bash "$1" "${@:2}"
                 values = record.read_text().splitlines()
                 self.assertNotIn("--restart", values)
                 self.assertEqual(option in values, option != "--no-restart")
+
+    def test_restart_is_explicit_and_file_only_install_disables_default_hot_reload(self):
+        for options, expected in [(["--restart"], "--restart"), (["--no-restart"], None),
+                                  (["--hot-reload"], "--hot-reload"), (["--dry-run"], "--hot-reload"),
+                                  (["--uninstall"], None), (["--uninstall", "--restart"], "--restart"),
+                                  (["--check-model"], None)]:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                result, record, _ = self.run_script(directory, options)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                values = record.read_text().splitlines()
+                for mode in ["--hot-reload", "--restart"]:
+                    self.assertEqual(values.count(mode), 1 if mode == expected else 0)
+
+    def test_conflicting_modes_fail_before_dependencies_or_downloads(self):
+        for options in [["--restart", "--hot-reload"], ["--hot-reload", "--restart"],
+                        ["--no-restart", "--hot-reload"], ["--restart", "--no-restart"],
+                        ["--hot-reload", "--uninstall"], ["--check-model", "--restart"]]:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                result, record, operations = self.run_script(directory, options, TEST_DEPENDENCIES="0")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(record.exists() or operations.exists())
 
     def test_read_only_modes_do_not_install_missing_dependencies(self):
         for option in ["--dry-run", "--check-model"]:

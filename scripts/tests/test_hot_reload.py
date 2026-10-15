@@ -145,6 +145,23 @@ class HotInstallTests(unittest.TestCase):
         self.assertEqual(set(installer.managed_libraries(record, self.plan)), {self.lib, self.target})
         self.assertFalse((self.root / "window-refresh.env").exists())
 
+    def test_same_version_is_noop_without_config_or_binary_writes(self):
+        self.args.version = self.record["version"]
+        (self.unpacked / "codex-window-refresh.so").write_bytes(self.lib.read_bytes())
+        self.assertIn("无需更新", self.install())
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertEqual(json.loads(self.record_file.read_text()), self.record)
+        self.assertEqual(self.checker.read_bytes(), b"original-checker")
+        self.assertFalse(self.target.exists())
+        self.assertFalse(list(self.record_dir.glob("*/index.json")))
+
+    def test_same_version_with_different_package_is_not_silently_overwritten(self):
+        self.args.version = self.record["version"]
+        with self.assertRaisesRegex(installer.InstallError, "版本号相同但安装包"):
+            self.install()
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertEqual(self.lib.read_bytes(), b"original-library")
+
     def test_failed_activation_restores_old_version_and_reserves_attempted_path(self):
         self.mode = "failed-load"
         with self.assertRaisesRegex(installer.InstallError, "旧版已恢复"):
