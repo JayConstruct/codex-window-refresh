@@ -28,7 +28,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.20"
+const Version = "0.1.0-rc.21"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -69,6 +69,7 @@ type DurableStore interface {
 	Close() error
 }
 type Options struct {
+	LibraryPath     string
 	EngineFactory   func(config.Config, core.Host, core.Store, core.Clock, core.Random) (Engine, error)
 	HostFactory     func(cpa.Callback, WrapperConfig) (Host, error)
 	OpenStore       func(string) (DurableStore, error)
@@ -111,6 +112,8 @@ func (w WrapperConfig) samePlumbing(other WrapperConfig) bool {
 }
 
 type Service struct {
+	versionMu     sync.Mutex
+	instanceID    string
 	calls         sync.RWMutex
 	lifecycle     sync.Mutex
 	mu            sync.RWMutex
@@ -316,7 +319,7 @@ func (s *Service) configureContext(lifecycleContext context.Context, payload []b
 		return errors.New("identity_source_not_supported_by_cpa_adapter")
 	}
 	s.mu.RLock()
-	existing, previous, stopping, quiesced := s.engine, s.wrapper, s.stopping, s.quiesced
+	existing, previous, stopping, quiesced, previousDone := s.engine, s.wrapper, s.stopping, s.quiesced, s.done
 	s.mu.RUnlock()
 	if stopping && !quiesced {
 		return errors.New("plugin is stopping; process restart required")
@@ -333,6 +336,9 @@ func (s *Service) configureContext(lifecycleContext context.Context, payload []b
 		existing = nil
 	}
 	if existing != nil {
+		if !schedulerRunning(previousDone, stopping) {
+			return errors.New("scheduler stopped; cannot acknowledge reconfiguration")
+		}
 		if err := existing.UpdateConfig(wrapper.effective(cfg)); err != nil {
 			return errors.New("configuration update failed")
 		}
@@ -340,7 +346,7 @@ func (s *Service) configureContext(lifecycleContext context.Context, payload []b
 		s.cfg = cfg
 		s.wrapper = wrapper
 		s.mu.Unlock()
-		return nil
+		return s.publishRuntimeVersion("running", nil)
 	}
 	if s.options.EngineFactory == nil {
 		return errors.New("scheduler factory unavailable")
@@ -369,12 +375,17 @@ func (s *Service) configureContext(lifecycleContext context.Context, payload []b
 	if err != nil {
 		return errors.New("scheduler initialization failed")
 	}
+	instanceID, err := newRuntimeInstance()
+	if err != nil {
+		return errors.New("runtime instance identity initialization failed")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	s.mu.Lock()
 	s.wrapper = wrapper
 	s.cfg = cfg
 	s.engine = engine
+	s.instanceID = instanceID
 	s.host = host
 	s.store = store
 	s.cancel = cancel
@@ -382,10 +393,19 @@ func (s *Service) configureContext(lifecycleContext context.Context, payload []b
 	s.stopping, s.quiesced, s.lastError = false, false, ""
 	s.responseQuota = cpa.ResponseQuotaObserver{}
 	s.mu.Unlock()
+	if err := s.publishRuntimeVersion("running", nil); err != nil {
+		cancel()
+		close(done)
+		s.mu.Lock()
+		s.engine, s.store, s.host, s.cancel, s.done = nil, nil, nil, nil, nil
+		s.mu.Unlock()
+		return err
+	}
 	committed = true
 	hostCommitted = true
 	go func() {
 		defer close(done)
+		defer func() { _ = s.publishRuntimeVersion("stopped", done) }()
 		defer func() {
 			if recover() != nil {
 				s.mu.Lock()
@@ -443,6 +463,9 @@ func (s *Service) stopRuntime(ctx context.Context) error {
 	if cancel != nil {
 		cancel()
 	}
+	if err := s.publishRuntimeVersion("quiescing", nil); err != nil {
+		return err
+	}
 	if done != nil {
 		timer := time.NewTimer(s.options.ShutdownTimeout)
 		defer timer.Stop()
@@ -462,6 +485,13 @@ func (s *Service) stopRuntime(ctx context.Context) error {
 		}
 	}
 	closeHostConnections(host)
+	phase := "stopped"
+	if quiesced {
+		phase = "quiesced"
+	}
+	if err := s.publishRuntimeVersion(phase, nil); err != nil {
+		return err
+	}
 	if store != nil {
 		if err := store.Close(); err != nil {
 			return errors.New("state store close failed")
@@ -491,6 +521,7 @@ func (s *Service) WaitForShutdown() {
 		<-done
 	}
 	closeHostConnections(host)
+	_ = s.publishRuntimeVersion("stopped", nil)
 	if store != nil {
 		_ = store.Close()
 	}
@@ -587,7 +618,7 @@ func (s *Service) management(ctx context.Context, payload []byte) (any, error) {
 		}); ok {
 			instance = reader.ManagementSnapshot().InstanceID
 		}
-		return response(200, map[string]any{"version": Version, "hot_reload_protocol": 1, "phase": phase, "instance_id": instance}), nil
+		return response(200, map[string]any{"version": Version, "hot_reload_protocol": HotReloadProtocol, "phase": phase, "instance_id": instance}), nil
 	}
 	if engine == nil {
 		return response(503, map[string]string{"error": "scheduler not initialized"}), nil

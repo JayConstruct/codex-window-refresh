@@ -253,6 +253,19 @@ class InstallIntegrationTests(unittest.TestCase):
         wrapper = yaml.safe_load(self.config.read_text())['plugins']['configs'][installer.PLUGIN]
         self.assertEqual(wrapper['store']['release-tag'], 'v0.1.0-rc.20')
 
+    def test_local_hot_reload_needs_no_management_tls_address_even_with_bridge_transport(self):
+        self.install()
+        data = yaml.safe_load(self.config.read_text())
+        data['tls'] = {'enable': True}
+        data['plugins']['configs'][installer.PLUGIN].pop('management_url', None)
+        data['plugins']['configs'][installer.PLUGIN].pop('management_key_env', None)
+        self.config.write_text(yaml.safe_dump(data))
+        self.args.hot_reload = True
+        self.args.key_file = None
+        self.args.management_url = None
+        self.plan = installer.infer(self.args)
+        self.assertEqual(self.plan['quota_transport'], 'management')
+
     def test_install_upgrade_uninstall_preserve_policy_and_state(self):
         self.install()
         data = yaml.safe_load(self.config.read_text())

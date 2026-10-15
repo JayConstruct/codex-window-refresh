@@ -12,7 +12,7 @@ for argument in "$@"; do
         '自动安装依赖、识别 CPA、安装最新版本（含 rc）并重启核实的 systemd 服务。' \
         '首次安装默认仅查询额度；在面板填写模型后可开启模型唤醒。升级保留策略、模型和状态。' \
         '常用参数：--cpa-dir 路径、--model 模型、--service 服务、--user-service --user 用户、--version 版本。' \
-        '--hot-reload：热重载已有插件，不重启 CPA（首次启用需先重启升级一次）。' \
+        '--hot-reload：通过本机版本文件确认热重载，无需管理 key，不重启 CPA。' \
         '--no-restart：不自动重启；--dry-run：只预览，不安装依赖；--check-model：只诊断模型。'
       exit 0
       ;;

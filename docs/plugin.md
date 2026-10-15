@@ -80,7 +80,11 @@ CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/co
 
 本地 Context 无法直接中断已经进入的 C host callback。宿主 callback 的 HTTP/模型超时与取消协议负责实际请求终止；若宿主永久不返回，原生 shutdown 会继续等待。Linux 初始化通过 self-dlopen 设置 `RTLD_NODELETE`，保持 Go `c-shared` 执行映射有效，直至进程退出；不会在旧 Go 线程仍存活时回收代码。不同版本必须使用不同路径，旧版可以由 CPA 保留为 retired，不能反复将已 retired 的同一路径当成全新实例初始化。
 
-认证 GET `/v0/management/codex-window-refresh/lifecycle` 返回 `version`、`hot_reload_protocol: 1`、`phase`（running/quiesced/stopped）及 `instance_id`，不触发宿主或上游请求。热重载通过 Linux boot ID、PID 和进程启动时间判断同进程交接，保留已知前台请求；真实进程重启不继承旧的忙碌状态。已派发模型仍按未知送达恢复，禁止自动重发。操作步骤和首次重启要求见 [安装说明](install.md#热重载升级)。
+rc.21 起，插件在已持有独占锁的 `state_dir` 中原子写入 `runtime-version.json`（权限 `0600`），报告 `hot_reload_protocol: 2`、实际版本、阶段、实例 ID、CPA PID、进程启动时间、boot ID、实际加载库路径及本次配置标记。存储关闭后旧实例不能再写入。注册、重新配置、暂停和关闭更新文件，后台任务异常退出写入 stopped；不会每秒写入或连接上游。
+
+安装器通过 `store.local-reload-token` 传递随机的本次操作标记。旧实例先确认已读取固定版本配置，新版注册后回写新标记，再对同一新版实例做一次配置往返确认；不同标记、旧实例、已退出或重启的 CPA 不能满足确认条件。标记仅用于关联本地操作，不是管理 key。文件包含本机路径及运行标识，不包含管理密钥、账号凭据、请求正文或用户活动。
+
+认证 GET `/v0/management/codex-window-refresh/lifecycle` 保留作可选诊断，返回 `version`、`hot_reload_protocol: 2`、`phase`（running/quiesced/stopped）及运行时 `instance_id`，安装器不再访问它。热重载保留同进程中已知的前台占用；真实进程重启清理旧占用。已派发模型仍按未知送达恢复，禁止自动重发。操作步骤和旧版本首次升级要求见 [安装说明](install.md#热重载升级)。
 
 当前协调器按串行方式执行网络操作，实际生成并发为 1（不会超过配置上限）；管理摘要明确报告 `effective_concurrency`。真实前台生成的原子防护能力以 `/capabilities` 为准。
 
@@ -93,10 +97,10 @@ CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/co
 ```sh
 cc -Wall -Wextra -Werror -o /tmp/codex-window-refresh-fake-host cmd/plugin/testdata/fake_host.c -ldl
 cp /tmp/codex-window-refresh.so /tmp/codex-window-refresh-vtest.so
-/tmp/codex-window-refresh-fake-host /tmp/codex-window-refresh.so /tmp/codex-window-refresh-lifecycle.json /tmp/codex-window-refresh-vtest.so
+/tmp/codex-window-refresh-fake-host /tmp/codex-window-refresh.so /tmp/codex-window-refresh-lifecycle.json /tmp/codex-window-refresh-vtest.so /tmp/codex-window-refresh-state/runtime-version.json
 ```
 
-生命周期 JSON 需含 schema_version 6 和 base64 编码的包装 YAML 字节；模拟真实 CPA 的包装 YAML 还应含 `enabled: true`、`priority: 0`（官方字段 `config_yaml` 是 `[]byte`）。此测试覆盖原生映射与生命周期，不代替真实 CPA 配置 watcher、前台流量和生产账号联调。
+生命周期 JSON 需含 schema_version 6 和 base64 编码的包装 YAML 字节；模拟真实 CPA 的包装 YAML 还应含 `enabled: true`、`priority: 0`（官方字段 `config_yaml` 是 `[]byte`）。此 fake host 的版本文件断言使用 `store.local-reload-token` 为 64 个 `a`；可直接用 `make native-smoke` 自动生成匹配的测试文件。此测试覆盖原生映射与生命周期，不代替真实 CPA 配置 watcher、前台流量和生产账号联调。
 
 原生结构声明参考官方 MIT 示例，来源许可保存在 `cmd/plugin/NOTICE`；规则、服务和运行时实现为本项目代码。
 

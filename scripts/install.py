@@ -16,6 +16,7 @@ import pathlib
 import platform
 import pwd
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -57,6 +58,10 @@ class ManagementQueryError(InstallError):
     def __init__(self, message, status=None):
         super().__init__(message)
         self.status = status
+
+
+class LocalVersionError(InstallError):
+    pass
 
 
 def require(condition, message):
@@ -388,7 +393,7 @@ def infer(args):
     if args.version != "latest" and version_key(args.version) < version_key("v0.1.0-rc.9") and getattr(args, "quota_transport", None) is None:
         quota_transport = "management"
     require(quota_transport in {"host", "management"}, "额度查询方式必须是 host 或 management。")
-    needs_management = quota_transport == "management" or getattr(args, "hot_reload", False) or getattr(args, "check_model", False) or (not policy.exists() and not args.model and not getattr(args, "defer_model", False))
+    needs_management = not getattr(args, "hot_reload", False) and (quota_transport == "management" or getattr(args, "check_model", False) or (not policy.exists() and not args.model and not getattr(args, "defer_model", False)))
     if needs_management and not args.management_url and not wrapper.get("management_url"):
         require(not isinstance(tls, dict) or not tls.get("enable"), "CPA 已启用 TLS，请指定 --management-url。")
     port = server.get("port", data.get("port", 8317))
@@ -406,7 +411,8 @@ def infer(args):
     return {"directory": directory, "binary": binary, "config": config, "text": text, "data": data,
             "plugins": plugins, "wrapper": wrapper, "plugin_dir": plugin_dir, "policy": policy,
             "state": state, "env": env, "service_env": service_env, "record": record, "dropin": dropin, "service": service, "service_auto": service_auto,
-            "uid": account.pw_uid, "gid": gid, "user": user, "url": url, "env_name": env_name, "quota_transport": quota_transport}
+            "uid": account.pw_uid, "gid": gid, "user": user, "url": url, "env_name": env_name, "quota_transport": quota_transport,
+            "process_pid": processes[0].get("pid") if processes else None}
 
 
 def download(url, destination, limit):
@@ -792,42 +798,55 @@ def prompt(question, yes):
     return input(question + " [y/N] ").strip().lower() in {"y", "yes"}
 
 
-def hot_get(base, route, key):
-    # This path never submits a model or quota request and never follows a
-    # redirect with the management credential. Config changes use local atomic
-    # writes so the same transaction backs up the exact original configuration.
-    require(route in {"/plugins", f"/plugins/{PLUGIN}/config", f"/{PLUGIN}/lifecycle"},
-            "热重载查询路径无效。")
-    request = urllib.request.Request(base + route, headers={
-        "Authorization": "Bearer " + key, "Accept": "application/json"})
-    handlers = [NoManagementRedirect()]
-    if loopback_host(urllib.parse.urlsplit(base).hostname):
-        handlers.append(urllib.request.ProxyHandler({}))
+def local_runtime(plan):
+    """Read the plugin's atomic receipt, never CPA's management API or keys."""
     try:
-        with urllib.request.build_opener(*handlers).open(request, timeout=3) as response:
-            require(response.url == request.full_url, "热重载接口地址发生变化。")
-            raw = response.read((4 << 20) + 1)
-            require(len(raw) <= 4 << 20, "热重载接口响应过大。")
-        data = json.loads(raw)
-    except urllib.error.HTTPError as error:
-        status = error.code
-        error.close()
-        raise ManagementQueryError(f"热重载管理查询失败：HTTP {status}；请检查管理密钥、接口及 CPA 版本。", status) from None
-    except (urllib.error.URLError, OSError, ValueError):
-        raise ManagementQueryError("热重载管理查询失败；请检查管理地址、TLS 证书及 CPA 连接。") from None
-    require(isinstance(data, dict), "热重载接口返回格式无效。")
-    return data
+        state_dir = safe_path(plan["state"])
+        info = state_dir.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != plan["uid"] or stat.S_IMODE(info.st_mode) != 0o700:
+            raise LocalVersionError("插件状态目录的拥有者或权限不符。")
+        fd = os.open(state_dir / "runtime-version.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != plan["uid"] or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 16384:
+                raise LocalVersionError("插件版本文件的类型、拥有者、权限或大小不符。")
+            raw = stream.read(16385)
+        if len(raw) > 16384:
+            raise LocalVersionError("插件版本文件过大。")
+        report = json.loads(raw)
+        if (not isinstance(report, dict) or report.get("hot_reload_protocol") != 2
+                or not isinstance(report.get("version"), str) or version_key("v" + report["version"]) is None
+                or report.get("phase") not in {"running", "quiescing", "quiesced", "stopped"}
+                or not isinstance(report.get("instance_id"), str) or not re.fullmatch(r"[0-9a-f]{32}", report["instance_id"])
+                or not isinstance(report.get("reload_token"), str) or not re.fullmatch(r"(?:[0-9a-f]{64})?", report["reload_token"])
+                or type(report.get("pid")) is not int or report["pid"] != plan.get("process_pid")
+                or report.get("config_file") != str(plan["policy"]) or report.get("state_dir") != str(state_dir)
+                or not isinstance(report.get("library_path"), str)
+                or pathlib.Path(report["library_path"]).parent != plan["plugin_dir"]):
+            raise LocalVersionError("插件版本文件与当前实例或安装路径不一致。")
+        process = pathlib.Path("/proc") / str(report["pid"])
+        process_stat = (process / "stat").read_text()
+        fields = process_stat[process_stat.rindex(")") + 1:].split()
+        if (len(fields) < 20 or fields[0] == "Z" or fields[19] != report.get("process_start")
+                or pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip() != report.get("boot_id")
+                or (process / "exe").resolve(strict=True) != plan["binary"] or process.stat().st_uid != plan["uid"]):
+            raise LocalVersionError("插件版本文件来自已退出、已重启或不匹配的 CPA 进程。")
+        return report
+    except LocalVersionError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError):
+        raise LocalVersionError("无法读取有效的本机插件版本文件；旧版本须普通升级并重启一次，版本文件由插件自动生成。") from None
 
 
-def hot_wait(base, key, predicate, description, timeout=30):
+def hot_wait(predicate, description, timeout=30):
     deadline = time.monotonic() + timeout
     while True:
         try:
-            if predicate():
-                return
-        except ManagementQueryError as error:
-            if error.status in {401, 403}:
-                raise
+            result = predicate()
+            if result:
+                return result
+        except LocalVersionError:
+            pass
         require(time.monotonic() < deadline, f"等待{description}超时。")
         time.sleep(0.25)
 
@@ -860,7 +879,7 @@ def hot_install(args, plan, unpacked):
     require(plan.get("quota_transport", "host") == plan["wrapper"].get("quota_transport", "host"),
             "热重载不能修改额度查询方式，请使用原安装参数。")
     metadata = json.loads((unpacked / "BUILD-INFO.json").read_text())
-    require(metadata.get("hot_reload_protocol") == 1, "目标安装包不支持热重载；请使用普通安装并重启 CPA。")
+    require(metadata.get("hot_reload_protocol") == 2, "目标安装包不支持本机版本文件确认；请使用普通安装并重启 CPA。")
     record_file = plan["record"] / "installed.json"
     require(record_file.is_file(), "热重载需要本安装器的已有安装记录；手动安装请参照 docs/install.md。")
     previous = json.loads(private_file(record_file).read_text())
@@ -868,33 +887,19 @@ def hot_install(args, plan, unpacked):
             and previous.get("checker") == str(plan["directory"] / "window-refresh"),
             "安装路径与记录不一致，请使用原安装参数。")
     libraries = managed_libraries(previous, plan)
-    base = model_discovery_base(plan["url"])
-    require(urllib.parse.urlsplit(base).path == "/v0/management",
-            "热重载需要 CPA 的 /v0/management 插件接口，请用 --management-url 指定。")
-    key, _ = management_credentials(args, plan)
-    try:
-        before = hot_get(base, f"/{PLUGIN}/lifecycle", key)
-    except ManagementQueryError as error:
-        if error.status == 404:
-            raise InstallError("当前插件尚不支持热重载；首次升级到支持版本须普通安装并重启 CPA 一次。") from None
-        raise
-    require(before.get("hot_reload_protocol") == 1 and before.get("phase") == "running"
-            and isinstance(before.get("instance_id"), str) and before["instance_id"],
-            "当前插件未处于支持热重载的运行状态；首次升级须重启一次。")
+    require(type(plan.get("process_pid")) is int and plan["process_pid"] > 0,
+            "无法核实正在运行的 CPA 进程；未执行热重载。")
+    before = local_runtime(plan)
+    require(before["phase"] == "running", "当前插件没有报告运行状态；未执行热重载。")
     current = "v" + str(before.get("version", "")).removeprefix("v")
     require(version_key(current) is not None and previous.get("version") == current,
             "实际运行版本与安装记录不一致；请先完成上次升级或重启。")
     require(pathlib.Path(previous["library"]).name == f"{PLUGIN}-{current}.so",
             "热重载需要版本化安装；请先普通安装支持版本并重启 CPA 一次。")
     require(version_key(args.version) > version_key(current), "热重载仅支持升级到更新版本；相同版本或降级请重启安装。")
-    inventory = hot_get(base, "/plugins", key)
-    entries = [entry for entry in inventory.get("plugins", []) if entry.get("id") == PLUGIN]
-    require(inventory.get("plugins_enabled") is True and inventory.get("plugins_dir") == str(plan["plugin_dir"])
-            and len(entries) == 1 and entries[0].get("effective_enabled") is True
-            and entries[0].get("path") == previous["library"],
+    require(plan["plugins"].get("enabled") is True and plan["wrapper"].get("enabled", True) is True
+            and before["library_path"] == previous["library"],
             "运行中的 CPA 插件目录、文件或启用状态与安装记录不一致。")
-    require(hot_get(base, f"/plugins/{PLUGIN}/config", key) == plan["wrapper"],
-            "运行配置与磁盘不一致，请等待 CPA 配置加载后重新运行。")
     target = safe_path(plan["plugin_dir"] / f"{PLUGIN}-{args.version}.so")
     require(not target.exists(), "目标版本文件已存在；为避免覆盖映射中的库，未执行热重载。")
     run(str(unpacked / "window-refresh"), "check", str(plan["policy"]))
@@ -904,34 +909,35 @@ def hot_install(args, plan, unpacked):
     expected = plan["text"]
     staging = False
 
-    def select(version):
+    def select(version, instance=None, changed=False):
         nonlocal expected
         require(plan["config"].read_text() == expected,
                 "CPA 配置被其他进程修改；未覆盖，请检查热重载状态和备份。")
         data, _ = load_yaml(expected)
         wrapper = data["plugins"]["configs"][PLUGIN]
         store = copy.deepcopy(wrapper.get("store") or {})
-        store.update({"version": version.removeprefix("v"), "release-tag": version})
+        token = secrets.token_hex(32)
+        store.update({"version": version.removeprefix("v"), "release-tag": version, "local-reload-token": token})
         wrapper["store"] = store
         updated = replace_plugins(expected, data["plugins"])
         info = plan["config"].stat()
         transaction.write(plan["config"], updated.encode(), stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
         expected = updated
-        hot_wait(base, key, lambda: hot_get(base, f"/plugins/{PLUGIN}/config", key).get("store") == store,
-                 "CPA 读取版本选择")
+        return hot_wait(lambda: running(version, changed, token, instance), "运行插件回写本次版本选择")
 
-    def running(version, changed=False):
-        status = hot_get(base, f"/{PLUGIN}/lifecycle", key)
-        return (status.get("hot_reload_protocol") == 1 and status.get("phase") == "running"
+    def running(version, changed=False, token=None, instance=None):
+        status = local_runtime(plan)
+        return status if (status.get("phase") == "running"
                 and status.get("version") == version.removeprefix("v")
-                and bool(status.get("instance_id"))
-                and (not changed or status["instance_id"] != before["instance_id"]))
+                and status["library_path"] == str(plan["plugin_dir"] / f"{PLUGIN}-{version}.so")
+                and (token is None or status["reload_token"] == token)
+                and (instance is None or status["instance_id"] == instance)
+                and (not changed or status["instance_id"] != before["instance_id"])) else None
 
     try:
         # Confirm CPA has read the old pin before creating a discoverable new
         # library. Merely staging a higher version must not trigger activation.
-        select(current)
-        require(running(current), "旧版本在准备阶段未正常运行。")
+        select(current, instance=before["instance_id"])
         transaction.write(target, (unpacked / "codex-window-refresh.so").read_bytes(), 0o644)
         staging = True
         # Prepare all local installation bookkeeping before switching. After a
@@ -945,8 +951,11 @@ def hot_install(args, plan, unpacked):
         record["installed_hashes"].update({str(path): hashlib.sha256(path.read_bytes()).hexdigest()
                                            for path in [target, checker]})
         transaction.write(record_file, json.dumps(record, indent=2).encode(), 0o600)
-        select(args.version)
-        hot_wait(base, key, lambda: running(args.version, True), "新版插件接管")
+        ready = select(args.version, changed=True)
+        # A second configuration round trip acknowledges the same instance
+        # after the serialized host replacement has completed, not just during
+        # its initial plugin.register callback.
+        select(args.version, instance=ready["instance_id"], changed=True)
         require(plan["config"].read_text() == expected, "CPA 配置已被其他进程修改，请检查当前插件状态。")
     except BaseException as failure:
         try:
@@ -954,9 +963,8 @@ def hot_install(args, plan, unpacked):
                 # CPA itself resumes the old instance when registration fails.
                 # Only pin/restore after observing that recovery. An uncertain
                 # or successful replacement must keep its files and metadata.
-                hot_wait(base, key, lambda: running(current), "CPA 恢复旧版")
+                hot_wait(lambda: running(current), "CPA 恢复旧版")
             select(current)
-            hot_wait(base, key, lambda: running(current), "旧版插件恢复")
             require(plan["config"].read_text() == expected, "CPA 配置已变化，不能自动恢复。")
             if staging:
                 # CPA can retain a retired mapping until process exit. Reserve
@@ -972,7 +980,7 @@ def hot_install(args, plan, unpacked):
                 restored["installed_hashes"][str(target)] = hashlib.sha256(target.read_bytes()).hexdigest()
                 atomic_write(record_file, json.dumps(restored, indent=2).encode(), 0o600)
         except BaseException:
-            raise InstallError(f"热重载未完成，且无法确认旧版恢复；未重启 CPA。保留版本文件及备份：{backup}；请检查插件日志和 lifecycle 接口。") from None
+            raise InstallError(f"热重载未完成，且无法确认旧版恢复；未重启 CPA。保留版本文件及备份：{backup}；请检查插件日志和 runtime-version.json。") from None
         raise InstallError(f"热重载失败，旧版已恢复；未重启 CPA。已尝试的版本文件保留且不会选中，重试该版本须重启安装。备份：{backup}") from failure
     print(f"热重载成功：{current} → {args.version}；已核对新版实例运行，CPA 未重启。备份：{backup}")
 
@@ -1271,14 +1279,16 @@ def main():
           + (f"（{scope}）" if plan["service"] else ""))
     if plan.get("service_auto") and not args.hot_reload:
         print("已核实识别 CPA 所属 systemd 服务；交互安装结束时将询问是否重启。")
-    if plan.get("quota_transport", "host") == "management":
+    if args.hot_reload:
+        print("本机版本文件确认，无需管理 key，不访问管理 HTTP 接口，不重启 CPA。")
+    elif plan.get("quota_transport", "host") == "management":
         print(f"管理入口：{plan['url']}；管理密钥保存到私有 0600 环境文件。")
     else:
         print("宿主额度查询无需管理密钥；模型识别或诊断使用的临时密钥不保存。")
     if plan.get("service_env", plan["env"]) != plan["env"]:
         print(f"用户服务环境文件：{plan['service_env']}（CPA 用户拥有，权限 0600）")
     if args.hot_reload:
-        print("热重载需要管理密钥，仅用于核对本机插件状态，不保存临时密钥；不会重启 CPA 或改变策略。")
+        print(f"版本文件：{plan['state'] / 'runtime-version.json'}（由插件自动写入）")
     elif not args.check_model:
         print("安装时开启宿主 plugins.enabled；首次策略保持关闭。plugins 节的注释可能重新排版，原配置会备份。")
     if args.dry_run:

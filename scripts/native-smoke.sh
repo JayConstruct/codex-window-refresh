@@ -8,8 +8,9 @@ root=pathlib.Path(sys.argv[1])
 policy=root/'policy.yaml'
 policy.write_text('enabled: false\nquota_query:\n  automatic: true\n')
 wrapper=f'enabled: true\npriority: 0\nconfig_file: {policy}\nstate_dir: {root / "state"}\n'
+wrapper += 'store:\n  local-reload-token: ' + 'a' * 64 + '\n'
 (root/'lifecycle.json').write_text(json.dumps({'schema_version':6,'config_yaml':base64.b64encode(wrapper.encode()).decode()}))
 PY
 cc -Wall -Wextra -Werror -o "$task_tmp/fake-host" cmd/plugin/testdata/fake_host.c -ldl
 cp bin/codex-window-refresh.so "$task_tmp/codex-window-refresh-vtest.so"
-"$task_tmp/fake-host" "$(pwd)/bin/codex-window-refresh.so" "$task_tmp/lifecycle.json" "$task_tmp/codex-window-refresh-vtest.so"
+"$task_tmp/fake-host" "$(pwd)/bin/codex-window-refresh.so" "$task_tmp/lifecycle.json" "$task_tmp/codex-window-refresh-vtest.so" "$task_tmp/state/runtime-version.json"

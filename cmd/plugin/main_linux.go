@@ -48,6 +48,11 @@ static int retain_plugin_mapping(void) {
  dlclose(handle);
  return 0;
 }
+static const char* plugin_library_path(void) {
+ Dl_info info;
+ if(!dladdr((void*)&copy_host_api,&info)) return NULL;
+ return info.dli_fname;
+}
 static int call_host(cliproxy_host_api* host,const char* method,const uint8_t* request,size_t len,cliproxy_buffer* response) {
  return host->call(host->host_ctx,method,request,len,response);
 }
@@ -117,7 +122,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, api *C.cliproxy_plugin_api)
 		return
 	}
 	callback = &nativeCallback{api: copied}
-	service = pluginservice.New(callback, pluginservice.Options{EngineFactory: engineFactory})
+	service = pluginservice.New(callback, pluginservice.Options{EngineFactory: engineFactory, LibraryPath: C.GoString(C.plugin_library_path())})
 	api.abi_version = 1
 	api.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	api.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)

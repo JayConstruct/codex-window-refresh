@@ -92,25 +92,31 @@ python3 /tmp/codex-window-refresh-install.py \
 
 ## 热重载升级
 
-rc.20 起使用 `codex-window-refresh-v版本号.so` 和 `plugins.configs.codex-window-refresh.store.version` 固定版本。首次从 rc.19 或更早版本升级，先按普通安装流程升级到 rc.20 并重启 CPA 一次；旧插件无法由新安装器补上可恢复的暂停和原生映射保护。之后升级到更新版本时：
+rc.21 起通过本机版本文件确认热重载，**无需管理 key、密钥文件或管理地址**。插件在现有状态目录自动生成 `runtime-version.json`，不需要用户创建或填写。
+
+rc.20 及更早版本不会生成此文件。首次升级到 rc.21，先用普通安装命令并重启 CPA 一次；之后升级到兼容新版时：
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh --hot-reload --key-file /root/cpa-management-key
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh --hot-reload
 ```
 
-沿用原来的路径、用户、服务参数。密钥文件是 root 拥有、权限 `0600` 的纯文本 CPA 管理原始密钥，不能使用 API Key 或 bcrypt 哈希；交互运行 Python 安装器也可临时输入。管理查询仅核对本地插件接口，不测试模型或查询上游额度，临时密钥不写入环境文件。后台仍按已有策略运行。
+沿用原来的路径、用户、服务及额度查询方式参数。已有管理桥配置不因热重载而改变；此模式不读取桥密钥，也不连接管理 HTTP 接口。下载公开 Release 和校验和仍需访问 GitHub，离线安装使用固定版本、安装包和校验和参数。
 
-先用 `--hot-reload --dry-run` 查看路径；固定版本使用 `--version vX.Y.Z-rc.N`，离线包仍需准确版本与校验和。`--hot-reload` 与 `--restart`、`--uninstall`、`--check-model` 互斥，统一 shell 入口在此模式下不会自动加 `--restart`。默认普通安装仍会重启，不会自动选择热重载。
+先用 `--hot-reload --dry-run` 查看路径；固定版本使用 `--version vX.Y.Z-rc.N`。`--hot-reload` 与 `--restart`、`--uninstall`、`--check-model` 互斥，统一 shell 入口在此模式下不会自动加 `--restart`。默认普通安装仍会重启，不会自动选择热重载。
 
-要求 CPA ABI 1 / RPC schema 6，并具有版本文件发现、`plugin.quiesce`、注册失败清理及 `plugin.reconfigure` 恢复机制（实现参考 CPA `3de4e248f6bb12fc7dfafb183404f3b248578922`）。管理地址需提供 `/v0/management/plugins`、`/plugins/<id>/config` 和插件 `/codex-window-refresh/lifecycle`。仅有 v8 管理入口时此安装器模式不适用；TLS 部署须明确指定 `--management-url https://主机:端口/v0/management`，保持证书验证。Docker 容器需同时能看到主配置与整个插件目录的变更，宜在容器内操作，单文件绑定挂载不适用此原子替换流程。
+要求 CPA ABI 1 / RPC schema 6，并具有版本文件发现、`plugin.quiesce`、注册失败清理及 `plugin.reconfigure` 恢复机制（参考 CPA `3de4e248f6bb12fc7dfafb183404f3b248578922`）。安装器与 CPA 必须可见相同文件、PID 命名空间和 `/proc`；Docker 宜在容器内操作，配置文件和整个插件目录须支持原子替换，单文件绑定挂载不适用。确认过程不依赖 v0/v8 管理路由、管理端口或 TLS 配置。
 
-安装器先核对已有安装记录、运行版本、路径和配置，再确认 CPA 读到旧版固定选择，放入独立新版文件并切换选择。只有 `/lifecycle` 返回目标版本、`phase: running` 且 `instance_id` 改变才确认成功。策略、状态目录、宿主查询方式和密钥环境保持不变。不会覆盖正在映射的旧库，也不因失败执行服务重启。新插件启动后继续原有自动规则。
+版本文件包含实际版本、阶段、实例 ID、CPA PID、进程启动时间、boot ID、实际加载库路径及配置确认标记；权限 `0600`，状态目录保持 CPA 用户拥有及 `0700`。不包含管理密钥、账号凭据、请求正文或用户活动。注册、重新配置、暂停、关闭及后台异常退出时更新，不进行持续高频磁盘写入。文件不是用户配置，不要手动修改。
 
-新版注册失败时，CPA 先同步清理失败实例并恢复旧实例；安装器确认旧版运行后重新固定旧版。已尝试的版本文件会保留，避免复用宿主尚未释放的原生映射；同版本重试须走普通安装并重启，或发布更高版本。如果无法确认接管或恢复，保留文件、当前版本选择和备份，明确报告状态未知，请检查 CPA 日志及 `/lifecycle`，不要手动删库或清空状态。主配置被并发修改时停止，不覆盖外部更改。
+安装器先核对本地安装记录、文件权限、路径及活着的 CPA 进程，再向主配置的 `store.local-reload-token` 写入随机操作标记，等待当前插件回写确认。确认旧版已读到固定版本后，放入独立的新版 `.so` 并切换选择；新版必须报告目标版本和新的实例 ID，再由同一实例回写第二次配置标记，才报告成功。标记只关联本机操作，不是管理 key。残留版本文件、同 PID 的重启进程、迟到旧实例或未读到新配置的插件都不能确认成功。
 
-Go `c-shared` 的旧映射通过 `RTLD_NODELETE` 保留到 CPA 进程退出，每次升级会增加驻留映射；这是在线切换而非回收全部动态库内存。频繁升级后可择机重启回收。切换会等待正在执行的插件回调，可能有短暂的观测交接窗口，不承诺所有前台回调零延迟或无遗漏；CPA 本身不会被安装器重启。已知前台占用和送达未知记录跨实例保留，真正进程重启会清理旧占用。
+策略、状态目录、宿主查询方式和已有密钥环境保持不变。不会覆盖正在映射的旧库，也不因失败重启服务；新插件启动后继续原有自动规则。主配置的其他字段保留，`plugins` 节排版可能变化，原文件先备份。
 
-仍可用普通安装加 `--restart` 更新版本化安装。CPA 可能在下一次进程启动时清理未选中的旧文件，安装记录允许这些历史文件已被清理；卸载核对并移除仍存在的安装器所属版本文件，保留业务策略、窗口状态和备份。
+新版注册失败时，CPA 先清理失败实例并恢复旧实例；安装器确认旧版运行且回写新标记后重新固定旧版。已尝试的版本文件保留，避免复用宿主仍保留的原生映射；同版本重试须普通安装并重启，或发布更高版本。如果无法确认接管或恢复，保留文件、当前版本选择和备份并报告状态未知，请检查 CPA 日志与 `runtime-version.json`；不要手动删库或清空业务状态。主配置被并发修改时停止，不覆盖外部更改。
+
+Go `c-shared` 的旧映射通过 `RTLD_NODELETE` 保留到 CPA 进程退出，每次升级会增加驻留映射；频繁升级后可择机重启回收。切换会等待正在执行的插件回调，可能有短暂的观测交接窗口，不承诺所有前台回调零延迟或无遗漏；安装器不重启 CPA。已知前台占用和送达未知记录跨实例保留，真正进程重启清理旧占用。
+
+仍可用普通安装加 `--restart` 更新版本化安装。CPA 可能在下一次进程启动时清理未选中的旧文件，安装记录允许历史文件已被清理；卸载核对并移除仍存在的安装器所属版本文件，保留业务策略、窗口状态和备份。
 
 ## 1. 下载与校验
 
