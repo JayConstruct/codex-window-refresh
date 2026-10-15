@@ -31,10 +31,19 @@ type HostCapabilities struct {
 	ForegroundGuard              bool
 }
 
+// Availability preserves the host status separately from plugin pause policy.
+const (
+	AccountAvailable          = "available"
+	AccountDisabled           = "disabled"
+	AccountUnavailable        = "unavailable"
+	AccountBindingUnavailable = "binding_unavailable"
+)
+
 type HostAccount struct {
-	ID         AccountID
-	Generation CredentialGeneration
-	Enabled    bool
+	ID           AccountID
+	Generation   CredentialGeneration
+	Enabled      bool
+	Availability string
 }
 
 type QuotaRead struct {

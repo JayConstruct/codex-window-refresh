@@ -23,6 +23,7 @@ func ReconcileAccounts(s *CoreState, hosts []HostAccount, now time.Time) {
 			a = AccountState{ID: h.ID, Generation: h.Generation, OrdinaryParticipant: true, WeeklyEnabled: true, Permission: PermissionUnknown}
 		}
 		a.Enabled = h.Enabled
+		a.Availability = h.Availability
 		if !a.Enabled && a.Task != nil {
 			a.Task.State = TaskSuspended
 			releaseAccount(s, h.ID)

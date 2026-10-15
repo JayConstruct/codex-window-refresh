@@ -454,15 +454,12 @@
     if (evidence?.State === 'expired') return '窗口已到期 · 等待实际请求启动';
     return '尚未确认窗口启动 · 不倒计时';
   }
-  function manualWakeReason(account, config, summary, capabilities, now) {
+  function manualWakeReason(account, config, summary, capabilities) {
     if (!summary?.running || summary.host_enabled === false) return '后台未运行或 CPA 插件已停用';
     if (!config?.execution?.model?.trim()) return '请先填写并保存唤醒模型，无需开启自动唤醒';
     if (capabilities?.StableAccountIdentity !== true || capabilities?.ExactAccountExecution !== true || capabilities?.QuotaAdapterReady !== true) return '宿主账号绑定、模型执行或额度接口未就绪';
-    if (!account?.Enabled || config.account_overrides?.[account.ID]?.paused === true) return 'CPA 账号不可用或已暂停唤醒；仍可手动查询额度';
+    if (config.account_overrides?.[account.ID]?.paused === true) return '已暂停唤醒；恢复并保存后可手动唤醒';
     if (account.Task?.OperationID) return '已有请求待验证，不重复唤醒';
-    const currentTime = now === undefined ? Date.now() : now;
-    if ((account.FiveHour?.State === 'active' && (resetTime(account.FiveHour.ResetAt) || 0) > currentTime) || (resetTime(account.FiveHourBaseline?.StableResetAt) || 0) > currentTime) return '5 小时窗口已启动，无需重复唤醒';
-    if ((resetTime(account.BackoffUntil) || 0) > currentTime) return '账号失败退避中，请稍后重试';
     return '';
   }
   function modelFailureMessage(code) {
@@ -615,7 +612,7 @@
     container.replaceChildren();
     for (const [label, value] of entries) { const row = el('div'); row.append(el('dt', label), el('dd', value ?? '未知')); container.append(row); }
   }
-  const holds = {plugin_disabled: '模型唤醒未启用', account_inventory_unavailable: '账号清单暂不可用', account_disabled: '账号已禁用或暂停', delivery_evidence_pending: '已发送，等待确认', quota_adapter_unavailable: '额度适配器不可用', foreground_busy: '账号正在处理前台请求', backoff: '失败退避中', active_five_hour: '5 小时窗口内', quota_exhausted: '额度耗尽', quota_unknown: '额度证据未知', not_due: '尚未到执行时间', outside_hours: '不在允许时段', target_satisfied: '人数比例容量已满足', credential_changed: '账号凭据已变化', weekly_reset_unconfirmed: '周重置尚未确认', weekly_reset_conflict: '周与短窗口证据冲突', no_concurrency_slot: '等待执行空位'};
+  const holds = {plugin_disabled: '模型唤醒未启用', account_inventory_unavailable: '账号清单暂不可用', account_disabled: 'CPA 账号不可用或已暂停唤醒', account_unavailable: 'CPA 仍报告账号暂时不可用，额度查询不会解除此状态', delivery_evidence_pending: '已发送，等待确认', quota_adapter_unavailable: '额度适配器不可用', foreground_busy: '账号正在处理前台请求', backoff: '失败退避中', active_five_hour: '5 小时窗口内', quota_exhausted: '额度耗尽', quota_unknown: '额度证据未知', not_due: '尚未到执行时间', outside_hours: '不在允许时段', target_satisfied: '人数比例容量已满足', credential_changed: '账号凭据已变化', weekly_reset_unconfirmed: '周重置尚未确认', weekly_reset_conflict: '周与短窗口证据冲突', no_concurrency_slot: '等待执行空位'};
   const states = {unknown: '未知', inactive: '未启动', active: '窗口内', expired: '已到期', pending: '待处理', waiting: '等待', reserved: '已预留', dispatch_intent: '准备发送', verifying: '核实窗口', awaiting_evidence: '等待证据', satisfied: '已满足', suspended: '已暂停'};
   const reasons = {five_hour_reset: '5 小时重置', weekly_reset: '周重置', daily_schedule: '每日时间规则', manual_wake: '手动唤醒'};
   function renderOverview() {
@@ -975,8 +972,9 @@
       name.append(el('div', id, 'account-id'));
       const runningPaused = runningConfig?.account_overrides && Object.hasOwn(runningConfig.account_overrides, id) && runningConfig.account_overrides[id]?.paused === true;
       const pauseChanged = paused !== Boolean(runningPaused);
-      const accountStatus = pauseChanged ? (paused ? '待保存：暂停唤醒' : '待保存：恢复唤醒') : paused ? '唤醒已暂停' : a.Enabled ? '账号已启用' : 'CPA 账号不可用';
+      const accountStatus = pauseChanged ? (paused ? '待保存：暂停唤醒' : '待保存：恢复唤醒') : paused ? '唤醒已暂停' : ({disabled: 'CPA 账号已禁用', unavailable: 'CPA 账号暂时不可用', binding_unavailable: 'CPA 账号绑定不可用'}[a.Availability] || (a.Enabled ? '账号已启用' : 'CPA 账号不可用'));
       header.append(name, badge(accountStatus, paused || pauseChanged || !a.Enabled ? 'warning' : '')); card.append(header);
+      if (!a.Enabled && !runningPaused) card.append(el('p', 'CPA 状态约每 30 秒检查；页面自动刷新默认关闭。额度查询不解除 CPA 禁用或暂时不可用，手动唤醒会重新核对。', 'hint'));
       const windows = el('div', undefined, 'window-grid'); windows.append(windowCell('5 小时额度', a.FiveHour), windowCell('周额度', a.Weekly)); card.append(windows);
       const queryRow = el('div', undefined, 'account-query'), job = quotaJob();
       const querying = activeJob(job), selected = job.account_id === id;
@@ -1000,9 +998,9 @@
       const wakeButton = el('button', waking && wakeSelected ? '正在唤醒…' : '手动唤醒此账号', 'quiet');
       wakeButton.type = 'button'; wakeButton.dataset.wakeAccount = id;
       wakeButton.disabled = !session.connected() || actionBusy || !!wakeReason || waking || querying;
-      wakeButton.title = wakeReason || '会发送真实模型请求并消耗额度；不需要开启自动唤醒';
+      wakeButton.title = wakeReason || '先查询最新额度和 CPA 状态，满足条件才发送真实模型请求，否则显示跳过原因';
       wakeButton.addEventListener('click', () => { if (!wakeButton.disabled) void requestManualWake(id); });
-      let wakeText = wakeReason || '发送真实模型请求 · 消耗额度 · 需确认';
+      let wakeText = wakeReason || '先查询额度与状态 · 符合条件才唤醒，否则跳过 · 需确认';
       if (wakeSelected && wake.phase) {
         const phases = {queued: '已排队，等待手动唤醒', running: '正在核对额度并唤醒', verifying: '请求已发送，等待服务端窗口证据', completed: '已确认窗口启动', unknown: '送达或窗口启动未确认，不自动重试', skipped: '未发送，安全条件不满足'};
         wakeText = jobProblem(wake) || phases[wake.phase] || '未完成唤醒：' + (holds[wake.last_error] || ({model_required: '请填写并保存唤醒模型', host_capability_unavailable: '宿主接口未就绪', dispatch_spacing: '发送间隔未到，请稍后重试', send_not_sent: '模型请求未送达，请稍后重试', credential_changed: '账号凭据已更换，请重新查询'}[wake.last_error]) || quotaFailure({last_error: wake.last_error}));
@@ -1406,7 +1404,7 @@
   function manualWakeJob() { return trackedJob(pendingManualWake, 'manual_wake'); }
   async function requestManualWake(accountID) {
     if (actionBusy || !session.connected()) return;
-    if (!root.confirm('手动唤醒账号“' + accountID + '”？将使用已保存的模型和消息发送真实模型请求并消耗额度，不会开启自动唤醒。仅查询额度不会启动倒计时，窗口启动以服务端证据为准。')) return;
+    if (!root.confirm('手动唤醒账号“' + accountID + '”？将先查询最新额度并核对 CPA 状态；符合条件时使用已保存的模型和消息发送真实模型请求并消耗额度，否则跳过并显示原因。不会开启自动唤醒。仅查询额度不会启动倒计时，窗口启动以服务端证据为准。')) return;
     const generation = session.generation();
     pendingManualWake = startTracking(accountID);
     let accepted = false;
@@ -1415,7 +1413,7 @@
       const result = await session.request('/manual-wake', 'POST', {account_id: accountID});
       if (generation !== session.generation()) return;
       mutationEpoch++; accepted = true; acceptedJob(pendingManualWake, result);
-      notice(result.status === 'already_queued' ? '已有此账号的手动唤醒任务，请等待结果。' : '已安排此账号的手动唤醒；将核对额度后发送模型请求。');
+      notice(result.status === 'already_queued' ? '已有此账号的手动唤醒任务，请等待结果。' : '已安排此账号的手动唤醒；将查询最新额度与状态，再决定唤醒或跳过。');
       await readSnapshots();
     } catch (error) {
       if (error.code === 'authentication') { report(error); return; }

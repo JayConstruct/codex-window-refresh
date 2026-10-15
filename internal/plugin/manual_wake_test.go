@@ -11,15 +11,16 @@ import (
 
 type manualWakeEngine struct {
 	*fakeEngine
-	target   core.AccountID
-	requests int
-	ready    bool
+	target      core.AccountID
+	requests    int
+	unavailable bool
+	ready       bool
 }
 
 func (engine *manualWakeEngine) Snapshot() core.CoreState {
 	state := engine.fakeEngine.Snapshot()
 	account := state.Accounts["a"]
-	account.Enabled = true
+	account.Enabled = !engine.unavailable
 	state.Accounts["a"] = account
 	return state
 }
@@ -39,7 +40,7 @@ func (engine *manualWakeEngine) Diagnostics() (core.HostCapabilities, string, in
 
 func TestManualWakeAPIRequiresExactAccountAndQueuesWithoutNetwork(t *testing.T) {
 	service, base, _, callback := setupService(t)
-	engine := &manualWakeEngine{fakeEngine: base, ready: true}
+	engine := &manualWakeEngine{fakeEngine: base, ready: true, unavailable: true}
 	service.engine = engine
 	service.cfg.Enabled = false
 	call := func(body string) managementResponse {

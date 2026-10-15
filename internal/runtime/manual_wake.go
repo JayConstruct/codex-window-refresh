@@ -101,7 +101,7 @@ func (e *Engine) stepManualWake(ctx context.Context) error {
 		e.finishManualWake("blocked", "credential_changed")
 		return nil
 	}
-	if !account.Enabled || e.cfg.ManualWakeDisabled {
+	if e.cfg.Account(id).Paused || e.cfg.ManualWakeDisabled {
 		e.finishManualWake("blocked", "account_disabled")
 		return nil
 	}
@@ -117,22 +117,10 @@ func (e *Engine) stepManualWake(ctx context.Context) error {
 		e.finishManualWake("blocked", "delivery_evidence_pending")
 		return nil
 	}
-	now := e.clock.Now()
-	if !e.state.LastDispatchAt.IsZero() && now.Before(e.state.LastDispatchAt.Add(e.cfg.Runtime().MinDispatchSpacing)) {
-		e.finishManualWake("blocked", "dispatch_spacing")
-		return nil
-	}
-	if now.Before(account.BackoffUntil) || now.Before(e.nextPreflight[id]) || core.ForegroundBusy(e.state, id, account.Generation) {
-		code := "backoff"
-		if core.ForegroundBusy(e.state, id, account.Generation) {
-			code = "foreground_busy"
-		}
-		e.finishManualWake("blocked", code)
-		return nil
-	}
 	e.manualWake.Phase = "running"
 	e.recordWakeJob()
 	e.publish(false)
+	preflightBackoff := e.nextPreflight[id]
 	readFence := e.state.NextReadSequence
 	if err := e.observe(ctx, id); err != nil {
 		e.finishManualWake("failed", quotaReadErrorCode(err))
@@ -142,9 +130,47 @@ func (e *Engine) stepManualWake(ctx context.Context) error {
 		e.finishManualWake("failed", "request_cancelled")
 		return nil
 	}
-	now = e.clock.Now()
+	activityEpoch := e.activityEpoch[id]
+	// Quota permission never overrides CPA availability. Re-read the selected
+	// host status after the quota request, then apply all send protections.
+	if _, supported := e.host.(selectedAccountReader); supported {
+		if err := e.refreshSelectedAccount(ctx, id); err != nil {
+			e.finishManualWake("failed", quotaReadErrorCode(err))
+			return nil
+		}
+	}
+	e.drain()
+	if activityEpoch != e.activityEpoch[id] {
+		e.finishManualWake("blocked", "foreground_changed_during_quota_read")
+		return nil
+	}
 	account = e.state.Accounts[id]
-	if account.Generation != e.manualWake.Generation || account.FiveHour.ReadStartedSeq <= readFence || account.PermissionAcceptedSeq <= readFence {
+	if account.Generation != e.manualWake.Generation {
+		e.finishManualWake("blocked", "credential_changed")
+		return nil
+	}
+	if !account.Enabled {
+		code := "account_disabled"
+		if account.Availability == core.AccountUnavailable {
+			code = "account_unavailable"
+		}
+		e.finishManualWake("blocked", code)
+		return nil
+	}
+	now := e.clock.Now()
+	if !e.state.LastDispatchAt.IsZero() && now.Before(e.state.LastDispatchAt.Add(e.cfg.Runtime().MinDispatchSpacing)) {
+		e.finishManualWake("blocked", "dispatch_spacing")
+		return nil
+	}
+	if now.Before(account.BackoffUntil) || now.Before(preflightBackoff) || core.ForegroundBusy(e.state, id, account.Generation) {
+		code := "backoff"
+		if core.ForegroundBusy(e.state, id, account.Generation) {
+			code = "foreground_busy"
+		}
+		e.finishManualWake("blocked", code)
+		return nil
+	}
+	if account.FiveHour.ReadStartedSeq <= readFence || account.PermissionAcceptedSeq <= readFence {
 		e.finishManualWake("blocked", "quota_unknown")
 		return nil
 	}

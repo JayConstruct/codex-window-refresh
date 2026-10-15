@@ -47,7 +47,7 @@ plugins:
 | POST `/v0/management/codex-window-refresh/recheck` | 通知协调器重新检查；不能绕过窗口、用户名额、时间段或送达抑制规则 |
 | GET `/v0/management/codex-window-refresh/snapshot` | 统一的已发布运行视图：`instance_id/snapshot_seq/summary/accounts/capabilities/config`；面板运行数据只读取此接口，配置文件草稿另读 config-editor |
 | POST `/v0/management/codex-window-refresh/quota-query` | 无请求体或 `{}` 时批量查询；可选 `{ "account_id": "账号 ID" }` 仅查询该账号。手动查询始终允许，仍需要后台运行及额度桥就绪，返回 202、queued/already_queued 和稳定 `job_id`；不同目标忙碌时返回 409，未知账号返回 404；不创建唤醒任务或派发模型，进度位于摘要 scheduler.quota_query |
-| POST `/v0/management/codex-window-refresh/manual-wake` | 必须传 `{ "account_id": "账号 ID" }`，仅排队该账号一次模型唤醒；使用已保存的模型与消息，不接受模型覆盖或批量请求。自动唤醒可关闭，但 CPA 插件必须运行、账号未暂停、已保存模型且宿主能力就绪。返回 202，未知账号 404，参数错误 400，忙碌或待验证请求 409；进度位于 scheduler.manual_wake |
+| POST `/v0/management/codex-window-refresh/manual-wake` | 必须传 `{ "account_id": "账号 ID" }`，仅排队该账号一次“查询后决定唤醒”任务；使用已保存的模型与消息，不接受模型覆盖或批量请求。自动唤醒可关闭，但 CPA 插件必须运行、账号未暂停、已保存模型且宿主能力就绪。返回 202，未知账号 404，参数错误 400，忙碌或待验证请求 409；进度位于 scheduler.manual_wake；不按缓存的账号 Enabled 拒绝排队，执行时查询最新额度并核对 CPA 状态，不满足条件时记录 blocked 及具体原因，不发送模型请求 |
 | POST `/v0/management/codex-window-refresh/quota-connection-check` | 宿主模式下显式创建并取消本地 HTTP 操作，不读凭据、不执行 HTTP 或模型。返回 200 和固定 status，可带脱敏 error；管理桥模式返回 409，不支持检查的适配器返回 501 |
 
 CPA 的 ResourceRoute 不做管理认证。菜单资源 `/v0/resource/plugins/codex-window-refresh/status` 与 `/panel.js`、`/panel.css` 只返回静态面板资产，HTML 不嵌入账号、配置、额度或运行状态。页面优先复用同源 CPA 已保存的管理凭据，无法复用时手动输入密钥，再通过已认证管理 API 查询与编辑；模块不持久化手动输入的密钥。资源使用限制同源脚本、样式与连接的 CSP。使用与保存行为详见 [网页面板](panel.md)。JSON 管理响应采用 schema 6 原始响应语义；Body 按官方 RPC 的 `[]byte` 序列化传输。

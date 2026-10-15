@@ -40,7 +40,7 @@ func manualWakeResponse(engine Engine, wrapper WrapperConfig, cfg config.Config,
 	if !exists {
 		return response(404, map[string]string{"error": "account_not_found"})
 	}
-	if !account.Enabled || cfg.Account(target).Paused {
+	if cfg.Account(target).Paused {
 		return response(409, map[string]string{"error": "account_disabled"})
 	}
 	if strings.TrimSpace(cfg.Execution.Model) == "" {

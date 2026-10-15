@@ -61,6 +61,33 @@ func (e *Engine) stepSelectedAccountQuery(ctx context.Context, before []byte) er
 		e.finishManualQuery("completed")
 		return e.commitChanged(ctx, before)
 	}
+	e.reconcileSelectedAccount(account)
+	e.clearManualJobBlocks()
+	e.drain()
+	e.stepManualQuery(ctx)
+	return e.commitChanged(ctx, before)
+}
+
+// refreshSelectedAccount only refreshes the selected host identity and status.
+func (e *Engine) refreshSelectedAccount(ctx context.Context, id core.AccountID) error {
+	readCtx, cancel := context.WithTimeout(ctx, e.cfg.Execution.QuotaReadTimeout.Value())
+	defer cancel()
+	account, err := e.host.(selectedAccountReader).Account(readCtx, id)
+	if err != nil {
+		return err
+	}
+	if err := readCtx.Err(); err != nil {
+		return err
+	}
+	if account.ID != id || account.Generation == "" {
+		return errors.New("account_binding_changed")
+	}
+	e.reconcileSelectedAccount(account)
+	return nil
+}
+
+func (e *Engine) reconcileSelectedAccount(account core.HostAccount) {
+	id := account.ID
 	// Preserve other accounts: the single entry is not an authoritative pool.
 	found := false
 	for index := range e.inventory {
@@ -79,10 +106,6 @@ func (e *Engine) stepSelectedAccountQuery(ctx context.Context, before []byte) er
 		state.OrdinaryParticipant, state.WeeklyEnabled = policy.OrdinaryParticipant, policy.WeeklyEnabled
 		e.state.Accounts[accountID] = state
 	}
-	e.clearManualJobBlocks()
-	e.drain()
-	e.stepManualQuery(ctx)
-	return e.commitChanged(ctx, before)
 }
 
 func (e *Engine) manualQueryWaiting() bool {

@@ -45,35 +45,43 @@ func provider(e authEntry) string {
 	}
 	return e.Type
 }
-func enabled(e authEntry) bool { return !e.Disabled && !e.Unavailable && e.Status != "disabled" }
+func availability(e authEntry) string {
+	if e.Disabled || e.Status == "disabled" {
+		return core.AccountDisabled
+	}
+	if e.Unavailable {
+		return core.AccountUnavailable
+	}
+	return core.AccountAvailable
+}
 func generation(hostID, upstream string) core.CredentialGeneration {
 	sum := sha256.Sum256([]byte("codex-account-v1\x00" + hostID + "\x00" + upstream))
 	return core.CredentialGeneration(hex.EncodeToString(sum[:]))
 }
-func (h *Host) readBinding(ctx context.Context, id core.AccountID, index string) (AuthBinding, bool, error) {
+func (h *Host) readBinding(ctx context.Context, id core.AccountID, index string) (AuthBinding, string, error) {
 	if h.callback == nil || id == "" || index == "" {
-		return AuthBinding{}, false, ErrBindingUnavailable
+		return AuthBinding{}, "", ErrBindingUnavailable
 	}
 	var runtime authRuntime
 	if err := h.callback.Call(ctx, "host.auth.get_runtime", authRequest{index}, &runtime); err != nil {
 		if err := inventoryContextError(ctx, err); err != nil {
-			return AuthBinding{}, false, err
+			return AuthBinding{}, "", err
 		}
-		return AuthBinding{}, false, ErrHostCallback
+		return AuthBinding{}, "", ErrHostCallback
 	}
 	if runtime.Auth.ID != string(id) || runtime.Auth.AuthIndex != index || provider(runtime.Auth) != "codex" {
-		return AuthBinding{}, false, ErrBindingChanged
+		return AuthBinding{}, "", ErrBindingChanged
 	}
 	if runtime.Auth.RuntimeOnly {
-		return AuthBinding{}, false, ErrBindingUnavailable
+		return AuthBinding{}, "", ErrBindingUnavailable
 	}
 	var raw authGet
 	defer func() { clear(raw.JSON) }()
 	if err := h.callback.Call(ctx, "host.auth.get", authRequest{index}, &raw); err != nil {
 		if err := inventoryContextError(ctx, err); err != nil {
-			return AuthBinding{}, false, err
+			return AuthBinding{}, "", err
 		}
-		return AuthBinding{}, false, ErrBindingUnavailable
+		return AuthBinding{}, "", ErrBindingUnavailable
 	}
 	// Decode only the allowlisted account_id; secrets are never retained or logged.
 	var metadata struct {
@@ -81,9 +89,9 @@ func (h *Host) readBinding(ctx context.Context, id core.AccountID, index string)
 		Type      string `json:"type"`
 	}
 	if raw.AuthIndex != index || json.Unmarshal(raw.JSON, &metadata) != nil || strings.TrimSpace(metadata.AccountID) == "" || metadata.Type != "codex" {
-		return AuthBinding{}, false, ErrBindingUnavailable
+		return AuthBinding{}, "", ErrBindingUnavailable
 	}
-	return AuthBinding{AccountID: id, AuthIndex: index, UpstreamAccountID: metadata.AccountID, Generation: generation(string(id), metadata.AccountID)}, enabled(runtime.Auth), nil
+	return AuthBinding{AccountID: id, AuthIndex: index, UpstreamAccountID: metadata.AccountID, Generation: generation(string(id), metadata.AccountID)}, availability(runtime.Auth), nil
 }
 
 func inventoryContextError(ctx context.Context, err error) error {
@@ -142,20 +150,20 @@ func (h *Host) Accounts(ctx context.Context) ([]core.HostAccount, error) {
 		if _, ok := accounts[id]; ok {
 			continue
 		}
-		a := core.HostAccount{ID: id, Generation: unavailableGeneration(id)}
+		a := core.HostAccount{ID: id, Generation: unavailableGeneration(id), Availability: core.AccountBindingUnavailable}
 		if counts[id] > 1 {
 			diagnostics[id] = "account_identity_ambiguous"
 		} else if strings.TrimSpace(entry.AuthIndex) == "" || entry.RuntimeOnly {
 			diagnostics[id] = ErrBindingUnavailable.Error()
 		} else {
-			b, active, err := h.readBinding(ctx, id, entry.AuthIndex)
+			b, status, err := h.readBinding(ctx, id, entry.AuthIndex)
 			if contextErr := inventoryContextError(ctx, err); contextErr != nil {
 				return nil, contextErr
 			}
 			if err != nil {
 				diagnostics[id] = err.Error()
 			} else {
-				a.Generation, a.Enabled = b.Generation, active
+				a.Generation, a.Enabled, a.Availability = b.Generation, status == core.AccountAvailable, status
 				bindings[id] = b
 			}
 		}
@@ -195,7 +203,7 @@ func (h *Host) Account(ctx context.Context, id core.AccountID) (core.HostAccount
 		}
 		return core.HostAccount{}, ErrBindingUnavailable
 	}
-	b, active, err := h.readBinding(ctx, id, old.AuthIndex)
+	b, status, err := h.readBinding(ctx, id, old.AuthIndex)
 	if contextErr := inventoryContextError(ctx, err); contextErr != nil {
 		return core.HostAccount{}, contextErr
 	}
@@ -210,14 +218,14 @@ func (h *Host) Account(ctx context.Context, id core.AccountID) (core.HostAccount
 		return core.HostAccount{}, ErrBindingChanged
 	}
 	if err != nil {
-		a = core.HostAccount{ID: id, Generation: unavailableGeneration(id)}
+		a = core.HostAccount{ID: id, Generation: unavailableGeneration(id), Availability: core.AccountBindingUnavailable}
 		delete(h.bindings, id)
 		if h.inventoryDiagnostics == nil {
 			h.inventoryDiagnostics = map[core.AccountID]string{}
 		}
 		h.inventoryDiagnostics[id] = err.Error()
 	} else {
-		a = core.HostAccount{ID: id, Generation: b.Generation, Enabled: active}
+		a = core.HostAccount{ID: id, Generation: b.Generation, Enabled: status == core.AccountAvailable, Availability: status}
 		h.bindings[id] = b
 		delete(h.inventoryDiagnostics, id)
 	}
@@ -247,14 +255,14 @@ func (h *Host) validateBinding(ctx context.Context, id core.AccountID, gen core.
 	if !ok {
 		return AuthBinding{}, ErrBindingUnavailable
 	}
-	b, active, err := h.readBinding(ctx, id, old.AuthIndex)
+	b, status, err := h.readBinding(ctx, id, old.AuthIndex)
 	if err != nil {
 		return AuthBinding{}, err
 	}
 	if b.Generation != gen || old.Generation != gen {
 		return AuthBinding{}, ErrBindingChanged
 	}
-	if requireActive && !active {
+	if requireActive && status != core.AccountAvailable {
 		return AuthBinding{}, ErrBindingUnavailable
 	}
 	return b, nil

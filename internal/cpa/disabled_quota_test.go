@@ -43,6 +43,17 @@ func TestUnavailableAccountsCanReadQuotaButCannotSend(t *testing.T) {
 				t.Fatalf("unavailable account became sendable: %+v %v", accounts, err)
 			}
 			account := accounts[0]
+			wantStatus := core.AccountDisabled
+			if scenario.unavailable {
+				wantStatus = core.AccountUnavailable
+			}
+			if account.Availability != wantStatus {
+				t.Fatalf("host status lost: %+v", account)
+			}
+			refreshed, err := host.Account(context.Background(), account.ID)
+			if err != nil || refreshed.Availability != wantStatus || refreshed.Enabled {
+				t.Fatalf("selected refresh lost host status: %+v %v", refreshed, err)
+			}
 			observation, err := host.ObserveQuota(context.Background(), core.QuotaRead{AccountID: account.ID, Generation: account.Generation, ReadStartedSeq: 1})
 			if err != nil || reads != 1 || observation.Permission == nil || *observation.Permission != core.PermissionBlocked {
 				t.Fatalf("read-only quota rejected: %+v %v", observation, err)

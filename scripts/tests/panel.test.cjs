@@ -94,7 +94,14 @@ test('manual wake remains independent of automatic settings but requires safety 
   assert.match(manualWakeReason(account, config, {...summary, host_enabled: false}, capabilities), /停用/);
   assert.match(manualWakeReason(account, config, summary, {}), /未就绪/);
   assert.match(manualWakeReason({...account, Task: {OperationID: 'pending'}}, config, summary, capabilities), /待验证/);
-  assert.match(manualWakeReason({...account, FiveHour: {State: 'active', ResetAt: new Date(Date.now() + 60000).toISOString()}}, config, summary, capabilities), /无需重复/);
+  for (const cached of [
+    {Enabled: false},
+    {Enabled: false, Availability: 'disabled'},
+    {FiveHour: {State: 'active', ResetAt: new Date(Date.now() + 60000).toISOString()}},
+    {FiveHourBaseline: {StableResetAt: new Date(Date.now() + 60000).toISOString()}},
+    {BackoffUntil: new Date(Date.now() + 60000).toISOString()}
+  ]) assert.equal(manualWakeReason({...account, ...cached}, config, summary, capabilities), '');
+  assert.match(manualWakeReason(account, {...config, account_overrides: {'account-a': {paused: true}}}, summary, capabilities), /已暂停/);
   const calls = [], session = createSession(async (url, options) => {calls.push({url, options}); return response({status: 'queued'}, 202);});
   session.setKey('test-key');
   await session.request('/manual-wake', 'POST', {account_id: 'account-a'});
@@ -419,10 +426,12 @@ test('account cards require confirmation for exact manual wake and never animate
   assert.match(confirmations[0], /真实模型请求并消耗额度/);
   lookup('disconnect').listeners.get('click')();
 });
-test('unavailable account still allows exact quota query while manual wake stays blocked', async () => {
+test('unavailable account allows quota query and manual wake recheck', async () => {
   const {lookup, requests, settle} = createPanelFixture(async (url, options, data) => {
     data.capabilities.StableAccountIdentity = data.capabilities.ExactAccountExecution = true;
-    data.accounts = {'unavailable-account': {ID: 'unavailable-account', Enabled: false, Permission: 'blocked', FiveHour: {State: 'expired', Remaining: {Value: 0, Unit: 'percent'}}}};
+    data.accounts = {'unavailable-account': {ID: 'unavailable-account', Enabled: false, Availability: 'unavailable', Permission: 'blocked', FiveHour: {State: 'expired', Remaining: {Value: 0, Unit: 'percent'}}}};
+    if (options.method === 'POST' && url.endsWith('/quota-query')) data.summary.scheduler.quota_query = {account_id: 'unavailable-account', phase: 'completed', completed: 1};
+    if (options.method === 'POST' && url.endsWith('/manual-wake')) data.summary.scheduler.manual_wake = {account_id: 'unavailable-account', phase: 'blocked', last_error: 'account_unavailable'};
     return response(data[url.split('/').pop()] || {status: 'queued'}, options.method === 'POST' ? 202 : 200);
   });
   lookup('management-key').value = 'test-key'; lookup('login-form').listeners.get('submit')({preventDefault() {}});
@@ -433,14 +442,22 @@ test('unavailable account still allows exact quota query while manual wake stays
   const wake = items.find(item => item.dataset.wakeAccount === 'unavailable-account');
   assert.ok(query); assert.ok(wake);
   assert.equal(query.disabled, false);
-  assert.equal(wake.disabled, true);
-  assert.ok(items.some(item => item.textContent === 'CPA 账号不可用'));
+  assert.equal(wake.disabled, false);
+  assert.ok(items.some(item => item.textContent === 'CPA 账号暂时不可用'));
   query.listeners.get('click')();
   await settle();
   const writes = requests.filter(request => request.options.method === 'POST');
   assert.equal(writes.length, 1);
   assert.ok(writes[0].url.endsWith('/quota-query'));
   assert.deepEqual(JSON.parse(writes[0].options.body), {account_id: 'unavailable-account'});
+  const refreshedWake = descendants(lookup('account-list')).find(item => item.dataset.wakeAccount === 'unavailable-account');
+  assert.equal(refreshedWake.disabled, false, 'successful quota query must leave wake recheck available');
+  refreshedWake.listeners.get('click')();
+  await settle();
+  const wakeWrites = requests.filter(request => request.options.method === 'POST' && request.url.endsWith('/manual-wake'));
+  assert.equal(wakeWrites.length, 1);
+  assert.deepEqual(JSON.parse(wakeWrites[0].options.body), {account_id: 'unavailable-account'});
+  assert.ok(descendants(lookup('account-list')).some(item => item.textContent.includes('CPA 仍报告账号暂时不可用')));
   lookup('disconnect').listeners.get('click')();
 });
 test('granular settings can be added to legacy drafts without enabling other features', () => {

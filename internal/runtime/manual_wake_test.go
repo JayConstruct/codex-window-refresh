@@ -294,3 +294,76 @@ func TestManualWakeDisabledFlagSurvivesConfigCopyAndReload(t *testing.T) {
 		t.Fatal("disabled host flag was lost during configuration copy")
 	}
 }
+
+func TestManualWakeRefreshesQuotaBeforeDecidingWhetherToSend(t *testing.T) {
+	for _, scenario := range []string{"recovered", "still_unavailable", "disabled", "became_unavailable", "changed_binding", "refresh_failed", "active", "exhausted", "backoff", "preflight_backoff", "foreground_during_refresh"} {
+		t.Run(scenario, func(t *testing.T) {
+			engine, base, _, clock := manualWakeFixture(t)
+			pool := append([]core.HostAccount(nil), base.initial...)
+			pool[0].Enabled, pool[0].Availability = false, core.AccountUnavailable
+			if scenario == "became_unavailable" {
+				pool[0].Enabled, pool[0].Availability = true, core.AccountAvailable
+			}
+			delegate := engine.host
+			host := &targetedLatencyHost{Host: delegate, pool: pool}
+			host.refresh = func(id core.AccountID) (core.HostAccount, error) {
+				if base.reads != 1 {
+					t.Fatal("status refreshed before quota completed")
+				}
+				a := core.HostAccount{ID: id, Generation: "g", Enabled: true, Availability: core.AccountAvailable}
+				switch scenario {
+				case "still_unavailable", "became_unavailable":
+					a.Enabled, a.Availability = false, core.AccountUnavailable
+				case "disabled":
+					a.Enabled, a.Availability = false, core.AccountDisabled
+				case "changed_binding":
+					a.Generation = "replacement"
+				case "foreground_during_refresh":
+					engine.EnqueueActivity(core.ActivityEvent{RequestID: "new-request", Identity: "user", AccountID: id, Generation: "g", Phase: core.ActivityStarted, At: clock.now})
+				case "refresh_failed":
+					return core.HostAccount{}, errors.New("host_callback_failed")
+				}
+				return a, nil
+			}
+			if scenario == "active" || scenario == "exhausted" {
+				host.Host = controlledHost{Host: delegate, read: func(_ context.Context, read core.QuotaRead) (core.QuotaObservation, error) {
+					base.reads++
+					payload := `{"rate_limit":{"allowed":true,"primary_window":{"limit_window_seconds":18000,"used_percent":0,"reset_after_seconds":17999}}}`
+					if scenario == "exhausted" {
+						payload = `{"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"limit_window_seconds":18000,"used_percent":100,"reset_after_seconds":18000}}}`
+					}
+					return cpa.ParseQuota([]byte(payload), read, clock.now, core.ObservationQuery, engine.state.Accounts[read.AccountID])
+				}}
+			}
+			engine.host = host
+			if scenario == "preflight_backoff" {
+				engine.nextPreflight["a"] = clock.now.Add(time.Minute)
+			}
+			if scenario == "backoff" {
+				a := engine.state.Accounts["a"]
+				a.BackoffUntil = clock.now.Add(time.Minute)
+				engine.state.Accounts["a"] = a
+			}
+			engine.QueueManualWake("a")
+			if err := engine.Step(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if base.reads != 1 || host.targets != 1 {
+				t.Fatalf("missing fresh query and status: reads=%d refreshes=%d", base.reads, host.targets)
+			}
+			wantSends := 0
+			if scenario == "recovered" {
+				wantSends = 1
+			}
+			if len(base.sends) != wantSends {
+				t.Fatalf("unexpected dispatch: %d, job=%+v", len(base.sends), engine.manualWake)
+			}
+			if wantSends == 0 && engine.manualWake.LastError == "" {
+				t.Fatalf("skip reason missing: %+v", engine.manualWake)
+			}
+			if scenario == "still_unavailable" && (engine.Snapshot().Accounts["a"].Enabled || engine.manualWake.LastError != "account_unavailable") {
+				t.Fatal("quota success overrode CPA status")
+			}
+		})
+	}
+}

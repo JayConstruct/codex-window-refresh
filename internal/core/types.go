@@ -91,6 +91,7 @@ type WindowBaseline struct {
 type AccountState struct {
 	ID                    AccountID
 	Generation            CredentialGeneration
+	Availability          string
 	Enabled               bool
 	OrdinaryParticipant   bool
 	WeeklyEnabled         bool
