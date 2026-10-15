@@ -171,7 +171,25 @@ try {
     const result = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
     assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails)); return result.result.value;
   }
-  await cdp('Page.navigate', { url });
+  let navigationSerial = 0;
+  async function navigate(method, params = {}) {
+    // CDP acknowledges a reload before the old document disappears. A ready
+    // workspace in that document must not satisfy the next page's assertions.
+    const marker = `smoke-navigation-${++navigationSerial}`;
+    await evaluate(`window.__panelSmokeNavigation = ${JSON.stringify(marker)}`);
+    const result = await cdp(method, params);
+    assert.ok(!result.errorText, result.errorText);
+    await waitFor(async () => {
+      try {
+        const state = await cdp('Runtime.evaluate', {expression: `window.__panelSmokeNavigation !== ${JSON.stringify(marker)} && document.readyState === "complete"`, returnByValue:true});
+        return !state.exceptionDetails && state.result?.value === true;
+      } catch (error) {
+        if (/Execution context|Cannot find context|Inspected target navigated/i.test(error.message)) return false;
+        throw error;
+      }
+    }, 'Navigation did not finish in a new document');
+  }
+  await navigate('Page.navigate', { url });
   await waitFor(() => evaluate('document.readyState === "complete" && !!document.getElementById("connect")'), 'Login did not render');
   await evaluate(`document.getElementById('management-key').value=${JSON.stringify(key)}; document.getElementById('login-form').requestSubmit()`);
   try { await waitFor(() => evaluate('!document.getElementById("workspace").hidden'), 'Login did not succeed'); }
@@ -215,7 +233,7 @@ try {
         localStorage.setItem(name, raw); return raw;
       })()`);
       const beforeReload = reads.length;
-      await cdp('Page.reload');
+      await navigate('Page.reload');
       await waitFor(async () => reads.length >= beforeReload + 2 && await evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Saved CPA credentials did not auto-connect');
       assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(legacy ? 'managementKey' : 'cli-proxy-auth')})`), saved, 'Auto-connect modified host storage');
       assert.equal(await evaluate('document.getElementById("management-key").value'), '', 'Auto-connect exposed key in form');
@@ -223,13 +241,13 @@ try {
       assert.equal(await evaluate('document.getElementById("workspace").hidden'), true, 'Disconnect did not stay disconnected');
     }
   }
-  await cdp('Page.navigate', {url: new URL('/management.html', url).href});
+  await navigate('Page.navigate', {url: new URL('/management.html', url).href});
   try { await waitFor(() => evaluate('!!document.querySelector("iframe")?.contentDocument?.getElementById("workspace") && !document.querySelector("iframe").contentDocument.getElementById("workspace").hidden'), 'CPA menu iframe did not auto-connect'); }
   catch (error) {
     console.error('Iframe diagnostic:', await evaluate('JSON.stringify({url:location.pathname,frame:document.querySelector("iframe")?.contentDocument?.readyState,notice:document.querySelector("iframe")?.contentDocument?.getElementById("notice")?.textContent})'), errors, caughtExceptions);
     throw error;
   }
-  await cdp('Page.navigate', {url});
+  await navigate('Page.navigate', {url});
   await waitFor(() => evaluate('document.readyState === "complete" && !!document.getElementById("workspace") && !document.getElementById("workspace").hidden'), 'Reopening did not auto-connect');
   assert.equal(posts.length, 0, 'Auto-connect dispatched operations');
   assert.equal(await evaluate('document.getElementById("auto-refresh").checked'), false, 'Reopening enabled page refresh without opt-in');
@@ -238,7 +256,7 @@ try {
   await evaluate('document.getElementById("background-refresh").click()');
   await waitFor(()=>evaluate('!document.getElementById("refresh").disabled && document.getElementById("refresh-status").textContent.includes("含后台标签页")'),'Background refresh opt-in did not apply');
   const hostLogin = await evaluate('localStorage.getItem("managementKey")');
-  await cdp('Page.reload');
+  await navigate('Page.reload');
   await waitFor(()=>evaluate('document.readyState === "complete" && !document.getElementById("workspace").hidden && document.getElementById("auto-refresh").checked && document.getElementById("background-refresh").checked'),'Reload did not restore saved refresh preferences');
   assert.equal(await evaluate('localStorage.getItem("managementKey")'), hostLogin, 'Preference restoration changed host login');
   await evaluate(`document.querySelector('[data-tab="accounts"]').click()`);
@@ -250,14 +268,15 @@ try {
   assert.equal(await evaluate('document.querySelector(".account-card").dataset.accountId'), 'fixture-account', 'Unknown quota sorted ahead of known percentage');
   assert.equal(await evaluate('document.getElementById("account-list").classList.contains("compact")'), true, 'Compact layout did not apply');
   assert.equal(posts.length, beforeDisplayChange, 'Changing account display wrote server rules');
-  await cdp('Page.reload');
+  await navigate('Page.reload');
   await waitFor(()=>evaluate('document.readyState === "complete" && !document.getElementById("workspace").hidden && document.getElementById("account-layout").value==="compact" && document.getElementById("account-sort").value==="five-remaining"'),'Account display preferences did not survive reload');
   await evaluate('document.querySelector("[data-tab=accounts]").click()');
   assert.equal(await evaluate('Array.from(document.querySelectorAll(".account-disclosure")).every(item=>!item.open)'),true,'Account diagnostics were not collapsed');
   await evaluate('document.querySelector(".account-disclosure").open=true');
   await waitFor(()=>evaluate('document.querySelector(".account-disclosure").open'),'Account details did not open');
   await evaluate('window.retainedAccountCard=document.querySelector(".account-card");window.retainedAccountButton=window.retainedAccountCard.querySelector("[data-quota-account]");window.retainedAccountButton.focus()');
-  const accountInteractionState = () => evaluate('({active:document.activeElement?.outerHTML,retained:window.retainedAccountCard?.dataset.accountId,retainedConnected:window.retainedAccountCard?.isConnected,retainedOpen:window.retainedAccountCard?.querySelector(".account-disclosure")?.open,cards:Array.from(document.querySelectorAll(".account-card")).map(card=>({id:card.dataset.accountId,open:card.querySelector(".account-disclosure").open,retained:card===window.retainedAccountCard,focused:card.contains(document.activeElement)}))})');
+  await waitFor(() => evaluate('!document.getElementById("tab-accounts").hidden && document.activeElement===window.retainedAccountButton'), 'Account focus was not established before polling');
+  const accountInteractionState = () => evaluate('({active:document.activeElement?.outerHTML?.slice(0,400),retained:window.retainedAccountCard?.dataset.accountId,retainedConnected:window.retainedAccountCard?.isConnected,retainedOpen:window.retainedAccountCard?.querySelector(".account-disclosure")?.open,cards:Array.from(document.querySelectorAll(".account-card")).map(card=>({id:card.dataset.accountId,open:card.querySelector(".account-disclosure").open,retained:card===window.retainedAccountCard,focused:card.contains(document.activeElement)}))})');
   console.log('Account interaction before polling:', JSON.stringify(await accountInteractionState()));
   const otherAccount = '<img src=x onerror=alert(1)>', originalOtherWindow = structuredClone(accounts[otherAccount].FiveHour);
   accounts[otherAccount].FiveHour = {...originalOtherWindow, Remaining: {Value: 1, Unit: 'percent'}};
@@ -486,7 +505,7 @@ try {
   assert.equal(await evaluate('document.getElementById("account-list").textContent.includes("fixture-account")'), false, '401 retained account data');
   assert.equal(await evaluate('document.getElementById("config-json").value'), '', '401 retained editor content');
   const beforeRejectedLogin = reads.length;
-  await cdp('Page.reload');
+  await navigate('Page.reload');
   await waitFor(async () => reads.length > beforeRejectedLogin && await evaluate('document.readyState === "complete" && !!document.getElementById("login-section") && !document.getElementById("login-section").hidden && document.getElementById("notice").textContent.includes("认证失败")'), 'Rejected saved key did not return to manual login');
   assert.equal(reads.length - beforeRejectedLogin, 1, 'Rejected saved key retried or dispatched parallel reads');
   assert.equal(await evaluate('localStorage.length'), 3, 'Failed auto-connect changed host login or preferences');
