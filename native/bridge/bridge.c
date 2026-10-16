@@ -24,7 +24,8 @@
 #include <unistd.h>
 #define FRAME_LIMIT (4u<<20)
 #define HTTP_BODY_LIMIT (2u<<20)
-#define WORKERS 8
+#define WORKERS 10
+#define HOST_CALLS 8
 #define QUEUE 32
 #define MGMT "/v0/management/codex-window-refresh/v2/"
 #define RESOURCE "/v0/resource/plugins/codex-window-refresh/"
@@ -55,6 +56,7 @@ static pthread_mutex_t queue_mu=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t available=PTHREAD_COND_INITIALIZER,drained=PTHREAD_COND_INITIALIZER;
 static pthread_t accept_thread,workers[WORKERS];
 static int listener=-1,owner_lock=-1,stopping=1,running=0,live=0,queued[QUEUE],qhead=0,qsize=0,created=0,initialized=0;
+static int host_active;
 static char bridge_path[sizeof(((struct sockaddr_un*)0)->sun_path)],daemon_path[sizeof(bridge_path)],instance[65];
 static char process_identity[128];
 static int identify_process(void) {
@@ -174,8 +176,13 @@ static J *rpc(J*req) {
         json_object_object_add(j,"bridge_instance_id",json_object_new_string(instance));
         json_object_object_add(j,"read_only",json_object_new_boolean(1));
         json_object_object_add(j,"version",json_object_new_string(CWR_VERSION));
-        json_object_object_add(j,"max_host_calls",json_object_new_int(WORKERS));
+        json_object_object_add(j,"max_host_calls",json_object_new_int(HOST_CALLS));
+        pthread_mutex_lock(&queue_mu);
+        json_object_object_add(j,"active_host_calls",json_object_new_int(host_active));
+        pthread_mutex_unlock(&queue_mu);
         json_object_object_add(j,"events_supported",json_object_new_boolean(1));
+        json_object_object_add(j,"passive_quota_supported",json_object_new_boolean(1));
+        json_object_object_add(j,"quota_observer",cwr_bindings_status());
         json_object_object_add(j,"host_process_id",json_object_new_string(process_identity));
         return ok(j);
     }
@@ -183,6 +190,7 @@ static J *rpc(J*req) {
     if(!expected||strcmp(expected,instance)!=0)return error("bridge_instance_changed");
     if(!strcmp(method,"bridge.events.pull"))return cwr_events_pull(field(req,"payload"),instance,process_identity);
     if(!strcmp(method,"bridge.events.ack"))return cwr_events_ack(field(req,"payload"));
+    if(!strcmp(method,"bridge.bindings.replace"))return cwr_bindings_replace(field(req,"payload"));
     if(strcmp(method,"host.auth.list")&&strcmp(method,"host.auth.get")&&strcmp(method,"host.auth.get_runtime"))return error("method_not_allowed");
     J*payload=field(req,"payload");
     if(!payload||json_object_get_type(payload)!=4)return error("invalid_payload");
@@ -194,13 +202,19 @@ static J *rpc(J*req) {
     if(budget<1||budget>300000)return error("invalid_deadline");
     pthread_mutex_lock(&queue_mu);
     int stopped=stopping;
+    int busy=host_active>=HOST_CALLS;
+    if(!stopped&&!busy)host_active++;
     pthread_mutex_unlock(&queue_mu);
     if(stopped)return error("bridge_stopping");
+    if(busy)return error("bridge_busy");
     const char*raw=json_object_to_json_string_ext(payload,0);
     Buffer result= {
         0
     };
     int status=host.call(host.host_ctx,method,(const uint8_t*)raw,strlen(raw),&result);
+    pthread_mutex_lock(&queue_mu);
+    host_active--;
+    pthread_mutex_unlock(&queue_mu);
     J*response=NULL;
     if(!status&&result.ptr&&result.len<=FRAME_LIMIT)response=parse(result.ptr,result.len);
     if(result.ptr)host.free_buffer(result.ptr,result.len);
@@ -609,6 +623,9 @@ static J *registration(void) {
     json_object_object_add(cap,"management_api",json_object_new_boolean(1));
     json_object_object_add(cap,"request_interceptor",json_object_new_boolean(1));
     json_object_object_add(cap,"request_lifecycle_plugin",json_object_new_boolean(1));
+    json_object_object_add(cap,"response_interceptor",json_object_new_boolean(1));
+    json_object_object_add(cap,"response_stream_interceptor",json_object_new_boolean(1));
+    json_object_object_add(cap,"websocket_response_observer",json_object_new_boolean(1));
     json_object_object_add(r,"capabilities",cap);
     return ok(r);
 }
@@ -643,7 +660,7 @@ static int plugin_call(char*method,uint8_t*payload,size_t size,Buffer*out) {
     out->ptr=NULL;
     out->len=0;
     if(!method||!method[0]||strnlen(method,257)>256||(size&&!payload))return 1;
-    int hook=!strcmp(method,"request.intercept_before")||!strcmp(method,"request.intercept_after")||!strcmp(method,"request.complete");
+    int hook=!strcmp(method,"request.intercept_before")||!strcmp(method,"request.intercept_after")||!strcmp(method,"request.complete")||!strcmp(method,"response.intercept_after")||!strcmp(method,"response.intercept_stream_chunk")||!strcmp(method,"websocket.response_event");
     if(hook) {
         pthread_rwlock_rdlock(&gate);
         if(running&&!stopping)cwr_observe_hook(method,size<=(64u<<20)?payload:NULL,size<=(64u<<20)?size:0);

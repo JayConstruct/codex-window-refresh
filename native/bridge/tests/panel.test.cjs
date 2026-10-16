@@ -89,3 +89,20 @@ test('activity refresh keeps polling and stops after CPA authentication expires'
   assert.equal(ui.get('query').disabled, true);
   assert.equal(ui.timers.size, 0);
 });
+
+test('background quota changes reload the account view after the overview revision advances', async () => {
+  let overviews = 0, accounts = 0;
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) {
+      overviews++;
+      return [200, {...view('a', overviews), read_only: true, query_concurrency: 8, accounts_revision: overviews}];
+    }
+    accounts++;
+    return [200, {...view('a', accounts), accounts_revision: accounts, accounts: [{id: accounts === 1 ? 'initial' : 'updated', status: 'available'}], next_after: ''}];
+  });
+  await ui.get('connect').onclick();
+  const [id, timer] = [...ui.timers.entries()].find(([, timer]) => timer.delay === 5000);
+  ui.timers.delete(id); await timer.fn();
+  assert.equal(accounts, 2);
+  assert.match(ui.get('accounts').children[0].children[0].textContent, /updated/);
+});

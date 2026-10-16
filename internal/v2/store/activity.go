@@ -36,6 +36,7 @@ type Overview struct {
 	Revision         uint64          `json:"view_revision"`
 	AccountsRevision uint64          `json:"accounts_revision"`
 	Activity         ActivitySummary `json:"activity"`
+	Inventory        InventoryStatus `json:"inventory"`
 }
 
 const cursorSQL = "SELECT bridge_instance,host_process,sequence,loss_epoch,status,reason,connected,connection_error,last_seen FROM event_state WHERE singleton=1"
@@ -62,6 +63,9 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	}
 	o.Activity.EventCursor, err = readCursor(tx.QueryRowContext(ctx, cursorSQL))
 	if err != nil {
+		return o, err
+	}
+	if err = tx.QueryRowContext(ctx, "SELECT status,error_code,last_success_at FROM inventory_state WHERE singleton=1").Scan(&o.Inventory.Status, &o.Inventory.ErrorCode, &o.Inventory.LastSuccessAt); err != nil {
 		return o, err
 	}
 	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM activity_users u WHERE last_activity>=? OR EXISTS(SELECT 1 FROM activity_requests r WHERE r.identity=u.identity AND r.phase='active')", time.Now().UTC().Add(-30*time.Minute).Format("2006-01-02T15:04:05.000000000Z")).Scan(&o.Activity.RecentUsers); err != nil {
@@ -100,6 +104,10 @@ func validateBatch(b events.Batch) error {
 		}
 		switch e.Kind {
 		case "started", "account_selected", "completed":
+		case "quota_observed":
+			if !ValidID(e.AccountID) || !ValidID(e.AuthIndex) || !ValidID(e.Binding) || (e.Source != "cpa_response_headers" && e.Source != "cpa_websocket_quota") || len(e.Quota) > 2048 || len(e.Headers) > 10 {
+				return errors.New("invalid_quota_event")
+			}
 		default:
 			return errors.New("invalid_event_kind")
 		}
@@ -178,7 +186,12 @@ func (s *Store) ApplyEvents(ctx context.Context, b events.Batch) (uint64, error)
 			if e.Sequence != c.Sequence+1 {
 				return errors.New("noncontiguous_event_batch")
 			}
-			if err = applyActivity(tx, ctx, b.Instance, e, &c); err != nil {
+			if e.Kind == "quota_observed" {
+				err = applyQuota(ctx, tx, e)
+			} else {
+				err = applyActivity(tx, ctx, b.Instance, e, &c)
+			}
+			if err != nil {
 				return err
 			}
 			c.Sequence = e.Sequence

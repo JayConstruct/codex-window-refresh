@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Window Refresh v2</title><link rel="stylesheet" href="panel.css"></head>
-<body><main><p class="eyebrow">CODEX WINDOW REFRESH · V2</p><h1>账号额度</h1><p>独立后台查询原型。此版本只查询额度。</p>
+<body><main><p class="eyebrow">CODEX WINDOW REFRESH · V2</p><h1>账号额度</h1><p>独立后台。支持手动查询和正常业务额度观测。</p><p id="inventory" role="status">CPA 账号尚未同步。</p>
 <section><label for="key">CPA 管理密钥</label><div class="row"><input id="key" type="password" autocomplete="off" placeholder="仅保留在当前页面内存中"><button id="connect">连接</button></div><p id="connection" role="status">尚未连接</p><p id="activity" role="status">活动观测尚未连接。</p></section>
 <section><h2>查询额度</h2><label for="account">账号 ID</label><div class="row"><input id="account" placeholder="留空查询全部 Codex 账号"><button id="query" disabled>创建查询任务</button></div><p id="job" role="status">尚无任务</p><p id="error" role="alert"></p></section>
 <section><div class="row"><h2>账号结果</h2><button id="refresh" disabled>刷新</button></div><div id="accounts">连接后读取已保存结果。</div><button id="more" hidden>加载更多</button></section>

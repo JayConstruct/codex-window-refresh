@@ -25,11 +25,12 @@ type Client struct {
 	instance atomic.Value
 }
 type Hello struct {
-	Protocol    int    `json:"protocol_version"`
-	Instance    string `json:"bridge_instance_id"`
-	ReadOnly    bool   `json:"read_only"`
-	Events      bool   `json:"events_supported"`
-	HostProcess string `json:"host_process_id"`
+	Protocol     int    `json:"protocol_version"`
+	Instance     string `json:"bridge_instance_id"`
+	ReadOnly     bool   `json:"read_only"`
+	Events       bool   `json:"events_supported"`
+	HostProcess  string `json:"host_process_id"`
+	PassiveQuota bool   `json:"passive_quota_supported"`
 }
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -129,6 +130,20 @@ func (c *Client) PullEvents(ctx context.Context, instance string, after uint64) 
 }
 func (c *Client) AckEvents(ctx context.Context, instance string, through uint64) error {
 	return c.exchangeFor(ctx, "bridge.events.ack", map[string]any{"through": through}, nil, instance)
+}
+func (c *Client) PublishBindings(ctx context.Context, instance string, accounts []store.Account) error {
+	type binding struct {
+		ID      string `json:"id"`
+		Index   string `json:"auth_index"`
+		Binding string `json:"binding"`
+	}
+	list := []binding{}
+	for _, a := range accounts {
+		if a.Binding != "" && a.AuthIndex != "" {
+			list = append(list, binding{a.ID, a.AuthIndex, a.Binding})
+		}
+	}
+	return c.exchangeFor(ctx, "bridge.bindings.replace", map[string]any{"accounts": list}, nil, instance)
 }
 
 func (c *Client) Handshake(ctx context.Context) (Hello, error) {

@@ -257,6 +257,9 @@ func quotaHeaders(headers http.Header) []byte {
 	return raw
 }
 
+// QuotaHeaders extracts provider quota fields without retaining unrelated headers.
+func QuotaHeaders(headers http.Header) []byte { return quotaHeaders(headers) }
+
 // Websocket rate-limit frames use snake_case or camelCase in official CPA's
 // quota normalizer. Keep those aliases at the adapter boundary only.
 func (w *quotaWindow) UnmarshalJSON(raw []byte) error {

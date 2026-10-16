@@ -119,7 +119,7 @@ func publicCode(err error) string {
 		return "query_interrupted"
 	}
 	switch err.Error() {
-	case "bridge_unavailable", "bridge_busy", "bridge_instance_changed", "bridge_transport_failed", "bridge_protocol_incompatible", "bridge_response_invalid", "host_callback_failed", "inventory_too_large", "account_identity_ambiguous", "account_identity_unavailable", "account_binding_changed", "quota_credential_missing", "quota_proxy_invalid", "quota_transport_failed", "quota_authentication_failed", "quota_upstream_forbidden", "quota_upstream_rate_limited", "quota_upstream_http_failed", "quota_body_failed", "quota_response_too_large", "quota_response_unrecognized":
+	case "bridge_unavailable", "bridge_busy", "bridge_instance_changed", "bridge_transport_failed", "bridge_protocol_incompatible", "bridge_response_invalid", "host_callback_failed", "inventory_too_large", "account_identity_ambiguous", "account_identity_unavailable", "account_binding_changed", "quota_credential_missing", "quota_proxy_invalid", "quota_transport_failed", "quota_authentication_failed", "quota_upstream_forbidden", "quota_upstream_rate_limited", "quota_upstream_http_failed", "quota_body_failed", "quota_response_too_large", "quota_response_unrecognized", "quota_clock_changed":
 		return err.Error()
 	}
 	return "quota_query_failed"
@@ -256,7 +256,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 503, "storage_unavailable")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]bool{"quota_query": true, "model_execution": false, "activity_tracking": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]bool{"quota_query": true, "model_execution": false, "activity_tracking": true, "passive_quota": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
 	case "GET /healthz":
 		if err := s.Store.Check(r.Context()); err != nil {
 			apiError(w, 503, "storage_unavailable")

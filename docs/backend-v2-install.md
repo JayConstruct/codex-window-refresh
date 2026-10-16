@@ -1,6 +1,6 @@
 # v2 只读预发布安装与更新
 
-适用于 Debian 12/13、amd64/arm64、CPA ABI 1/schema 6。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。v2 当前提供网页、额度查询、持久任务和活动观测；唤醒、短句生成及自动规则尚未实现。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
+适用于 Debian 12/13、amd64/arm64、CPA ABI 1/schema 6。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。v2 当前提供网页、额度查询、持久任务、活动及正常业务额度观测；唤醒、短句生成及自动规则尚未实现。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
 
 ## 首次切换
 
@@ -21,7 +21,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.2` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.3` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -47,7 +47,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.2 --package /path/codex-window-refresh-v2_v0.2.0-rc.2_linux_amd64.tar.gz \
+  --version v0.2.0-rc.3 --package /path/codex-window-refresh-v2_v0.2.0-rc.3_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 

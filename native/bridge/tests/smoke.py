@@ -240,6 +240,79 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(batch['latest_sequence'], 4100)
         self.assertEqual(len(batch['events']), 128)
 
+    @staticmethod
+    def quota_headers(used='25'):
+        return {'X-Codex-Allowed': ['true'], 'X-Codex-Primary-Used-Percent': [used],
+                'X-Codex-Primary-Window-Minutes': ['300'], 'X-Codex-Primary-Reset-After-Seconds': ['3000']}
+
+    def test_passive_headers_stream_and_websocket_are_bounded_and_leave_responses_untouched(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        bindings = {'accounts': [{'id': 'a', 'auth_index': 'a', 'binding': 'one'}]}
+        self.assertTrue(self.rpc('bridge.bindings.replace', bindings, instance)['ok'])
+        select = {'RequestID': 'headers', 'Metadata': {'caller_scope': 'u', 'selected_auth_id': 'a'}}
+        self.call('request.intercept_after', select)
+        # Completion can race ahead of the actual downstream response hook.
+        self.call('request.complete', {'RequestID': 'headers'})
+        headers = self.quota_headers()
+        headers['Authorization'] = ['secret-header']
+        response = {'RequestID': 'headers', 'ResponseHeaders': headers, 'Body': base64.b64encode(b'secret-text'*500000).decode()}
+        self.assertEqual(self.call('response.intercept_after', response), {'ok': True, 'result': {}})
+        self.call('response.intercept_after', response)  # Repeated header snapshot.
+        self.call('request.intercept_after', {'RequestID': 'stream', 'Metadata': {'selected_auth_id': 'a'}})
+        for index in [-1, 0, 1, 100]:
+            self.assertEqual(self.call('response.intercept_stream_chunk', {'RequestID': 'stream', 'ChunkIndex': index, 'ResponseHeaders': headers, 'Body': 'c2VjcmV0'}), {'ok': True, 'result': {}})
+        self.call('request.intercept_after', {'RequestID': 'websocket', 'Metadata': {'selected_auth_id': 'a'}})
+        frame = {'type': 'codex.rate_limits', 'rate_limits': {'allowed': True, 'primary': {'usedPercent': 40, 'windowMinutes': 300, 'resetAfterSeconds': 2900, 'private': 'secret-window'}, 'private': 'secret-rate'}, 'message': 'secret-text'}
+        websocket = {'RequestID': 'websocket', 'Provider': 'codex', 'AuthID': 'a', 'EventType': 'codex.rate_limits', 'Payload': base64.b64encode(json.dumps(frame).encode()).decode()}
+        self.assertEqual(self.call('websocket.response_event', websocket), {'ok': True, 'result': {}})
+        websocket['AuthID'] = 'another'
+        self.call('websocket.response_event', websocket)
+        batch = self.rpc('bridge.events.pull', {'after': 0}, instance)['result']
+        observations = [e for e in batch['events'] if e['kind'] == 'quota_observed']
+        self.assertEqual(len(observations), 3)
+        self.assertEqual(observations[0]['binding'], 'one')
+        self.assertEqual(observations[0]['headers']['x-codex-primary-used-percent'], ['25'])
+        self.assertEqual(observations[2]['quota']['rate_limits']['primary']['usedPercent'], 40)
+        self.assertNotIn('secret', json.dumps(batch))
+        self.assertEqual(batch, self.rpc('bridge.events.pull', {'after': 0}, instance)['result'])
+        for change in [{'Provider': 'claude'}, {'Metadata': {'source': 'plugin_host_model_callback'}},
+                       {'EventType': 'response.delta'}, {'Payload': 'not valid base64'},
+                       {'Payload': base64.b64encode(b'{"type":"codex.rate_limits","rate_limits":{"allowed":"secret"}}').decode()}]:
+            self.call('websocket.response_event', dict(websocket, AuthID='a', **change))
+        self.assertEqual(batch['latest_sequence'], self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['latest_sequence'])
+        # Updating identity invalidates a previously selected response binding.
+        bindings['accounts'][0]['binding'] = 'replacement'
+        self.rpc('bridge.bindings.replace', bindings, instance)
+        websocket['AuthID'] = 'a'
+        self.call('websocket.response_event', websocket)
+        self.assertEqual(batch['latest_sequence'], self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['latest_sequence'])
+
+    def test_passive_observation_reaches_database_without_an_upstream_query(self):
+        self.start_daemon()
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            hello = self.rpc('bridge.hello')['result']
+            if hello['quota_observer']['accounts'] == 2 and hello['quota_observer']['ready']:
+                break
+            time.sleep(.025)
+        self.assertEqual(hello['quota_observer']['accounts'], 2)
+        self.call('request.intercept_after', {'RequestID': 'quota', 'Metadata': {'selected_auth_id': 'a'}})
+        self.call('response.intercept_after', {'RequestID': 'quota', 'ResponseHeaders': self.quota_headers()})
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            _, page = self.management('accounts')
+            account = next((a for a in page['accounts'] if a['id'] == 'a'), {})
+            if account.get('quota'):
+                break
+            time.sleep(.025)
+        self.assertEqual(account['quota']['five_hour']['Remaining']['Value'], 75)
+        self.assertEqual(account['quota']['source'], 'cpa_response_headers')
+        observed_at = account['observed_at']
+        self.stop_daemon()
+        self.start_daemon()
+        _, page = self.management('accounts')
+        self.assertEqual(next(a for a in page['accounts'] if a['id'] == 'a')['observed_at'], observed_at)
+
     def test_daemon_ingests_offline_completion_and_bridge_reload_marks_unknown(self):
         self.start_daemon()
         self.wait_activity(0)
@@ -287,6 +360,31 @@ class NativeBridge(unittest.TestCase):
             conn.sendall(struct.pack('!I', (4 << 20)+1))
             size = struct.unpack('!I', self.read(conn, 4))[0]
             self.assertEqual(json.loads(self.read(conn, size))['error']['code'], 'invalid_frame')
+
+    def test_event_control_survives_all_host_callback_slots_being_blocked(self):
+        hello = self.rpc('bridge.hello')['result']
+        instance = hello['bridge_instance_id']
+        self.release.clear()
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(self.rpc('host.auth.get_runtime', {'auth_index': 'slow'}, instance))) for _ in range(hello['max_host_calls'])]
+        for thread in threads: thread.start()
+        try:
+            deadline = time.monotonic()+3
+            while time.monotonic()<deadline:
+                hello = self.rpc('bridge.hello')['result']
+                if hello['active_host_calls'] == hello['max_host_calls']: break
+                time.sleep(.01)
+            self.assertEqual(hello['active_host_calls'], hello['max_host_calls'])
+            self.assertEqual(self.rpc('host.auth.list', {}, instance)['error']['code'], 'bridge_busy')
+            self.call('request.intercept_before', {'RequestID': 'live-control', 'Metadata': {'caller_scope': 'u'}})
+            batch = self.rpc('bridge.events.pull', {'after': 0}, instance)['result']
+            self.assertEqual(batch['events'][0]['request_id'], 'live-control')
+            self.assertTrue(self.rpc('bridge.events.ack', {'through': batch['latest_sequence']}, instance)['ok'])
+        finally:
+            self.release.set()
+            for thread in threads: thread.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertTrue(all(reply['ok'] for reply in results))
 
     def test_update_script_installs_real_package_restarts_daemon_and_rolls_back(self):
         # Real packaged executables, actual native callbacks, Unix IPC and SQLite;

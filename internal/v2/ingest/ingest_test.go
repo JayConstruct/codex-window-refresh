@@ -72,10 +72,65 @@ func TestFailedCommitNeverAcknowledgesNativeBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := &fixtureLink{afterPull: func() { _ = s.Close() }}
-	if err = (Consumer{Store: s, Link: link}).Step(context.Background()); err == nil {
+	if err = (&Consumer{Store: s, Link: link}).Step(context.Background()); err == nil {
 		t.Fatal("closed storage accepted event")
 	}
 	if link.ackCalls != 0 {
 		t.Fatal("acknowledged uncommitted events")
+	}
+}
+
+type inventoryFixture struct{}
+
+func (inventoryFixture) Accounts(context.Context) ([]store.Account, error) {
+	return []store.Account{{ID: "good", AuthIndex: "good", Status: "available"}, {ID: "bad", AuthIndex: "bad", Status: "available"}}, nil
+}
+func (inventoryFixture) Identity(_ context.Context, a store.Account) (store.Account, error) {
+	if a.ID == "bad" {
+		return a, errors.New("unreadable")
+	}
+	a.Binding = "digest"
+	return a, nil
+}
+
+type publishingLink struct {
+	fixtureLink
+	store     *store.Store
+	published bool
+}
+
+func (p *publishingLink) PublishBindings(ctx context.Context, instance string, accounts []store.Account) error {
+	page, err := p.store.AccountPage(ctx, "", 10, nil)
+	if err != nil {
+		return err
+	}
+	if len(page.Accounts) != 2 {
+		return errors.New("published before commit")
+	}
+	for _, a := range accounts {
+		if a.ID == "bad" && a.Status != "binding_unavailable" {
+			return errors.New("bad account contaminated inventory")
+		}
+	}
+	p.published = true
+	return nil
+}
+func TestBindingInventoryIsCommittedBeforeNativePublicationAndBadAccountIsIsolated(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	link := &publishingLink{store: s}
+	consumer := &Consumer{Store: s, Link: link, Inventory: inventoryFixture{}}
+	if err = consumer.syncInventory(context.Background(), "bridge"); err != nil {
+		t.Fatal(err)
+	}
+	if !link.published {
+		t.Fatal("bindings not published")
+	}
+	view, err := s.Overview(context.Background())
+	if err != nil || view.Inventory.Status != "ready" {
+		t.Fatal(view, err)
 	}
 }

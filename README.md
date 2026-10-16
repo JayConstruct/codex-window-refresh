@@ -6,7 +6,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查�
 
 ## 一键安装或更新
 
-重建后的 **v0.2.0-rc.2 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+重建后的 **v0.2.0-rc.3 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --restart

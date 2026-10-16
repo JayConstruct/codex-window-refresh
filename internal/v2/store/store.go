@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	quotaevidence "codex-window-refresh/internal/v2/quota"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -35,6 +37,7 @@ const MaxPendingItems = 4096
 type Account struct {
 	ID         string          `json:"id"`
 	AuthIndex  string          `json:"-"`
+	Binding    string          `json:"-"`
 	Status     string          `json:"status"`
 	Quota      json.RawMessage `json:"quota,omitempty"`
 	ObservedAt string          `json:"observed_at,omitempty"`
@@ -133,7 +136,7 @@ func Open(dir string) (*Store, error) {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
-		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 2 {
+		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 3 {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
@@ -144,7 +147,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	if _, err = migration.Exec(schema); err == nil {
-		_, err = migration.Exec("UPDATE schema_version SET version=2")
+		_, err = migration.Exec("UPDATE schema_version SET version=3")
 	}
 	if err == nil {
 		err = migration.Commit()
@@ -156,7 +159,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	var version int
-	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 2 {
+	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 3 {
 		s.Close()
 		return nil, errors.New("unsupported_database_schema")
 	}
@@ -295,6 +298,9 @@ func (s *Store) Expand(ctx context.Context, j Job, accounts []Account) error {
 			selected = nil
 		}
 		for _, a := range selected {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM account_bindings WHERE account_id=? AND EXISTS(SELECT 1 FROM accounts WHERE id=? AND auth_index!=?)", a.ID, a.ID, a.AuthIndex); err != nil {
+				return err
+			}
 			if _, err := tx.ExecContext(ctx, "INSERT INTO accounts(id,auth_index,status,updated_at) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET quota=CASE WHEN accounts.auth_index=excluded.auth_index THEN accounts.quota ELSE NULL END,observed_at=CASE WHEN accounts.auth_index=excluded.auth_index THEN accounts.observed_at ELSE NULL END,auth_index=excluded.auth_index,status=excluded.status,updated_at=excluded.updated_at", a.ID, a.AuthIndex, a.Status, now()); err != nil {
 				return err
 			}
@@ -325,7 +331,7 @@ func (s *Store) Expand(ctx context.Context, j Job, accounts []Account) error {
 func (s *Store) Claim(ctx context.Context) (Run, error) {
 	r := Run{ID: ID()}
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT a.id,a.auth_index,a.status FROM job_items i JOIN accounts a ON a.id=i.account_id JOIN jobs j ON j.id=i.job_id WHERE i.phase='queued' AND NOT EXISTS(SELECT 1 FROM query_runs r WHERE r.account_id=i.account_id AND r.phase='running') ORDER BY j.created_at,i.account_id LIMIT 1`).Scan(&r.Account.ID, &r.Account.AuthIndex, &r.Account.Status)
+		err := tx.QueryRowContext(ctx, `SELECT a.id,a.auth_index,a.status,COALESCE(b.binding,'') FROM job_items i JOIN accounts a ON a.id=i.account_id LEFT JOIN account_bindings b ON b.account_id=a.id JOIN jobs j ON j.id=i.job_id WHERE i.phase='queued' AND NOT EXISTS(SELECT 1 FROM query_runs r WHERE r.account_id=i.account_id AND r.phase='running') ORDER BY j.created_at,i.account_id LIMIT 1`).Scan(&r.Account.ID, &r.Account.AuthIndex, &r.Account.Status, &r.Account.Binding)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -375,12 +381,43 @@ func (s *Store) Finish(ctx context.Context, r Run, quota json.RawMessage, code s
 			return errors.New("stale_query_result")
 		}
 		if code == "" {
-			result, updateErr := tx.ExecContext(ctx, "UPDATE accounts SET quota=?,observed_at=? WHERE id=? AND auth_index=?", string(quota), observedAt, r.Account.ID, r.Account.AuthIndex)
-			if updateErr != nil {
-				return updateErr
-			}
-			if n, _ := result.RowsAffected(); n != 1 {
+			var binding, old string
+			err = tx.QueryRowContext(ctx, "SELECT COALESCE(b.binding,''),COALESCE(a.quota,'') FROM accounts a LEFT JOIN account_bindings b ON b.account_id=a.id WHERE a.id=? AND a.auth_index=?", r.Account.ID, r.Account.AuthIndex).Scan(&binding, &old)
+			if errors.Is(err, sql.ErrNoRows) || err == nil && r.Account.Binding != "" && binding != r.Account.Binding {
 				code = "account_binding_changed"
+			} else if err != nil {
+				return err
+			}
+			if code == "" {
+				var snapshot struct {
+					Binding string `json:"binding"`
+				}
+				_ = json.Unmarshal(quota, &snapshot)
+				if snapshot.Binding != "" {
+					if binding != "" && binding != snapshot.Binding {
+						code = "account_binding_changed"
+					} else {
+						merged, _, e := quotaevidence.Merge([]byte(old), quota)
+						if e != nil {
+							return e
+						}
+						quota = merged
+						var stamp struct {
+							ObservedAt time.Time `json:"observed_at"`
+						}
+						_ = json.Unmarshal(quota, &stamp)
+						observedAt = stamp.ObservedAt.UTC().Format(time.RFC3339Nano)
+					}
+				}
+			}
+			if code == "" {
+				result, updateErr := tx.ExecContext(ctx, "UPDATE accounts SET quota=?,observed_at=? WHERE id=? AND auth_index=?", string(quota), observedAt, r.Account.ID, r.Account.AuthIndex)
+				if updateErr != nil {
+					return updateErr
+				}
+				if n, _ := result.RowsAffected(); n != 1 {
+					code = "account_binding_changed"
+				}
 			}
 		}
 		phase := "completed"
@@ -394,6 +431,7 @@ func (s *Store) Finish(ctx context.Context, r Run, quota json.RawMessage, code s
 		return err
 	})
 }
+
 func (s *Store) Job(ctx context.Context, id string) (Job, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {

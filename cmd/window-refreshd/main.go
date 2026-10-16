@@ -61,7 +61,8 @@ func run() error {
 	workerDone := make(chan struct{})
 	go func() { defer close(workerDone); service.Run(ctx) }()
 	eventsDone := make(chan struct{})
-	go func() { defer close(eventsDone); (ingest.Consumer{Store: st, Link: link}).Run(ctx) }()
+	consumer := &ingest.Consumer{Store: st, Link: link, Inventory: source}
+	go func() { defer close(eventsDone); consumer.Run(ctx) }()
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)

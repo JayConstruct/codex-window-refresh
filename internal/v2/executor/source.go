@@ -13,8 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"codex-window-refresh/internal/core"
-	"codex-window-refresh/internal/cpa"
+	"codex-window-refresh/internal/v2/quota"
 	"codex-window-refresh/internal/v2/store"
 )
 
@@ -97,6 +96,16 @@ type credential struct {
 }
 
 func (c *CPA) binding(ctx context.Context, a store.Account) (credential, error) {
+	cred, err := c.readBinding(ctx, a)
+	if err != nil {
+		return credential{}, err
+	}
+	if cred.Token == "" || len(cred.Token) > 65536 || strings.IndexFunc(cred.Token, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {
+		return credential{}, errors.New("quota_credential_missing")
+	}
+	return cred, nil
+}
+func (c *CPA) readBinding(ctx context.Context, a store.Account) (credential, error) {
 	var runtime struct {
 		Auth authEntry `json:"auth"`
 	}
@@ -123,10 +132,23 @@ func (c *CPA) binding(ctx context.Context, a store.Account) (credential, error) 
 		cred.Token = cred.Fallback
 	}
 	cred.Fallback = ""
-	if cred.Token == "" || len(cred.Token) > 65536 || strings.IndexFunc(cred.Token, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {
-		return credential{}, errors.New("quota_credential_missing")
-	}
 	return cred, nil
+}
+
+func bindingID(a store.Account, upstream string) string {
+	sum := sha256.Sum256([]byte(a.ID + "\x00" + a.AuthIndex + "\x00" + upstream))
+	return hex.EncodeToString(sum[:])
+}
+
+// Identity reads the host binding without requiring a usable access token.
+// Credentials remain transient; only the binding digest leaves this adapter.
+func (c *CPA) Identity(ctx context.Context, a store.Account) (store.Account, error) {
+	cred, err := c.readBinding(ctx, a)
+	if err != nil {
+		return a, err
+	}
+	a.Binding = bindingID(a, cred.Upstream)
+	return a, nil
 }
 func (c *CPA) client(cred credential) (*http.Client, error) {
 	proxy := ""
@@ -195,6 +217,9 @@ func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, erro
 	if err != nil {
 		return nil, err
 	}
+	if a.Binding != "" && a.Binding != bindingID(a, cred.Upstream) {
+		return nil, errors.New("account_binding_changed")
+	}
 	endpoint := c.endpoint
 	if endpoint == "" {
 		endpoint = "https://chatgpt.com/backend-api/wham/usage"
@@ -211,6 +236,7 @@ func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, erro
 	if err != nil {
 		return nil, err
 	}
+	started := time.Now().UTC()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, errors.New("quota_transport_failed")
@@ -240,21 +266,16 @@ func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, erro
 	if err != nil || after.Upstream != cred.Upstream {
 		return nil, errors.New("account_binding_changed")
 	}
-	sum := sha256.Sum256([]byte(a.ID + "\x00" + cred.Upstream))
-	generation := core.CredentialGeneration(hex.EncodeToString(sum[:]))
-	observation, err := cpa.ParseQuota(raw, core.QuotaRead{AccountID: core.AccountID(a.ID), Generation: generation}, time.Now().UTC(), core.ObservationQuery, core.AccountState{})
+	at := time.Now().UTC()
+	if at.Before(started) {
+		return nil, errors.New("quota_clock_changed")
+	}
+	observation, err := quota.Normalize(raw, nil, bindingID(a, cred.Upstream), "cpa_wham_usage", at, started)
 	if err != nil {
 		return nil, errors.New("quota_response_unrecognized")
 	}
 	// Only normalized, allowlisted fields reach durable storage.
-	return json.Marshal(struct {
-		Source     string               `json:"source"`
-		Binding    string               `json:"binding"`
-		ObservedAt time.Time            `json:"observed_at"`
-		Permission *core.Permission     `json:"permission,omitempty"`
-		FiveHour   *core.WindowEvidence `json:"five_hour,omitempty"`
-		Weekly     *core.WindowEvidence `json:"weekly,omitempty"`
-	}{"cpa_wham_usage", string(generation), observation.ReceivedAt, observation.Permission, observation.FiveHour, observation.Weekly})
+	return json.Marshal(observation)
 }
 func (c *CPA) Close() {
 	c.mu.Lock()

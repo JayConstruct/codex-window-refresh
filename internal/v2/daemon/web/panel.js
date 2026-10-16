@@ -69,6 +69,10 @@
     if (current !== generation || !views.accept('overview', sequence, data)) return null;
     if (!data.read_only) throw new Error('后台协议不兼容');
     const activity = data.activity;
+    const inventory = data.inventory;
+    $('inventory').textContent = inventory?.status === 'ready'
+      ? 'CPA 账号已同步 · 最近同步 ' + inventory.last_success_at + ' · 正常业务中的额度信息会自动保存'
+      : 'CPA 账号同步尚未就绪' + (inventory?.error_code ? '：' + inventory.error_code : '') + '；保留已保存结果';
     $('activity').textContent = activity?.connected
       ? '已观测近期身份 ' + activity.observed_recent_users + ' · 在途 ' + activity.observed_active_requests + ' · 未知占用 ' + activity.unknown_requests + ' · ' + (activity.status === 'gap' ? '观测存在缺口：' + activity.reason : '初始在途状态尚未核实')
       : 'CPA 活动观测尚未连接；显示的是已保存数据。';
@@ -79,7 +83,10 @@
       if (current !== generation) return;
       try {
         const data = await overview();
-        if (current === generation && data) $('connection').textContent = '独立后台已连接 · 查询并发 ' + data.query_concurrency;
+        if (current === generation && data) {
+          $('connection').textContent = '独立后台已连接 · 查询并发 ' + data.query_concurrency;
+          if (data.accounts_revision !== accountsRevision) await accounts();
+        }
       } catch (e) {
         if (current !== generation || authenticationFailed(e)) return;
         $('connection').textContent = '后台连接中断，正在重试'; error(e);

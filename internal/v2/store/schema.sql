@@ -1,6 +1,6 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 2 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 3 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
 CREATE TABLE IF NOT EXISTS accounts(
  id TEXT PRIMARY KEY, auth_index TEXT NOT NULL, status TEXT NOT NULL,
  quota TEXT, observed_at TEXT, updated_at TEXT NOT NULL
@@ -78,5 +78,18 @@ CREATE TRIGGER IF NOT EXISTS event_update AFTER UPDATE ON event_state
  WHEN OLD.bridge_instance IS NOT NEW.bridge_instance OR OLD.sequence IS NOT NEW.sequence
  OR OLD.loss_epoch IS NOT NEW.loss_epoch OR OLD.status IS NOT NEW.status OR OLD.reason IS NOT NEW.reason
  OR OLD.connected IS NOT NEW.connected OR OLD.connection_error IS NOT NEW.connection_error BEGIN
+ UPDATE view_state SET revision=revision+1;
+END;
+CREATE TABLE IF NOT EXISTS account_bindings(
+ account_id TEXT PRIMARY KEY REFERENCES accounts(id), binding TEXT NOT NULL,
+ confirmed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inventory_state(
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), status TEXT NOT NULL DEFAULT 'pending',
+ error_code TEXT NOT NULL DEFAULT '', last_success_at TEXT NOT NULL DEFAULT ''
+);
+INSERT OR IGNORE INTO inventory_state(singleton) VALUES(1);
+CREATE TRIGGER IF NOT EXISTS inventory_update AFTER UPDATE ON inventory_state
+ WHEN OLD.status IS NOT NEW.status OR OLD.error_code IS NOT NEW.error_code BEGIN
  UPDATE view_state SET revision=revision+1;
 END;

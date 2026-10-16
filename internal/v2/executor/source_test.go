@@ -82,3 +82,16 @@ func TestQueryNormalizesAndDoesNotPersistCredentials(t *testing.T) {
 		t.Fatal("account replacement during query accepted")
 	}
 }
+
+func TestKnownBindingRejectsReplacementBeforeHTTP(t *testing.T) {
+	host := &fixtureHost{}
+	c := &CPA{Host: host, transport: roundTrip(func(*http.Request) (*http.Response, error) { t.Fatal("query escaped binding fence"); return nil, nil })}
+	a, err := c.Identity(context.Background(), store.Account{ID: "a", AuthIndex: "i", Status: "available"})
+	if err != nil || a.Binding == "" {
+		t.Fatal(err)
+	}
+	host.changed = true
+	if _, err = c.Query(context.Background(), a); err == nil || err.Error() != "account_binding_changed" {
+		t.Fatal("replacement was not rejected", err)
+	}
+}
