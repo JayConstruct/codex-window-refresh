@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import platform
 import struct
@@ -76,6 +77,57 @@ class V2PackageTests(unittest.TestCase):
             self.assertEqual(v2.common.latest_version("amd64"), "v0.1.0-rc.28")
             self.assertEqual(v2.latest("amd64"), self.version)
             with self.assertRaises(v2.InstallError): v2.latest("arm64")
+
+
+class V2CleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.cpa = self.root / "cpa"
+        self.cpa.mkdir()
+        self.plan = dict(directory=self.cpa, binary=self.cpa/"cli-proxy-api", config=self.cpa/"config.yaml",
+                         uid=os.getuid(), plugin_dir=self.cpa/"plugins", plugins={"configs": {}},
+                         data={"auth-dir": str(self.cpa/"auth")})
+        backend = self.cpa / "window-refresh-v2"
+        self.locations = dict(root=backend, data=backend/"data", runtime=backend/"run", record=backend/"installed.json",
+                              unit=self.root/"units/backend.service", dropin=self.root/"units/cpa.d/75-window-refresh-v2.conf")
+        self.current = backend / "releases/v0.2.0-rc.2"
+        self.library = self.plan["plugin_dir"] / "codex-window-refresh-v0.2.0-rc.1.so"
+
+    def put(self, path, text="fixture"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_cleanup_removes_legacy_and_backups_but_keeps_current_data_and_peers(self):
+        old = [self.cpa/"window-refresh.yaml", self.cpa/"window-refresh.env", self.cpa/"window-refresh-state/state.json",
+               self.cpa/"window-refresh-install/backup/private.json", self.cpa/"window-refresh",
+               self.plan["plugin_dir"]/"codex-window-refresh-v0.1.0-rc.28.so",
+               self.plan["plugin_dir"]/"codex-window-refresh.so",
+               self.locations["root"]/"releases/v0.2.0-rc.1/window-refreshd",
+               self.locations["root"]/"backups/old/backend.sqlite"]
+        keep = [self.plan["config"], self.plan["binary"], self.cpa/"auth/account.json", self.library,
+                self.current/"window-refreshd", self.locations["data"]/"backend.sqlite",
+                self.plan["plugin_dir"]/"another-plugin.so", self.cpa/"other-state/data.json"]
+        for path in old + keep: self.put(path)
+        targets = v2.cleanup_plan(self.plan, self.locations, None, self.library, self.current)
+        v2.cleanup_deployment(targets, self.plan, self.locations)
+        for path in old: self.assertFalse(path.exists(), str(path))
+        for path in keep: self.assertEqual(path.read_text(), "fixture", str(path))
+
+    def test_cleanup_refuses_host_auth_current_data_other_plugins_and_symlinks(self):
+        peer = self.cpa / "peer-state"
+        self.plan["plugins"]["configs"]["peer"] = {"state_dir": str(peer)}
+        for path in [self.cpa, self.plan["config"], self.cpa/"auth", self.cpa/"auth/account.json",
+                     self.locations["data"], self.locations["data"]/"backend.sqlite", peer, peer/"data.json"]:
+            with self.subTest(path=path), self.assertRaises(v2.InstallError):
+                v2.validate_cleanup_path(path, self.plan, self.locations)
+        self.put(self.cpa/"auth/account.json")
+        (self.cpa/"window-refresh-state").symlink_to(self.cpa/"auth", target_is_directory=True)
+        with self.assertRaises(v2.InstallError):
+            v2.cleanup_plan(self.plan, self.locations, None, self.library, self.current)
+        self.assertEqual((self.cpa/"auth/account.json").read_text(), "fixture")
 
 
 if __name__ == "__main__":

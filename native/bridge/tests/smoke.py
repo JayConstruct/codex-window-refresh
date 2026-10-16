@@ -295,6 +295,7 @@ class NativeBridge(unittest.TestCase):
         installer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(installer)
         version = (ROOT / 'release/v2-version.txt').read_text().strip()
+        bridge_version = 'v' + (ROOT/'native/bridge/version.h').read_text().split('"')[1]
         packages = self.root / 'packages'
         if os.environ.get('CWR_V2_TEST_ARCHIVE'):
             archive = Path(os.environ['CWR_V2_TEST_ARCHIVE'])
@@ -312,20 +313,32 @@ class NativeBridge(unittest.TestCase):
         config.write_text(original)
         v1state = cpa / 'window-refresh-state'
         v1state.mkdir()
-        (v1state / 'state.json').write_text('{"preserve":"old-unknown-operation"}')
+        (v1state / 'state.json').write_text('{"legacy":"discard-this-data"}')
+        (cpa/'window-refresh.yaml').write_text('enabled: false\n')
+        (cpa/'window-refresh.env').write_text('CPA_MANAGEMENT_KEY=legacy-only\n')
+        (cpa/'plugins').mkdir()
+        (cpa/'plugins/codex-window-refresh-v0.1.0-rc.28.so').write_bytes(b'old plugin')
+        (cpa/'plugins/other-plugin.so').write_bytes(b'preserve other plugin')
+        (cpa/'auth').mkdir()
+        (cpa/'auth/account.json').write_text('{"preserve":"CPA account"}')
         user = pwd.getpwuid(os.getuid()).pw_name
         plan = dict(directory=cpa, binary=ROOT/'bin/window-refreshd', config=config,
                     plugins=installer.common.load_yaml(original)[0]['plugins'], wrapper={}, text=original,
                     plugin_dir=cpa/'plugins', uid=os.getuid(), gid=os.getgid(), user=user,
-                    service=dict(name='fixture-cpa.service', scope='system'))
+                    data={'auth-dir': str(cpa/'auth')}, service=dict(name='fixture-cpa.service', scope='system'))
         actual_paths = installer.paths(plan)
         actual_paths['unit'] = self.root/'units/backend.service'
         actual_paths['dropin'] = self.root/'units/cpa.d/v2.conf'
+        old_dropin = actual_paths['dropin'].with_name('60-window-refresh.conf')
+        old_dropin.parent.mkdir(parents=True)
+        old_dropin.write_text('# Managed by codex-window-refresh installer\n[Service]\nEnvironmentFile="' + str(cpa/'window-refresh.env') + '"\n')
         actions = []
         real_run = subprocess.run
         real_directory = installer.common.directory
         def run_probe(command, *args, **kwargs):
             if command[0] == 'runuser': command = command[4:]
+            if command[0] == 'systemctl':
+                return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
             return real_run(command, *args, **kwargs)
         def service(service, action, *names):
             actions.append((service['name'], action))
@@ -355,8 +368,24 @@ class NativeBridge(unittest.TestCase):
             stack.enter_context(mock.patch.object(installer.common, 'directory', side_effect=lambda path, mode, uid, gid, strict=False: real_directory(path, mode, os.getuid() if uid == 0 else uid, os.getgid() if gid == 0 else gid, strict)))
             stack.enter_context(mock.patch.object(installer.common, 'private_file', side_effect=lambda path: path))
             stack.enter_context(mock.patch.object(installer.subprocess, 'run', side_effect=run_probe))
+            real_initial_ready = installer.wait_ready
+            def reject_first_activation(*arguments, **options):
+                real_initial_ready(*arguments, **options)
+                raise installer.InstallError('injected first activation failure')
+            with mock.patch.object(installer, 'wait_ready', side_effect=reject_first_activation):
+                with self.assertRaises(installer.InstallError): installer.install(args, plan, arch)
+            self.assertTrue((v1state/'state.json').exists())
+            self.assertTrue((cpa/'window-refresh.yaml').exists())
+            self.assertTrue(old_dropin.exists())
+            self.assertTrue((cpa/'plugins/codex-window-refresh-v0.1.0-rc.28.so').exists())
             installer.install(args, plan, arch)
-            self.assertEqual(installer.probe(self.runtime, version)['version'], version)
+            self.assertEqual(installer.probe(self.runtime, version, bridge_version=bridge_version)['version'], version)
+            self.assertFalse(v1state.exists())
+            self.assertFalse((cpa/'window-refresh.yaml').exists())
+            self.assertFalse((cpa/'window-refresh.env').exists())
+            self.assertFalse(old_dropin.exists())
+            self.assertFalse((cpa/'plugins/codex-window-refresh-v0.1.0-rc.28.so').exists())
+            self.assertFalse((actual_paths['root']/'backups').exists())
             status, accepted = self.management('jobs', 'POST', {'kind': 'quota_query'}, 'update-preserves-job')
             self.assertEqual(status, 202)
             job_id = accepted['job_id']
@@ -370,13 +399,29 @@ class NativeBridge(unittest.TestCase):
             plan.update(text=config.read_text(), plugins=data['plugins'], wrapper=data['plugins']['configs'][installer.common.PLUGIN])
             args.restart = False
             actions.clear()
-            old_instance = installer.probe(self.runtime, version)['instance_id']
+            old_instance = installer.probe(self.runtime, version, bridge_version=bridge_version)['instance_id']
+            stale_release = actual_paths['root']/'releases/v0.2.0-rc.1'
+            stale_release.mkdir()
+            (stale_release/'old-binary').write_bytes(b'obsolete backend')
             installer.install(args, plan, arch)
-            ready = installer.probe(self.runtime, version)
+            ready = installer.probe(self.runtime, version, bridge_version=bridge_version)
             self.assertNotEqual(old_instance, ready['instance_id'])
+            self.assertFalse(stale_release.exists())
             self.assertFalse(any(name == 'fixture-cpa.service' for name, _ in actions), actions)
             _, replay = self.management('jobs', 'POST', {'kind': 'quota_query'}, 'update-preserves-job')
             self.assertEqual(replay['job_id'], job_id)
+            # A cleanup error happens after activation: retain the new process
+            # and pending targets, then finish deletion on the next deployment.
+            stale_release.mkdir()
+            (stale_release/'old-binary').write_bytes(b'obsolete backend')
+            with mock.patch.object(installer, 'cleanup_deployment', side_effect=OSError('injected cleanup failure')):
+                with self.assertRaisesRegex(installer.InstallError, '新版本已运行'):
+                    installer.install(args, plan, arch)
+            installer.probe(self.runtime, version, bridge_version=bridge_version)
+            self.assertTrue(json.loads(actual_paths['record'].read_text())['cleanup_pending'])
+            installer.install(args, plan, arch)
+            self.assertFalse(stale_release.exists())
+            self.assertTrue(json.loads(actual_paths['record'].read_text())['cleanup_complete'])
             # Exercise an activation failure after files and SQLite changed.
             real_wait_ready = installer.wait_ready
             def failed_health(*arguments, **options):
@@ -390,7 +435,7 @@ class NativeBridge(unittest.TestCase):
             deadline = time.monotonic()+5
             while time.monotonic()<deadline:
                 try:
-                    installer.probe(self.runtime, version)
+                    installer.probe(self.runtime, version, bridge_version=bridge_version)
                     break
                 except Exception:
                     time.sleep(.025)
@@ -399,7 +444,9 @@ class NativeBridge(unittest.TestCase):
             import sqlite3
             with sqlite3.connect(actual_paths['data']/'backend.sqlite') as database:
                 self.assertEqual(database.execute('PRAGMA user_version').fetchone()[0], 0)
-            self.assertEqual((v1state/'state.json').read_text(), '{"preserve":"old-unknown-operation"}')
+            self.assertFalse(v1state.exists())
+            self.assertEqual((cpa/'auth/account.json').read_text(), '{"preserve":"CPA account"}')
+            self.assertEqual((cpa/'plugins/other-plugin.so').read_bytes(), b'preserve other plugin')
             self.assertIn('fixture-preserved', config.read_text())
             self.assertTrue(data['plugins']['configs']['other']['enabled'])
 

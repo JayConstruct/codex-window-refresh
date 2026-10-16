@@ -93,7 +93,7 @@ curl --unix-socket /absolute/private/run/daemon.sock http://localhost/healthz
 
 `healthz` 验证后台与数据库，不能证明 CPA 接入或上游额度可用。没有接入层时任务保持明确的依赖阻塞，达到从接受时起 2 分钟的依赖等待期限后失败。
 
-当前原生接入层以 CPA 进程环境变量 `CWR_V2_RUNTIME_DIR` 获取相同的私有运行目录。v2 安装器统一生成后台服务及 CPA 环境 drop-in，首次显式重启 CPA。原生测试以模拟服务控制器验证实际包的首次安装、仅重启后台的更新、任务保留和健康失败后的 SQLite 恢复；仍未在真实 CPA/systemd 部署上验收。
+当前原生接入层以 CPA 进程环境变量 `CWR_V2_RUNTIME_DIR` 获取相同的私有运行目录。v2 安装器统一生成后台服务及 CPA 环境 drop-in，首次显式重启 CPA；验证成功后清除 v1 遗留数据、旧版本和临时恢复副本，后续保留 v2 数据。原生测试以模拟服务控制器验证实际包的首次安装、仅重启后台的更新、任务保留和健康失败后的 SQLite 恢复；仍未在真实 CPA/systemd 部署上验收。
 
 ## 原型 API
 

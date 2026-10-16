@@ -11,7 +11,9 @@ import json
 import os
 import pathlib
 import platform
+import pwd
 import re
+import shutil
 import socket
 import sqlite3
 import stat
@@ -133,6 +135,79 @@ def read_record(locations, plan):
     return record
 
 
+def validate_cleanup_path(path, plan, locations):
+    """A plugin cleanup can never include CPA configuration, credentials or peers."""
+    path = common.safe_path(path)
+    protected = [plan["directory"], plan["binary"], plan["config"], plan["plugin_dir"], locations["root"], locations["data"], locations["runtime"], locations["record"], locations["unit"], locations["dropin"]]
+    require(not path.is_relative_to(locations["data"]) and not path.is_relative_to(locations["runtime"]), "清理路径落在当前 v2 数据目录，未删除。")
+    home = pathlib.Path(pwd.getpwuid(plan["uid"]).pw_dir)
+    auth = plan.get("data", {}).get("auth-dir", "~/.cli-proxy-api")
+    if isinstance(auth, str) and auth:
+        auth = pathlib.Path(str(home) + auth[1:] if auth.startswith("~/") else auth)
+        if not auth.is_absolute():
+            processes = common.detect_processes(plan["binary"])
+            working = processes[0].get("cwd") if len(processes) == 1 else None
+            working = working or plan.get("service", {}).get("WorkingDirectory")
+            require(working and pathlib.Path(working).is_absolute(), "无法核实 CPA 相对账号目录，未清理。")
+            auth = pathlib.Path(working) / auth
+        protected.append(common.safe_path(auth))
+        require(not path.is_relative_to(protected[-1]), "清理路径落在 CPA 账号目录内，未删除。")
+    for name, config in plan["plugins"].get("configs", {}).items():
+        if name != common.PLUGIN and isinstance(config, dict):
+            for field in ["config_file", "state_dir"]:
+                value = config.get(field)
+                if isinstance(value, str) and pathlib.Path(value).is_absolute():
+                    peer = common.safe_path(value)
+                    require(not path.is_relative_to(peer), "清理路径与其他插件数据重叠，未删除。")
+                    protected.append(peer)
+    require(not any(p == path or p.is_relative_to(path) for p in protected), "清理路径覆盖 CPA、当前后台或其他插件，未删除。")
+    return path
+
+
+def cleanup_plan(plan, locations, previous, library, release_dir):
+    candidates = []
+    for name, fallback in [("policy", "window-refresh.yaml"), ("state", "window-refresh-state"),
+                           ("env", "window-refresh.env"), ("record", "window-refresh-install")]:
+        candidates.append(pathlib.Path(plan.get(name, plan["directory"] / fallback)))
+    candidates.append(plan["directory"] / "window-refresh")
+    # A rc.1 installation can still reference custom legacy locations. Save the
+    # cleanup list until it finishes, so removing old wrapper fields loses no paths.
+    candidates.extend(pathlib.Path(p) for p in (previous or {}).get("cleanup_pending", []))
+    old_dropin = locations["dropin"].with_name("60-window-refresh.conf")
+    candidates.append(old_dropin)
+    candidates.append(old_dropin.with_name("99-window-refresh-quota-env.conf"))
+    candidates.append(old_dropin.with_name("60-window-refresh.env"))
+    for name in ["codex-window-refresh.so", "codex-window-refresh-v*.so"]:
+        for path in plan["plugin_dir"].glob(name):
+            if path != library and re.fullmatch(r"codex-window-refresh(?:-v\d+\.\d+\.\d+(?:-rc\.[1-9]\d*)?)?\.so", path.name):
+                candidates.append(path)
+    releases = locations["root"] / "releases"
+    if releases.exists():
+        candidates.extend(p for p in releases.iterdir() if p != release_dir and re.fullmatch(r"v0\.2\.\d+-rc\.[1-9]\d*", p.name))
+    result = []
+    for path in candidates:
+        path = validate_cleanup_path(path, plan, locations)
+        require(path not in {library, release_dir} and not library.is_relative_to(path) and not release_dir.is_relative_to(path), "清理目标包含当前版本，未删除。")
+        if path.exists() and path not in result:
+            require(path.is_file() or path.is_dir(), "清理目标不是普通文件或目录。")
+            result.append(path)
+    return result
+
+
+def cleanup_deployment(targets, plan, locations):
+    for target in targets:
+        path = validate_cleanup_path(target, plan, locations)
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    # Recovery copies exist only during activation. A successful deployment
+    # deliberately retains neither old plugin data nor old executable backups.
+    backups = common.safe_path(locations["root"] / "backups")
+    if backups.exists():
+        shutil.rmtree(backups)
+
+
 def probe(runtime, version, host_pid=None, bridge_version=None):
     """Run as the CPA user. Only read local IPC readiness; never query accounts."""
     class HTTP(http.client.HTTPConnection):
@@ -244,12 +319,18 @@ def install(args, plan, arch):
         daemon_service = dict(plan["service"], name=locations["name"])
         # Preserve the existing bridge filename on daemon-only updates, so a
         # config watcher cannot trigger a needless native lifecycle transition.
-        library = pathlib.Path(previous["library"]) if previous and not changed_bridge else plan["plugin_dir"] / f"codex-window-refresh-{args.version}.so"
+        library = pathlib.Path(previous["library"]) if previous and not changed_bridge else plan["plugin_dir"] / f"codex-window-refresh-{bridge_version}.so"
+        cleanup = cleanup_plan(plan, locations, previous, library, release_dir)
+        legacy_dropins = [locations["dropin"].with_name(name) for name in ["60-window-refresh.conf", "99-window-refresh-quota-env.conf"]]
+        require(not any(p.exists() for p in legacy_dropins) or args.restart, "清除旧版服务环境需要显式 --restart；未切换或删除文件。")
         plugins = copy.deepcopy(plan["plugins"])
         plugins.update(enabled=True, dir=str(plan["plugin_dir"]))
         wrapper = plugins.setdefault("configs", {}).setdefault(common.PLUGIN, {})
+        for field in ["config_file", "state_dir", "quota_transport", "management_url", "management_key_env"]:
+            wrapper.pop(field, None)
         wrapper["enabled"] = True
         store = wrapper.setdefault("store", {})
+        store.pop("local-reload-token", None)
         store.update(version=library.name[len("codex-window-refresh-v"):-3], **{"release-tag": "v" + library.name[len("codex-window-refresh-v"):-3]})
         text = common.replace_plugins(plan["text"], plugins)
         binary = release_dir / "window-refreshd"
@@ -277,6 +358,9 @@ def install(args, plan, arch):
                 transaction.write(library, bridge_bytes, 0o644)
             transaction.write(locations["unit"], unit, 0o644)
             transaction.write(locations["dropin"], dropin, 0o644)
+            for legacy_dropin in legacy_dropins:
+                if legacy_dropin.exists():
+                    transaction.remove(legacy_dropin)
             if text != plan["text"]:
                 transaction.write_watched(plan["config"], text.encode(), plan["text"].encode())
             common.service_run(daemon_service, "daemon-reload")
@@ -289,7 +373,7 @@ def install(args, plan, arch):
             record = dict(backend="v2", library=str(library), bridge_sha256=bridge_hash, bridge_version=bridge_version,
                           config=str(plan["config"]), uid=plan["uid"], gid=plan["gid"],
                           service=plan["service"]["name"], scope=plan["service"].get("scope", "system"),
-                          backup=str(backup), hashes=hashes, **ready)
+                          cleanup_pending=[str(p) for p in cleanup], hashes=hashes, **ready)
             transaction.write(locations["record"], (json.dumps(record, indent=2) + "\n").encode(), 0o600)
         except BaseException:
             # Quiesce the new processes before restoring files/database. Never
@@ -313,9 +397,18 @@ def install(args, plan, arch):
             if stopped_cpa:
                 common.service_run(plan["service"], "start", plan["service"]["name"])
             raise
+        # Activation has committed. Cleanup failures must not attempt rollback
+        # after any old data has been deleted; keep the pending list for retry.
+        try:
+            cleanup_deployment(cleanup, plan, locations)
+            record["cleanup_pending"] = []
+            record["cleanup_complete"] = True
+            common.atomic_write(locations["record"], (json.dumps(record, indent=2) + "\n").encode(), 0o600)
+        except (OSError, InstallError):
+            raise InstallError("新版本已运行，但旧版清理未完成；未回退。请重试 v2 部署以继续清理。") from None
         print(f"v2 更新成功：{args.version}；已核对后台版本、接入实例和 CPA PID。")
-        print(f"CPA {'已按 --restart 重启' if stopped_cpa else '未重启'}；备份：{backup}")
-        print("当前仅提供只读额度查询和活动观测；v1 策略、状态保留，自动唤醒和模型生成在 v2 中不执行。")
+        print(f"CPA {'已按 --restart 重启' if stopped_cpa else '未重启'}；已清除 v1 数据、旧版本和临时备份，保留当前 v2 数据。")
+        print("当前仅提供只读额度查询和活动观测；自动唤醒和模型生成在 v2 中不执行。")
 
 
 def main():
@@ -344,7 +437,8 @@ def main():
     print(f"v2 只读后台；CPA 服务：{plan['service']['name']}；运行用户：{plan['user']}")
     print(f"数据：{locations['data']}；运行目录：{locations['runtime']}")
     if args.dry_run:
-        print("仅预览；未下载、写入或重启。首次切换或接入层变化需要 --restart。")
+        print("成功后清除 v1 策略、状态、环境文件、旧插件和后台版本、临时备份；保留当前 v2 数据。")
+        print("仅预览；未下载、写入、清理或重启。首次切换、清理旧服务环境或接入层变化需要 --restart。")
         return
     if args.version == "latest":
         args.version = latest(arch)
