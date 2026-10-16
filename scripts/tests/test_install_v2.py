@@ -79,6 +79,22 @@ class V2PackageTests(unittest.TestCase):
             with self.assertRaises(v2.InstallError): v2.latest("arm64")
 
 
+class V2CPAResourceTests(unittest.TestCase):
+    def test_listener_address_and_tls_are_inferred(self):
+        self.assertEqual(v2.cpa_resource_url({"data": {"host": "0.0.0.0", "port": 9999}}),
+                         "http://127.0.0.1:9999/v0/resource/plugins/codex-window-refresh/healthz")
+        self.assertTrue(v2.cpa_resource_url({"data": {"server": {"host": "::", "port": 9443,
+                            "tls": {"enable": True}}}}).startswith("https://[::1]:9443/"))
+        self.assertTrue(v2.cpa_resource_url({"cpa_url": "https://cpa.example.com:9443/"}).startswith(
+                        "https://cpa.example.com:9443/"))
+
+    def test_resource_probe_never_uses_a_key_or_redirect_address(self):
+        for url in ("http://user:secret@127.0.0.1", "http://127.0.0.1?token=secret",
+                    "http://127.0.0.1/admin", "file:///tmp/daemon.sock", "http://127.0.0.1:0"):
+            with self.subTest(url=url), self.assertRaises(v2.InstallError):
+                v2.cpa_resource_url({"cpa_url": url})
+
+
 class V2CleanupTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

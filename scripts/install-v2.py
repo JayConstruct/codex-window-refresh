@@ -23,6 +23,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 
 spec = importlib.util.spec_from_file_location("cwr_installer_common", pathlib.Path(__file__).with_name("install.py"))
 common = importlib.util.module_from_spec(spec)
@@ -208,7 +209,26 @@ def cleanup_deployment(targets, plan, locations):
         shutil.rmtree(backups)
 
 
-def probe(runtime, version, host_pid=None, bridge_version=None):
+def cpa_resource_url(plan):
+    """Resolve the CPA listener, not a daemon address or an authenticated API."""
+    data = plan.get("data", {})
+    server = data.get("server", {})
+    tls = server.get("tls", data.get("tls", {}))
+    host = server.get("host", data.get("host", "")) or "127.0.0.1"
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    port = server.get("port", data.get("port", 8317))
+    authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    scheme = "https" if isinstance(tls, dict) and tls.get("enable") else "http"
+    base = plan.get("cpa_url") or f"{scheme}://{authority}"
+    parsed = urllib.parse.urlsplit(base)
+    require(parsed.scheme in {"http", "https"} and parsed.hostname and parsed.port != 0
+            and not parsed.username and not parsed.password and not parsed.query and not parsed.fragment
+            and parsed.path in {"", "/"}, "--cpa-url 须为无认证信息和路径的 CPA HTTP(S) 地址。")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc,
+            "/v0/resource/plugins/codex-window-refresh/healthz", "", ""))
+
+
+def probe(runtime, version, host_pid=None, bridge_version=None, resource_url=None):
     """Run as the CPA user. Only read local IPC readiness; never query accounts."""
     class HTTP(http.client.HTTPConnection):
         def connect(self):
@@ -248,6 +268,22 @@ def probe(runtime, version, host_pid=None, bridge_version=None):
     if host_pid is not None:
         parts = hello.get("host_process_id", "").split(":")
         require(len(parts) == 3 and parts[1] == str(host_pid), "接入层不属于当前 CPA 进程。")
+    require(resource_url, "必须经 CPA 资源入口验证插件注册。")
+    url = urllib.parse.urlsplit(resource_url)
+    connection = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    conn = connection(url.hostname, url.port, timeout=2)
+    try:
+        conn.request("GET", url.path, headers={"Cache-Control": "no-cache"})
+        response = conn.getresponse()
+        raw = response.read(65537)
+        require(response.status == 200 and len(raw) <= 65536,
+                "CPA 未注册插件或资源入口不可用。")
+        health = json.loads(raw)
+    finally:
+        conn.close()
+    require(health.get("status") == "ready" and health.get("version") == version[1:]
+            and health.get("read_only") is True and health.get("instance_id") == data["instance_id"],
+            "CPA 资源入口未连接到目标后台实例。")
     return {"version": version, "instance_id": data["instance_id"], "bridge_instance_id": hello["bridge_instance_id"]}
 
 
@@ -255,22 +291,23 @@ def wait_ready(plan, locations, version, bridge_version, timeout=30):
     # A non-root CPA rejects a root socket peer. Use a small stdlib-only probe
     # under the CPA UID instead of copying credentials or weakening peer checks.
     code = ("import pathlib,sys\n" +
-            "\n".join(["import http.client,json,socket,struct", "class InstallError(Exception): pass",
+            "\n".join(["import http.client,json,socket,struct,urllib.parse", "class InstallError(Exception): pass",
                          "def require(ok, message):\n if not ok: raise InstallError(message)"]) + "\n")
     import inspect
-    code += inspect.getsource(probe) + "\nprint(json.dumps(probe(pathlib.Path(sys.argv[1]),sys.argv[2],int(sys.argv[3]),sys.argv[4])))\n"
+    code += inspect.getsource(probe) + "\nprint(json.dumps(probe(pathlib.Path(sys.argv[1]),sys.argv[2],int(sys.argv[3]),sys.argv[4],sys.argv[5])))\n"
+    resource_url = cpa_resource_url(plan)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         processes = common.detect_processes(plan["binary"])
         if len(processes) == 1 and processes[0]["uid"] == plan["uid"]:
-            command = ["python3", "-c", code, str(locations["runtime"]), version, str(processes[0]["pid"]), bridge_version]
+            command = ["python3", "-c", code, str(locations["runtime"]), version, str(processes[0]["pid"]), bridge_version, resource_url]
             if plan["uid"] != 0:
                 command = ["runuser", "-u", plan["user"], "--", *command]
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=6)
             if result.returncode == 0:
                 return json.loads(result.stdout)
         time.sleep(.25)
-    raise InstallError("文件已安装，但未确认目标 CPA 接入层与后台版本连通；不能报告更新成功。")
+    raise InstallError("未确认 CPA 插件注册、资源入口和目标后台连通；请检查 CPA 插件注册日志，不能报告更新成功。")
 
 
 def install(args, plan, arch):
@@ -406,14 +443,14 @@ def install(args, plan, arch):
             common.atomic_write(locations["record"], (json.dumps(record, indent=2) + "\n").encode(), 0o600)
         except (OSError, InstallError):
             raise InstallError("新版本已运行，但旧版清理未完成；未回退。请重试 v2 部署以继续清理。") from None
-        print(f"v2 更新成功：{args.version}；已核对后台版本、接入实例和 CPA PID。")
+        print(f"v2 更新成功：{args.version}；已核对 CPA 注册资源入口、后台版本、接入实例和 CPA PID。")
         print(f"CPA {'已按 --restart 重启' if stopped_cpa else '未重启'}；已清除 v1 数据、旧版本和临时备份，保留当前 v2 数据。")
         print("当前仅提供只读额度查询和活动观测；自动唤醒和模型生成在 v2 中不执行。")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["cpa-dir", "config", "plugin-dir", "working-dir", "user", "service", "package", "checksums"]:
+    for name in ["cpa-dir", "config", "plugin-dir", "working-dir", "user", "service", "package", "checksums", "cpa-url"]:
         parser.add_argument("--" + name)
     parser.add_argument("--version", default="latest")
     for name in ["restart", "user-service", "dry-run"]:
@@ -432,6 +469,8 @@ def main():
     for name, value in dict(model=None, defer_model=True, management_url=None, quota_transport="host", hot_reload=False, check_model=False).items():
         setattr(args, name, value)
     plan = common.infer(args)
+    plan["cpa_url"] = args.cpa_url
+    cpa_resource_url(plan)
     locations = paths(plan)
     common.verify_elf(plan["binary"], arch)
     print(f"v2 只读后台；CPA 服务：{plan['service']['name']}；运行用户：{plan['user']}")

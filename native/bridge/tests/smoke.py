@@ -9,6 +9,7 @@ import ctypes as C
 import contextlib
 import hashlib
 import http.server
+import http.client
 import importlib.util
 import json
 import os
@@ -76,6 +77,88 @@ class NativeBridge(unittest.TestCase):
         self.addCleanup(self.cleanup)
         registration = self.call('plugin.register', {'schema_version': 6})
         self.assertTrue(registration['ok'], registration)
+        self.assert_host_registration(registration)
+
+    @staticmethod
+    def host_accepts_registration(registration):
+        # CPA host.go validPlugin() at pinned upstream 3de4e248f6bb12fc7dfafb183404f3b248578922
+        # requires all four metadata strings before publishing capabilities/routes.
+        result = registration.get('result', {})
+        metadata = result.get('metadata', {})
+        return (registration.get('ok') is True and
+                all(isinstance(metadata.get(key), str) and metadata[key].strip()
+                    for key in ('Name', 'Version', 'Author', 'GitHubRepository')) and
+                result.get('capabilities', {}).get('management_api') is True)
+
+    def assert_host_registration(self, registration):
+        self.assertTrue(self.host_accepts_registration(registration), registration)
+        routes = self.call('management.register', {})
+        self.assertTrue(routes['ok'], routes)
+        menus = [r for r in routes['result']['Resources'] if r.get('Menu')]
+        self.assertEqual(len(menus), 1)
+        self.assertEqual(menus[0]['Path'], '/status')
+        self.assertIn('/healthz', [r['Path'] for r in routes['result']['Resources']])
+
+    @contextlib.contextmanager
+    def cpa_resources(self, registration=None):
+        # Contract fixture: actual native responses and daemon; public HTTP dispatch
+        # is enabled only after the host metadata gate and resource registration.
+        registration = registration or self.call('plugin.register', {'schema_version': 6})
+        accepted = self.host_accepts_registration(registration)
+        routes = self.call('management.register', {})['result']['Resources'] if accepted else []
+        prefix = '/v0/resource/plugins/codex-window-refresh'
+        paths = {prefix + r['Path'] for r in routes}
+        bridge = self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(inner):
+                if inner.path not in paths:
+                    inner.send_response(404)
+                    inner.end_headers()
+                    return
+                result = bridge.call('management.handle', {'Method': 'GET', 'Path': inner.path})['result']
+                body = base64.b64decode(result['Body'])
+                inner.send_response(result['StatusCode'])
+                for name, values in result.get('Headers', {}).items():
+                    for value in values:
+                        inner.send_header(name, value)
+                inner.send_header('Content-Length', str(len(body)))
+                inner.end_headers()
+                inner.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        with http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+            worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=.02))
+            worker.start()
+            try:
+                yield f'http://127.0.0.1:{server.server_port}'
+            finally:
+                server.shutdown()
+                worker.join()
+
+    def test_registration_gate_and_installer_reject_live_but_unregistered_bridge(self):
+        spec = importlib.util.spec_from_file_location('v2_registration_installer', ROOT/'scripts/install-v2.py')
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        self.start_daemon()
+        self.wait_activity(0)
+        version = 'v' + self.rpc('bridge.hello')['result']['version']
+        for omitted in ('Author', 'GitHubRepository'):
+            broken = self.call('plugin.register', {'schema_version': 6})
+            del broken['result']['metadata'][omitted]
+            with self.cpa_resources(broken) as url:
+                # The original installer accepted both live sockets in this state.
+                with self.assertRaisesRegex(installer.InstallError, 'CPA 未注册'):
+                    installer.probe(self.runtime, version, os.getpid(), version,
+                                    url+'/v0/resource/plugins/codex-window-refresh/healthz')
+        with self.cpa_resources() as url:
+            ready = installer.probe(self.runtime, version, os.getpid(), version,
+                                    url+'/v0/resource/plugins/codex-window-refresh/healthz')
+            self.assertEqual(ready['version'], version)
+            with contextlib.closing(http.client.HTTPConnection('127.0.0.1', int(url.rsplit(':', 1)[1]))) as conn:
+                conn.request('GET', '/v0/resource/plugins/codex-window-refresh/status')
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertIn(b'<html', response.read().lower())
 
     def cleanup(self):
         self.release.set()
@@ -457,6 +540,7 @@ class NativeBridge(unittest.TestCase):
         args = type('Args', (), dict(version=version, package=str(archive), checksums=str(sums), restart=True))()
         arch = 'arm64' if os.uname().machine == 'aarch64' else 'amd64'
         with contextlib.ExitStack() as stack:
+            plan['cpa_url'] = stack.enter_context(self.cpa_resources())
             stack.enter_context(mock.patch.object(installer, 'paths', return_value=actual_paths))
             stack.enter_context(mock.patch.object(installer.common, 'service_run', side_effect=service))
             stack.enter_context(mock.patch.object(installer.common, 'detect_processes', return_value=[dict(uid=os.getuid(), pid=os.getpid())]))
@@ -477,7 +561,7 @@ class NativeBridge(unittest.TestCase):
             self.assertTrue(old_dropin.exists())
             self.assertTrue((cpa/'plugins/codex-window-refresh-v0.1.0-rc.28.so').exists())
             installer.install(args, plan, arch)
-            self.assertEqual(installer.probe(self.runtime, version, bridge_version=bridge_version)['version'], version)
+            self.assertEqual(installer.probe(self.runtime, version, bridge_version=bridge_version, resource_url=installer.cpa_resource_url(plan))['version'], version)
             self.assertFalse(v1state.exists())
             self.assertFalse((cpa/'window-refresh.yaml').exists())
             self.assertFalse((cpa/'window-refresh.env').exists())
@@ -497,12 +581,12 @@ class NativeBridge(unittest.TestCase):
             plan.update(text=config.read_text(), plugins=data['plugins'], wrapper=data['plugins']['configs'][installer.common.PLUGIN])
             args.restart = False
             actions.clear()
-            old_instance = installer.probe(self.runtime, version, bridge_version=bridge_version)['instance_id']
+            old_instance = installer.probe(self.runtime, version, bridge_version=bridge_version, resource_url=installer.cpa_resource_url(plan))['instance_id']
             stale_release = actual_paths['root']/'releases/v0.2.0-rc.1'
             stale_release.mkdir()
             (stale_release/'old-binary').write_bytes(b'obsolete backend')
             installer.install(args, plan, arch)
-            ready = installer.probe(self.runtime, version, bridge_version=bridge_version)
+            ready = installer.probe(self.runtime, version, bridge_version=bridge_version, resource_url=installer.cpa_resource_url(plan))
             self.assertNotEqual(old_instance, ready['instance_id'])
             self.assertFalse(stale_release.exists())
             self.assertFalse(any(name == 'fixture-cpa.service' for name, _ in actions), actions)
@@ -515,7 +599,7 @@ class NativeBridge(unittest.TestCase):
             with mock.patch.object(installer, 'cleanup_deployment', side_effect=OSError('injected cleanup failure')):
                 with self.assertRaisesRegex(installer.InstallError, '新版本已运行'):
                     installer.install(args, plan, arch)
-            installer.probe(self.runtime, version, bridge_version=bridge_version)
+            installer.probe(self.runtime, version, bridge_version=bridge_version, resource_url=installer.cpa_resource_url(plan))
             self.assertTrue(json.loads(actual_paths['record'].read_text())['cleanup_pending'])
             installer.install(args, plan, arch)
             self.assertFalse(stale_release.exists())
@@ -533,7 +617,7 @@ class NativeBridge(unittest.TestCase):
             deadline = time.monotonic()+5
             while time.monotonic()<deadline:
                 try:
-                    installer.probe(self.runtime, version, bridge_version=bridge_version)
+                    installer.probe(self.runtime, version, bridge_version=bridge_version, resource_url=installer.cpa_resource_url(plan))
                     break
                 except Exception:
                     time.sleep(.025)

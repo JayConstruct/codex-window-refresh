@@ -528,9 +528,12 @@ static J *proxy(J*req) {
     }
     else if(!strncmp(path,RESOURCE,strlen(RESOURCE))&&strcmp(method,"GET")==0) {
         tail=path+strlen(RESOURCE);
-        if(strcmp(tail,"status")&&strcmp(tail,"panel.js")&&strcmp(tail,"panel.css"))return http_error(404,"not_found");
-        snprintf(endpoint,sizeof(endpoint),"/ui/%s",tail);
-        type=strcmp(tail,"status")==0?"text/html; charset=utf-8":strcmp(tail,"panel.js")==0?"text/javascript; charset=utf-8":"text/css; charset=utf-8";
+        if(!strcmp(tail,"healthz"))snprintf(endpoint,sizeof(endpoint),"/healthz");
+        else {
+            if(strcmp(tail,"status")&&strcmp(tail,"panel.js")&&strcmp(tail,"panel.css"))return http_error(404,"not_found");
+            snprintf(endpoint,sizeof(endpoint),"/ui/%s",tail);
+            type=strcmp(tail,"status")==0?"text/html; charset=utf-8":strcmp(tail,"panel.js")==0?"text/javascript; charset=utf-8":"text/css; charset=utf-8";
+        }
     }
     else return http_error(404,"not_found");
     CURL*curl=curl_easy_init();
@@ -618,6 +621,8 @@ static J *registration(void) {
     json_object_object_add(r,"schema_version",json_object_new_int(6));
     json_object_object_add(metadata,"Name",json_object_new_string("codex-window-refresh"));
     json_object_object_add(metadata,"Version",json_object_new_string(CWR_VERSION));
+    json_object_object_add(metadata,"Author",json_object_new_string("codex-window-refresh contributors"));
+    json_object_object_add(metadata,"GitHubRepository",json_object_new_string("https://github.com/JayConstruct/codex-window-refresh"));
     json_object_object_add(metadata,"ConfigFields",json_object_new_array());
     json_object_object_add(r,"metadata",metadata);
     json_object_object_add(cap,"management_api",json_object_new_boolean(1));
@@ -643,9 +648,9 @@ static J *routes(void) {
         json_object_array_add(list,item);
     }
     const char*assets[]= {
-        "/status","/panel.js","/panel.css"
+        "/status","/panel.js","/panel.css","/healthz"
     };
-    for(int i=0;i<3;i++) {
+    for(int i=0;i<4;i++) {
         J*item=json_object_new_object();
         json_object_object_add(item,"Path",json_object_new_string(assets[i]));
         if(!i)json_object_object_add(item,"Menu",json_object_new_string("Codex Window Refresh v2"));

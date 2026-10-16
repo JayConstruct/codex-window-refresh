@@ -21,7 +21,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.3` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.4` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -29,9 +29,11 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 
 普通 v1 的 `install.sh` 不自动选择 v2 包；检测到已有 v2 安装记录时拒绝覆盖。不能通过旧脚本把正在运行的 v2 改回 v1。
 
-安装器完成以下核对后才报告成功：包的 SHA-256、ELF 架构、glibc 与协议；后台实际报告版本；接入层实际版本；后台消费的接入实例与当前 CPA 进程 PID。安装验证不会查询上游或发起模型请求。生产环境仍需用户通过 CPA 页面验证真实管理认证及账号额度访问。
+安装器完成以下核对后才报告成功：包的 SHA-256、ELF 架构、glibc 与协议；后台实际报告版本；接入层实际版本；后台消费的接入实例与当前 CPA 进程 PID；经 CPA 的公开资源入口返回的健康状态、版本与后台实例 ID。接入层 socket 已启动但 CPA 拒绝注册时，安装失败并回滚。安装验证不会查询上游或发起模型请求。生产环境仍需用户通过 CPA 页面验证真实管理认证及账号额度访问。
 
 网页仍从 CPA 原入口 `/v0/resource/plugins/codex-window-refresh/status` 打开，不额外开放网络端口。刷新网页后使用 CPA 管理密钥连接；密钥只保存在页面内存中。
+
+默认从 CPA 配置推断 HTTP(S) 监听地址。若须使用证书匹配的域名或其他可访问地址，可添加 `--cpa-url https://cpa.example.com:8317`；该地址不带路径或密钥，HTTPS 使用系统证书信任。健康检查仅返回后台就绪状态、版本和实例 ID，不访问账号或发送管理密钥。
 
 ## 文件与服务
 
@@ -47,7 +49,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.3 --package /path/codex-window-refresh-v2_v0.2.0-rc.3_linux_amd64.tar.gz \
+  --version v0.2.0-rc.4 --package /path/codex-window-refresh-v2_v0.2.0-rc.4_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 
