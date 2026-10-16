@@ -2,6 +2,9 @@
 *.dylib
 *.dll
 *.exe
+*.test
+*.pprof
+/coverage.out
 bin/
 dist/
 runtime-state/

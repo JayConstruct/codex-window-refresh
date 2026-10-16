@@ -14,7 +14,7 @@
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh
 ```
 
-root 会话可省略 `sudo`。此命令要求已有 `curl`，缺失时先执行 `sudo apt-get update && sudo apt-get install -y ca-certificates curl`。完整下载成功后才执行脚本，不使用边下载边执行的管道。统一入口自动安装缺少的 `ca-certificates curl python3 python3-yaml`，默认使用 `--version latest --quota-transport host --defer-model --yes --hot-reload`；识别、校验、备份和文件回滚仍由同一个 Python 安装器负责，不复制安装逻辑。旧 `cpa-quota-upgrade.sh` 委托该入口，旧 `cpa-quota-fix.sh` 仅供可选管理桥密钥修复，默认安装不运行它。
+root 会话可省略 `sudo`。此命令要求已有 `curl`，缺失时先执行 `sudo apt-get update && sudo apt-get install -y ca-certificates curl`。完整下载成功后才执行脚本，不使用边下载边执行的管道。统一入口自动安装缺少的 `ca-certificates curl python3 python3-yaml`，默认使用 `--version latest --quota-transport host --defer-model --yes --hot-reload`；识别、校验、备份和文件回滚仍由同一个 Python 安装器负责，不复制安装逻辑。旧 `cpa-quota-upgrade.sh` 委托该入口。旧的独立检查和管理桥修复脚本已移除；模型诊断使用下文的 `--check-model`，可选管理桥通过安装器的 `--quota-transport management` 配置。
 
 首次没有 `--model` 时跳过模型识别，不询问管理密钥，不猜测模型；策略为 `enabled: false`、`execution.model: ""`，自动查询默认关闭，手动查询始终允许。随后在面板填写并保存支持的模型，即可按账号确认手动唤醒；自动查询、自动唤醒需分别手动开启并保存。也可在一行命令末尾加 `--model 实际模型名`，首次写入该模型但仍不自动开启唤醒。已有策略、模型、窗口状态和旧密钥文件在更新时保留，`--defer-model` 不会关闭已开启的模型唤醒。直接使用 Python 安装器且不加此参数时，保留原有交互/模型识别行为。
 

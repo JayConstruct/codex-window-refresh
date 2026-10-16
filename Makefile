@@ -2,7 +2,7 @@ GOCACHE ?= /tmp/codex-window-refresh-go-cache
 export GOCACHE
 export GOTOOLCHAIN := local
 
-.PHONY: check test vet race build plugin native-smoke installer-check panel-check release-check
+.PHONY: check test vet race build plugin native-smoke installer-check panel-check release-check clean
 
 check: test vet
 
@@ -34,3 +34,7 @@ panel-check:
 
 release-check:
 	python3 scripts/release_check.py
+
+clean:
+	rm -rf bin dist scripts/__pycache__ scripts/tests/__pycache__
+	rm -f *.test *.pprof coverage.out
