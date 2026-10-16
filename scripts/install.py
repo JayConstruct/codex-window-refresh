@@ -466,6 +466,11 @@ def latest_version(architecture):
     for page in range(1, 6):
         releases = release_page(page)
         for item in releases:
+            # The independent read-only backend has a separate installer and
+            # assets. Never select it for an existing v1 automatic update.
+            if any(isinstance(asset, dict) and str(asset.get("name", "")).startswith("codex-window-refresh-v2_")
+                   for asset in item.get("assets", []) or []):
+                continue
             key = version_key(item.get("tag_name"))
             if item.get("draft") is False and item.get("published_at") and key is not None:
                 candidates.append((key, item))
@@ -1339,6 +1344,8 @@ def main():
             "--hot-reload 不能与 --restart、--uninstall 或 --check-model 同时使用。")
     require(not args.user_service or args.service, "--user-service 需要同时指定 --service。")
     plan = infer(args)
+    require(not (plan["directory"] / "window-refresh-v2/installed.json").exists(),
+            "此 CPA 已切换到 v2；请使用 scripts/install-v2.sh 更新。回退 v1 需按备份恢复，不能覆盖安装。")
     require(not args.restart or plan["service"], "--restart 需要 --service，或能核实识别的 systemd 服务。")
     verify_elf(plan["binary"], architecture)
     target = "最新发布版本（含 rc 测试版，执行时查询）" if args.version == "latest" else args.version

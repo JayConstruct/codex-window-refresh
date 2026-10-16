@@ -1,0 +1,266 @@
+package executor
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"codex-window-refresh/internal/core"
+	"codex-window-refresh/internal/cpa"
+	"codex-window-refresh/internal/v2/store"
+)
+
+type Callback interface {
+	Call(context.Context, string, any, any) error
+}
+type Source interface {
+	Accounts(context.Context) ([]store.Account, error)
+	Query(context.Context, store.Account) (json.RawMessage, error)
+}
+type CPA struct {
+	Host Callback
+	// Transport and endpoint are private test seams. Production always uses the
+	// fixed quota endpoint and explicitly selected account proxy.
+	endpoint   string
+	transport  http.RoundTripper
+	mu         sync.Mutex
+	transports map[string]*http.Transport
+}
+type authEntry struct {
+	ID          string `json:"id"`
+	Index       string `json:"auth_index"`
+	Provider    string `json:"provider"`
+	Type        string `json:"type"`
+	Disabled    bool   `json:"disabled"`
+	RuntimeOnly bool   `json:"runtime_only"`
+}
+
+func (c *CPA) Accounts(ctx context.Context) ([]store.Account, error) {
+	var list struct {
+		Files []authEntry `json:"files"`
+	}
+	if err := c.Host.Call(ctx, "host.auth.list", struct{}{}, &list); err != nil {
+		return nil, err
+	}
+	if len(list.Files) > 10000 {
+		return nil, errors.New("inventory_too_large")
+	}
+	seen := map[string]bool{}
+	counts := map[string]int{}
+	for _, a := range list.Files {
+		if store.ValidID(a.ID) {
+			counts[a.ID]++
+		}
+	}
+	accounts := []store.Account{}
+	for _, a := range list.Files {
+		if a.Provider != "codex" && !(a.Provider == "" && a.Type == "codex") {
+			continue
+		}
+		if !store.ValidID(a.ID) {
+			continue
+		}
+		if seen[a.ID] {
+			continue
+		}
+		seen[a.ID] = true
+		status := "available"
+		if a.Disabled {
+			status = "disabled"
+		}
+		if a.Index == "" || a.RuntimeOnly || counts[a.ID] > 1 {
+			status = "binding_unavailable"
+			a.Index = ""
+		}
+		accounts = append(accounts, store.Account{ID: a.ID, AuthIndex: a.Index, Status: status})
+	}
+	return accounts, nil
+}
+
+type credential struct {
+	Type       string `json:"type"`
+	Upstream   string `json:"account_id"`
+	Token      string `json:"access_token"`
+	Fallback   string `json:"token"`
+	Proxy      string `json:"proxy_url"`
+	ProxyCamel string `json:"proxyUrl"`
+	ProxyDash  string `json:"proxy-url"`
+	ProxyUpper string `json:"proxyURL"`
+}
+
+func (c *CPA) binding(ctx context.Context, a store.Account) (credential, error) {
+	var runtime struct {
+		Auth authEntry `json:"auth"`
+	}
+	if err := c.Host.Call(ctx, "host.auth.get_runtime", map[string]string{"auth_index": a.AuthIndex}, &runtime); err != nil {
+		return credential{}, err
+	}
+	r := runtime.Auth
+	if r.ID != a.ID || r.Index != a.AuthIndex || r.RuntimeOnly || (r.Provider != "codex" && !(r.Provider == "" && r.Type == "codex")) {
+		return credential{}, errors.New("account_binding_changed")
+	}
+	var raw struct {
+		Index string          `json:"auth_index"`
+		JSON  json.RawMessage `json:"json"`
+	}
+	defer func() { clear(raw.JSON) }()
+	if err := c.Host.Call(ctx, "host.auth.get", map[string]string{"auth_index": a.AuthIndex}, &raw); err != nil {
+		return credential{}, err
+	}
+	var cred credential
+	if len(raw.JSON) > 1<<20 || raw.Index != a.AuthIndex || json.Unmarshal(raw.JSON, &cred) != nil || cred.Type != "codex" || strings.TrimSpace(cred.Upstream) == "" {
+		return credential{}, errors.New("account_binding_changed")
+	}
+	if cred.Token == "" {
+		cred.Token = cred.Fallback
+	}
+	cred.Fallback = ""
+	if cred.Token == "" || len(cred.Token) > 65536 || strings.IndexFunc(cred.Token, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {
+		return credential{}, errors.New("quota_credential_missing")
+	}
+	return cred, nil
+}
+func (c *CPA) client(cred credential) (*http.Client, error) {
+	proxy := ""
+	for _, p := range []string{cred.Proxy, cred.ProxyCamel, cred.ProxyDash, cred.ProxyUpper} {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if strings.EqualFold(p, "none") || strings.EqualFold(p, "direct") {
+			p = "direct"
+		}
+		if proxy != "" && proxy != p {
+			return nil, errors.New("quota_proxy_invalid")
+		}
+		proxy = p
+	}
+	if proxy == "" {
+		proxy = "direct"
+	}
+	transport := c.transport
+	if transport == nil {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.transports == nil {
+			c.transports = map[string]*http.Transport{}
+		}
+		t := c.transports[proxy]
+		if t == nil {
+			t = http.DefaultTransport.(*http.Transport).Clone()
+			t.Proxy = nil
+			t.MaxIdleConns = 16
+			t.MaxIdleConnsPerHost = 4
+			t.IdleConnTimeout = 30 * time.Second
+			if proxy != "direct" {
+				u, err := url.Parse(proxy)
+				if err != nil || u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+					return nil, errors.New("quota_proxy_invalid")
+				}
+				switch strings.ToLower(u.Scheme) {
+				case "http", "https", "socks5", "socks5h":
+				default:
+					return nil, errors.New("quota_proxy_invalid")
+				}
+				t.Proxy = http.ProxyURL(u)
+			}
+			// Bound transports including credential-bearing proxy keys. Active requests
+			// retain their transport; retiring only closes idle connections.
+			if len(c.transports) >= 16 {
+				for key, old := range c.transports {
+					old.CloseIdleConnections()
+					delete(c.transports, key)
+					break
+				}
+			}
+			c.transports[proxy] = t
+		}
+		transport = t
+	}
+	return &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
+}
+func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, error) {
+	if a.Status == "binding_unavailable" || a.AuthIndex == "" {
+		return nil, errors.New("account_identity_unavailable")
+	}
+	cred, err := c.binding(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := c.endpoint
+	if endpoint == "" {
+		endpoint = "https://chatgpt.com/backend-api/wham/usage"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, errors.New("quota_request_invalid")
+	}
+	req.Header.Set("Authorization", "Bearer "+cred.Token)
+	req.Header.Set("Chatgpt-Account-Id", cred.Upstream)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "codex-window-refresh-v2")
+	client, err := c.client(cred)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, errors.New("quota_transport_failed")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		switch resp.StatusCode {
+		case 401:
+			return nil, errors.New("quota_authentication_failed")
+		case 403:
+			return nil, errors.New("quota_upstream_forbidden")
+		case 429:
+			return nil, errors.New("quota_upstream_rate_limited")
+		}
+		return nil, errors.New("quota_upstream_http_failed")
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (2<<20)+1))
+	defer clear(raw)
+	if err != nil {
+		return nil, errors.New("quota_body_failed")
+	}
+	if len(raw) > 2<<20 {
+		return nil, errors.New("quota_response_too_large")
+	}
+	// Revalidate after network work, including the actual upstream account ID.
+	after, err := c.binding(ctx, a)
+	if err != nil || after.Upstream != cred.Upstream {
+		return nil, errors.New("account_binding_changed")
+	}
+	sum := sha256.Sum256([]byte(a.ID + "\x00" + cred.Upstream))
+	generation := core.CredentialGeneration(hex.EncodeToString(sum[:]))
+	observation, err := cpa.ParseQuota(raw, core.QuotaRead{AccountID: core.AccountID(a.ID), Generation: generation}, time.Now().UTC(), core.ObservationQuery, core.AccountState{})
+	if err != nil {
+		return nil, errors.New("quota_response_unrecognized")
+	}
+	// Only normalized, allowlisted fields reach durable storage.
+	return json.Marshal(struct {
+		Source     string               `json:"source"`
+		Binding    string               `json:"binding"`
+		ObservedAt time.Time            `json:"observed_at"`
+		Permission *core.Permission     `json:"permission,omitempty"`
+		FiveHour   *core.WindowEvidence `json:"five_hour,omitempty"`
+		Weekly     *core.WindowEvidence `json:"weekly,omitempty"`
+	}{"cpa_wham_usage", string(generation), observation.ReceivedAt, observation.Permission, observation.FiveHour, observation.Weekly})
+}
+func (c *CPA) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.transports {
+		t.CloseIdleConnections()
+	}
+	c.transports = nil
+}

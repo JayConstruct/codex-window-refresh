@@ -6,6 +6,14 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查�
 
 ## 一键安装或更新
 
+重建后的 **v0.2.0-rc.1 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+
+```sh
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --restart
+```
+
+v2 当前仅提供额度查询和活动观测，尚无唤醒、短句生成或自动规则。首次切换会停止 v1 功能并保留原策略与状态；以后只有后台改变时只重启后台，接入层改变时仍须显式 `--restart`。下面的旧入口继续更新 v1，不会自动切换 v2。
+
 Debian 12/13 已安装 rc.21 或更新版插件时，更新直接执行同一行，默认热重载：
 
 ```sh
@@ -37,6 +45,9 @@ curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/ma
 
 ## 文档
 
+- [后端 v2 只读原型：构建与验证](docs/backend-v2-prototype.md)
+- [后端 v2 安装、脚本更新与回退](docs/backend-v2-install.md)
+- [后端 v2 重建设计（独立后台，兼容现有 CPA；分阶段实现中）](docs/backend-v2-design.md)
 - [面板设计参考与浏览器偏好保存](docs/panel-design-references.md)
 - [用户规则与调度逻辑](docs/codex-refresh-design.md)
 - [核心模型与并发边界](docs/core-architecture.md)
@@ -74,7 +85,7 @@ third_party/  上游许可和固定源码来源清单
 
 ## 本地检查
 
-需要 Go 1.23 或更新版本；依赖 `gopkg.in/yaml.v3`。构建 Linux 插件与加载测试还需 CGO、C 编译器，加载测试需要 Python 3：
+需要 Go 1.23 或更新版本，Go 依赖由 `go.mod` 管理。完整测试包含 v2 SQLite 存储，因此需要 CGO 和 C 编译器；原生加载测试还需要 Python 3。v2 C 接入层的额外依赖和独立构建命令见 [原型说明](docs/backend-v2-prototype.md)。
 
 ```sh
 make check
