@@ -2,9 +2,9 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -133,12 +133,6 @@ func copyConfig(c config.Config) config.Config {
 		enabled := *c.BusinessEnabled
 		out.BusinessEnabled = &enabled
 	}
-	return out
-}
-func cloneState(s core.CoreState) core.CoreState {
-	b, _ := json.Marshal(s)
-	var out core.CoreState
-	_ = json.Unmarshal(b, &out)
 	return out
 }
 func (e *Engine) Snapshot() core.CoreState {
@@ -383,7 +377,7 @@ func (e *Engine) Step(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	before, _ := json.Marshal(e.state)
+	before := stateDigest(e.state)
 	e.reconcileHistory(e.clock.Now())
 	e.startManualQuery()
 	e.startManualWake()
@@ -636,9 +630,19 @@ func (e *Engine) Step(ctx context.Context) error {
 	}
 	return e.commitChanged(ctx, before)
 }
-func (e *Engine) commitChanged(ctx context.Context, before []byte) error {
-	after, _ := json.Marshal(e.state)
-	if bytes.Equal(before, after) {
+
+// Encode directly into the hash: retaining a complete JSON document across a
+// network wait needlessly keeps historical prompts and request records alive.
+func stateDigest(state core.CoreState) [sha256.Size]byte {
+	hash := sha256.New()
+	_ = json.NewEncoder(hash).Encode(state)
+	var result [sha256.Size]byte
+	hash.Sum(result[:0])
+	return result
+}
+
+func (e *Engine) commitChanged(ctx context.Context, before [sha256.Size]byte) error {
+	if before == stateDigest(e.state) {
 		// Query-only outcomes can be terminal without changing durable account
 		// state (for example, an unavailable adapter or an empty inventory).
 		e.measureManualCommit(0)
@@ -647,7 +651,7 @@ func (e *Engine) commitChanged(ctx context.Context, before []byte) error {
 	}
 	return e.commit(ctx)
 }
-func (e *Engine) failStep(ctx context.Context, before []byte, code string) error {
+func (e *Engine) failStep(ctx context.Context, before [sha256.Size]byte, code string) error {
 	e.drain()
 	if err := e.commitChanged(ctx, before); err != nil {
 		return err

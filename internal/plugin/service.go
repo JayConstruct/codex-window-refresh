@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +29,7 @@ import (
 )
 
 const ID = "codex-window-refresh"
-const Version = "0.1.0-rc.27"
+const Version = "0.1.0-rc.28"
 const Repository = "https://github.com/JayConstruct/codex-window-refresh"
 const SchemaVersion = 6
 const ManagementPrefix = "/v0/management/" + ID
@@ -324,7 +325,7 @@ func (s *Service) configureContext(lifecycleContext context.Context, payload []b
 	if stopping && !quiesced {
 		return errors.New("plugin is stopping; process restart required")
 	}
-	if existing != nil && !wrapper.samePlumbing(previous) {
+	if (existing != nil || (quiesced && previous.ConfigFile != "")) && !wrapper.samePlumbing(previous) {
 		return errors.New("wrapper plumbing changes require process restart")
 	}
 	if quiesced {
@@ -502,7 +503,15 @@ func (s *Service) stopRuntime(ctx context.Context) error {
 	s.cancel = nil
 	s.done = nil
 	s.host = nil
+	// CPA retains retired libraries for rollback. Keeping the engine here also
+	// retains both durable state and its published snapshot in every old runtime.
+	// Rollback creates a fresh engine from the committed state after taking its lock.
+	s.engine = nil
+	s.responseQuota = cpa.ResponseQuotaObserver{}
 	s.mu.Unlock()
+	// A retired Go shared library can remain idle forever. Return its unused
+	// heap now rather than waiting for another allocation to trigger collection.
+	debug.FreeOSMemory()
 	return nil
 }
 
@@ -530,6 +539,8 @@ func (s *Service) WaitForShutdown() {
 	s.cancel = nil
 	s.done = nil
 	s.host = nil
+	s.engine = nil
+	s.responseQuota = cpa.ResponseQuotaObserver{}
 	s.mu.Unlock()
 }
 

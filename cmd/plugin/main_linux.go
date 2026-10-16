@@ -86,8 +86,7 @@ func main() {}
 type runtimeEngine struct{ *scheduler.Engine }
 
 func (e runtimeEngine) Diagnostics() (core.HostCapabilities, string, int) {
-	s := e.Status()
-	return s.Capabilities, s.LastError, s.EffectiveConcurrency
+	return e.Engine.Diagnostics()
 }
 func engineFactory(cfg config.Config, host core.Host, store core.Store, clock core.Clock, random core.Random) (pluginservice.Engine, error) {
 	e, err := scheduler.New(cfg, host, store, clock, random)

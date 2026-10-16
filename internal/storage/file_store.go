@@ -2,7 +2,6 @@
 package storage
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -39,6 +38,8 @@ type FileStore struct {
 	dirInfo     os.FileInfo
 	lock        *os.File
 	fingerprint [32]byte
+	revision    uint64
+	initial     *core.CoreState // ownership transfers to the first successful Load
 	exists      bool
 	poisoned    error
 	closed      bool
@@ -75,12 +76,14 @@ func Open(dir string) (*FileStore, error) {
 		return nil, err
 	}
 	s := &FileStore{dir: abs, dirInfo: info, lock: lock, syncDirectory: (*os.File).Sync}
-	_, sum, exists, err := s.readDisk()
+	state, sum, exists, err := s.readDisk()
 	if err != nil {
 		_ = closeProcessLock(lock)
 		return nil, err
 	}
 	s.fingerprint, s.exists = sum, exists
+	s.revision = state.Revision
+	s.initial = &state
 	return s, nil
 }
 
@@ -91,6 +94,17 @@ func (s *FileStore) Load(ctx context.Context) (core.CoreState, error) {
 	defer s.mu.Unlock()
 	if err := s.check(ctx); err != nil {
 		return core.CoreState{}, err
+	}
+	if s.initial != nil {
+		if err := s.checkCurrent(); err != nil {
+			return core.CoreState{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return core.CoreState{}, err
+		}
+		state := *s.initial
+		s.initial = nil
+		return state, nil
 	}
 	state, err := s.readCurrent()
 	if err != nil {
@@ -113,11 +127,10 @@ func (s *FileStore) Commit(ctx context.Context, expectedRevision uint64, next co
 	if err := s.check(ctx); err != nil {
 		return 0, err
 	}
-	current, err := s.readCurrent()
-	if err != nil {
+	if err := s.checkCurrent(); err != nil {
 		return 0, err
 	}
-	if current.Revision != expectedRevision {
+	if s.revision != expectedRevision {
 		return 0, ErrRevisionConflict
 	}
 	if expectedRevision == math.MaxUint64 {
@@ -156,7 +169,7 @@ func (s *FileStore) Commit(ctx context.Context, expectedRevision uint64, next co
 	}
 	// Recheck the pathname immediately before replacement. Cooperative writers
 	// cannot race this check because the process lock remains held.
-	if _, err := s.readCurrent(); err != nil {
+	if err := s.checkCurrent(); err != nil {
 		return 0, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -178,6 +191,8 @@ func (s *FileStore) Commit(ctx context.Context, expectedRevision uint64, next co
 		return 0, s.poison(fmt.Errorf("storage: close directory after replacement: %w", closeErr))
 	}
 	s.fingerprint, s.exists = sha256.Sum256(data), true
+	s.revision = next.Revision
+	s.initial = nil
 	return next.Revision, nil
 }
 
@@ -188,6 +203,7 @@ func (s *FileStore) Close() error {
 		return nil
 	}
 	s.closed = true
+	s.initial = nil
 	return closeProcessLock(s.lock)
 }
 
@@ -217,46 +233,86 @@ func (s *FileStore) readCurrent() (core.CoreState, error) {
 	return state, nil
 }
 
-func (s *FileStore) readDisk() (core.CoreState, [32]byte, bool, error) {
-	var zero [32]byte
+// Revalidate every byte without rebuilding the entire object graph twice per
+// commit. The revision belongs to the fingerprint validated by Open/Commit.
+func (s *FileStore) checkCurrent() error {
+	f, err := s.openDisk()
+	if err != nil {
+		return s.poison(err)
+	}
+	if f == nil {
+		if s.exists {
+			return s.poison(ErrExternalChange)
+		}
+		return nil
+	}
+	defer f.Close()
+	hash := sha256.New()
+	count, err := io.Copy(hash, io.LimitReader(f, maxStateBytes+1))
+	if err != nil {
+		return s.poison(fmt.Errorf("storage: read state: %w", err))
+	}
+	if count > maxStateBytes {
+		return s.poison(errors.New("storage: state exceeds size limit"))
+	}
+	var sum [32]byte
+	hash.Sum(sum[:0])
+	if !s.exists || sum != s.fingerprint {
+		return s.poison(ErrExternalChange)
+	}
+	return nil
+}
+
+func (s *FileStore) openDisk() (*os.File, error) {
 	info, err := os.Lstat(s.dir)
 	if err != nil || !os.SameFile(s.dirInfo, info) || !info.IsDir() || info.Mode().Perm() != 0700 || !ownedByCurrentUser(info) {
-		return core.CoreState{}, zero, false, errors.New("storage: state directory changed or is inaccessible")
+		return nil, errors.New("storage: state directory changed or is inaccessible")
 	}
 	if err := checkProcessLock(s.lock, filepath.Join(s.dir, ".lock")); err != nil {
-		return core.CoreState{}, zero, false, err
+		return nil, err
 	}
 	path := filepath.Join(s.dir, "state.json")
 	info, err = os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("storage: stat state: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || !ownedByCurrentUser(info) {
+		return nil, errors.New("storage: state must be an owned regular file with mode 0600")
+	}
+	if info.Size() > maxStateBytes {
+		return nil, errors.New("storage: state exceeds size limit")
+	}
+	f, err := openStateRead(path)
+	if err != nil {
+		return nil, fmt.Errorf("storage: open state: %w", err)
+	}
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		_ = f.Close()
+		return nil, errors.New("storage: state file changed during read")
+	}
+	return f, nil
+}
+
+func (s *FileStore) readDisk() (core.CoreState, [32]byte, bool, error) {
+	var zero [32]byte
+	f, err := s.openDisk()
+	if err != nil {
+		return core.CoreState{}, zero, false, err
+	}
+	if f == nil {
 		state := core.CoreState{}
 		initializeMaps(&state)
 		return state, zero, false, nil
 	}
-	if err != nil {
-		return core.CoreState{}, zero, false, fmt.Errorf("storage: stat state: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || !ownedByCurrentUser(info) {
-		return core.CoreState{}, zero, false, errors.New("storage: state must be an owned regular file with mode 0600")
-	}
-	f, err := openStateRead(path)
-	if err != nil {
-		return core.CoreState{}, zero, false, fmt.Errorf("storage: open state: %w", err)
-	}
 	defer f.Close()
-	opened, err := f.Stat()
-	if err != nil || !os.SameFile(info, opened) {
-		return core.CoreState{}, zero, false, errors.New("storage: state file changed during read")
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxStateBytes+1))
-	if err != nil {
-		return core.CoreState{}, zero, false, fmt.Errorf("storage: read state: %w", err)
-	}
-	if len(data) > maxStateBytes {
-		return core.CoreState{}, zero, false, errors.New("storage: state exceeds size limit")
-	}
+	hash := sha256.New()
+	limited := &io.LimitedReader{R: f, N: maxStateBytes + 1}
 	var saved envelope
-	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder := json.NewDecoder(io.TeeReader(limited, hash))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&saved); err != nil {
 		return core.CoreState{}, zero, false, errors.New("storage: corrupt or incompatible state JSON")
@@ -267,8 +323,13 @@ func (s *FileStore) readDisk() (core.CoreState, [32]byte, bool, error) {
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return core.CoreState{}, zero, false, errors.New("storage: trailing state JSON")
 	}
+	if limited.N == 0 {
+		return core.CoreState{}, zero, false, errors.New("storage: state exceeds size limit")
+	}
 	initializeMaps(saved.State)
-	return *saved.State, sha256.Sum256(data), true, nil
+	var sum [32]byte
+	hash.Sum(sum[:0])
+	return *saved.State, sum, true, nil
 }
 
 func initializeMaps(state *core.CoreState) {

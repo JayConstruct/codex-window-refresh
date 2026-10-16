@@ -106,6 +106,68 @@ func TestRevisionCASDoesNotOverwrite(t *testing.T) {
 	}
 }
 
+func TestInitialStateTransferRevalidatesFileAndDoesNotRetainCallerState(t *testing.T) {
+	store, dir := openTestStore(t)
+	if _, err := store.Commit(context.Background(), 0, dispatchState()); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+	store, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.initial != nil {
+		t.Fatal("store retains transferred state")
+	}
+	first.Accounts["account-a"].Task.OperationID = "mutated"
+	second, err := store.Load(context.Background())
+	if err != nil || second.Accounts["account-a"].Task.OperationID != "operation-a" {
+		t.Fatal("later load reused caller's state", err)
+	}
+	_ = store.Close()
+	store, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"schema":1,"state":{"Revision":99}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(context.Background()); !errors.Is(err, ErrExternalChange) {
+		t.Fatal("first load accepted changed bytes", err)
+	}
+}
+
+func TestCommitFingerprintRejectsExternalEditWithoutPriorLoad(t *testing.T) {
+	store, dir := openTestStore(t)
+	if _, err := store.Commit(context.Background(), 0, dispatchState()); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "state.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Whitespace changes keep the same revision and valid JSON; all bytes must
+	// still be checked before overwriting the pathname.
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Commit(context.Background(), 1, dispatchState()); !errors.Is(err, ErrExternalChange) {
+		t.Fatal("commit accepted external edit", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(data) {
+		t.Fatal("external edit was overwritten")
+	}
+}
+
 func TestConcurrentCASAllowsOneWriter(t *testing.T) {
 	store, _ := openTestStore(t)
 	var workers sync.WaitGroup

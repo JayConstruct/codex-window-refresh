@@ -29,7 +29,7 @@ func (e *Engine) canQuerySelectedAccount() bool {
 		(e.manualQuery.Phase == "queued" || e.manualQuery.Phase == "running")
 }
 
-func (e *Engine) stepSelectedAccountQuery(ctx context.Context, before []byte) error {
+func (e *Engine) stepSelectedAccountQuery(ctx context.Context, before [32]byte) error {
 	id := e.manualQuery.AccountID
 	if !e.caps.QuotaAdapterReady {
 		e.stepManualQuery(ctx)

@@ -31,6 +31,9 @@ func TestQuiesceHandsOffRealStateLockAndResumesAfterFailedReplacement(t *testing
 		t.Fatal("two instances acquired the state lock")
 	}
 	rpcResult(t, s.Handle(ctx, "plugin.quiesce", nil))
+	if s.engine != nil || s.host != nil || s.store != nil {
+		t.Fatal("retired library retains its engine, account state or host")
+	}
 	rpcResult(t, s.Handle(ctx, "plugin.quiesce", nil))
 	phase := managementCall(t, s, "GET", ManagementPrefix+"/lifecycle")
 	var status struct{ Phase string }
@@ -51,6 +54,9 @@ func TestQuiesceHandsOffRealStateLockAndResumesAfterFailedReplacement(t *testing
 	}
 	if err := s.Shutdown(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if s.engine != nil {
+		t.Fatal("shutdown retains scheduler state")
 	}
 	if err := s.configure(payload); err == nil {
 		t.Fatal("final shutdown was incorrectly resumable")

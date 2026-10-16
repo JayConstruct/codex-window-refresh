@@ -44,8 +44,12 @@ func (e *Engine) reconcileHistory(now time.Time) {
 		}
 	}
 	if len(entries) > maximumHistoryEntries {
-		entries = entries[len(entries)-maximumHistoryEntries:]
+		copy(entries, entries[len(entries)-maximumHistoryEntries:])
+		entries = entries[:maximumHistoryEntries]
 	}
+	// Pruned prompts and source slices must not remain reachable in the unused
+	// part of the backing array, including after history reaches its entry limit.
+	clear(e.state.History[len(entries):])
 	e.state.History = entries
 }
 
