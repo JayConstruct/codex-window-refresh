@@ -10,9 +10,11 @@ rc.8 支持可编辑候选生成提示词及 Codex 模型唤醒，数据库由 s
 
 rc.9 修复编辑焦点、完整窗口倒计时，增加按账号读取模型目录、Codex 风格提示词草稿及账号状态显示/筛选。数据库保持 schema 8，原生接入层源码和版本保持 rc.8；安装器按真实文件校验和判断是否需要重启 CPA，不仅比较版本号。从 rc.8 更新时，只有接入层文件一致才可省略 `--restart`；首次切换、旧接入层或文件变化仍须显式 `--restart`。详见 [rc.9 发布说明](releases/v0.2.0-rc.9.md)。
 
+rc.10 保留候选、账号及历史控件的焦点和详情展开状态，修复轮询取消确认、无关历史读取禁用输入及分页读取竞争。数据库仍为 schema 8、原生接入层仍为 rc.8；从 rc.9 更新时，安装器确认接入层文件完全一致后可仅重启后台。详见 [rc.10 发布说明](releases/v0.2.0-rc.10.md)。
+
 首次升级 rc.8 时先保持自动唤醒及五小时、周、每日规则关闭，核对实际模型、时区与允许时段，再显式手动唤醒一个测试账号。手动操作会先只读查额度和活动保护，可能跳过或阻塞，不保证一定发送；若发送则可能消耗模型额度。模型完成与窗口核实分开显示，结果未知不得换新键重复发送。确认行为后再按需保存开启自动规则。自动规则默认关闭并不覆盖旧版中用户已经明确保存的设置。
 
-升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.9 发布说明](releases/v0.2.0-rc.9.md)。
+升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.10 发布说明](releases/v0.2.0-rc.10.md)。
 
 旧后台不能直接打开迁移后的新库，回退必须停服务并恢复升级前一致的数据库备份，不能仅替换旧二进制。安装器激活失败时会使用临时一致备份恢复，但成功后会清理该副本；需要日后手动降级时，升级前须另行保存停机或 SQLite 在线一致备份。
 
@@ -35,7 +37,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.9` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.10` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -63,7 +65,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.9 --package /path/codex-window-refresh-v2_v0.2.0-rc.9_linux_amd64.tar.gz \
+  --version v0.2.0-rc.10 --package /path/codex-window-refresh-v2_v0.2.0-rc.10_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 

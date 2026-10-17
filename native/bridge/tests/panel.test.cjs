@@ -144,12 +144,14 @@ test('HTTP deployments can use getRandomValues when randomUUID is unavailable', 
 function panel(respond, options = {}) {
   class Element {
     constructor(tag = 'div') {
+      this.nodeType = tag === '#text' ? 3 : 1;
       this.tagName = tag; this.children = []; this.value = ''; this.checked = false; this.disabled = false; this.hidden = false; this.dataset = {};
       this.attributes = new Map(); this.listeners = new Map(); this._text = ''; this.parentNode = null;
       this.classList = {toggle() {}};
     }
     set textContent(value) { this._text = String(value); this.children = []; }
     get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
+    get childNodes() { return this.children; }
     replaceChildren(...children) { this._text = ''; this.children = []; this.append(...children); }
     append(...children) {
       for (const child of children) {
@@ -158,8 +160,17 @@ function panel(respond, options = {}) {
       }
     }
     setAttribute(name, value) { this.attributes.set(name, value); }
+    getAttributeNames() { return [...this.attributes.keys()]; }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    hasAttribute(name) { return this.attributes.has(name); }
     removeAttribute(name) { this.attributes.delete(name); }
     addEventListener(name, callback) { this.listeners.set(name, callback); }
+    insertBefore(child, before) {
+      if (child.parentNode) child.parentNode.removeChild(child);
+      const index = before ? this.children.indexOf(before) : this.children.length;
+      this._text = ''; child.parentNode = this; this.children.splice(index, 0, child);
+    }
+    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; return child; }
   }
   const elements = new Map(), timers = new Map(), calls = [], events = new Map(), storage = options.storage || {};
   let nextTimer = 0;
@@ -293,6 +304,52 @@ test('background quota changes reload the table after the overview revision adva
   await ui.get('connect').onclick(); await ui.tick(5000);
   assert.equal(accounts, 2); assert.match(ui.get('accounts').textContent, /updated/);
   assert.equal(ui.calls.filter(call => call.method === 'POST').length, 0);
+});
+test('account updates reuse rows and buttons while refreshing quota, labels and event handlers', async () => {
+  let revision = 0;
+  const ui = panel(url => url.endsWith('/overview') ? [200, overview(++revision)] : [200, accountPage(revision, [{id: 'stable-account', status: revision === 1 ? 'available' : 'disabled', pending_query: revision === 1 ? {phase: 'queued', trigger: 'manual_batch'} : undefined}])]);
+  await ui.get('connect').onclick();
+  const row = ui.get('accounts').children[0], action = row.children[5], button = action.children[0];
+  await ui.tick(5000);
+  assert.equal(ui.get('accounts').children[0], row);
+  assert.equal(row.children[5].children[0], button);
+  assert.match(row.textContent, /已禁用/);
+  assert.equal(action.children.length, 1);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('query history keeps expanded results and the same summary while task progress changes', async () => {
+  let revision = 1;
+  const summary = () => ({id: 'stable-history', phase: 'running', total: 1, completed: revision > 1 ? 1 : 0, failed: 0});
+  const ui = panel(url => url.includes('/jobs?job_id=') ? [200, {...view('a', revision), job_id: 'stable-history', phase: 'running', items: [{account_id: 'one', phase: 'running'}]}] : url.endsWith('/overview') ? [200, {...overview(revision), dashboard: {...overview().dashboard, recent_jobs: [summary()]}}] : [200, accountPage()]);
+  await ui.get('connect').onclick();
+  const button = ui.get('history-list').children[0].children.at(-1); await button.onclick();
+  const card = ui.get('history-list').children[0], details = card.children.find(node => node.tagName === 'details');
+  const heading = details.children[0]; details.open = true;
+  revision++; await ui.tick(1500);
+  assert.equal(ui.get('history-list').children[0], card);
+  assert.equal(card.children.find(node => node.tagName === 'details'), details);
+  assert.equal(details.children[0], heading); assert.equal(details.open, true);
+});
+test('background account reads do not disable pagination and obsolete errors cannot reset a newer page', async () => {
+  let reads = 0, revision = 0, releaseBackground, releasePage;
+  const response = () => [200, {...accountPage(revision), next_after: 'cursor'}];
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) return [200, overview(++revision)];
+    reads++;
+    if (reads === 2) return new Promise(resolve => { releaseBackground = () => resolve([409, {error: 'view_changed'}]); });
+    if (reads === 3) return new Promise(resolve => { releasePage = () => resolve(response()); });
+    return response();
+  });
+  await ui.get('connect').onclick();
+  const polling = ui.tick(5000); await flush();
+  assert.equal(ui.get('next').disabled, false);
+  const paging = ui.get('next').onclick(); await flush();
+  assert.equal(ui.get('next').disabled, true);
+  releaseBackground(); await polling;
+  assert.equal(ui.get('next').disabled, true);
+  assert.equal(reads, 3, 'An obsolete background failure reset the new page');
+  releasePage(); await paging;
+  assert.equal(ui.get('next').disabled, false);
 });
 test('periodic status reads update disabled, exhausted and recovered badges without requesting quota', async () => {
   let revision = 0;
@@ -960,6 +1017,16 @@ test('Codex style preset changes only prompt draft and never saves or generates 
   assert.equal(ui.get('model-save').disabled, false);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
+test('unchanged model polling does not dismiss a pending phrase clear confirmation', async () => {
+  const ui = panel(url => modelResponse(url, modelSettings(1, modelConfig({phrases: ['保留的短句']}))));
+  await openModels(ui); ui.get('model-clear').onclick();
+  assert.equal(ui.get('model-confirmation').hidden, false);
+  await ui.tick(5000);
+  assert.equal(ui.get('model-confirmation').hidden, false);
+  assert.equal(ui.get('model-phrases').value, '保留的短句');
+  ui.get('model-cancel-action').onclick(); assert.equal(ui.get('model-confirmation').hidden, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
 test('generation prompt validation accepts legacy omissions and empty defaults but enforces bytes and controls', () => {
   const draft = modelConfigDraft(modelConfig());
   assert.equal(draft.generation_prompt, ''); assert.equal(validateModelDraft(draft).config.generation_prompt, '');
@@ -1436,6 +1503,21 @@ test('candidate all-select and navigation preserve results without implicitly ap
   ui.get('generation-select-all').onclick(); ui.get('generation-apply').onclick();
   assert.equal(ui.get('model-phrases').value, '第一句\n第二句'); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
 });
+test('candidate checkboxes keep their nodes and keyboard-toggle handlers through repeated renders', async () => {
+  const ui = panel(url => url.includes('/prompt-generations') ? [200, {...view(), job_id: 'stable-candidates', phase: 'completed', candidates: ['第一句', '第二句']}] : modelResponse(url));
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  const label = ui.get('generation-candidates').children[0], checkbox = label.children[0];
+  checkbox.checked = true; checkbox.onchange();
+  assert.equal(ui.get('generation-candidates').children[0], label);
+  assert.equal(label.children[0], checkbox);
+  await ui.tick(5000);
+  assert.equal(label.children[0], checkbox); assert.equal(checkbox.checked, true);
+  checkbox.checked = false; checkbox.onchange();
+  assert.equal(ui.get('generation-apply').disabled, true);
+  checkbox.checked = true; checkbox.onchange(); ui.get('generation-apply').onclick();
+  assert.equal(ui.get('model-phrases').value, '第一句');
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
 test('lost generation acknowledgement never automatically retries and explicit verification keeps the exact key and body', async () => {
   let posts = 0;
   const ui = panel((url, options) => {
@@ -1592,6 +1674,34 @@ test('wake reads are capability gated, defaults stay off and opening or refreshi
   assert.equal(ui.get('auto-wake').checked, false); assert.equal(ui.get('auto-wake').disabled, false);
   ui.nav.find(node => node.dataset.page === 'wake').listeners.get('click')(); await flush(); await ui.get('wake-history-refresh').onclick();
   assert.equal(ui.get('wake-enabled').checked, false); assert.equal(ui.get('wake-manual-submit').disabled, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('unchanged wake polling preserves consent but changed rules and explicit reload clear it', async () => {
+  let settings = wakeSettings();
+  const ui = panel(url => wakeResponse(url, settings)); await openWake(ui);
+  ui.get('wake-settings-consent').checked = true; ui.get('wake-settings-consent').onchange();
+  await ui.tick(5000); assert.equal(ui.get('wake-settings-consent').checked, true);
+  settings = wakeSettings(2, wakeConfig({accounts_per_user: 0.5}));
+  await ui.tick(5000); assert.equal(ui.get('wake-settings-consent').checked, false);
+  ui.get('wake-settings-consent').checked = true;
+  await ui.get('wake-settings-reload').onclick();
+  assert.equal(ui.get('wake-settings-consent').checked, false);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('reading historical wake results does not disable an unrelated manual account draft', async () => {
+  let release;
+  const job = {...view(), job_id: 'historic', account_id: 'historic-account', phase: 'completed'};
+  const ui = panel(url => url.includes('/wake-jobs?job_id=') ? new Promise(resolve => { release = () => resolve([200, job]); }) : url.includes('/wake-jobs?limit=') ? [200, {...view(), jobs: [job]}] : wakeResponse(url));
+  await openWake(ui); ui.get('wake-account').value = 'new-draft';
+  const card = ui.get('wake-history').children[0], button = card.children.at(-1);
+  const reading = button.onclick(); await flush();
+  assert.equal(ui.get('wake-history').children[0], card);
+  assert.equal(card.children.at(-1), button);
+  assert.equal(ui.get('wake-manual-fields').disabled, false);
+  assert.equal(ui.get('wake-manual-submit').disabled, true);
+  release(); await reading;
+  assert.equal(ui.get('wake-account').value, 'new-draft');
+  assert.equal(card.children.at(-1), button);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
 test('wake opt-in requires a rule and separate spend consent; saving uses only wake revision and config', async () => {

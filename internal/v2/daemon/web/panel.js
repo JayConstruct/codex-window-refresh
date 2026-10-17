@@ -334,7 +334,38 @@
   Object.assign(codes, {prompt_generation_unavailable: '后台未提供候选生成功能', invalid_prompt_generation: '生成参数无效，请检查账号、模型和数量', generation_account_unavailable: '生成账号不可用或凭据绑定已变化，请检查账号状态', generation_response_invalid: '模型返回的候选短句无效', generation_request_rejected: '模型请求被拒绝', generation_interrupted: '生成被中断，可能已消耗额度', generation_outcome_unknown: '生成结果未知，可能已消耗额度', idempotency_key_required: '缺少有效的请求标识', job_id_required: '缺少有效的生成任务标识'});
   const settingsFields = {automatic: 'settings-automatic', fiveHour: 'settings-five-hour', weekly: 'settings-weekly', interval: 'settings-interval', timezone: 'settings-timezone', delayMin: 'settings-delay-min', delayMax: 'settings-delay-max', excluded: 'settings-excluded'};
   const pending = new Map(), controllers = new Set(), queryBusy = new Set(), unresolved = new Map();
-  const setText = (id, text) => { if ($(id)) $(id).textContent = text; };
+  const setText = (id, text) => { if ($(id) && $(id).textContent !== String(text)) $(id).textContent = text; };
+  function updateChildren(parent, children) {
+    const previous = Array.from(parent.childNodes);
+    const keyed = new Map(previous.filter(node => node.dataset?.renderKey).map(node => [node.dataset.renderKey, node]));
+    const used = new Set();
+    const compatible = (before, after) => before && before.nodeType === after.nodeType && before.tagName === after.tagName;
+    const desired = children.map((next, index) => {
+      const key = next.dataset?.renderKey;
+      const current = key ? keyed.get(key) : previous[index];
+      if (!compatible(current, next) || used.has(current) || !key && current.dataset?.renderKey) return next;
+      used.add(current);
+      if (current.nodeType === 3) {
+        if (current.textContent !== next.textContent) current.textContent = next.textContent;
+        return current;
+      }
+      for (const name of current.getAttributeNames()) if (!next.hasAttribute(name) && !(name === 'open' && current.tagName === 'DETAILS')) current.removeAttribute(name);
+      for (const name of next.getAttributeNames()) if (current.getAttribute(name) !== next.getAttribute(name)) current.setAttribute(name, next.getAttribute(name));
+      for (const name of ['className', 'title', 'disabled', 'checked', 'value', 'max', 'type', 'colSpan']) {
+        if (name in next && current[name] !== next[name]) current[name] = next[name];
+      }
+      for (const name of Object.keys(current.dataset)) if (!Object.hasOwn(next.dataset, name)) delete current.dataset[name];
+      Object.assign(current.dataset, next.dataset);
+      current.onclick = next.onclick; current.onchange = next.onchange;
+      if (next.childNodes.length) updateChildren(current, Array.from(next.childNodes));
+      else if (current.textContent !== next.textContent) current.textContent = next.textContent;
+      return current;
+    });
+    for (let index = 0; index < desired.length; index++) {
+      if (parent.childNodes[index] !== desired[index]) parent.insertBefore(desired[index], parent.childNodes[index] || null);
+    }
+    for (const node of Array.from(parent.childNodes)) if (!desired.includes(node)) parent.removeChild(node);
+  }
   const sidebarPreference = 'cwr-v2-sidebar:' + base;
   function renderSidebar(collapsed, persist = false) {
     $('app-sidebar').dataset.collapsed = String(collapsed);
@@ -498,7 +529,7 @@
     for (const [name, id] of Object.entries(wakeFields)) {
       if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else if ($(id).value !== draft[name]) $(id).value = draft[name];
     }
-    wakeBase = data; $('wake-settings-consent').checked = false;
+    wakeBase = data;
   }
   function applyWakeSettings(data, discard = false) {
     const config = data?.config;
@@ -511,7 +542,7 @@
     const dirty = wakeDirty();
     if (savedWakeSettings?.instance_id !== data.instance_id || savedWakeSettings.revision !== data.revision) { $('wake-overview-consent').checked = false; $('wake-settings-consent').checked = false; }
     savedWakeSettings = data;
-    if (discard || !dirty) { fillWakeDraft(data); wakeConflict = false; }
+    if (discard || !dirty) { fillWakeDraft(data); wakeConflict = false; if (discard) $('wake-settings-consent').checked = false; }
     else if (wakeBase.instance_id !== data.instance_id || wakeBase.revision !== data.revision) wakeConflict = true;
     renderWakeSettings(); return true;
   }
@@ -611,8 +642,9 @@
   function renderWakeHistory() {
     const merged = new Map(wakeJobs.map(job => [job.job_id, job])); if (wakeTask) merged.set(wakeTask.job_id, wakeTask);
     const jobs = [...merged.values()].sort((first, second) => (timestamp(second.created_at) || 0) - (timestamp(first.created_at) || 0));
-    $('wake-history').replaceChildren(...jobs.slice(0, 20).map(job => {
+    const items = jobs.slice(0, 20).map(job => {
       const item = element('article', 'task-item'), heading = element('div', 'task-heading');
+      item.dataset.renderKey = 'wake:' + job.job_id;
       heading.append(element('strong', '', job.account_id || '指定账号'), badge(wakePhases[job.phase] || '状态未知', ['failed', 'unknown'].includes(job.phase) ? 'attention' : 'available'));
       item.append(heading, element('p', 'task-description', wakeReasons[job.reason] || '后台唤醒任务'));
       if (job.scheduled_at) item.append(element('small', 'task-description', '后台计划：' + (Number.isFinite(timestamp(job.scheduled_at)) ? new Date(job.scheduled_at).toLocaleString('zh-CN', {hour12: false}) : '待核实')));
@@ -620,14 +652,14 @@
       if (job.error_code) item.append(element('small', 'error-text', message(job.error_code)));
       if (job.phase === 'unknown') item.append(element('p', 'error-text', '可能已消耗额度；禁止重发，仅可读取原任务。'));
       const time = element('small', 'task-time', age(job.updated_at || job.created_at)); time.dataset.observedAt = job.updated_at || job.created_at || ''; item.append(time);
-      const button = element('button', 'text-button', '读取任务结果'); button.type = 'button'; button.disabled = !connected || !wakeExecutionSupported(); button.onclick = () => readWakeJob(job.job_id); item.append(button); return item;
-    }));
-    if (!jobs.length) $('wake-history').append(element('p', 'muted', wakeExecutionSupported() ? '暂无唤醒任务；读取页面不会创建任务。' : '当前后台尚未接入模型唤醒。'));
+      const button = element('button', 'text-button', '读取任务结果'); button.dataset.renderKey = 'read'; button.type = 'button'; button.disabled = !connected || !wakeExecutionSupported(); button.onclick = () => readWakeJob(job.job_id); item.append(button); return item;
+    });
+    updateChildren($('wake-history'), items.length ? items : [element('p', 'muted', wakeExecutionSupported() ? '暂无唤醒任务；读取页面不会创建任务。' : '当前后台尚未接入模型唤醒。')]);
   }
   function renderManualWake() {
-    const supported = wakeExecutionSupported(), locked = !connected || !supported || wakeSubmitting || wakeReading || wakeActive() || wakeUnconfirmed || wakeUnknown;
+    const supported = wakeExecutionSupported(), locked = !connected || !supported || wakeSubmitting || wakeActive() || wakeUnconfirmed || wakeUnknown;
     $('wake-manual-fields').disabled = locked;
-    $('wake-manual-submit').disabled = locked || !$('wake-manual-consent').checked;
+    $('wake-manual-submit').disabled = locked || wakeReading || !$('wake-manual-consent').checked;
     $('wake-manual-verify').hidden = !wakeUnconfirmed && !wakeUnknown;
     $('wake-manual-verify').disabled = !connected || !supported || wakeSubmitting || wakeReading || wakeUnknown && !wakeTask?.job_id;
     $('wake-history-refresh').disabled = !connected || !supported || wakeJobsLoading;
@@ -725,8 +757,9 @@
       Object.keys(validateModelDraft(modelConfigDraft(config)).errors).length) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
     if (savedModelSettings?.instance_id === data.instance_id && savedModelSettings.revision > data.revision) return false;
     const dirty = modelDirty();
+    const sameBase = modelBase?.instance_id === data.instance_id && modelBase.revision === data.revision;
     savedModelSettings = data;
-    if (discard || !dirty) { fillModelDraft(data); modelConflict = false; modelConfirmation = ''; }
+    if (discard || !dirty) { fillModelDraft(data); modelConflict = false; if (discard || !sameBase) modelConfirmation = ''; }
     else if (modelBase.instance_id !== data.instance_id || modelBase.revision !== data.revision) modelConflict = true;
     renderModelSettings(); return true;
   }
@@ -943,15 +976,16 @@
     if (!supported) setText('generation-message', '当前后台尚未提供候选生成功能，不会发送模型请求。');
     const candidates = generationTask?.phase === 'completed' ? generationTask.candidates || [] : [];
     $('generation-results').hidden = !candidates.length;
-    $('generation-candidates').replaceChildren();
-    candidates.forEach((phrase, index) => {
+    const candidateNodes = candidates.map((phrase, index) => {
       const label = element('label', 'generation-candidate'), checkbox = element('input');
+      label.dataset.renderKey = JSON.stringify([generationTask.job_id, index, phrase]);
       checkbox.type = 'checkbox'; checkbox.checked = generationSelected.has(index);
       checkbox.disabled = !connected || !supported;
       checkbox.setAttribute('aria-label', '选择候选短句 ' + (index + 1));
-      checkbox.onchange = () => { if (checkbox.checked) generationSelected.add(index); else generationSelected.delete(index); renderGeneration(); };
-      label.append(checkbox, element('span', '', phrase)); $('generation-candidates').append(label);
+      checkbox.onchange = function () { if (this.checked) generationSelected.add(index); else generationSelected.delete(index); renderGeneration(); };
+      label.append(checkbox, element('span', '', phrase)); return label;
     });
+    updateChildren($('generation-candidates'), candidateNodes);
     $('generation-select-all').disabled = !connected || !supported || !candidates.length;
     $('generation-apply').disabled = !connected || !supported || !modelSupported() || !modelBase || modelSaving || modelLoading || !generationSelected.size;
     renderModelCatalogs();
@@ -1112,9 +1146,10 @@
     return cell;
   }
   function renderAccounts() {
-    $('accounts').replaceChildren();
+    const rows = [];
     for (const account of accountsData) {
       const row = element('tr', 'account-row'), name = element('td', 'account-name');
+      row.dataset.renderKey = 'account:' + account.id;
       name.append(element('strong', '', account.id));
       const status = element('td'), value = accountStatus(account);
       status.append(badge(value.label, value.kind));
@@ -1129,12 +1164,13 @@
       button.setAttribute('aria-label', '立即查询账号 ' + account.id); button.onclick = () => submitQuery(account.id);
       action.append(button);
       if (['queued', 'running'].includes(account.pending_query?.phase)) action.append(queueAnnotation(account.pending_query, 'query-pending'));
-      row.append(name, status, five, weekly, observed, action); $('accounts').append(row);
+      row.append(name, status, five, weekly, observed, action); rows.push(row);
     }
     if (!accountsData.length) {
       const row = element('tr'), cell = element('td', 'empty-state', connected ? ($('accounts-search').value || $('accounts-filter').value !== 'all' ? '没有符合条件的账号' : '尚无账号，后台将自动同步 CPA') : '连接 CPA 后显示真实账号额度');
-      cell.colSpan = 6; row.append(cell); $('accounts').append(row);
+      cell.colSpan = 6; row.append(cell); rows.push(row);
     }
+    updateChildren($('accounts'), rows);
     const total = overviewData?.dashboard?.total ?? accountsData.length;
     setText('accounts-count', connected ? total + ' 个账号' : '等待连接');
     setText('accounts-page-info', accountsData.length ? (pageStart + 1) + '–' + (pageStart + accountsData.length) + ' / ' + (filteredTotal ?? overviewData?.dashboard?.total ?? '—') : '0 / ' + (connected ? filteredTotal ?? total : '—'));
@@ -1155,6 +1191,7 @@
   }
   function taskElement(job, detailed = false) {
     const item = element('article', 'task-item'), heading = element('div', 'task-heading');
+    item.dataset.renderKey = 'query:' + (job.job_id || job.id);
     const phase = displayedJobPhase(job);
     heading.append(element('strong', '', job.account_id || job.target || '全部账号'), badge(phaseNames[phase] || '状态未知', phase === 'failed' ? 'attention' : ['queued', 'blocked'].includes(phase) ? 'unavailable' : 'available'));
     const counts = jobCounts(job);
@@ -1166,6 +1203,7 @@
     if (job.error_code) item.append(element('small', 'task-description error-text', message(job.error_code)));
     if (detailed && Array.isArray(job.items)) {
       const details = element('details', 'task-results');
+      details.dataset.renderKey = 'results';
       details.append(element('summary', '', '逐账号结果 · ' + job.items.length + ' 个账号'));
       for (const result of job.items.slice(0, 20)) {
         const row = element('p', 'task-description', (result.account_id || '账号') + ' · ' + (phaseNames[result.phase] || '状态未知') + (result.error_code ? ' · ' + message(result.error_code) : ''));
@@ -1177,6 +1215,7 @@
       item.append(details);
     } else if (detailed && (job.job_id || job.id)) {
       const button = element('button', 'task-open', '查看逐账号结果'); button.type = 'button'; button.disabled = !connected;
+      button.dataset.renderKey = 'open';
       button.onclick = () => openJob(job.job_id || job.id); item.append(button);
     }
     return item;
@@ -1197,11 +1236,9 @@
   }
   function renderTasks() {
     const jobs = recentJobs(), active = jobs.filter(job => !['completed', 'failed', 'cancelled'].includes(job.phase));
-    $('tasks').replaceChildren(...active.slice(0, 3).map(job => taskElement(job)));
-    if (!active.length) $('tasks').append(element('div', 'empty-state', connected ? '暂无执行中的任务' : '连接后查看后台任务'));
+    updateChildren($('tasks'), active.length ? active.slice(0, 3).map(job => taskElement(job)) : [element('div', 'empty-state', connected ? '暂无执行中的任务' : '连接后查看后台任务')]);
     setText('tasks-count', Math.max(active.length, overviewData?.dashboard?.tasks?.active || 0) + ' 项');
-    $('history-list').replaceChildren(...jobs.map(job => taskElement(job, true)));
-    if (!jobs.length) $('history-list').append(element('div', 'empty-state', connected ? '暂无查询历史，任务将在后台持久保存' : '连接后查看已保存任务'));
+    updateChildren($('history-list'), jobs.length ? jobs.map(job => taskElement(job, true)) : [element('div', 'empty-state', connected ? '暂无查询历史，任务将在后台持久保存' : '连接后查看已保存任务')]);
     const latest = active[0];
     setText('job', latest ? (phaseNames[displayedJobPhase(latest)] || '查询任务') + ' · ' + (latest.account_id || latest.target || '全部账号') : '查询额度不发送模型请求');
   }
@@ -1259,7 +1296,7 @@
       const row = element('div', 'diagnostic-row'); row.append(element('span', '', label), element('strong', '', value)); return row;
     }));
   }
-  async function accounts(reset = false, expectedRevision = accountsRevision) {
+  async function accounts(reset = false, expectedRevision = accountsRevision, background = false) {
     const current = generation, sequence = views.begin('accounts'), filtersAt = filterSequence;
     const search = $('accounts-search').value.trim(), status = $('accounts-filter').value || 'all';
     let path = '/accounts?limit=' + PAGE_SIZE;
@@ -1267,7 +1304,8 @@
     if (status !== 'all') path += '&status=' + encodeURIComponent(status);
     const after = reset ? '' : cursor;
     if (after) path += '&after=' + encodeURIComponent(after) + '&revision=' + expectedRevision;
-    updatingAccounts = true; controls();
+    if (!background) updatingAccounts = true;
+    controls();
     try {
       const data = await api(path);
       if (current !== generation || filtersAt !== filterSequence) return;
@@ -1278,10 +1316,10 @@
       accountsData = data.accounts; accountsRevision = data.accounts_revision; accountsViewRevision = data.view_revision; nextCursor = data.next_after || '';
       filteredTotal = Number.isInteger(data.filter_total) ? data.filter_total : Number.isInteger(data.total) ? data.total : null; renderAccounts();
     } catch (error) {
-      if (current !== generation || filtersAt !== filterSequence || error.code === 'stale') return;
+      if (current !== generation || filtersAt !== filterSequence || views.latest.get('accounts') !== sequence || error.code === 'stale') return;
       if (after && error.code === 'view_changed') return accounts(true);
       throw error;
-    } finally { if (current === generation && filtersAt === filterSequence) { updatingAccounts = false; controls(); } }
+    } finally { if (current === generation && filtersAt === filterSequence && views.latest.get('accounts') === sequence) { updatingAccounts = false; controls(); } }
   }
   async function overview() {
     const current = generation, sequence = views.begin('overview'), previous = views.instance;
@@ -1335,8 +1373,8 @@
     try {
       const data = await overview();
       if (current !== generation || !data) return;
-      if (forceAccounts || data.accounts_revision !== accountsRevision || data.view_revision !== accountsViewRevision) {
-        await accounts(forceAccounts || !cursor, data.accounts_revision);
+      if (!updatingAccounts && (forceAccounts || data.accounts_revision !== accountsRevision || data.view_revision !== accountsViewRevision)) {
+        await accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing);
       }
       await pollJobs();
       if (wakeSettingsSupported() && wakeSettingsAttempt !== views.instance) await reloadWakeSettings();

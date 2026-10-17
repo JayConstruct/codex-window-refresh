@@ -6,7 +6,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查�
 
 ## 一键安装或更新
 
-重建后的 **v0.2.0-rc.9 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+重建后的 **v0.2.0-rc.10 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --restart
@@ -25,6 +25,8 @@ rc.8 增加可编辑候选生成提示词及 Codex 模型唤醒，数据库迁�
 唤醒与候选生成共用物理模型并发和账号发送保护；模型返回完成不等于窗口已启动，需只读额度证据核实。结果未知不自动重发，重启保持防重记录。网页显示计划和核实状态，不展示近期活跃用户数。功能、安全边界与升级要求见 [V2 网页面板](docs/backend-v2-panel.md)及 [rc.8 发布说明](docs/releases/v0.2.0-rc.8.md)。首次升级到 rc.8 或更新版本时须更新旧接入层并显式 `--restart`，升级前请保留一致备份。
 
 rc.9 修复轮询导致输入框失焦，支持按账号读取 CPA 注册模型和显式填入 Codex 风格提示词草稿；唤醒请求禁用工具，不伪造客户端身份。查询返回整五小时/七天的占位值不显示倒计时，后台每 30 秒同步账号状态，并区分正常、禁用、暂不可用、额度耗尽及受限。数据库仍为 schema 8，原生接入层仍为 rc.8；配置和发送防重记录继续保留，详见 [rc.9 发布说明](docs/releases/v0.2.0-rc.9.md)。
+
+rc.10 进一步修复跨页面轮询干扰：候选复选框、账号按钮和历史控件保持节点及焦点，查询详情保留展开状态；未变化的读取不取消确认，历史任务读取不打断无关账号草稿。后台分页读取与显式操作隔离，旧请求不能覆盖新页面。数据库和接入层保持不变，详见 [rc.10 发布说明](docs/releases/v0.2.0-rc.10.md)。
 
 Debian 12/13 已安装 rc.21 或更新版插件时，更新直接执行同一行，默认热重载：
 

@@ -341,6 +341,10 @@ try {
   }
   assert.equal(posts.length, 0, 'Navigating dispatched a write');
   assert.equal(reads.some(path => path.endsWith('/settings')), false, 'Overview config should avoid redundant settings reads');
+  await evaluate('document.querySelector("[data-page=query]").click();const queryInput=document.getElementById("settings-excluded");queryInput.focus();queryInput.value="01:00-02:00";queryInput.dispatchEvent(new Event("input"));queryInput.setSelectionRange(1,4);document.getElementById("refresh").onclick()');
+  assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("settings-excluded").value,document.getElementById("settings-excluded").selectionStart,document.getElementById("settings-excluded").selectionEnd]'), ['settings-excluded', '01:00-02:00', 1, 4], 'Query settings polling changed the draft or cursor');
+  await evaluate('document.getElementById("settings-excluded").value="";document.getElementById("settings-excluded").dispatchEvent(new Event("input"))');
+  await evaluate('document.querySelector("[data-page=overview]").click()');
   const initialConfig = structuredClone(queryConfig);
   settingsPostGate = gate();
   await evaluate('document.getElementById("five-hour-query").click()');
@@ -520,6 +524,11 @@ try {
   await evaluate('document.querySelector("[data-page=history]").click()');
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /处于排除时段/);
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /手动批量/);
+  await evaluate('document.querySelector("#history-list .task-open").click()');
+  await waitFor(() => evaluate('!!document.querySelector("#history-list details")'), 'Query history details did not load');
+  await evaluate('globalThis.historyDetails=document.querySelector("#history-list details");historyDetails.open=true;globalThis.historySummary=historyDetails.querySelector("summary");historySummary.focus();document.getElementById("refresh").onclick()');
+  await waitFor(() => evaluate('!document.getElementById("sync").disabled'), 'History refresh did not finish');
+  assert.equal(await evaluate('historyDetails.isConnected && historyDetails.open && document.activeElement===historySummary'), true, 'Query history polling reset expansion or focus');
   await evaluate('document.querySelector("[data-page=overview]").click()');
   await waitFor(() => evaluate('!document.getElementById("query").disabled'), 'Batch submission did not finish');
   accountReadGate = {started: false};
@@ -547,6 +556,12 @@ try {
   await waitFor(() => evaluate('document.getElementById("accounts").rows.length===6'), 'Search did not reset');
   accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.querySelector("progress").value===11'), 'Background refresh not applied');
+  await evaluate('globalThis.accountQueryButton=document.getElementById("accounts").rows[0].querySelector("button");accountQueryButton.focus()');
+  const accountReadsBeforeFocus = reads.filter(path => path.includes('/accounts?')).length;
+  accounts[0].quota.weekly.Remaining.Value = 66; revision++; accountsRevision++;
+  await waitFor(() => reads.filter(path => path.includes('/accounts?')).length > accountReadsBeforeFocus, 'Account focus test did not receive background data');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].cells[3].textContent.includes("66%")'), 'Updated quota did not render in reused account row');
+  assert.equal(await evaluate('accountQueryButton.isConnected && document.activeElement===accountQueryButton'), true, 'Account refresh recreated the focused query button');
   const writesBeforeStatus = posts.length;
   accounts[0].status = 'disabled'; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="已禁用"'), 'Periodic host state did not update disabled badge');
@@ -644,6 +659,13 @@ try {
   assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24', 'Generation changed quota account totals');
   assert.deepEqual(modelConfig.phrases, poolBeforeGeneration, 'Generation replaced saved pool automatically');
   assert.equal(await evaluate('document.getElementById("generation-apply").disabled'), true, 'Candidates were selected without confirmation');
+  await evaluate('globalThis.firstCandidate=document.querySelector("#generation-candidates input");firstCandidate.focus();firstCandidate.click()');
+  assert.equal(await evaluate('firstCandidate.isConnected && document.activeElement===firstCandidate && firstCandidate.checked'), true, 'Selecting a candidate recreated its checkbox');
+  await evaluate('document.getElementById("refresh").onclick()');
+  assert.equal(await evaluate('firstCandidate.isConnected && document.activeElement===firstCandidate && firstCandidate.checked'), true, 'Polling lost candidate checkbox focus or selection');
+  await cdp('Input.dispatchKeyEvent', {type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32});
+  await cdp('Input.dispatchKeyEvent', {type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32});
+  assert.equal(await evaluate('!firstCandidate.checked && document.getElementById("generation-apply").disabled'), true, 'Reused candidate checkbox no longer responds to keyboard toggles');
   await evaluate('document.getElementById("generation-select-all").click();document.getElementById("generation-apply").click()');
   assert.match(await evaluate('document.getElementById("model-phrases").value'), /浏览器候选短句 1/);
   assert.deepEqual(modelConfig.phrases, poolBeforeGeneration, 'Applying candidates automatically saved settings');
