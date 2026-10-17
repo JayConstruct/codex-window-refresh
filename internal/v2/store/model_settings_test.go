@@ -44,6 +44,7 @@ func TestModelSettingsDefaultsNoopPersistenceAndIndependence(t *testing.T) {
 	config.FiveHourPrompt = "五小时提示"
 	config.WeeklyModel = "fixture-weekly"
 	config.WeeklyPrompt = "周提示"
+	config.GenerationPrompt = "只生成简短的中文天气问候，不要提出问题。"
 	config.PromptMode = "random"
 	config.Phrases = []string{"  第一条  ", "第二条"}
 	saved, err := storage.SaveModelSettings(ctx, 0, config)

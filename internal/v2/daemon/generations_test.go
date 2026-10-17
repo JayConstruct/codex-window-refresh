@@ -99,7 +99,7 @@ func TestGenerationAPIValidationAndManualOnlyWorker(t *testing.T) {
 		}
 	}}
 	service, storage := generationService(t, source)
-	for _, body := range []string{`{}`, generationBody + ` {}`, strings.Replace(generationBody, `"count":2`, `"count":21`, 1), strings.Replace(generationBody, `"model":"test-model"`, `"model":"bad model"`, 1), strings.Replace(generationBody, `"count":2`, `"count":2,"prompt":"secret prompt"`, 1)} {
+	for _, body := range []string{`{}`, generationBody + ` {}`, strings.Replace(generationBody, `"count":2`, `"count":21`, 1), strings.Replace(generationBody, `"model":"test-model"`, `"model":"bad model"`, 1), strings.Replace(generationBody, `"count":2`, `"count":2,"prompt":"secret prompt\u0000"`, 1)} {
 		response := request(service, "POST", "/api/v2/prompt-generations", body, "invalid")
 		if response.Code != 400 || strings.Contains(response.Body.String(), "secret prompt") {
 			t.Fatal(response.Code, response.Body.String())

@@ -6,7 +6,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查�
 
 ## 一键安装或更新
 
-重建后的 **v0.2.0-rc.7 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+重建后的 **v0.2.0-rc.8 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --restart
@@ -19,6 +19,10 @@ rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总�
 rc.6 进一步支持侧栏折叠、总览到期查询开关直接保存、模型/提示词配置和短句池，以及显式确认的手动候选生成。手动生成会消耗所选 Codex 账号模型额度；仅查看页面、配置保存及额度查询不会触发模型请求，生成结果需确认加入草稿并保存，自动唤醒仍未实现。升级 rc.6 需要迁移到 schema 5、同时更新接入层并添加 `--restart`；详见[发布说明](docs/releases/v0.2.0-rc.6.md)。
 
 rc.7 支持使用 CPA 反重力账号生成短句候选，并提供独立生成账号目录。明确选择 Codex 或反重力账号及其实际可用模型后才生成，不回退其他账号；反重力不计入 Codex 额度查询和容量统计。升级会迁移到 schema 6，须同时更新后台与接入层并添加 `--restart`；详见[发布说明](docs/releases/v0.2.0-rc.7.md)。
+
+rc.8 增加可编辑候选生成提示词及 Codex 模型唤醒，数据库迁移到 schema 8（包含此前源码 schema 7 的提示词快照）。rc.7 仍为 schema 6，不包含这些功能。首次升级默认关闭自动唤醒、五小时、周及每日规则；手动唤醒先只读查询额度、核对绑定和活动状态，通过准入后才发送指定账号模型。自动规则显式开启后，后续额度观测（包括额度查询结果）可触发独立唤醒任务；额度查询操作本身仍不发送模型请求。反重力仅支持候选生成，不支持唤醒。
+
+唤醒与候选生成共用物理模型并发和账号发送保护；模型返回完成不等于窗口已启动，需只读额度证据核实。结果未知不自动重发，重启保持防重记录。网页显示计划和核实状态，不展示近期活跃用户数。功能、安全边界与升级要求见 [V2 网页面板](docs/backend-v2-panel.md)及 [rc.8 发布说明](docs/releases/v0.2.0-rc.8.md)。本次须同时更新后台和接入层并显式 `--restart`，升级前请保留一致备份。
 
 Debian 12/13 已安装 rc.21 或更新版插件时，更新直接执行同一行，默认热重载：
 
@@ -51,7 +55,7 @@ curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/ma
 
 ## 文档
 
-- [后端 v2 只读原型：构建与验证](docs/backend-v2-prototype.md)
+- [后端 v2：构建、安全边界与验证](docs/backend-v2-prototype.md)
 - [后端 v2 安装、脚本更新与回退](docs/backend-v2-install.md)
 - [后端 v2 重建设计（独立后台，兼容现有 CPA；分阶段实现中）](docs/backend-v2-design.md)
 - [面板设计参考与浏览器偏好保存](docs/panel-design-references.md)

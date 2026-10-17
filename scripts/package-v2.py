@@ -58,9 +58,11 @@ def main():
                 bridge_version="v" + re.search(r'"([^"]+)"', (ROOT / "native/bridge/version.h").read_text())[1],
                 platform="linux", architecture=arch, host_abi=1, rpc_schema=6,
                 protocol_version=1, minimum_glibc_symbols=glibc,
-                go_version=packaging.command("go", "version"), model_execution=False,
+                go_version=packaging.command("go", "version"), model_execution=True,
+                wake=True, wake_providers=["codex"],
                 prompt_generation=True, model_settings=True,
                 prompt_generation_providers=["codex", "antigravity"],
+                editable_generation_prompt=True,
                 real_account_validation=False)
     members = {
         "codex-window-refresh-v2-bridge.so": (bridge.read_bytes(), 0o644),

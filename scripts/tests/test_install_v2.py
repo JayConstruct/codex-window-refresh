@@ -67,6 +67,16 @@ class V2PackageTests(unittest.TestCase):
             entry.linkname = "/etc/passwd"
             with self.assertRaises(v2.InstallError): self.unpack(self.package(extra=entry))
 
+    def test_explicit_wake_capability_is_accepted_without_enabling_any_rules(self):
+        info = self.unpack(self.package(changes=dict(model_execution=True, wake=True, wake_providers=["codex"])))
+        self.assertIs(info["model_execution"], True)
+        for changes in [dict(model_execution="true", wake=True, wake_providers=["codex"]),
+                        dict(model_execution=1, wake=True, wake_providers=["codex"]),
+                        dict(model_execution=True, wake=False, wake_providers=["codex"]),
+                        dict(model_execution=True, wake=True, wake_providers=["antigravity"])]:
+            with self.subTest(changes=changes), self.assertRaises(v2.InstallError):
+                self.unpack(self.package(changes=changes))
+
     def test_v1_latest_skips_v2_but_does_not_silently_downgrade_v1(self):
         records = [dict(tag_name="v0.1.0-rc.28", draft=False, published_at="now", assets=[
             dict(name="codex-window-refresh_v0.1.0-rc.28_linux_amd64.tar.gz", state="uploaded", size=100),

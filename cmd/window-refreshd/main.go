@@ -73,7 +73,7 @@ func run() error {
 			server.Close()
 		}
 	}()
-	fmt.Fprintln(os.Stderr, "window-refreshd: quota backend and manual candidate generation ready")
+	fmt.Fprintln(os.Stderr, "window-refreshd: quota backend, model wake and candidate generation ready")
 	err = server.Serve(listener)
 	stop()
 	<-workerDone

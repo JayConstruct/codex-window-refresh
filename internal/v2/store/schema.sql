@@ -1,6 +1,6 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 6 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 8 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
 CREATE TABLE IF NOT EXISTS accounts(
  id TEXT PRIMARY KEY, auth_index TEXT NOT NULL, status TEXT NOT NULL,
  quota TEXT, observed_at TEXT, updated_at TEXT NOT NULL
@@ -68,10 +68,40 @@ CREATE TRIGGER IF NOT EXISTS model_settings_update AFTER UPDATE ON model_setting
 CREATE TABLE IF NOT EXISTS prompt_generations(
  id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL,
  account_id TEXT NOT NULL, auth_index TEXT NOT NULL, binding TEXT NOT NULL, provider TEXT NOT NULL DEFAULT 'codex', model TEXT NOT NULL,
- count INTEGER NOT NULL, phase TEXT NOT NULL, error_code TEXT NOT NULL DEFAULT '',
+ count INTEGER NOT NULL, prompt TEXT NOT NULL DEFAULT '', phase TEXT NOT NULL, error_code TEXT NOT NULL DEFAULT '',
  candidates TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS prompt_generations_queue ON prompt_generations(phase,created_at);
+CREATE TABLE IF NOT EXISTS wake_settings(
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, config TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wake_jobs(
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, auth_index TEXT NOT NULL, binding TEXT NOT NULL,
+ reason TEXT NOT NULL, cycle TEXT NOT NULL, phase TEXT NOT NULL,
+ idempotency_key TEXT UNIQUE, request_hash TEXT NOT NULL DEFAULT '',
+ scheduled_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ error_code TEXT NOT NULL DEFAULT '', hold_reason TEXT NOT NULL DEFAULT '',
+ query_job_id TEXT NOT NULL DEFAULT '', query_gate TEXT NOT NULL DEFAULT '',
+ model TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '', policy_revision INTEGER NOT NULL DEFAULT 0,
+ model_revision INTEGER NOT NULL DEFAULT 0, verification_attempts INTEGER NOT NULL DEFAULT 0,
+ hold_until TEXT NOT NULL DEFAULT '', next_check_at TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS wake_account_live ON wake_jobs(account_id,binding) WHERE phase IN ('queued','checking','prepared','sending','verifying','unknown');
+CREATE INDEX IF NOT EXISTS wake_jobs_queue ON wake_jobs(phase,scheduled_at);
+CREATE TABLE IF NOT EXISTS wake_cycles(
+ account_id TEXT NOT NULL, binding TEXT NOT NULL, reason TEXT NOT NULL, cycle TEXT NOT NULL,
+ job_id TEXT NOT NULL, PRIMARY KEY(account_id,binding,reason)
+);
+CREATE TABLE IF NOT EXISTS wake_baselines(
+ account_id TEXT PRIMARY KEY, binding TEXT NOT NULL, five_hour_reset TEXT NOT NULL DEFAULT '',
+ weekly_reset TEXT NOT NULL DEFAULT '', boot TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS wake_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),account_id TEXT NOT NULL DEFAULT '');
+INSERT OR IGNORE INTO wake_cursor(singleton) VALUES(1);
+CREATE TRIGGER IF NOT EXISTS wake_settings_insert AFTER INSERT ON wake_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS wake_settings_update AFTER UPDATE ON wake_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS wake_jobs_insert AFTER INSERT ON wake_jobs BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS wake_jobs_update AFTER UPDATE ON wake_jobs BEGIN UPDATE view_state SET revision=revision+1; END;
 CREATE TRIGGER IF NOT EXISTS prompt_generations_insert AFTER INSERT ON prompt_generations BEGIN UPDATE view_state SET revision=revision+1; END;
 CREATE TRIGGER IF NOT EXISTS prompt_generations_update AFTER UPDATE ON prompt_generations BEGIN UPDATE view_state SET revision=revision+1; END;
 CREATE TABLE IF NOT EXISTS query_plans(

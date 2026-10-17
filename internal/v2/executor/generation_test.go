@@ -147,6 +147,15 @@ func TestGenerationPinsAccountAndRequest(t *testing.T) {
 	}
 }
 
+func TestGenerationUsesNativeSerialBudgetAndDoesNotReplayKnownUnsentRefusal(t *testing.T) {
+	cpa, host, account := generationFixture()
+	host.opened = generationOpened{}
+	host.executeErr = errors.New("model_budget_busy")
+	if _, err := cpa.GenerateCandidates(context.Background(), account, "fixture-model", 2); err == nil || err.Error() != "generation_request_rejected" || host.executes != 1 || host.closes != 0 || !host.request.Serial {
+		t.Fatal(err)
+	}
+}
+
 func TestGenerationPreflightNeverExecutesInvalidRequests(t *testing.T) {
 	tests := []struct {
 		name   string

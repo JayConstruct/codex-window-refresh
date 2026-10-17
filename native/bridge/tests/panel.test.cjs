@@ -792,7 +792,10 @@ test('randomized bulk submission sends no client delay, schedule, settings or mo
 });
 
 const {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview} = require('../../../internal/v2/daemon/web/panel.js');
-const modelConfig = overrides => ({...modelDefaults, phrases: [], ...overrides});
+const modelConfig = overrides => {
+  const {generation_prompt, ...legacyDefaults} = modelDefaults;
+  return {...legacyDefaults, phrases: [], ...overrides};
+};
 const modelSettings = (revision = 1, config = modelConfig(), instance = 'a') => ({...view(instance, revision), revision, config});
 const modelOverview = (instance = 'a', capable = true, canGenerate = true) => ({...overview(), ...view(instance, 20), capabilities: {quota_query: true, model_settings: capable, prompt_generation: canGenerate, model_execution: false}});
 const submitModels = ui => ui.get('model-settings-form').onsubmit({preventDefault() {}});
@@ -810,6 +813,112 @@ function modelResponse(url, settings = modelSettings(), instance = 'a') {
   if (url.endsWith('/model-settings')) return [200, settings];
   return url.endsWith('/overview') ? [200, modelOverview(instance)] : [200, {...accountPage(), ...view(instance)}];
 }
+function editablePromptResponse(url, settings = modelSettings(1, modelConfig({generation_prompt: modelDefaults.generation_prompt}))) {
+  if (url.endsWith('/overview')) { const data = modelOverview(); data.capabilities.editable_generation_prompt = true; return [200, data]; }
+  return modelResponse(url, settings);
+}
+test('generation prompt validation accepts legacy omissions and empty defaults but enforces bytes and controls', () => {
+  const draft = modelConfigDraft(modelConfig());
+  assert.equal(draft.generation_prompt, ''); assert.equal(validateModelDraft(draft).config.generation_prompt, '');
+  for (const value of ['', ' \t\n\r', '你'.repeat(2730) + 'ab']) assert.equal(validateModelDraft({...draft, generation_prompt: value}).errors.generation_prompt, undefined);
+  for (const value of ['你'.repeat(2731), 'x'.repeat(8193), 'bad\0', 'bad\u0085', null, 1]) assert.ok(validateModelDraft({...draft, generation_prompt: value}).errors.generation_prompt);
+  const phrases = Array.from({length: 128}, (_, index) => String(index).padStart(3, '0') + 'x'.repeat(509)).join('\n');
+  assert.ok(validateModelDraft({...draft, phrases, generation_prompt: 'x'.repeat(8192)}).errors.total);
+});
+test('editable generation prompt loads and persists only on explicit model configuration save, independently of wake prompts', async () => {
+  let settings = modelSettings(1, modelConfig({generation_prompt: '已保存的生成提示词'}));
+  const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings') && options.method === 'POST') { settings = modelSettings(2, JSON.parse(options.body).config); return [200, settings]; }
+    return editablePromptResponse(url, settings);
+  });
+  await openModels(ui); assert.equal(ui.get('generation-prompt').value, '已保存的生成提示词');
+  assert.equal(ui.get('generation-prompt').disabled, false);
+  configureCandidateRequest(ui); edit(ui, 'generation-prompt', '  自定义候选\n\t精确保留空白。  ');
+  assert.equal(ui.get('generation-consent').checked, false); assert.match(ui.get('model-diff').textContent, /候选生成提示词/);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  await ui.tick(5000); assert.equal(ui.get('generation-prompt').value, '  自定义候选\n\t精确保留空白。  ');
+  ui.nav.find(node => node.dataset.page === 'overview').listeners.get('click')();
+  ui.nav.find(node => node.dataset.page === 'models').listeners.get('click')(); await flush();
+  assert.equal(ui.get('generation-prompt').value, '  自定义候选\n\t精确保留空白。  ');
+  await submitModels(ui);
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 1); assert.ok(posts[0].url.endsWith('/model-settings'));
+  assert.equal(settings.config.generation_prompt, '  自定义候选\n\t精确保留空白。  ');
+  assert.equal(settings.config.default_prompt, modelDefaults.default_prompt); assert.equal(settings.config.five_hour_prompt, ''); assert.equal(settings.config.weekly_prompt, '');
+  assert.equal(ui.get('model-save').disabled, true);
+});
+test('generation uses the exact unsaved prompt snapshot and verification never switches to later edits', async () => {
+  let submissions = 0;
+  const ui = panel((url, options) => {
+    if (url.includes('/prompt-generations')) {
+      if (++submissions === 1) throw new Error('lost acknowledgement');
+      return [202, {instance_id: 'a', job_id: 'prompt-snapshot', phase: 'queued', candidates: []}];
+    }
+    return editablePromptResponse(url);
+  });
+  await openModels(ui); configureCandidateRequest(ui); edit(ui, 'generation-prompt', '  草稿候选\n\t不改唤醒。  ');
+  assert.equal(ui.get('generation-consent').checked, false); await submitCandidates(ui); assert.equal(submissions, 0);
+  ui.get('generation-consent').checked = true; ui.get('generation-consent').onchange(); await submitCandidates(ui);
+  assert.equal(ui.get('generation-prompt').disabled, true); assert.equal(ui.get('generation-reset-prompt').disabled, true);
+  ui.get('generation-prompt').value = '不应使用的新提示词'; ui.get('generation-reset-prompt').onclick();
+  await ui.get('generation-verify').onclick();
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 2);
+  assert.equal(posts[0].body, posts[1].body); assert.equal(posts[0].headers['Idempotency-Key'], posts[1].headers['Idempotency-Key']);
+  assert.deepEqual(JSON.parse(posts[0].body), {account_id: 'codex-01', model: 'actual-model', count: 3, prompt: '  草稿候选\n\t不改唤醒。  '});
+  assert.equal(ui.calls.some(call => call.url.endsWith('/model-settings') && call.method === 'POST'), false);
+});
+test('empty editable prompts omit the request field and legacy model configurations load as empty', async () => {
+  const ui = panel((url, options) => url.includes('/prompt-generations') ? [202, {instance_id: 'a', job_id: 'empty-prompt', phase: 'queued', candidates: []}] : editablePromptResponse(url, modelSettings()));
+  await openModels(ui); assert.equal(ui.get('generation-prompt').value, ''); assert.equal(ui.get('model-save').disabled, true);
+  configureCandidateRequest(ui); await submitCandidates(ui);
+  assert.deepEqual(JSON.parse(ui.calls.find(call => call.method === 'POST').body), {account_id: 'codex-01', model: 'actual-model', count: 3});
+});
+test('older backends disable generation prompt editing and never receive unsupported fields in either POST', async () => {
+  let settings = modelSettings();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings') && options.method === 'POST') { settings = modelSettings(2, JSON.parse(options.body).config); return [200, settings]; }
+    if (url.includes('/prompt-generations')) return [202, {instance_id: 'a', job_id: 'legacy-prompt', phase: 'queued', candidates: []}];
+    return modelResponse(url, settings);
+  });
+  await openModels(ui); assert.equal(ui.get('generation-prompt').disabled, true); assert.equal(ui.get('generation-reset-prompt').disabled, true);
+  assert.match(ui.get('generation-prompt-help').textContent, /不支持/);
+  edit(ui, 'generation-prompt', '不该发送'); ui.get('generation-reset-prompt').onclick();
+  assert.equal(ui.get('model-save').disabled, true);
+  edit(ui, 'model-default', 'legacy-model'); await submitModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 2);
+  assert.equal(Object.hasOwn(JSON.parse(posts[0].body).config, 'generation_prompt'), false);
+  assert.equal(Object.hasOwn(JSON.parse(posts[1].body), 'prompt'), false);
+});
+test('resetting generation prompt changes only a draft and cancels spend consent without any write', async () => {
+  const ui = panel(url => editablePromptResponse(url, modelSettings(1, modelConfig({generation_prompt: '自定义'}))));
+  await openModels(ui); configureCandidateRequest(ui); ui.get('generation-reset-prompt').onclick();
+  assert.equal(ui.get('generation-prompt').value, modelDefaults.generation_prompt); assert.equal(ui.get('generation-consent').checked, false);
+  assert.equal(ui.get('model-save').disabled, false); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  edit(ui, 'generation-prompt', ''); assert.match(ui.get('model-diff').textContent, /内置生成提示词/);
+});
+test('polling a changed saved generation prompt clears previous spend consent', async () => {
+  let settings = modelSettings(1, modelConfig({generation_prompt: '第一版'}));
+  const ui = panel(url => editablePromptResponse(url, settings)); await openModels(ui); configureCandidateRequest(ui);
+  assert.equal(ui.get('generation-consent').checked, true);
+  settings = modelSettings(2, modelConfig({generation_prompt: '第二版'})); await ui.tick(5000);
+  assert.equal(ui.get('generation-prompt').value, '第二版'); assert.equal(ui.get('generation-consent').checked, false);
+  assert.equal(ui.get('generation-submit').disabled, true); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('invalid generation prompt blocks direct model and generation submission', async () => {
+  const ui = panel(url => editablePromptResponse(url)); await openModels(ui); configureCandidateRequest(ui);
+  for (const value of ['你'.repeat(2731), 'bad\0', 'bad\u0085']) {
+    edit(ui, 'generation-prompt', value); ui.get('generation-consent').checked = true; ui.get('generation-consent').onchange();
+    await submitModels(ui); await submitCandidates(ui);
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false); assert.match(ui.get('generation-message').textContent, /8192/);
+  }
+});
+test('unknown generation locks prompt and reset without changing the snapshotted request or allowing resend', async () => {
+  const ui = panel((url, options) => url.includes('/prompt-generations') ? [200, {instance_id: 'a', job_id: 'unknown-prompt', phase: 'unknown', candidates: []}] : editablePromptResponse(url));
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  assert.equal(ui.get('generation-prompt').disabled, true); assert.equal(ui.get('generation-reset-prompt').disabled, true);
+  ui.get('generation-reset-prompt').onclick(); await submitCandidates(ui); await ui.get('generation-verify').onclick();
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(ui.calls.filter(call => call.url.includes('/prompt-generations?job_id=')).length, 1);
+});
 
 test('model validation enforces UTF-8 bytes, controls, prompt strategies and phrase uniqueness', () => {
   const draft = modelConfigDraft(modelConfig());
@@ -1273,4 +1382,277 @@ test('model and candidate writes never automatically retry after authentication 
     assert.equal(ui.get('login-section').hidden, false); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
     assert.equal(ui.get(candidate ? 'generation-submit' : 'model-save').disabled, true);
   }
+});
+
+const {wakeDefaults, wakeConfigDraft, validateWakeDraft} = require('../../../internal/v2/daemon/web/panel.js');
+const wakeConfig = overrides => ({...wakeDefaults, random_delay: {...wakeDefaults.random_delay}, allowed_hours: [...wakeDefaults.allowed_hours], ...overrides});
+const wakeSettings = (revision = 1, config = wakeConfig(), instance = 'a') => ({...view(instance, 20 + revision), revision, config});
+const wakeOverview = (instance = 'a', capabilities = {}) => ({...overview(), ...view(instance, 20), capabilities: {quota_query: true, model_settings: true, model_execution: true, wake_settings: true, automatic_wake: true, ...capabilities}});
+function wakeResponse(url, settings = wakeSettings(), instance = 'a') {
+  if (url.endsWith('/overview')) return [200, wakeOverview(instance)];
+  if (url.endsWith('/wake-settings')) return [200, settings];
+  if (url.includes('/wake-jobs?')) return [200, {...view(instance, 20), jobs: []}];
+  return modelResponse(url, modelSettings(1, modelConfig(), instance), instance);
+}
+const submitWakeSettings = ui => ui.get('wake-settings-form').onsubmit({preventDefault() {}});
+const submitWake = ui => ui.get('wake-manual-form').onsubmit({preventDefault() {}});
+async function openWake(ui) {
+  await ui.get('connect').onclick(); ui.nav.find(node => node.dataset.page === 'wake').listeners.get('click')(); await flush();
+}
+function configureWakeRequest(ui, account = 'codex-01') {
+  ui.get('wake-account').value = account; ui.get('wake-manual-consent').checked = true; ui.get('wake-manual-consent').onchange();
+}
+test('wake policy validation mirrors float capacity, interval, timezone and opt-in safety limits', () => {
+  const draft = wakeConfigDraft(wakeConfig()); assert.deepEqual(validateWakeDraft(draft).errors, {});
+  for (const perUser of ['0', '0.5', '100']) assert.equal(validateWakeDraft({...draft, perUser}).errors.perUser, undefined);
+  for (const perUser of ['', 'Infinity', 'NaN', '-1', '100.1']) assert.ok(validateWakeDraft({...draft, perUser}).errors.perUser);
+  assert.deepEqual(validateWakeDraft({...draft, allowed: '', dailyTarget: '0'}).config.allowed_hours, []);
+  assert.equal(validateWakeDraft({...draft, allowed: '23:00-04:00, 08:00-12:00', dailyWindow: '23:00-24:00'}).errors.allowed, undefined);
+  assert.ok(validateWakeDraft({...draft, allowed: '23:00-04:00, 03:00-05:00'}).errors.allowed);
+  for (const dailyWindow of ['23:00-01:00', '', '08:00-08:00', '08:00-09:00, 10:00-11:00']) assert.ok(validateWakeDraft({...draft, dailyWindow}).errors.dailyWindow);
+  assert.ok(validateWakeDraft({...draft, dailyTarget: '3', maximum: '2'}).errors.dailyTarget);
+  assert.ok(validateWakeDraft({...draft, maximum: '0'}).errors.maximum);
+  assert.ok(validateWakeDraft({...draft, enabled: true}).errors.enabled);
+  assert.deepEqual(validateWakeDraft({...draft, enabled: true, weekly: true}).errors, {});
+  assert.ok(validateWakeDraft({...draft, timezone: 'Local'}).errors.timezone);
+  assert.ok(validateWakeDraft({...draft, delayMin: '60', delayMax: '5'}).errors.delayMax);
+});
+test('wake reads are capability gated, defaults stay off and opening or refreshing never submits work', async () => {
+  const legacy = panel(basic); await openWake(legacy);
+  assert.equal(legacy.calls.some(call => call.url.includes('/wake-')), false);
+  assert.equal(legacy.get('auto-wake').disabled, true); assert.equal(legacy.get('wake-manual-fields').disabled, true);
+  const ui = panel(url => wakeResponse(url)); await ui.get('connect').onclick();
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/wake-settings')).length, 1);
+  assert.equal(ui.calls.some(call => call.url.includes('/wake-jobs')), false);
+  assert.equal(ui.get('auto-wake').checked, false); assert.equal(ui.get('auto-wake').disabled, false);
+  ui.nav.find(node => node.dataset.page === 'wake').listeners.get('click')(); await flush(); await ui.get('wake-history-refresh').onclick();
+  assert.equal(ui.get('wake-enabled').checked, false); assert.equal(ui.get('wake-manual-submit').disabled, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('wake opt-in requires a rule and separate spend consent; saving uses only wake revision and config', async () => {
+  let settings = wakeSettings();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-settings') && options.method === 'POST') { settings = wakeSettings(2, JSON.parse(options.body).config); return [200, settings]; }
+    return wakeResponse(url, settings);
+  });
+  await openWake(ui); edit(ui, 'wake-enabled', true); await submitWakeSettings(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  edit(ui, 'wake-five-hour', true); await submitWakeSettings(ui); assert.equal(ui.get('wake-settings-save').disabled, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  ui.get('wake-settings-consent').checked = true; ui.get('wake-settings-consent').onchange();
+  assert.equal(ui.get('wake-settings-save').disabled, false); await submitWakeSettings(ui);
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 1); assert.ok(posts[0].url.endsWith('/wake-settings'));
+  assert.deepEqual(JSON.parse(posts[0].body), {revision: 1, config: wakeConfig({enabled: true, on_five_hour_reset: true})});
+  assert.equal(ui.get('wake-settings-consent').checked, false); assert.equal(ui.get('auto-wake').checked, true);
+  assert.equal(ui.calls.some(call => /prompt-generations|\/wake-jobs$|\/jobs$/.test(call.url)), false);
+});
+test('editing any enabled wake draft clears spend consent while disabled rules save without consent', async () => {
+  const ui = panel((url, options) => url.endsWith('/wake-settings') && options.method === 'POST' ? [200, wakeSettings(2, JSON.parse(options.body).config)] : wakeResponse(url));
+  await openWake(ui); ui.get('wake-settings-consent').checked = true; edit(ui, 'wake-per-user', '0.5');
+  assert.equal(ui.get('wake-settings-consent').checked, false); assert.equal(ui.get('wake-settings-save').disabled, false);
+  await submitWakeSettings(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('overview auto wake directly saves only the saved enabled flag and preserves the independent editor draft', async () => {
+  let settings = wakeSettings(1, wakeConfig({on_five_hour_reset: true}));
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-settings') && options.method === 'POST') { settings = wakeSettings(settings.revision + 1, JSON.parse(options.body).config); return [200, settings]; }
+    return wakeResponse(url, settings);
+  });
+  await openWake(ui); edit(ui, 'wake-per-user', '0.5');
+  ui.nav.find(node => node.dataset.page === 'overview').listeners.get('click')();
+  ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange();
+  assert.equal(ui.get('auto-wake').checked, false); assert.match(ui.get('wake-overview-message').textContent, /确认/);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  ui.get('wake-overview-consent').checked = true; ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange();
+  assert.equal(settings.config.enabled, true); assert.equal(settings.config.accounts_per_user, 1); assert.equal(ui.get('wake-per-user').value, '0.5');
+  assert.equal(ui.panels.find(node => node.dataset.view === 'overview').hidden, false); assert.equal(ui.get('wake-overview-consent').checked, false);
+  ui.get('auto-wake').checked = false; await ui.get('auto-wake').onchange();
+  assert.equal(settings.config.enabled, false); assert.equal(ui.get('wake-per-user').value, '0.5');
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 2);
+});
+test('overview refuses enabling an empty rule set and settings capability alone cannot authorize execution', async () => {
+  const ui = panel(url => url.endsWith('/overview') ? [200, wakeOverview('a', {model_execution: false})] : wakeResponse(url));
+  await openWake(ui); assert.equal(ui.get('auto-wake').disabled, true); assert.equal(ui.get('wake-enabled').disabled, true);
+  assert.equal(ui.get('wake-manual-fields').disabled, true);
+  edit(ui, 'wake-enabled', true); edit(ui, 'wake-five-hour', true); ui.get('wake-settings-consent').checked = true; await submitWakeSettings(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  const empty = panel(url => wakeResponse(url)); await openWake(empty);
+  empty.get('wake-overview-consent').checked = true; empty.get('auto-wake').checked = true; await empty.get('auto-wake').onchange();
+  assert.equal(empty.get('auto-wake').checked, false); assert.match(empty.get('wake-overview-message').textContent, /至少开启/);
+  assert.equal(empty.calls.some(call => call.method === 'POST'), false);
+});
+test('pending wake settings saves lock controls and conflicts require explicit GET verification without automatic retry', async () => {
+  let release, posts = 0;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-settings') && options.method === 'POST') { posts++; return new Promise(resolve => { release = resolve; }); }
+    return wakeResponse(url);
+  });
+  await openWake(ui); edit(ui, 'wake-per-user', '0.5'); const pending = submitWakeSettings(ui); await flush();
+  assert.equal(ui.get('wake-settings-fields').disabled, true); assert.equal(ui.get('auto-wake').disabled, true); await submitWakeSettings(ui);
+  release([409, {error: 'wake_settings_conflict'}]); await pending;
+  assert.equal(ui.get('wake-per-user').value, '0.5'); assert.equal(ui.get('wake-settings-save').disabled, true); assert.equal(ui.get('auto-wake').disabled, true);
+  await ui.tick(5000); await submitWakeSettings(ui); assert.equal(posts, 1);
+  await ui.get('wake-settings-reload').onclick(); assert.equal(ui.get('wake-per-user').value, '1'); assert.equal(ui.get('wake-settings-conflict').hidden, true);
+});
+test('lost wake settings acknowledgements never retry; overview GET verification preserves dirty rule drafts', async () => {
+  let settings = wakeSettings(1, wakeConfig({on_weekly_reset: true}));
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-settings') && options.method === 'POST') { settings = wakeSettings(2, JSON.parse(options.body).config); throw new Error('lost ack'); }
+    return wakeResponse(url, settings);
+  });
+  await openWake(ui); edit(ui, 'wake-per-user', '0.25');
+  ui.get('wake-overview-consent').checked = true; ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange();
+  assert.equal(ui.get('auto-wake').checked, false); assert.equal(ui.get('wake-per-user').value, '0.25');
+  await ui.tick(5000); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  await ui.get('wake-overview-reload').onclick(); assert.equal(ui.get('auto-wake').checked, true); assert.equal(ui.get('wake-per-user').value, '0.25');
+  assert.equal(ui.get('wake-settings-save').disabled, true); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('wake draft polling preserves dirty configuration and marks concurrent saved changes as conflicts', async () => {
+  let settings = wakeSettings(); const ui = panel(url => wakeResponse(url, settings)); await openWake(ui);
+  edit(ui, 'wake-per-user', '0.5'); await ui.tick(5000); assert.equal(ui.get('wake-per-user').value, '0.5');
+  settings = wakeSettings(2, wakeConfig({accounts_per_user: 2})); await ui.tick(5000);
+  assert.equal(ui.get('wake-per-user').value, '0.5'); assert.equal(ui.get('wake-settings-conflict').hidden, false);
+  assert.equal(ui.get('wake-settings-save').disabled, true); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('manual wake requires explicit spend consent, validates account and posts only its ID once', async () => {
+  const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? [202, {...view(), job_id: 'manual-one', phase: 'checking'}] : wakeResponse(url));
+  await openWake(ui); await submitWake(ui); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  configureWakeRequest(ui, ''); await submitWake(ui); configureWakeRequest(ui, 'bad\naccount'); await submitWake(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  configureWakeRequest(ui); await submitWake(ui); await submitWake(ui);
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 1);
+  assert.deepEqual(JSON.parse(posts[0].body), {account_id: 'codex-01'}); assert.ok(posts[0].headers['Idempotency-Key']);
+  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /查询并核实/);
+});
+test('manual wake reads each real execution phase and permits a new intent only after a known terminal result and new consent', async () => {
+  let phase = 'queued';
+  const ui = panel((url, options) => url.startsWith('/v0/management/codex-window-refresh/v2/wake-jobs') ? url.includes('?limit=') ? [200, {...view(), jobs: []}] : [200, {...view(), job_id: 'phase-job', account_id: 'codex-01', reason: 'manual', phase}] : wakeResponse(url));
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui);
+  for (phase of ['checking', 'prepared', 'sending', 'verifying']) {
+    await ui.get('wake-history').children[0].children.at(-1).onclick(); assert.equal(ui.get('wake-manual-fields').disabled, true);
+    assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  }
+  phase = 'completed'; await ui.get('wake-history').children[0].children.at(-1).onclick();
+  assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-consent').checked, false);
+  await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('manual wake lost acknowledgement verifies the exact original key and account without automatic POST retry', async () => {
+  let posts = 0;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-jobs') && options.method === 'POST') { if (++posts === 1) throw new Error('lost acknowledgement'); return [202, {...view(), job_id: 'verified-wake', phase: 'prepared'}]; }
+    return wakeResponse(url);
+  });
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.tick(5000);
+  assert.equal(posts, 1); assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-verify').hidden, false);
+  ui.get('wake-account').value = 'replacement'; await submitWake(ui); assert.equal(posts, 1);
+  await ui.get('wake-manual-verify').onclick(); const writes = ui.calls.filter(call => call.method === 'POST'); assert.equal(writes.length, 2);
+  assert.equal(writes[0].body, writes[1].body); assert.equal(writes[0].headers['Idempotency-Key'], writes[1].headers['Idempotency-Key']);
+});
+test('unknown manual wake never resends or releases its account fields after refresh or settings reads', async () => {
+  const job = {...view(), job_id: 'unknown-wake', account_id: 'codex-01', reason: 'manual', phase: 'unknown', hold_reason: 'verification_pending'};
+  const ui = panel((url, options) => url.includes('/wake-jobs') ? url.includes('?limit=') ? [200, {...view(), jobs: [job]}] : [200, job] : wakeResponse(url));
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.get('wake-history-refresh').onclick(); await ui.get('wake-settings-reload').onclick();
+  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /禁止|不会重发/);
+  await submitWake(ui); await ui.get('wake-manual-verify').onclick();
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1); assert.match(ui.get('wake-history').textContent, /等待结果核实|禁止重发/);
+});
+test('missing wake jobs become read-only unknown results and never create replacement work', async () => {
+  const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? [202, {...view(), job_id: 'gone-wake', phase: 'queued'}] : url.includes('/wake-jobs?job_id=') ? [404, {error: 'not_found'}] : wakeResponse(url));
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.tick(5000);
+  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /无法核实/);
+  await submitWake(ui); await ui.get('wake-manual-verify').onclick(); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('wake skipped and failed results explain holds without inventing success or retrying', async () => {
+  for (const phase of ['skipped', 'failed', 'cancelled']) {
+    const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? [202, {...view(), job_id: 'terminal-wake', phase, hold_reason: 'active_window', error_code: phase === 'failed' ? 'wake_model_missing' : ''}] : wakeResponse(url));
+    await openWake(ui); configureWakeRequest(ui); await submitWake(ui);
+    assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-consent').checked, false);
+    assert.match(ui.get('wake-history').textContent, /已有活动窗口/); await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  }
+});
+test('manual wake preflight rejections clear spend consent without fabricating jobs', async () => {
+  for (const [status, error] of [[409, 'wake_account_unavailable'], [409, 'wake_model_missing'], [400, 'invalid_wake_request'], [429, 'queue_full'], [503, 'wake_unavailable']]) {
+    const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? [status, {error}] : wakeResponse(url));
+    await openWake(ui); configureWakeRequest(ui); await submitWake(ui);
+    assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-consent').checked, false);
+    assert.match(ui.get('wake-manual-message').textContent, /未接受/); await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  }
+});
+test('manual wake uncertain storage failures and verification failures stay locked with the same intent', async () => {
+  const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? [503, {error: 'storage_unavailable'}] : wakeResponse(url));
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.get('wake-manual-verify').onclick(); await submitWake(ui);
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 2); assert.equal(posts[0].body, posts[1].body);
+  assert.equal(ui.get('wake-manual-fields').disabled, true);
+});
+test('backend restart prevents uncertain manual wake POST verification against a new instance', async () => {
+  let instance = 'a';
+  const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? Promise.reject(new Error('lost ack')) : wakeResponse(url, wakeSettings(1, wakeConfig(), instance), instance));
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui); instance = 'b'; await ui.tick(5000);
+  assert.match(ui.get('wake-manual-message').textContent, /实例已更换/); assert.equal(ui.get('wake-manual-verify').disabled, true);
+  await ui.get('wake-manual-verify').onclick(); await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('expired authentication during wake writes stops polling and never retries', async () => {
+  for (const manual of [true, false]) {
+    const ui = panel((url, options) => options.method === 'POST' ? [401, {error: 'unauthorized'}] : wakeResponse(url)); await openWake(ui);
+    if (manual) { configureWakeRequest(ui); await submitWake(ui); }
+    else { edit(ui, 'wake-per-user', '0.5'); await submitWakeSettings(ui); }
+    assert.equal(ui.get('login-section').hidden, false); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+    assert.equal(ui.get('wake-manual-submit').disabled, true); assert.equal(ui.get('auto-wake').disabled, true);
+  }
+});
+test('disconnecting an in-flight wake settings save preserves its draft and demands explicit read verification after reconnect', async () => {
+  let release;
+  const ui = panel((url, options) => url.endsWith('/wake-settings') && options.method === 'POST' ? new Promise(resolve => { release = () => resolve([200, wakeSettings(2, JSON.parse(options.body).config)]); }) : wakeResponse(url));
+  await openWake(ui); edit(ui, 'wake-per-user', '0.5'); const pending = submitWakeSettings(ui); await flush();
+  ui.get('disconnect').onclick(); ui.get('key').value = 'fixture-key'; await ui.get('connect').onclick(); release(); await pending;
+  assert.equal(ui.get('wake-per-user').value, '0.5'); assert.equal(ui.get('wake-settings-save').disabled, true); assert.equal(ui.get('auto-wake').disabled, true);
+  await submitWakeSettings(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  await ui.get('wake-settings-reload').onclick(); assert.equal(ui.get('wake-per-user').value, '1');
+});
+test('disconnecting a pending manual wake prevents late acknowledgements from enabling a new request', async () => {
+  let release;
+  const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? new Promise(resolve => { release = () => resolve([202, {...view(), job_id: 'late-wake', phase: 'prepared'}]); }) : wakeResponse(url));
+  await openWake(ui); configureWakeRequest(ui); const pending = submitWake(ui); await flush(); ui.get('disconnect').onclick();
+  ui.get('key').value = 'fixture-key'; await ui.get('connect').onclick(); release(); await pending;
+  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-verify').hidden, false);
+  await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('backend wake settings changes invalidate an earlier overview spend confirmation', async () => {
+  let settings = wakeSettings(1, wakeConfig({on_five_hour_reset: true}));
+  const ui = panel(url => wakeResponse(url, settings)); await openWake(ui); ui.get('wake-overview-consent').checked = true;
+  settings = wakeSettings(2, wakeConfig({on_five_hour_reset: true, accounts_per_user: 2})); await ui.tick(5000);
+  assert.equal(ui.get('wake-overview-consent').checked, false);
+  ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange(); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('wake histories safely render all backend hold reasons and unknown public errors without exposing arbitrary HTML', async () => {
+  const holds = ['quota_pending', 'quota_unknown', 'quota_blocked', 'active_window', 'weekly_reset_conflict', 'activity_unknown', 'account_busy', 'capacity_satisfied', 'outside_allowed_hours', 'model_busy', 'model_missing', 'verification_pending'];
+  const jobs = holds.map((hold_reason, index) => ({job_id: 'hold-' + index, account_id: '<img src=x onerror=alert(1)>', phase: 'queued', reason: 'weekly_reset', hold_reason, error_code: index ? '' : 'internal_secret_text'}));
+  const ui = panel(url => url.includes('/wake-jobs?limit=') ? [200, {...view(), jobs}] : wakeResponse(url)); await openWake(ui);
+  assert.equal(ui.get('wake-history').children.length, 12); assert.match(ui.get('wake-history').textContent, /额度证据未知|目标容量已满足|等待结果核实/);
+  assert.doesNotMatch(ui.get('wake-history').textContent, /internal_secret_text/);
+  assert.equal(ui.get('wake-history').children[0].children[0].children[0].children.length, 0);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('malformed wake save acknowledgements remain uncertain and cannot be blindly resubmitted', async () => {
+  for (const config of [undefined, {}, {...wakeConfig(), allowed_hours: null}]) {
+    const ui = panel((url, options) => url.endsWith('/wake-settings') && options.method === 'POST' ? [200, {...view(), revision: 2, config}] : wakeResponse(url));
+    await openWake(ui); edit(ui, 'wake-per-user', '0.5'); await submitWakeSettings(ui);
+    assert.equal(ui.get('wake-settings-save').disabled, true); assert.equal(ui.get('auto-wake').disabled, true);
+    await submitWakeSettings(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+    assert.match(ui.get('wake-settings-message').textContent, /尚未确认/);
+  }
+});
+test('older wake history snapshots cannot roll a known unknown outcome back to an active state', async () => {
+  let jobRevision = 30, phase = 'unknown';
+  const ui = panel((url, options) => {
+    if (url.includes('/wake-jobs')) {
+      const job = {job_id: 'monotonic-wake', account_id: 'codex-01', phase};
+      return url.includes('?limit=') ? [200, {...view('a', jobRevision), jobs: [job]}] : [200, {...view('a', jobRevision), ...job}];
+    }
+    return wakeResponse(url);
+  });
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui);
+  jobRevision = 29; phase = 'queued'; await ui.get('wake-history-refresh').onclick();
+  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-status').textContent, '结果未知');
+  await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
 });

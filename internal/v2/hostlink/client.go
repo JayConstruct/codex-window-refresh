@@ -24,6 +24,7 @@ type Client struct {
 	Path       string
 	instance   atomic.Value
 	generation atomic.Value
+	wake       atomic.Value
 }
 type generationCapability struct {
 	instance  string
@@ -38,6 +39,7 @@ type Hello struct {
 	PassiveQuota        bool     `json:"passive_quota_supported"`
 	PromptGeneration    bool     `json:"prompt_generation_supported"`
 	GenerationProviders []string `json:"prompt_generation_providers"`
+	WakeSupported       bool     `json:"wake_supported"`
 }
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -116,8 +118,9 @@ func (c *Client) exchangeFor(ctx context.Context, method string, request, respon
 	}
 	if !e.OK {
 		switch e.Error.Code {
-		case "bridge_busy", "bridge_instance_changed", "method_not_allowed", "host_callback_failed", "bridge_stopping", "invalid_event_cursor",
+		case "bridge_busy", "model_budget_busy", "bridge_instance_changed", "method_not_allowed", "host_callback_failed", "bridge_stopping", "invalid_event_cursor",
 			"generation_not_supported", "generation_request_invalid", "generation_delivery_unknown", "generation_candidates_invalid",
+			"wake_not_supported", "wake_request_invalid", "wake_delivery_unknown",
 			"account_binding_changed", "account_not_found", "account_identity_unavailable", "account_disabled":
 			return errors.New(e.Error.Code)
 		}
@@ -157,6 +160,7 @@ func (c *Client) PublishBindings(ctx context.Context, instance string, accounts 
 
 func (c *Client) Handshake(ctx context.Context) (Hello, error) {
 	c.generation.Store(generationCapability{})
+	c.wake.Store("")
 	var h Hello
 	var raw json.RawMessage
 	err := c.exchange(ctx, "bridge.hello", struct{}{}, &raw)
@@ -195,8 +199,20 @@ func (c *Client) Handshake(ctx context.Context) (Hello, error) {
 			capability.providers = append([]string(nil), h.GenerationProviders...)
 		}
 		c.generation.Store(capability)
+		if h.WakeSupported {
+			c.wake.Store(h.Instance)
+		}
 	}
 	return h, err
+}
+func (c *Client) Instance() string {
+	instance, _ := c.instance.Load().(string)
+	return instance
+}
+func (c *Client) SupportsWake() bool {
+	instance := c.Instance()
+	wake, _ := c.wake.Load().(string)
+	return instance != "" && instance == wake
 }
 func (c *Client) SupportsPromptGeneration() bool {
 	return len(c.SupportedGenerationProviders()) != 0
@@ -215,7 +231,7 @@ func (c *Client) Call(ctx context.Context, method string, request, response any)
 	case "host.model.execute_stream", "host.model.stream_read", "host.model.stream_close":
 		instance, _ := c.instance.Load().(string)
 		capability, _ := c.generation.Load().(generationCapability)
-		if instance == "" || instance != capability.instance || len(capability.providers) == 0 {
+		if instance == "" || ((instance != capability.instance || len(capability.providers) == 0) && !c.SupportsWake()) {
 			return errors.New("generation_not_supported")
 		}
 		return c.exchangeFor(ctx, method, request, response, instance)

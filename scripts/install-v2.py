@@ -78,7 +78,9 @@ def unpack(archive, checksums, filename, output, version, arch):
     info = json.loads((output / "BUILD-INFO.json").read_text())
     require(info.get("backend") == "v2" and info.get("release") == version and info.get("architecture") == arch
             and info.get("platform") == "linux" and info.get("host_abi") == 1 and info.get("rpc_schema") == 6
-            and info.get("protocol_version") == 1 and info.get("model_execution") is False,
+            and info.get("protocol_version") == 1 and type(info.get("model_execution")) is bool
+            and (info["model_execution"] is False
+                 or info.get("wake") is True and info.get("wake_providers") == ["codex"]),
             "v2 包版本、架构或协议不匹配。")
     local, glibc = platform.libc_ver()[1], info.get("minimum_glibc_symbols", "")
     require(isinstance(glibc, str) and re.fullmatch(r"\d+(?:\.\d+)+", glibc) and local
@@ -446,7 +448,7 @@ def install(args, plan, arch):
         print(f"v2 更新成功：{args.version}；已核对 CPA 注册资源入口、后台版本、接入实例和 CPA PID。")
         print(f"CPA {'已按 --restart 重启' if stopped_cpa else '未重启'}；已清除 v1 数据、旧版本和临时备份，保留当前 v2 数据。")
         if metadata.get("prompt_generation") is True:
-            print("额度查询不发送模型请求；短句候选仅在手动确认后调用指定账号模型，自动唤醒仍关闭。")
+            print("额度查询本身不发送模型请求；短句候选与手动唤醒需明确确认。自动唤醒默认关闭，已有开启规则会保留并独立执行。")
         else:
             print("当前仅提供只读额度查询和活动观测；自动唤醒和模型生成在 v2 中不执行。")
 

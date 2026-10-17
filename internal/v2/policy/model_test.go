@@ -23,6 +23,23 @@ func TestModelDefaultsAndNormalization(t *testing.T) {
 	}
 }
 
+func TestGenerationPromptValidation(t *testing.T) {
+	for _, prompt := range []string{"", DefaultGenerationPrompt, "第一行\n第二行\r\n\t缩进", strings.Repeat("x", 8192)} {
+		config := DefaultModel()
+		config.GenerationPrompt = prompt
+		if !ValidGenerationPrompt(prompt) || config.Validate() != nil {
+			t.Fatal("valid generation prompt rejected")
+		}
+	}
+	for _, prompt := range []string{string([]byte{0xff}), "nul\x00", "escape\x1b", strings.Repeat("x", 8193), strings.Repeat("中", 2731)} {
+		config := DefaultModel()
+		config.GenerationPrompt = prompt
+		if ValidGenerationPrompt(prompt) || config.Validate() == nil {
+			t.Fatal("invalid generation prompt accepted")
+		}
+	}
+}
+
 func TestModelValidation(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -86,6 +103,7 @@ func TestModelValidation(t *testing.T) {
 
 func TestModelTextBudgetCountsUTF8BytesBeforePhraseTrimming(t *testing.T) {
 	config := DefaultModel()
+	config.GenerationPrompt = ""
 	config.DefaultPrompt = "x"
 	for index := 0; index < 127; index++ {
 		config.Phrases = append(config.Phrases, fmt.Sprintf("%03d", index)+strings.Repeat("x", 509))

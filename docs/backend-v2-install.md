@@ -6,6 +6,12 @@ rc.6 新增可折叠侧栏、总览查询开关直接保存、模型与提示词
 
 rc.7 支持反重力账号生成、独立生成账号目录及提供方协商，并将数据库迁移到 schema 6。rc.6 仍仅支持 Codex。升级需要后台与接入层同时更新并显式 `--restart`，不导入反重力账号到额度查询池，也不会自动调用模型或切换提供方。
 
+rc.8 支持可编辑候选生成提示词及 Codex 模型唤醒，数据库由 schema 6/7 迁移到 schema 8；rc.7 仍为 schema 6，不包含这些功能。新接入层需声明 `wake_supported` 并注册唤醒设置与任务管理路由，因此须同时更新后台与接入层并显式重启 CPA，不能只替换网页或后台。仅保存模型/提示词不会发送模型请求；保存并开启自动唤醒规则后，后台可因后续额度观测创建发送任务，与网页是否打开无关。反重力仍仅用于候选生成。
+
+首次升级 rc.8 时先保持自动唤醒及五小时、周、每日规则关闭，核对实际模型、时区与允许时段，再显式手动唤醒一个测试账号。手动操作会先只读查额度和活动保护，可能跳过或阻塞，不保证一定发送；若发送则可能消耗模型额度。模型完成与窗口核实分开显示，结果未知不得换新键重复发送。确认行为后再按需保存开启自动规则。自动规则默认关闭并不覆盖旧版中用户已经明确保存的设置。
+
+升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.8 发布说明](releases/v0.2.0-rc.8.md)。
+
 旧后台不能直接打开迁移后的新库，回退必须停服务并恢复升级前一致的数据库备份，不能仅替换旧二进制。安装器激活失败时会使用临时一致备份恢复，但成功后会清理该副本；需要日后手动降级时，升级前须另行保存停机或 SQLite 在线一致备份。
 
 ## 首次切换
@@ -27,7 +33,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.7` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.8` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -55,7 +61,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.7 --package /path/codex-window-refresh-v2_v0.2.0-rc.7_linux_amd64.tar.gz \
+  --version v0.2.0-rc.8 --package /path/codex-window-refresh-v2_v0.2.0-rc.8_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 

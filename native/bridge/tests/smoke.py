@@ -632,6 +632,35 @@ class NativeBridge(unittest.TestCase):
         self.assertTrue(self.call('plugin.quiesce', {})['ok'])
         self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 0, 1))
 
+    def test_serial_model_budget_blocks_new_calls_until_old_stream_is_closed(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.allow_models = True
+        self.expected_models = 2
+        request = dict(self.model_request(), model_serial=True)
+        for invalid in (False, 1, 'true'):
+            result = self.rpc('host.model.execute_stream', dict(request, model_serial=invalid), instance)
+            self.assertEqual(result['error']['code'], 'invalid_payload')
+        stream = self.rpc('host.model.execute_stream', request, instance)['result']['stream_id']
+        refused = self.rpc('host.model.execute_stream', request, instance)
+        self.assertEqual(refused['error']['code'], 'model_budget_busy')
+        self.assertEqual(self.models, 1)
+        self.model_close_error = True
+        self.assertFalse(self.rpc('host.model.stream_close', {'stream_id': stream}, instance)['ok'])
+        self.assertEqual(self.rpc('host.model.execute_stream', request, instance)['error']['code'], 'model_budget_busy')
+        self.assertEqual(self.models, 1)
+        self.model_close_error = False
+        deadline = time.monotonic()+4
+        while time.monotonic() < deadline:
+            opened = self.rpc('host.model.execute_stream', request, instance)
+            if opened.get('ok'):
+                break
+            self.assertEqual(opened['error']['code'], 'model_budget_busy')
+            time.sleep(.05)
+        self.assertTrue(opened['ok'], opened)
+        self.assertEqual(self.models, 2)
+        self.assertTrue(all('model_serial' not in request for request in self.model_requests))
+        self.assertTrue(self.rpc('host.model.stream_close', {'stream_id': opened['result']['stream_id']}, instance)['ok'])
+
     def test_failed_model_close_keeps_ownership_and_throttles_cleanup_without_reexecute(self):
         instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
         self.allow_models = True
@@ -731,7 +760,8 @@ class NativeBridge(unittest.TestCase):
         self.expected_models = 1
         self.block_model_read = True
         self.release.clear()
-        request = {'account_id': account_id, 'model': 'fixture-model', 'count': 2}
+        request = {'account_id': account_id, 'model': 'fixture-model', 'count': 2,
+                   'prompt': '生成自然的中文问候，避免重复。'}
         status, accepted = self.management('prompt-generations', 'POST', request, 'interrupted-candidate')
         self.assertEqual(status, 202, accepted)
         self.assertTrue(self.entered.wait(5))
@@ -798,6 +828,7 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(overview['inventory']['status'], 'ready')
         self.assertEqual(overview['dashboard']['total'], 2)
         self.assertEqual(overview['capabilities']['prompt_generation_providers'], ['codex', 'antigravity'])
+        self.assertTrue(overview['capabilities']['editable_generation_prompt'])
         status, accounts = self.management('accounts')
         self.assertEqual(status, 200)
         self.assertEqual([account['id'] for account in accounts['accounts']], ['a', 'b'])
@@ -805,7 +836,8 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(status, 200)
         self.allow_models = True
         self.expected_models = 1
-        request = {'account_id': 'antig', 'model': 'fixture-antigravity-model', 'count': 2}
+        request = {'account_id': 'antig', 'model': 'fixture-antigravity-model', 'count': 2,
+                   'prompt': '只生成简短自然的中文问候。\n不要提问。'}
         status, accepted = self.management('prompt-generations', 'POST', request, 'antigravity-exactly-once')
         self.assertEqual(status, 202, accepted)
         job_id = accepted['job_id']
@@ -820,10 +852,16 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(execution['exit_protocol'], 'openai-response')
         self.assertEqual(execution['model'], 'fixture-antigravity-model')
         self.assertTrue(execution['stream'])
-        self.assertEqual(json.loads(base64.b64decode(execution['body']))['model'], execution['model'])
+        body = json.loads(base64.b64decode(execution['body']))
+        self.assertEqual(body['model'], execution['model'])
+        self.assertEqual(body['input'][0]['content'][0]['text'], request['prompt'])
+        self.assertIn('exactly 2', body['instructions'])
+        self.assertIn('JSON array', body['instructions'])
         status, replay = self.management('prompt-generations', 'POST', request, 'antigravity-exactly-once')
         self.assertEqual((status, replay['job_id']), (202, job_id))
         self.assertEqual(self.management('prompt-generations', 'POST', dict(request, model='another-model'),
+                                         'antigravity-exactly-once')[0], 409)
+        self.assertEqual(self.management('prompt-generations', 'POST', dict(request, prompt='另一种生成要求'),
                                          'antigravity-exactly-once')[0], 409)
         self.stop_daemon()
         self.start_daemon()
@@ -862,6 +900,269 @@ class NativeBridge(unittest.TestCase):
         status, replay = self.management('prompt-generations', 'POST', request, 'antigravity-unknown')
         self.assertEqual((status, replay['job_id'], replay['phase']), (202, job_id, 'unknown'))
         time.sleep(.3)
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+
+    def wait_wake_fixture_ready(self):
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, overview = self.management('overview')
+            if status == 200 and overview.get('inventory', {}).get('status') == 'ready':
+                return overview
+            time.sleep(.025)
+        self.fail(f'wake fixture inventory did not become ready: {overview}')
+
+    def test_packaged_wake_capability_metadata_preserves_protocol_and_generation(self):
+        import tarfile
+        output = self.root/'wake-package'
+        subprocess.run(['python3', str(ROOT/'scripts/package-v2.py'), '--commit', '0'*40,
+                        '--epoch', '0', '--output', str(output)], check=True, stdout=subprocess.PIPE)
+        archives = list(output.glob('*.tar.gz'))
+        self.assertEqual(len(archives), 1)
+        with tarfile.open(archives[0], 'r:gz') as archive:
+            members = [member for member in archive.getmembers() if member.name.endswith('/BUILD-INFO.json')]
+            self.assertEqual(len(members), 1)
+            info = json.load(archive.extractfile(members[0]))
+        self.assertIs(info['model_execution'], True)
+        self.assertIs(info['wake'], True)
+        self.assertEqual(info['wake_providers'], ['codex'])
+        self.assertIs(info['prompt_generation'], True)
+        self.assertEqual(info['prompt_generation_providers'], ['codex', 'antigravity'])
+        self.assertIs(info['editable_generation_prompt'], True)
+        self.assertEqual((info['host_abi'], info['rpc_schema'], info['protocol_version']), (1, 6, 1))
+        self.assertIs(info['real_account_validation'], False)
+        self.assertEqual(self.models, 0)
+
+    def configure_wake_fixture_model(self):
+        status, settings = self.management('model-settings')
+        self.assertEqual(status, 200)
+        settings['config'].update(default_model='fixture-wake-model', default_prompt='你好，请简短回应。', prompt_mode='fixed')
+        status, saved = self.management('model-settings', 'POST',
+                                        {'revision': settings['revision'], 'config': settings['config']})
+        self.assertEqual(status, 200, saved)
+        return saved
+
+    def test_wake_settings_defaults_validation_and_restart_never_send_models(self):
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        hello = self.rpc('bridge.hello')['result']
+        self.assertTrue(hello['wake_supported'])
+        routes = self.call('management.register', {})['result']['Routes']
+        for endpoint in ('wake-settings', 'wake-jobs'):
+            for method in ('GET', 'POST'):
+                self.assertIn({'Method': method, 'Path': '/v0/management/codex-window-refresh/v2/'+endpoint}, routes)
+        status, settings = self.management('wake-settings')
+        self.assertEqual(status, 200)
+        self.assertEqual(settings['revision'], 0)
+        self.assertEqual(settings['config'], {
+            'enabled': False, 'on_five_hour_reset': False, 'on_weekly_reset': False,
+            'timezone': 'Asia/Shanghai', 'random_delay': {'min_seconds': 5, 'max_seconds': 60},
+            'allowed_hours': ['08:00-23:00'], 'accounts_per_user': 1, 'max_accounts': 10000,
+            'daily_enabled': False, 'daily_window': '09:00-09:10', 'daily_target': 1,
+        })
+        for request in ({'config': settings['config']}, {'revision': 0},
+                        {'revision': 0, 'config': dict(settings['config'], extra=True)},
+                        {'revision': 0, 'config': dict(settings['config'], daily_window='23:00-01:00')},
+                        {'revision': 0, 'config': dict(settings['config'], accounts_per_user=101)}):
+            status, rejected = self.management('wake-settings', 'POST', request)
+            self.assertEqual((status, rejected.get('error')), (400, 'invalid_wake_settings'))
+        config = dict(settings['config'], allowed_hours=[], accounts_per_user=2, max_accounts=10,
+                      daily_target=3, daily_window='10:00-10:20')
+        status, saved = self.management('wake-settings', 'POST', {'revision': 0, 'config': config})
+        self.assertEqual(status, 200, saved)
+        self.assertEqual(saved['revision'], 1)
+        status, conflict = self.management('wake-settings', 'POST', {'revision': 0, 'config': config})
+        self.assertEqual((status, conflict.get('error')), (409, 'wake_settings_conflict'))
+        status, page = self.management('wake-jobs', query={'limit': ['1']})
+        self.assertEqual((status, page['jobs']), (200, []))
+        self.assertEqual(self.management('wake-jobs', query={'limit': ['101']})[0], 400)
+        self.stop_daemon()
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, restored = self.management('wake-settings')
+        self.assertEqual((status, restored['revision'], restored['config']), (200, 1, config))
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
+
+    def test_manual_wake_readonly_preflight_failure_is_durable_and_never_sends_models(self):
+        self.antigravity_accounts = True
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        self.configure_wake_fixture_model()
+        self.query_delay(0, 0)
+        for request in ({}, {'account_id': 'a', 'model': 'arbitrary'}, {'account_id': 'a', 'force': True}):
+            self.assertEqual(self.management('wake-jobs', 'POST', request, 'wake-invalid')[0], 400)
+        self.assertEqual(self.management('wake-jobs', 'POST', {'account_id': 'a'})[0], 400)
+        status, rejected = self.management('wake-jobs', 'POST', {'account_id': 'antig'}, 'antig-cannot-wake')
+        self.assertEqual((status, rejected.get('error')), (409, 'wake_account_unavailable'))
+        request = {'account_id': 'a'}
+        status, accepted = self.management('wake-jobs', 'POST', request, 'wake-safe-preflight')
+        self.assertEqual(status, 202, accepted)
+        job_id = accepted['job_id']
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, result = self.management('wake-jobs', query={'job_id': [job_id]})
+            self.assertEqual(status, 200)
+            status, queries = self.management('jobs')
+            self.assertEqual(status, 200)
+            preflight = [job for job in queries['jobs'] if job.get('trigger') == 'wake_preflight' and job['phase'] == 'failed']
+            if result['phase'] == 'checking' and preflight:
+                break
+            time.sleep(.025)
+        self.assertEqual(result['phase'], 'checking', result)
+        self.assertTrue(preflight, queries)
+        self.assertEqual(result.get('hold_reason'), 'quota_unknown')
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
+        for sensitive in ('binding', 'auth_index', 'fixture-wake-model', '你好，请简短回应。', 'must-not-forward'):
+            self.assertNotIn(sensitive, json.dumps(result, ensure_ascii=False))
+        status, replay = self.management('wake-jobs', 'POST', request, 'wake-safe-preflight')
+        self.assertEqual((status, replay['job_id']), (202, job_id))
+        self.assertEqual(self.management('wake-jobs', 'POST', {'account_id': 'b'}, 'wake-safe-preflight')[0], 409)
+        self.stop_daemon()
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, restored = self.management('wake-jobs', 'POST', request, 'wake-safe-preflight')
+        self.assertEqual((status, restored['job_id'], restored['phase']), (202, job_id, 'checking'))
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
+
+    def test_interrupted_wake_recovers_unknown_and_does_not_resend_or_release_account(self):
+        import datetime
+        import sqlite3
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        self.configure_wake_fixture_model()
+        self.stop_daemon()
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        request = {'account_id': 'a'}
+        digest = hashlib.sha256(json.dumps(request, separators=(',', ':')).encode()).hexdigest()
+        with sqlite3.connect(self.root/'data'/'backend.sqlite') as database:
+            account = database.execute('SELECT a.id,a.auth_index,b.binding FROM accounts a '
+                                       'JOIN account_bindings b ON a.id=b.account_id WHERE a.id=?', ('a',)).fetchone()
+            self.assertIsNotNone(account)
+            database.execute('INSERT INTO wake_jobs(id,account_id,auth_index,binding,reason,cycle,phase,'
+                             'idempotency_key,request_hash,scheduled_at,created_at,updated_at,model,prompt) '
+                             "VALUES(?,?,?,?,'manual',?,'sending',?,?,?,?,?,?,?)",
+                             ('interrupted-wake-fixture', *account, 'wake-interrupted', 'wake-interrupted', digest,
+                              stamp, stamp, stamp, 'fixture-wake-model', '你好，请简短回应。'))
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, restored = self.management('wake-jobs', query={'job_id': ['interrupted-wake-fixture']})
+        self.assertEqual((status, restored['phase']), (200, 'unknown'), restored)
+        status, replay = self.management('wake-jobs', 'POST', request, 'wake-interrupted')
+        self.assertEqual((status, replay['job_id'], replay['phase']), (202, 'interrupted-wake-fixture', 'unknown'))
+        self.assertEqual(self.management('wake-jobs', 'POST', request, 'wake-new-key-must-not-resend')[0], 429)
+        time.sleep(.5)
+        status, after = self.management('wake-jobs', query={'job_id': ['interrupted-wake-fixture']})
+        self.assertEqual((status, after['phase']), (200, 'unknown'), after)
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
+
+    def emit_wake_fixture_quota(self, request_id, reset_seconds):
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            observer = self.rpc('bridge.hello')['result']['quota_observer']
+            if observer['ready'] and observer['accounts'] == 2:
+                break
+            time.sleep(.025)
+        self.assertTrue(observer['ready'])
+        headers = self.quota_headers('1')
+        headers.update({'X-Codex-Primary-Reset-After-Seconds': [str(reset_seconds)],
+                        'X-Codex-Secondary-Used-Percent': ['0'],
+                        'X-Codex-Secondary-Window-Minutes': ['10080'],
+                        'X-Codex-Secondary-Reset-After-Seconds': ['604800']})
+        self.call('request.intercept_after', {'RequestID': request_id, 'Metadata': {'selected_auth_id': 'a'}})
+        self.call('response.intercept_after', {'RequestID': request_id, 'ResponseHeaders': headers})
+        self.call('request.complete', {'RequestID': request_id})
+        expected_state = 'expired' if reset_seconds == 0 else 'active'
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, page = self.management('accounts')
+            self.assertEqual(status, 200)
+            account = next(account for account in page['accounts'] if account['id'] == 'a')
+            snapshot = account.get('quota', {})
+            if (snapshot.get('source') == 'cpa_response_headers' and
+                    snapshot.get('five_hour', {}).get('State') == expected_state and
+                    snapshot.get('weekly', {}).get('Remaining', {}).get('Value') == 100):
+                return snapshot
+            time.sleep(.025)
+        self.fail(f'passive wake quota did not converge: {account}')
+
+    def test_manual_wake_saved_prompt_exact_send_and_readonly_window_verification(self):
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        saved = self.configure_wake_fixture_model()
+        self.emit_wake_fixture_quota('wake-expired-evidence', 0)
+        self.assertEqual(self.models, 0)
+        self.allow_models = True
+        self.expected_models = 1
+        status, accepted = self.management('wake-jobs', 'POST', {'account_id': 'a'}, 'wake-exact-saved-prompt')
+        self.assertEqual(status, 202, accepted)
+        job_id = accepted['job_id']
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, result = self.management('wake-jobs', query={'job_id': [job_id]})
+            self.assertEqual(status, 200)
+            if result['phase'] in ('verifying', 'completed', 'failed', 'unknown', 'skipped'):
+                break
+            time.sleep(.025)
+        self.assertEqual(result['phase'], 'verifying', result)
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+        request = self.model_requests[0]
+        self.assertEqual((request['forced_provider'], request['auth_id'], request['entry_protocol'], request['exit_protocol']),
+                         ('codex', 'a', 'openai-response', 'codex'))
+        self.assertEqual(request['model'], saved['config']['default_model'])
+        body = json.loads(base64.b64decode(request['body']))
+        self.assertEqual(body, {'model': saved['config']['default_model'], 'stream': True, 'store': False,
+                               'input': [{'role': 'user', 'content': [{'type': 'input_text',
+                                          'text': saved['config']['default_prompt']}]}]})
+        self.assertNotIn('instructions', body)
+        status, replay = self.management('wake-jobs', 'POST', {'account_id': 'a'}, 'wake-exact-saved-prompt')
+        self.assertEqual((status, replay['job_id']), (202, job_id))
+        self.emit_wake_fixture_quota('wake-active-evidence', 3000)
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, verified = self.management('wake-jobs', query={'job_id': [job_id]})
+            self.assertEqual(status, 200)
+            if verified['phase'] == 'completed':
+                break
+            time.sleep(.025)
+        self.assertEqual(verified['phase'], 'completed', verified)
+        self.assertEqual(verified.get('error_code'), 'window_verified')
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+
+    def test_wake_model_error_unknown_blocks_candidate_and_new_wake_across_restart(self):
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        self.configure_wake_fixture_model()
+        self.emit_wake_fixture_quota('wake-error-expired-evidence', 0)
+        self.allow_models = True
+        self.expected_models = 1
+        self.model_error = True
+        request = {'account_id': 'a'}
+        status, accepted = self.management('wake-jobs', 'POST', request, 'wake-model-error')
+        self.assertEqual(status, 202, accepted)
+        job_id = accepted['job_id']
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, result = self.management('wake-jobs', query={'job_id': [job_id]})
+            self.assertEqual(status, 200)
+            if result['phase'] == 'unknown':
+                break
+            time.sleep(.025)
+        self.assertEqual(result['phase'], 'unknown', result)
+        self.assertEqual(result.get('error_code'), 'wake_outcome_unknown')
+        self.assertNotIn('secret', json.dumps(result))
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+        self.assertEqual(self.management('wake-jobs', 'POST', request, 'wake-model-error-new-key')[0], 429)
+        status, rejected = self.management('prompt-generations', 'POST',
+                                          {'account_id': 'a', 'model': 'fixture-model', 'count': 2},
+                                          'candidate-must-not-bypass-unknown-wake')
+        self.assertEqual((status, rejected.get('error')), (409, 'generation_account_unavailable'))
+        self.model_error = False
+        self.stop_daemon()
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, replay = self.management('wake-jobs', 'POST', request, 'wake-model-error')
+        self.assertEqual((status, replay['job_id'], replay['phase']), (202, job_id, 'unknown'))
+        self.assertEqual(self.management('wake-jobs', 'POST', request, 'wake-model-error-new-key-after-restart')[0], 429)
+        time.sleep(.5)
         self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
 
     def test_event_control_survives_all_host_callback_slots_being_blocked(self):

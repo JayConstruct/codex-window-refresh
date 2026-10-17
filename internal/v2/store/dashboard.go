@@ -233,6 +233,11 @@ func readDashboard(ctx context.Context, tx *sql.Tx, revision, accountsRevision u
 	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM jobs WHERE phase IN ('failed','blocked')").Scan(&dashboard.Errors); err != nil {
 		return dashboard, err
 	}
+	var wakeErrors int
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM wake_jobs WHERE phase IN ('failed','unknown')").Scan(&wakeErrors); err != nil {
+		return dashboard, err
+	}
+	dashboard.Errors += wakeErrors
 	dashboard.Errors += dashboard.Unavailable
 	dashboard.RecentJobs, err = recentJobs(ctx, tx, DashboardRecentLimit)
 	if err != nil {
@@ -261,6 +266,33 @@ func readDashboard(ctx context.Context, tx *sql.Tx, revision, accountsRevision u
 			severity = "error"
 		}
 		dashboard.RecentEvents = append(dashboard.RecentEvents, DashboardEvent{ID: "job:" + job.ID, Kind: "quota_query", At: job.UpdatedAt, Phase: job.Phase, JobID: job.ID, AccountID: job.Target, Detail: detail, Code: code, Severity: severity})
+	}
+	wakeRows, err := tx.QueryContext(ctx, "SELECT id,account_id,phase,updated_at FROM wake_jobs ORDER BY updated_at DESC,id DESC LIMIT ?", DashboardRecentLimit)
+	if err != nil {
+		return dashboard, err
+	}
+	for wakeRows.Next() {
+		var id, accountID, phase, updated string
+		if err = wakeRows.Scan(&id, &accountID, &phase, &updated); err != nil {
+			wakeRows.Close()
+			return dashboard, err
+		}
+		severity, detail := "info", "模型唤醒任务状态更新"
+		if phase == "unknown" {
+			severity, detail = "error", "模型唤醒结果未知，禁止自动重发"
+		} else if phase == "failed" {
+			severity, detail = "error", "模型唤醒失败"
+		} else if phase == "verifying" {
+			detail = "模型已返回，等待窗口证据核实"
+		} else if phase == "completed" {
+			detail = "模型唤醒已核实活动窗口"
+		}
+		dashboard.RecentEvents = append(dashboard.RecentEvents, DashboardEvent{ID: "wake:" + id, Kind: "model_wake", At: updated, Phase: phase, JobID: id, AccountID: accountID, Detail: detail, Code: "model_wake_" + phase, Severity: severity})
+	}
+	err = wakeRows.Err()
+	wakeRows.Close()
+	if err != nil {
+		return dashboard, err
 	}
 	if inventory.Status == "ready" && inventory.LastSuccessAt != "" {
 		dashboard.RecentEvents = append(dashboard.RecentEvents, DashboardEvent{ID: "inventory", Kind: "inventory", At: inventory.LastSuccessAt, Phase: "ready", Detail: "CPA 账号清单已同步", Code: "inventory_synced", Severity: "info"})

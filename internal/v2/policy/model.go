@@ -9,19 +9,28 @@ import (
 
 var ErrInvalidModelSettings = errors.New("invalid_model_settings")
 
+const DefaultGenerationPrompt = "生成简短、自然、适合日常问候的中文短句，避免重复。"
+
 type ModelConfig struct {
-	DefaultModel   string   `json:"default_model"`
-	DefaultPrompt  string   `json:"default_prompt"`
-	FiveHourModel  string   `json:"five_hour_model"`
-	FiveHourPrompt string   `json:"five_hour_prompt"`
-	WeeklyModel    string   `json:"weekly_model"`
-	WeeklyPrompt   string   `json:"weekly_prompt"`
-	PromptMode     string   `json:"prompt_mode"`
-	Phrases        []string `json:"phrases"`
+	DefaultModel     string   `json:"default_model"`
+	DefaultPrompt    string   `json:"default_prompt"`
+	FiveHourModel    string   `json:"five_hour_model"`
+	FiveHourPrompt   string   `json:"five_hour_prompt"`
+	WeeklyModel      string   `json:"weekly_model"`
+	WeeklyPrompt     string   `json:"weekly_prompt"`
+	GenerationPrompt string   `json:"generation_prompt"`
+	PromptMode       string   `json:"prompt_mode"`
+	Phrases          []string `json:"phrases"`
 }
 
 func DefaultModel() ModelConfig {
-	return ModelConfig{DefaultPrompt: "你好，请用一句简短的中文问候回复。", PromptMode: "fixed", Phrases: []string{}}
+	return ModelConfig{DefaultPrompt: "你好，请用一句简短的中文问候回复。", GenerationPrompt: DefaultGenerationPrompt, PromptMode: "fixed", Phrases: []string{}}
+}
+
+func ValidGenerationPrompt(prompt string) bool {
+	return utf8.ValidString(prompt) && len(prompt) <= 8192 && !strings.ContainsFunc(prompt, func(value rune) bool {
+		return unicode.IsControl(value) && value != '\n' && value != '\r' && value != '\t'
+	})
 }
 
 func (config ModelConfig) Normalize() ModelConfig {
@@ -41,7 +50,7 @@ func (config ModelConfig) Validate() error {
 		}
 		total += len(model)
 	}
-	for _, prompt := range []string{config.DefaultPrompt, config.FiveHourPrompt, config.WeeklyPrompt} {
+	for _, prompt := range []string{config.DefaultPrompt, config.FiveHourPrompt, config.WeeklyPrompt, config.GenerationPrompt} {
 		if !utf8.ValidString(prompt) || len(prompt) > 8192 || strings.ContainsFunc(prompt, func(value rune) bool {
 			return unicode.IsControl(value) && value != '\n' && value != '\r' && value != '\t'
 		}) {

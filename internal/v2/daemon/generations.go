@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,12 +9,22 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"codex-window-refresh/internal/v2/store"
 )
 
 type candidateGenerator interface {
 	GenerateCandidates(context.Context, store.Account, string, int) ([]string, error)
+}
+
+type promptCandidateGenerator interface {
+	GenerateCandidatesWithPrompt(context.Context, store.Account, string, int, string) ([]string, error)
+}
+
+func (s *Service) editableGenerationPrompt() bool {
+	_, ok := s.source.(promptCandidateGenerator)
+	return ok
 }
 
 type generationDirectory interface {
@@ -113,9 +124,14 @@ func (s *Service) promptGenerations(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, generation)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	raw, readErr := io.ReadAll(r.Body)
+	if readErr != nil || !utf8.Valid(raw) {
+		apiError(w, 400, "invalid_prompt_generation")
+		return
+	}
 	var request store.GenerationRequest
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&request) != nil || decoder.Decode(new(any)) != io.EOF || request.Validate() != nil {
 		apiError(w, 400, "invalid_prompt_generation")
@@ -130,6 +146,10 @@ func (s *Service) promptGenerations(w http.ResponseWriter, r *http.Request) {
 	if err == nil && !existing {
 		if !s.generationSupported() {
 			apiError(w, 503, "prompt_generation_unavailable")
+			return
+		}
+		if request.Prompt != "" && !s.editableGenerationPrompt() {
+			apiError(w, 503, "generation_prompt_unavailable")
 			return
 		}
 		if source, ok := s.source.(generationResolver); ok {
@@ -209,7 +229,14 @@ func (s *Service) generate(ctx context.Context) {
 			continue
 		}
 		requestCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-		candidates, err := generator.GenerateCandidates(requestCtx, generation.Account, generation.Model, generation.Count)
+		var candidates []string
+		if promptGenerator, supported := s.source.(promptCandidateGenerator); supported {
+			candidates, err = promptGenerator.GenerateCandidatesWithPrompt(requestCtx, generation.Account, generation.Model, generation.Count, generation.Prompt)
+		} else if generation.Prompt == "" {
+			candidates, err = generator.GenerateCandidates(requestCtx, generation.Account, generation.Model, generation.Count)
+		} else {
+			err = errors.New("generation_request_rejected")
+		}
 		if requestCtx.Err() != nil {
 			err = requestCtx.Err()
 		}

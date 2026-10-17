@@ -11,6 +11,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"codex-window-refresh/internal/v2/policy"
 )
 
 var ErrInvalidGeneration = errors.New("invalid_prompt_generation")
@@ -20,6 +22,7 @@ type GenerationRequest struct {
 	AccountID string `json:"account_id"`
 	Model     string `json:"model"`
 	Count     int    `json:"count"`
+	Prompt    string `json:"prompt,omitempty"`
 }
 
 type Generation struct {
@@ -33,10 +36,11 @@ type Generation struct {
 	Account    Account  `json:"-"`
 	Model      string   `json:"-"`
 	Count      int      `json:"-"`
+	Prompt     string   `json:"-"`
 }
 
 func (request GenerationRequest) Validate() error {
-	if !ValidID(request.AccountID) || request.Count < 1 || request.Count > 20 || len(request.Model) == 0 || len(request.Model) > 200 || !utf8.ValidString(request.Model) || strings.IndexFunc(request.Model, func(char rune) bool { return unicode.IsSpace(char) || unicode.IsControl(char) }) >= 0 {
+	if !ValidID(request.AccountID) || request.Count < 1 || request.Count > 20 || len(request.Model) == 0 || len(request.Model) > 200 || !utf8.ValidString(request.Model) || strings.IndexFunc(request.Model, func(char rune) bool { return unicode.IsSpace(char) || unicode.IsControl(char) }) >= 0 || !policy.ValidGenerationPrompt(request.Prompt) {
 		return ErrInvalidGeneration
 	}
 	return nil
@@ -51,12 +55,12 @@ func generationAccount(ctx context.Context, tx *sql.Tx, id string) (Account, err
 	return account, err
 }
 
-const generationColumns = "id,account_id,auth_index,binding,provider,model,count,phase,error_code,candidates,created_at,updated_at"
+const generationColumns = "id,account_id,auth_index,binding,provider,model,count,prompt,phase,error_code,candidates,created_at,updated_at"
 
 func scanGeneration(row interface{ Scan(...any) error }) (Generation, error) {
 	var generation Generation
 	var candidates string
-	err := row.Scan(&generation.ID, &generation.Account.ID, &generation.Account.AuthIndex, &generation.Account.Binding, &generation.Account.Provider, &generation.Model, &generation.Count, &generation.Phase, &generation.ErrorCode, &candidates, &generation.CreatedAt, &generation.UpdatedAt)
+	err := row.Scan(&generation.ID, &generation.Account.ID, &generation.Account.AuthIndex, &generation.Account.Binding, &generation.Account.Provider, &generation.Model, &generation.Count, &generation.Prompt, &generation.Phase, &generation.ErrorCode, &candidates, &generation.CreatedAt, &generation.UpdatedAt)
 	if err == nil {
 		if generation.Account.Provider == "" {
 			generation.Account.Provider = "codex"
@@ -165,8 +169,15 @@ func (st *Store) createGeneration(ctx context.Context, key string, request Gener
 			account.Provider = "codex"
 		}
 		stamp := now()
-		generation = Generation{ID: ID(), Phase: "queued", Candidates: []string{}, CreatedAt: stamp, UpdatedAt: stamp, Account: account, Model: request.Model, Count: request.Count}
-		_, err = tx.ExecContext(ctx, "INSERT INTO prompt_generations(id,idempotency_key,request_hash,account_id,auth_index,binding,provider,model,count,phase,candidates,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'queued','[]',?,?)", generation.ID, key, hash, account.ID, account.AuthIndex, account.Binding, account.Provider, request.Model, request.Count, stamp, stamp)
+		var guards int
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM wake_jobs WHERE account_id=? AND phase IN ('prepared','sending','verifying','unknown')", account.ID).Scan(&guards); err != nil {
+			return err
+		}
+		if guards > 0 {
+			return ErrGenerationAccount
+		}
+		generation = Generation{ID: ID(), Phase: "queued", Candidates: []string{}, CreatedAt: stamp, UpdatedAt: stamp, Account: account, Model: request.Model, Count: request.Count, Prompt: request.Prompt}
+		_, err = tx.ExecContext(ctx, "INSERT INTO prompt_generations(id,idempotency_key,request_hash,account_id,auth_index,binding,provider,model,count,prompt,phase,candidates,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'queued','[]',?,?)", generation.ID, key, hash, account.ID, account.AuthIndex, account.Binding, account.Provider, request.Model, request.Count, request.Prompt, stamp, stamp)
 		return err
 	})
 	return generation, existing, err
@@ -183,14 +194,14 @@ func (st *Store) ClaimGeneration(ctx context.Context) (Generation, error) {
 	var generation Generation
 	err := st.write(ctx, func(tx *sql.Tx) error {
 		var running int
-		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM prompt_generations WHERE phase='running'").Scan(&running); err != nil {
+		if err := tx.QueryRowContext(ctx, "SELECT (SELECT count(*) FROM prompt_generations WHERE phase='running')+(SELECT count(*) FROM wake_jobs WHERE phase IN ('prepared','sending'))").Scan(&running); err != nil {
 			return err
 		}
 		if running > 0 {
 			return ErrBusy
 		}
 		var err error
-		generation, err = scanGeneration(tx.QueryRowContext(ctx, "SELECT "+generationColumns+" FROM prompt_generations WHERE phase='queued' ORDER BY created_at,id LIMIT 1"))
+		generation, err = scanGeneration(tx.QueryRowContext(ctx, "SELECT "+generationColumns+" FROM prompt_generations g WHERE phase='queued' AND NOT EXISTS(SELECT 1 FROM wake_jobs w WHERE w.account_id=g.account_id AND w.phase IN ('prepared','sending','verifying','unknown')) ORDER BY created_at,id LIMIT 1"))
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}

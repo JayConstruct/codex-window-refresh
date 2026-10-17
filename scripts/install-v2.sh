@@ -3,7 +3,7 @@ set -euo pipefail
 directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
   printf '%s\n' '用法：sudo bash install-v2.sh [--cpa-dir 路径] [--restart] [--version v0.2.X-rc.N]' \
-    'v2 只读后台：首次切换或接入层变化须显式 --restart；仅后台变化时不重启 CPA。' \
+    'v2 独立后台：首次切换或接入层变化须显式 --restart；仅后台变化时不重启 CPA。' \
     '成功后清除 v1 数据、旧版本及临时备份；保留现有 v2 数据库。清理旧服务环境须 --restart。' \
     '支持 --service、--user-service --user、--dry-run、--package、--checksums 与 --cpa-url。'
   exit 0

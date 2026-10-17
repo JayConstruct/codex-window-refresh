@@ -197,7 +197,7 @@ func TestAuthReadsStillRefreshChangedBridge(t *testing.T) {
 }
 
 func TestGenerationErrorSanitization(t *testing.T) {
-	for _, code := range []string{"generation_not_supported", "generation_request_invalid", "generation_delivery_unknown", "generation_candidates_invalid", "account_binding_changed", "account_not_found", "account_identity_unavailable", "account_disabled", "private Authorization: secret"} {
+	for _, code := range []string{"generation_not_supported", "generation_request_invalid", "generation_delivery_unknown", "generation_candidates_invalid", "wake_not_supported", "wake_request_invalid", "wake_delivery_unknown", "account_binding_changed", "account_not_found", "account_identity_unavailable", "account_disabled", "private Authorization: secret"} {
 		t.Run(code, func(t *testing.T) {
 			client, _ := newBridgeTestClient(t, func(request bridgeTestRequest) any {
 				if request.Method == "bridge.hello" {
@@ -316,6 +316,110 @@ func TestInvalidProviderHandshakeRevokesCachedGeneration(t *testing.T) {
 			}
 			if !reflect.DeepEqual(server.calls(), []string{"bridge.hello", "bridge.hello"}) {
 				t.Fatal("failed handshake caused model retry")
+			}
+		})
+	}
+}
+
+func TestWakeCapabilityIsExplicitCachedAndInstanceBound(t *testing.T) {
+	client := &Client{Path: "/unused/no-wake-bridge"}
+	if client.SupportsWake() || client.Instance() != "" {
+		t.Fatal("uninitialized bridge advertises wake capability or instance")
+	}
+	for _, fixture := range []struct {
+		name    string
+		wake    any
+		include bool
+		want    bool
+	}{
+		{name: "legacy"},
+		{name: "disabled", include: true, wake: false},
+		{name: "enabled", include: true, wake: true, want: true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			client, server := newBridgeTestClient(t, func(bridgeTestRequest) any {
+				result := map[string]any{"protocol_version": 1, "bridge_instance_id": "wake-instance", "read_only": true}
+				if fixture.include {
+					result["wake_supported"] = fixture.wake
+				}
+				return map[string]any{"ok": true, "result": result}
+			})
+			hello, err := client.Handshake(context.Background())
+			if err != nil || hello.WakeSupported != fixture.want || client.SupportsWake() != fixture.want || client.Instance() != "wake-instance" {
+				t.Fatal(hello, err, client.SupportsWake(), client.Instance())
+			}
+			if client.SupportsPromptGeneration() {
+				t.Fatal("wake capability implicitly enables generation")
+			}
+			if !reflect.DeepEqual(server.calls(), []string{"bridge.hello"}) {
+				t.Fatal("cached getter performed network I/O", server.calls())
+			}
+			client.instance.Store("replacement")
+			if client.SupportsWake() {
+				t.Fatal("stale wake capability reused for replacement bridge")
+			}
+		})
+	}
+}
+
+func TestWakeOnlyModelStreamsNeverRetryOrRefreshHandshake(t *testing.T) {
+	for _, method := range []string{"host.model.execute_stream", "host.model.stream_read", "host.model.stream_close"} {
+		t.Run(method, func(t *testing.T) {
+			client, server := newBridgeTestClient(t, func(request bridgeTestRequest) any {
+				if request.Method == "bridge.hello" {
+					return map[string]any{"ok": true, "result": map[string]any{"protocol_version": 1, "bridge_instance_id": "wake-only", "read_only": true, "wake_supported": true}}
+				}
+				if request.Instance != "wake-only" || request.Method != method {
+					t.Errorf("unexpected wake request: %+v", request)
+				}
+				return bridgeError("bridge_instance_changed")
+			})
+			if _, err := client.Handshake(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Call(context.Background(), method, struct{}{}, &struct{}{}); err == nil || err.Error() != "bridge_instance_changed" {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(server.calls(), []string{"bridge.hello", method}) {
+				t.Fatal("wake stream action retried", server.calls())
+			}
+		})
+	}
+}
+
+func TestFailedHandshakeRevokesCachedWake(t *testing.T) {
+	for _, failure := range []string{"invalid-boolean", "read-write", "transport", "old-bridge"} {
+		t.Run(failure, func(t *testing.T) {
+			hellos := 0
+			client, server := newBridgeTestClient(t, func(bridgeTestRequest) any {
+				hellos++
+				result := map[string]any{"protocol_version": 1, "bridge_instance_id": "wake-trusted", "read_only": true, "wake_supported": true}
+				if hellos > 1 {
+					switch failure {
+					case "invalid-boolean":
+						result["wake_supported"] = "true"
+					case "read-write":
+						result["read_only"] = false
+					case "transport":
+						return bridgeError("host_callback_failed")
+					case "old-bridge":
+						delete(result, "wake_supported")
+					}
+				}
+				return map[string]any{"ok": true, "result": result}
+			})
+			if _, err := client.Handshake(context.Background()); err != nil || !client.SupportsWake() {
+				t.Fatal(err, client.SupportsWake())
+			}
+			_, err := client.Handshake(context.Background())
+			if (err == nil) != (failure == "old-bridge") || client.SupportsWake() {
+				t.Fatal(failure, err, client.SupportsWake())
+			}
+			if err := client.Call(context.Background(), "host.model.execute_stream", struct{}{}, &struct{}{}); err == nil || err.Error() != "generation_not_supported" {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(server.calls(), []string{"bridge.hello", "bridge.hello"}) {
+				t.Fatal("wake dispatch escaped revoked capability", server.calls())
 			}
 		})
 	}

@@ -1,4 +1,4 @@
-// Package daemon hosts quota queries and explicitly requested candidate generation.
+// Package daemon hosts quota queries, candidate generation and opt-in model wakeups.
 package daemon
 
 import (
@@ -37,17 +37,20 @@ type Options struct {
 	RequestInventorySync func() bool
 }
 type Service struct {
-	Store            *store.Store
-	source           executor.Source
-	options          Options
-	instance         string
-	wake             chan struct{}
-	generationWake   chan struct{}
-	generationError  atomic.Bool
-	expanderError    atomic.Value
-	maintenanceError atomic.Bool
-	schedulerError   atomic.Value
-	workerErrors     []atomic.Bool
+	Store              *store.Store
+	source             executor.Source
+	options            Options
+	instance           string
+	wake               chan struct{}
+	generationWake     chan struct{}
+	generationError    atomic.Bool
+	wakeWork           chan struct{}
+	wakeWorkerError    atomic.Bool
+	wakeSchedulerError atomic.Bool
+	expanderError      atomic.Value
+	maintenanceError   atomic.Bool
+	schedulerError     atomic.Value
+	workerErrors       []atomic.Bool
 }
 
 func New(st *store.Store, source executor.Source, o Options) (*Service, error) {
@@ -62,11 +65,14 @@ func New(st *store.Store, source executor.Source, o Options) (*Service, error) {
 	}
 	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	err := st.RecoverGenerations(recoverCtx)
+	if err == nil {
+		err = st.RecoverWakes(recoverCtx)
+	}
 	recoverCancel()
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{Store: st, source: source, options: o, instance: store.ID(), wake: make(chan struct{}, 1), generationWake: make(chan struct{}, 1), workerErrors: make([]atomic.Bool, o.QueryConcurrency)}
+	s := &Service{Store: st, source: source, options: o, instance: store.ID(), wake: make(chan struct{}, 1), generationWake: make(chan struct{}, 1), wakeWork: make(chan struct{}, 1), workerErrors: make([]atomic.Bool, o.QueryConcurrency)}
 	s.expanderError.Store("")
 	s.schedulerError.Store("")
 	return s, nil
@@ -97,6 +103,10 @@ func (s *Service) Run(ctx context.Context) {
 	go func() { defer workers.Done(); s.schedule(ctx) }()
 	workers.Add(1)
 	go func() { defer workers.Done(); s.generate(ctx) }()
+	workers.Add(1)
+	go func() { defer workers.Done(); s.scheduleWakes(ctx) }()
+	workers.Add(1)
+	go func() { defer workers.Done(); s.executeWakes(ctx) }()
 	for i := 0; i < s.options.QueryConcurrency; i++ {
 		workers.Add(1)
 		go func() { defer workers.Done(); s.worker(ctx, i) }()
@@ -115,6 +125,12 @@ func (s *Service) maintenance(ctx context.Context) {
 	}
 }
 func (s *Service) lastError() string {
+	if s.wakeWorkerError.Load() {
+		return "storage_unavailable"
+	}
+	if s.wakeSchedulerError.Load() {
+		return "automatic_wake_failed"
+	}
 	if s.generationError.Load() {
 		return "storage_unavailable"
 	}
@@ -276,7 +292,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 503, "storage_unavailable")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]any{"quota_query": true, "model_execution": false, "prompt_generation": s.generationSupported(), "generation_accounts": s.generationAccountsSupported(), "prompt_generation_providers": s.generationProviders(), "model_settings": true, "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]any{"quota_query": true, "model_execution": s.wakeSupported(), "wake_settings": true, "automatic_wake": s.wakeSupported(), "prompt_generation": s.generationSupported(), "editable_generation_prompt": s.editableGenerationPrompt(), "generation_accounts": s.generationAccountsSupported(), "prompt_generation_providers": s.generationProviders(), "model_settings": true, "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+	case "GET /api/v2/wake-settings", "POST /api/v2/wake-settings":
+		s.wakeSettings(w, r)
+	case "GET /api/v2/wake-jobs", "POST /api/v2/wake-jobs":
+		s.wakeJobs(w, r)
 	case "GET /api/v2/model-settings", "POST /api/v2/model-settings":
 		s.modelSettings(w, r)
 	case "GET /api/v2/prompt-generations", "POST /api/v2/prompt-generations":

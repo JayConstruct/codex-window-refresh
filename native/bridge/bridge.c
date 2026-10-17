@@ -189,6 +189,8 @@ static int equals(J*value,const char*expected) {
     return text&&!strcmp(text,expected);
 }
 static int model_payload(J*payload) {
+	J*serial=field(payload,"model_serial");
+	if(serial&&(json_object_get_type(serial)!=1||!json_object_get_int(serial)))return 0;
     const char*body=string(field(payload,"body"));
     const char*model=string(field(payload,"model"));
     int codex=equals(field(payload,"forced_provider"),"codex")&&equals(field(payload,"exit_protocol"),"codex");
@@ -280,6 +282,7 @@ static J *rpc(J*req) {
         json_object_object_add(j,"bridge_instance_id",json_object_new_string(instance));
         json_object_object_add(j,"read_only",json_object_new_boolean(1));
         json_object_object_add(j,"prompt_generation_supported",json_object_new_boolean(1));
+        json_object_object_add(j,"wake_supported",json_object_new_boolean(1));
         J*providers=json_object_new_array();
         json_object_array_add(providers,json_object_new_string("codex"));
         json_object_array_add(providers,json_object_new_string("antigravity"));
@@ -317,6 +320,14 @@ static J *rpc(J*req) {
     int stopped=stopping;
     int busy=host_active>=HOST_CALLS;
     int slot=-1;
+    if(!stopped&&!busy&&execute&&json_object_get_int(field(payload,"model_serial"))) {
+        for(int index=0;index<HOST_CALLS;index++) {
+            if(streams[index].used) {
+                pthread_mutex_unlock(&queue_mu);
+                return error("model_budget_busy");
+            }
+        }
+    }
     if(!stopped&&!busy&&model) {
         for(int index=0;index<HOST_CALLS;index++) {
             if(execute?!streams[index].used:(streams[index].used&&!strcmp(streams[index].id,string(field(payload,"stream_id"))))) {
@@ -336,6 +347,7 @@ static J *rpc(J*req) {
     pthread_mutex_unlock(&queue_mu);
     if(stopped)return error("bridge_stopping");
     if(busy)return error("bridge_busy");
+    if(execute)json_object_object_del(payload,"model_serial");
     J*response=host_callback(method,payload);
     pthread_mutex_lock(&queue_mu);
     host_active--;
@@ -672,8 +684,8 @@ static J *proxy(J*req) {
     char endpoint[128];
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
-        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts");
-        int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations");
+        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs");
+        int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs");
         if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
     }
@@ -788,13 +800,13 @@ static J *registration(void) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs"
     };
-    for(int i=0;i<12;i++) {
+    for(int i=0;i<16;i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);
-        json_object_object_add(item,"Method",json_object_new_string(i==3||i==4||i==6||i==8||i==10?"POST":"GET"));
+        json_object_object_add(item,"Method",json_object_new_string(i==3||i==4||i==6||i==8||i==10||i==13||i==15?"POST":"GET"));
         json_object_object_add(item,"Path",json_object_new_string(path));
         json_object_array_add(list,item);
     }

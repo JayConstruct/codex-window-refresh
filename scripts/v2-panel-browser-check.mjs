@@ -17,8 +17,11 @@ const jobs = new Map();
 let accountReadGate, settingsPostGate, settingsReadGate;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
-let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', prompt_mode: 'fixed', phrases: []};
+let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
 const generations = new Map();
+let wakeCapable = false, wakeRevision = 0, wakeConflictOnce = false;
+let wakeConfig = {enabled: false, on_five_hour_reset: false, on_weekly_reset: false, timezone: 'Asia/Shanghai', random_delay: {min_seconds: 5, max_seconds: 60}, allowed_hours: ['08:00-23:00'], accounts_per_user: 1, max_accounts: 10000, daily_enabled: false, daily_window: '09:00-09:10', daily_target: 1};
+const wakeJobs = new Map();
 const generationAccounts = [
   {id: 'codex-01', provider: 'codex', status: 'available'},
   {id: 'antigravity-fixture', provider: 'antigravity', status: 'available'},
@@ -83,18 +86,33 @@ try {
       if (request.method === 'POST') {
         let body = ''; for await (const chunk of request) body += chunk;
         posts.push({resource, body, headers: request.headers});
+        if (resource === 'wake-settings') {
+          const data = JSON.parse(body); assert.deepEqual(Object.keys(data).sort(), ['config', 'revision']);
+          assert.deepEqual(Object.keys(data.config).sort(), Object.keys(wakeConfig).sort());
+          if (wakeConflictOnce) { wakeConflictOnce = false; wakeRevision++; revision++; }
+          if (data.revision !== wakeRevision) { json(response, 409, {error: 'wake_settings_conflict'}); return; }
+          wakeConfig = data.config; wakeRevision++; revision++; json(response, 200, {...identity(), revision: wakeRevision, config: wakeConfig}); return;
+        }
+        if (resource === 'wake-jobs') {
+          const data = JSON.parse(body), key = request.headers['idempotency-key'];
+          assert.deepEqual(Object.keys(data), ['account_id']); assert.equal(data.account_id, 'codex-01'); assert.ok(key);
+          const existing = [...wakeJobs.values()].find(job => job.key === key);
+          if (existing) { assert.equal(existing.request, body); json(response, 202, {...identity(), ...existing}); return; }
+          const job = {job_id: 'manual-wake-' + wakeJobs.size, account_id: data.account_id, reason: 'manual', phase: 'queued', key, request: body, created_at: observed(), updated_at: observed()};
+          wakeJobs.set(job.job_id, job); revision++; json(response, 202, {...identity(), ...job}); return;
+        }
         if (resource === 'sync') { revision++; json(response, 202, {status: 'queued'}); return; }
         if (resource === 'model-settings') {
           const data = JSON.parse(body);
           assert.deepEqual(Object.keys(data).sort(), ['config', 'revision']);
-          assert.deepEqual(Object.keys(data.config).sort(), ['default_model', 'default_prompt', 'five_hour_model', 'five_hour_prompt', 'weekly_model', 'weekly_prompt', 'prompt_mode', 'phrases'].sort());
+          assert.deepEqual(Object.keys(data.config).sort(), ['default_model', 'default_prompt', 'five_hour_model', 'five_hour_prompt', 'weekly_model', 'weekly_prompt', 'generation_prompt', 'prompt_mode', 'phrases'].sort());
           if (modelConflictOnce) { modelConflictOnce = false; modelRevision++; revision++; modelConfig = {...modelConfig, default_model: 'fixture-concurrent-model'}; }
           if (data.revision !== modelRevision) { json(response, 409, {error: 'model_settings_conflict'}); return; }
           modelConfig = data.config; modelRevision++; revision++; json(response, 200, modelSettings()); return;
         }
         if (resource === 'prompt-generations') {
           const data = JSON.parse(body), key = request.headers['idempotency-key'];
-          assert.deepEqual(Object.keys(data).sort(), ['account_id', 'count', 'model']);
+          assert.deepEqual(Object.keys(data).sort(), ['account_id', 'count', 'model', 'prompt']);
           assert.ok(key); assert.equal(typeof data.account_id, 'string'); assert.equal(typeof data.model, 'string');
           assert.ok(Number.isInteger(data.count) && data.count >= 1 && data.count <= 20);
           const existing = [...generations.values()].find(job => job.key === key);
@@ -134,6 +152,14 @@ try {
         json(response, 202, {job_id: id, instance_id: 'local-browser-fixture'}); return;
       }
       reads.push(request.url);
+      if (resource === 'wake-settings') { json(response, 200, {...identity(), revision: wakeRevision, config: wakeConfig}); return; }
+      if (resource === 'wake-jobs') {
+        const id = url.searchParams.get('job_id');
+        if (!id) { assert.equal(url.searchParams.get('limit'), '20'); json(response, 200, {...identity(), jobs: [...wakeJobs.values()]}); return; }
+        const job = wakeJobs.get(id); if (!job) { json(response, 404, {error: 'not_found'}); return; }
+        job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++;
+        json(response, 200, {...identity(), ...job}); return;
+      }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
       if (resource === 'model-settings') { json(response, 200, modelSettings()); return; }
       if (resource === 'prompt-generations') {
@@ -148,7 +174,7 @@ try {
       }
       if (resource === 'overview') {
         json(response, 200, {...identity(), version: '0.2.0-rc.4', accounts_revision: accountsRevision, query_settings: {revision: settingsRevision, config: queryConfig}, read_only: true, query_concurrency: 8,
-          capabilities: {quota_query: true, passive_quota: true, model_execution: false, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true, generation_accounts: true, prompt_generation_providers: ['codex', 'antigravity']}, activity: {connected: true},
+          capabilities: {quota_query: true, passive_quota: true, model_execution: wakeCapable, wake_settings: wakeCapable, automatic_wake: wakeCapable, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true, generation_accounts: true, prompt_generation_providers: ['codex', 'antigravity'], editable_generation_prompt: true}, activity: {connected: true},
           inventory: {status: 'ready', last_success_at: observed()}, dashboard: {total: 24, available: 20, disabled: 2, unavailable: 2, capacity: 16, unknown_quota: 4, errors: 2,
             tasks: {active: 3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
             recent_events: [{kind: 'quota_query', at: observed(), account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: observed(), account_id: '', phase: 'queued'}, {kind: 'inventory', at: observed(), phase: 'ready'}]}}); return;
@@ -505,7 +531,12 @@ try {
   assert.equal(await evaluate('document.getElementById("generation-account").value'), '', 'Directory silently selected an account');
   assert.match(await evaluate('document.getElementById("generation-account-options").textContent'), /反重力.*已禁用/);
   assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24', 'Antigravity accounts leaked into quota metrics');
+  assert.equal(await evaluate('document.getElementById("generation-prompt").value'), modelConfig.generation_prompt, 'Saved generation prompt did not load');
   const modelWritesBeforeEditing = posts.length;
+  await clickWhenEnabled('generation-reset-prompt');
+  assert.equal(await evaluate('document.getElementById("generation-prompt").value'), '生成简短、自然、适合日常问候的中文短句，避免重复。', 'Prompt reset did not stage the default Chinese prompt');
+  assert.equal(posts.length, modelWritesBeforeEditing, 'Prompt reset caused a write');
+  await evaluate('document.getElementById("generation-prompt").value="保存的候选提示词\\n请生成自然问候。";document.getElementById("generation-prompt").dispatchEvent(new Event("input"))');
   await evaluate('for(const [id,value] of [["model-default","fixture-model"],["model-phrases","第一句\\n第二句\\n第一句"],["model-prompt-mode","random"]]){const node=document.getElementById(id);node.value=value.replaceAll("\\\\n","\\n");node.dispatchEvent(new Event("input"));}');
   assert.equal(await evaluate('document.getElementById("model-save").disabled'), true, 'Duplicate phrases were accepted');
   await evaluate('document.getElementById("model-deduplicate").click()');
@@ -524,6 +555,7 @@ try {
   await clickWhenEnabled('model-save');
   await waitFor(async () => modelRevision === 1 && await evaluate('!document.getElementById("model-fields").disabled && document.getElementById("model-save").disabled && document.getElementById("model-message").textContent.startsWith("配置已保存")'), 'Model settings were not saved');
   assert.equal(modelConfig.default_model, 'fixture-model'); assert.equal(modelConfig.phrases.length, 3);
+  assert.equal(modelConfig.generation_prompt, '保存的候选提示词\n请生成自然问候。', 'Explicit model save did not persist the generation prompt');
   assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'model-settings').body), {revision: 0, config: modelConfig});
   await evaluate('document.getElementById("model-default").value="unsaved-model";document.getElementById("model-default").dispatchEvent(new Event("input"))');
   const modelReadsBeforePoll = reads.filter(path => path.endsWith('/model-settings')).length;
@@ -550,13 +582,16 @@ try {
   await evaluate('document.getElementById("generation-account").value="codex-01";document.getElementById("generation-account").dispatchEvent(new Event("input"));document.getElementById("generation-model").value="codex-fixture-model";document.getElementById("generation-account").value="antigravity-fixture";document.getElementById("generation-account").dispatchEvent(new Event("input"))');
   assert.equal(await evaluate('document.getElementById("generation-model").value'), '', 'Codex model was carried into Antigravity automatically');
   await evaluate('for(const [id,value] of [["generation-model","antigravity-fixture-model"],["generation-count","2"]]){const node=document.getElementById(id);node.value=value;node.dispatchEvent(new Event("input"));}');
+  await evaluate('document.getElementById("generation-consent").click();document.getElementById("generation-prompt").value="本次草稿提示词\\n请生成简短、不重复的候选。";document.getElementById("generation-prompt").dispatchEvent(new Event("input"))');
+  assert.equal(await evaluate('document.getElementById("generation-consent").checked'), false, 'Editing generation prompt retained spend consent');
+  assert.equal(modelConfig.generation_prompt, '保存的候选提示词\n请生成自然问候。', 'Editing a generation draft automatically saved settings');
   assert.match(await evaluate('document.getElementById("generation-consent-label").textContent'), /反重力.*额度/);
   assert.equal(await evaluate('document.getElementById("generation-submit").disabled'), true, 'Generation does not require consent');
   await evaluate('document.getElementById("generation-consent").click()');
   await clickWhenEnabled('generation-submit');
   await waitFor(() => evaluate('!document.getElementById("generation-results").hidden'), 'Generated candidates did not appear');
   assert.equal(posts.filter(post => post.resource === 'prompt-generations').length, 1, 'Model generation submitted more than once');
-  assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'prompt-generations').body), {account_id: 'antigravity-fixture', model: 'antigravity-fixture-model', count: 2});
+  assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'prompt-generations').body), {account_id: 'antigravity-fixture', model: 'antigravity-fixture-model', count: 2, prompt: '本次草稿提示词\n请生成简短、不重复的候选。'});
   assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24', 'Generation changed quota account totals');
   assert.deepEqual(modelConfig.phrases, poolBeforeGeneration, 'Generation replaced saved pool automatically');
   assert.equal(await evaluate('document.getElementById("generation-apply").disabled'), true, 'Candidates were selected without confirmation');
@@ -564,6 +599,51 @@ try {
   assert.match(await evaluate('document.getElementById("model-phrases").value'), /浏览器候选短句 1/);
   assert.deepEqual(modelConfig.phrases, poolBeforeGeneration, 'Applying candidates automatically saved settings');
   await screenshot('model-generation-desktop.png');
+  assert.equal(reads.some(path => /\/wake-(settings|jobs)/.test(path)), false, 'Legacy capability fallback read unsupported wake APIs');
+  const beforeWakeReads = posts.length; wakeCapable = true; revision++;
+  await evaluate('document.querySelector("[data-page=overview]").click()');
+  await clickWhenEnabled('refresh');
+  await waitFor(() => evaluate('!document.getElementById("auto-wake").disabled'), 'Wake capability did not enable overview controls');
+  await evaluate('document.querySelector("[data-page=wake]").click()');
+  await waitFor(() => evaluate('!document.getElementById("wake-settings-fields").disabled'), 'Wake settings did not load');
+  assert.equal(posts.length, beforeWakeReads, 'Wake opening or reads dispatched a write');
+  assert.equal(await evaluate('document.getElementById("wake-enabled").checked'), false, 'Automatic wake was not off by default');
+  assert.equal(await evaluate('document.getElementById("wake-manual-submit").disabled'), true, 'Manual wake lacked spend consent');
+  await evaluate('document.getElementById("wake-five-hour").click();document.getElementById("wake-enabled").click()');
+  assert.equal(await evaluate('document.getElementById("wake-settings-save").disabled'), true, 'Enabled rules did not require spend consent');
+  await evaluate('document.getElementById("wake-enabled").click();document.getElementById("wake-per-user").value="0.5";document.getElementById("wake-per-user").dispatchEvent(new Event("input"))');
+  await clickWhenEnabled('wake-settings-save');
+  await waitFor(() => wakeRevision === 1 && evaluate('!document.getElementById("wake-settings-fields").disabled'), 'Disabled wake rules did not save');
+  assert.equal(wakeConfig.accounts_per_user, 0.5); assert.equal(wakeConfig.enabled, false);
+  await evaluate('document.getElementById("wake-per-user").value="0.75";document.getElementById("wake-per-user").dispatchEvent(new Event("input"));document.querySelector("[data-page=overview]").click();document.getElementById("auto-wake").click()');
+  assert.equal(posts.filter(post => post.resource === 'wake-settings').length, 1, 'Overview enabled wake without spend consent');
+  assert.equal(await evaluate('document.getElementById("auto-wake").checked'), false);
+  await evaluate('document.getElementById("wake-overview-consent").click();document.getElementById("auto-wake").click()');
+  await waitFor(() => wakeRevision === 2 && evaluate('!document.getElementById("auto-wake").disabled'), 'Direct overview auto-wake save did not complete');
+  assert.equal(wakeConfig.enabled, true); assert.equal(wakeConfig.accounts_per_user, 0.5, 'Overview saved an unrelated editor draft');
+  assert.equal(await evaluate('document.querySelector("[data-view=overview]").hidden'), false, 'Wake switch navigated away');
+  assert.equal(await evaluate('document.getElementById("wake-per-user").value'), '0.75', 'Overview save lost the rule draft');
+  await evaluate('document.getElementById("auto-wake").click()');
+  await waitFor(() => wakeRevision === 3 && evaluate('!document.getElementById("auto-wake").disabled'), 'Disabling automatic wake did not save without consent');
+  assert.equal(wakeConfig.enabled, false);
+  await evaluate('document.querySelector("[data-page=wake]").click()'); wakeConflictOnce = true;
+  await clickWhenEnabled('wake-settings-save');
+  await waitFor(() => evaluate('!document.getElementById("wake-settings-conflict").hidden'), 'Wake settings conflict did not appear');
+  assert.equal(await evaluate('document.getElementById("wake-per-user").value'), '0.75', 'Wake conflict lost draft');
+  assert.equal(posts.filter(post => post.resource === 'wake-settings').length, 4);
+  await clickWhenEnabled('wake-settings-reload');
+  await waitFor(() => evaluate('document.getElementById("wake-per-user").value==="0.5" && document.getElementById("wake-settings-conflict").hidden'), 'Explicit wake settings GET did not resolve conflict');
+  await evaluate('document.getElementById("wake-account").value="codex-01";document.getElementById("wake-account").dispatchEvent(new Event("input"));document.getElementById("wake-manual-consent").click()');
+  await clickWhenEnabled('wake-manual-submit');
+  await waitFor(() => evaluate('document.getElementById("wake-manual-status").textContent==="结果未知"'), 'Manual wake unknown outcome was not read');
+  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Manual wake submitted more than once');
+  assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'wake-jobs').body), {account_id: 'codex-01'});
+  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
+  await clickWhenEnabled('wake-history-refresh'); await clickWhenEnabled('wake-manual-verify');
+  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Unknown wake verification resent the model action');
+  assert.match(await evaluate('document.getElementById("wake-history").textContent'), /禁止重发/);
+  assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24', 'Wake changed the quota account pool');
+  await screenshot('wake-desktop.png');
   await evaluate('document.querySelector("[data-page=overview]").click()');
   for (const width of [768, 390]) {
     await cdp('Emulation.setDeviceMetricsOverride', {width, height: 844, deviceScaleFactor: 1, mobile: false});
@@ -577,6 +657,10 @@ try {
     await evaluate('document.querySelector("[data-page=models]").click()');
     assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Model editor overflow at ' + width);
     await screenshot('model-settings-' + width + '.png');
+    await evaluate('document.querySelector("[data-page=wake]").click()');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Wake editor overflow at ' + width);
+    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Wake navigation unlocked an unknown model action');
+    await screenshot('wake-' + width + '.png');
     if (width === 390) {
       await evaluate('document.getElementById("sidebar-toggle").click()');
       assert.equal(await evaluate('getComputedStyle(document.getElementById("primary-navigation")).display'), 'none', 'Mobile navigation did not collapse');
@@ -598,10 +682,12 @@ try {
   assert.equal(posts.filter(post => post.resource === 'settings').length, 8, 'Unexpected settings write after browser checks');
   assert.equal(posts.filter(post => post.resource === 'model-settings').length, 2, 'Unexpected model settings write count');
   assert.equal(posts.filter(post => post.resource === 'prompt-generations').length, 1, 'Unexpected generation write count');
-  assert.equal(posts.length, 14, 'Unexpected total API write count');
-  assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations'].includes(post.resource)), true, 'Unexpected API write');
+  assert.equal(posts.filter(post => post.resource === 'wake-settings').length, 4, 'Unexpected wake settings writes');
+  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Unexpected model wake writes');
+  assert.equal(posts.length, 19, 'Unexpected total API write count');
+  assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations', 'wake-settings', 'wake-jobs'].includes(post.resource)), true, 'Unexpected API write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
-  console.log('V2 browser checks passed: desktop/mobile layout, direct overview settings saves/locking/draft isolation/rejections/conflicts/unknown-result GET verification, explicit editor saves, settings validation/drafts/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging, authentication, local generation directory, disabled Antigravity selection, explicit catalog refresh and one exact Antigravity generation request.');
+  console.log('V2 browser checks passed: desktop/mobile layout, direct overview settings saves/locking/draft isolation/rejections/conflicts/unknown-result GET verification, explicit editor saves, settings validation/drafts/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging, authentication, local generation directory, disabled Antigravity selection, explicit catalog refresh, editable generation prompt reset/save/draft/consent isolation, exact Antigravity generation prompt snapshot, wake rules and spend consent, direct auto-wake saves with draft isolation, wake settings conflicts and unknown manual-wake read-only verification.');
   console.log('Local fixture screenshots: ' + output);
 } finally {
   accountReadGate?.release();

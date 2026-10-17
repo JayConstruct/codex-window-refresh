@@ -16,6 +16,7 @@ extern J *json_object_new_int64(int64_t);
 extern J *json_object_get(J *);
 extern int json_object_put(J *);
 extern int json_object_object_add(J *,const char *,J *);
+extern void json_object_object_del(J *,const char *);
 extern int json_object_object_get_ex(const J *,const char *,J **);
 extern int json_object_array_add(J *,J *);
 extern size_t json_object_array_length(const J *);

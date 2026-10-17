@@ -27,6 +27,7 @@ func readModelSettings(ctx context.Context, tx *sql.Tx) (ModelSettings, error) {
 	if err != nil {
 		return settings, err
 	}
+	settings.Config.GenerationPrompt = ""
 	if json.Unmarshal([]byte(raw), &settings.Config) != nil || settings.Config.Validate() != nil {
 		return settings, errors.New("model_settings_unreadable")
 	}

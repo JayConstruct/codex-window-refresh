@@ -145,7 +145,7 @@ func Open(dir string) (*Store, error) {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
-		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 6 {
+		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 8 {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
@@ -162,7 +162,14 @@ func Open(dir string) (*Store, error) {
 			_, err = migration.Exec("ALTER TABLE prompt_generations ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex'")
 		}
 		if err == nil {
-			_, err = migration.Exec("UPDATE schema_version SET version=6")
+			var promptColumn int
+			err = migration.QueryRow("SELECT count(*) FROM pragma_table_info('prompt_generations') WHERE name='prompt'").Scan(&promptColumn)
+			if err == nil && promptColumn == 0 {
+				_, err = migration.Exec("ALTER TABLE prompt_generations ADD COLUMN prompt TEXT NOT NULL DEFAULT ''")
+			}
+		}
+		if err == nil {
+			_, err = migration.Exec("UPDATE schema_version SET version=8")
 		}
 	}
 	if err == nil {
@@ -175,7 +182,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	var version int
-	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 6 {
+	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 8 {
 		s.Close()
 		return nil, errors.New("unsupported_database_schema")
 	}

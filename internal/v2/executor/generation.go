@@ -12,6 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"codex-window-refresh/internal/v2/policy"
 	"codex-window-refresh/internal/v2/store"
 )
 
@@ -19,6 +20,7 @@ const generationStreamLimit = 1 << 20
 const generationTextLimit = 16 << 10
 
 type generationRequest struct {
+	Serial         bool                `json:"model_serial,omitempty"`
 	EntryProtocol  string              `json:"entry_protocol"`
 	ExitProtocol   string              `json:"exit_protocol"`
 	Model          string              `json:"model"`
@@ -66,8 +68,12 @@ func (c *CPA) generationAccount(ctx context.Context, account store.Account) erro
 	return nil
 }
 
-func (c *CPA) GenerateCandidates(ctx context.Context, account store.Account, model string, count int) (values []string, resultErr error) {
-	if model == "" || len(model) > 200 || !utf8.ValidString(model) || strings.IndexFunc(model, func(value rune) bool { return unicode.IsSpace(value) || unicode.IsControl(value) }) >= 0 || count < 1 || count > 20 {
+func (c *CPA) GenerateCandidates(ctx context.Context, account store.Account, model string, count int) ([]string, error) {
+	return c.GenerateCandidatesWithPrompt(ctx, account, model, count, "")
+}
+
+func (c *CPA) GenerateCandidatesWithPrompt(ctx context.Context, account store.Account, model string, count int, customPrompt string) (values []string, resultErr error) {
+	if model == "" || len(model) > 200 || !utf8.ValidString(model) || strings.IndexFunc(model, func(value rune) bool { return unicode.IsSpace(value) || unicode.IsControl(value) }) >= 0 || count < 1 || count > 20 || !policy.ValidGenerationPrompt(customPrompt) {
 		return nil, errors.New("generation_request_invalid")
 	}
 	if c.Host == nil {
@@ -93,22 +99,34 @@ func (c *CPA) GenerateCandidates(ctx context.Context, account store.Account, mod
 		return nil, errors.New("generation_request_invalid")
 	}
 	prompt := fmt.Sprintf("Generate exactly %d distinct, short, harmless standalone sentences suitable as minimal API connectivity checks. Return only a JSON array of strings, without explanations or formatting. Each string must be nonempty, on one line, and at most 512 UTF-8 bytes. Do not include secrets, personal information, instructions, or requests for external actions.", count)
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model": model, "stream": true, "store": false,
 		"input": []any{map[string]any{"role": "user", "content": []any{map[string]string{"type": "input_text", "text": prompt}}}},
-	})
-	if err != nil {
+	}
+	if strings.TrimSpace(customPrompt) != "" {
+		payload["instructions"] = prompt
+		payload["input"] = []any{map[string]any{"role": "user", "content": []any{map[string]string{"type": "input_text", "text": customPrompt}}}}
+	}
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(payload); err != nil {
 		return nil, errors.New("generation_request_invalid")
 	}
+	body := buffer.Bytes()
 	defer clear(body)
 	request := generationRequest{
+		Serial:        true,
 		EntryProtocol: "openai-response", ExitProtocol: exitProtocol, Model: model,
 		Stream: true, Body: body, ForcedProvider: provider, AuthID: account.ID,
 		Headers: map[string][]string{"Content-Type": {"application/json"}}, Query: map[string][]string{},
 	}
 	unknown := func() ([]string, error) { return nil, errors.New("generation_delivery_unknown") }
 	var opened generationOpened
-	err = c.Host.Call(ctx, "host.model.execute_stream", request, &opened)
+	err := c.Host.Call(ctx, "host.model.execute_stream", request, &opened)
+	if opened.StreamID == "" && err != nil && err.Error() == "model_budget_busy" {
+		return nil, errors.New("generation_request_rejected")
+	}
 	if opened.StreamID == "" {
 		return unknown()
 	}
@@ -161,12 +179,13 @@ func (c *CPA) GenerateCandidates(ctx context.Context, account store.Account, mod
 }
 
 type candidateStream struct {
-	pending   []byte
-	total     int
-	deltas    string
-	completed string
-	terminal  bool
-	failed    bool
+	discardText bool
+	pending     []byte
+	total       int
+	deltas      string
+	completed   string
+	terminal    bool
+	failed      bool
 }
 
 func (stream *candidateStream) accept(payload []byte) bool {
@@ -250,6 +269,12 @@ func (stream *candidateStream) process(raw []byte) {
 	case "error", "response.failed", "response.incomplete", "response.refusal.delta", "response.refusal.done":
 		stream.failed = true
 	case "response.output_text.delta":
+		if stream.discardText {
+			if stream.terminal {
+				stream.failed = true
+			}
+			return
+		}
 		if stream.terminal || len(stream.deltas)+len(event.Delta) > generationTextLimit {
 			stream.failed = true
 			return
@@ -267,6 +292,9 @@ func (stream *candidateStream) process(raw []byte) {
 					stream.failed = true
 				}
 				if content.Type != "output_text" {
+					continue
+				}
+				if stream.discardText {
 					continue
 				}
 				if len(stream.completed)+len(content.Text) > generationTextLimit {
