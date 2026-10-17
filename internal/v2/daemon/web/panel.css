@@ -291,6 +291,23 @@ select { cursor: pointer; }
   .search-field { width: 195px; }
 }
 
+.sidebar-toggle-row { display: flex; padding: 0 13px 16px 24px; }
+.sidebar-toggle { min-height: 36px; gap: 10px; }
+.sidebar-toggle .icon { width: 18px; height: 18px; transform: rotate(180deg); }
+:root.sidebar-collapsed { --sidebar-width: 76px; }
+.sidebar-collapsed .sidebar { padding-inline: 0; }
+.sidebar-collapsed .brand { justify-content: center; padding: 0 0 18px; }
+.sidebar-collapsed .brand-icon { width: 33px; height: 33px; }
+.sidebar-collapsed .brand-copy, .sidebar-collapsed .sidebar-footer p, .sidebar-collapsed .sidebar-status strong { display: none; }
+.sidebar-collapsed .sidebar-toggle-row { justify-content: center; padding: 0 0 16px; }
+.sidebar-collapsed .sidebar-toggle { justify-content: center; width: 42px; }
+.sidebar-collapsed .sidebar-toggle .icon { transform: none; }
+.sidebar-collapsed .sidebar-toggle-label, .sidebar-collapsed .nav-item > span { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.sidebar-collapsed .nav-item { justify-content: center; gap: 0; padding-inline: 0; }
+.sidebar-collapsed .sidebar-footer { padding: 24px 5px 0; }
+.sidebar-collapsed .sidebar-status { justify-content: center; }
+.sidebar-collapsed .disconnect-button { width: 100%; margin-top: 12px; font-size: 11px; }
+
 @media (max-width: 1430px) {
   .metric-card { gap: 14px; padding-inline: 16px; }
   .metric-icon { width: 48px; height: 48px; border-radius: 17px; }
@@ -347,6 +364,15 @@ select { cursor: pointer; }
 @media (max-width: 720px) {
   :root { --sidebar-width: 0px; }
   .sidebar { position: relative; width: 100%; padding: 14px 0 0; border-right: 0; border-bottom: 1px solid var(--border); }
+  .sidebar-toggle-row { position: absolute; top: 17px; right: 16px; padding: 0; }
+  .sidebar-toggle { width: 36px; justify-content: center; }
+  .sidebar-toggle-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .sidebar-collapsed .sidebar { padding: 14px 0 0; }
+  .sidebar-collapsed .brand { justify-content: flex-start; padding: 0 18px 14px; }
+  .sidebar-collapsed .brand-copy { display: block; }
+  .sidebar-collapsed .navigation { display: none; }
+  .sidebar-collapsed .sidebar-toggle-row { padding: 0; }
+  .sidebar-collapsed .sidebar-toggle { width: 36px; }
   .brand { align-items: center; max-width: 250px; padding: 0 18px 14px; }
   .brand-name { font-size: 20px; }
   .brand-caption { font-size: 11px; }
@@ -354,9 +380,10 @@ select { cursor: pointer; }
   .nav-item { min-height: 40px; width: auto; flex-shrink: 0; justify-content: center; gap: 7px; padding: 8px 11px; border-radius: 7px; font-size: 13px; }
   .nav-item .icon { width: 18px; height: 18px; }
   .nav-item.active::before, .nav-item[aria-current="page"]::before { display: none; }
-  .sidebar-footer { position: absolute; top: 18px; right: 16px; display: block; padding: 0; }
+  .sidebar-footer, .sidebar-collapsed .sidebar-footer { position: absolute; top: 20px; right: 64px; display: block; padding: 0; }
   .sidebar-footer .sidebar-status, .sidebar-footer p { display: none; }
   .sidebar-footer .disconnect-button { margin: 0; }
+  .sidebar-collapsed .disconnect-button { width: auto; font-size: inherit; }
   .main-content { margin-left: 0; padding: 15px 16px; }
   .breadcrumb { font-size: 12px; }
   .page-header { margin-top: 9px; gap: 12px; }
@@ -411,3 +438,30 @@ select { cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; }
 }
+
+.model-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 18px; align-items: start; }
+.model-side { display: grid; gap: 18px; min-width: 0; }
+.model-layout fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.model-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.model-wide { grid-column: 1 / -1; }
+.model-layout input:not([type="checkbox"]), .model-layout select, .model-layout textarea { width: 100%; min-width: 0; }
+.model-layout textarea { display: block; min-height: 82px; resize: vertical; padding: 9px 11px; border: 1px solid #dbe2eb; border-radius: 7px; color: #25314a; background: #fff; font: inherit; line-height: 1.65; overflow-wrap: anywhere; }
+.model-layout textarea:disabled { color: var(--muted); background: #f5f7fa; }
+.model-layout textarea:focus-visible { outline: 3px solid #57c7bc; outline-offset: 3px; }
+.model-layout [aria-invalid="true"] { border-color: #d85c5c; }
+.model-tools { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 10px; }
+.model-phrase-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+.model-phrase-heading .field-label { margin-bottom: 0; }
+.model-confirmation { margin-top: 14px; padding: 13px; border: 1px solid #f0d59c; border-radius: 8px; background: #fff9ed; color: #875c16; }
+.model-preview-result { margin-top: 15px; padding: 13px; border-radius: 8px; background: #f3faf8; color: #355c57; white-space: pre-wrap; overflow-wrap: anywhere; }
+.model-diff-row span { white-space: pre-wrap; overflow-wrap: anywhere; }
+.generation-consent { display: flex; align-items: flex-start; gap: 9px; margin-top: 16px; color: #5d6475; }
+.generation-consent input { flex-shrink: 0; width: 17px; min-height: 17px; margin: 3px 0 0; }
+.generation-candidates { display: grid; gap: 8px; margin: 10px 0 14px; }
+.generation-candidate { display: flex; align-items: flex-start; gap: 9px; padding: 9px; border: 1px solid var(--border); border-radius: 7px; overflow-wrap: anywhere; }
+.generation-candidate input { flex-shrink: 0; width: 17px; min-height: 17px; margin: 3px 0 0; }
+#generation-results { margin-top: 20px; }
+#generation-fields > .field-label:not(:first-of-type) { margin-top: 13px; }
+#generation-use-default { margin-top: 7px; font-size: 12px; }
+@media (max-width: 1100px) { .model-layout { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 550px) { .model-form-grid { grid-template-columns: minmax(0, 1fr); } .model-layout .settings-actions > .button { width: 100%; white-space: normal; } }

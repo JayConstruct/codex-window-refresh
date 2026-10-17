@@ -445,7 +445,10 @@ def install(args, plan, arch):
             raise InstallError("新版本已运行，但旧版清理未完成；未回退。请重试 v2 部署以继续清理。") from None
         print(f"v2 更新成功：{args.version}；已核对 CPA 注册资源入口、后台版本、接入实例和 CPA PID。")
         print(f"CPA {'已按 --restart 重启' if stopped_cpa else '未重启'}；已清除 v1 数据、旧版本和临时备份，保留当前 v2 数据。")
-        print("当前仅提供只读额度查询和活动观测；自动唤醒和模型生成在 v2 中不执行。")
+        if metadata.get("prompt_generation") is True:
+            print("额度查询不发送模型请求；短句候选仅在手动确认后调用指定账号模型，自动唤醒仍关闭。")
+        else:
+            print("当前仅提供只读额度查询和活动观测；自动唤醒和模型生成在 v2 中不执行。")
 
 
 def main():

@@ -1,4 +1,4 @@
-// Package hostlink implements the private, bounded, read-only native bridge RPC.
+// Package hostlink implements the private, bounded native bridge RPC.
 package hostlink
 
 import (
@@ -21,16 +21,18 @@ import (
 const MaxFrame = 4 << 20
 
 type Client struct {
-	Path     string
-	instance atomic.Value
+	Path               string
+	instance           atomic.Value
+	generationInstance atomic.Value
 }
 type Hello struct {
-	Protocol     int    `json:"protocol_version"`
-	Instance     string `json:"bridge_instance_id"`
-	ReadOnly     bool   `json:"read_only"`
-	Events       bool   `json:"events_supported"`
-	HostProcess  string `json:"host_process_id"`
-	PassiveQuota bool   `json:"passive_quota_supported"`
+	Protocol         int    `json:"protocol_version"`
+	Instance         string `json:"bridge_instance_id"`
+	ReadOnly         bool   `json:"read_only"`
+	Events           bool   `json:"events_supported"`
+	HostProcess      string `json:"host_process_id"`
+	PassiveQuota     bool   `json:"passive_quota_supported"`
+	PromptGeneration bool   `json:"prompt_generation_supported"`
 }
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -109,7 +111,9 @@ func (c *Client) exchangeFor(ctx context.Context, method string, request, respon
 	}
 	if !e.OK {
 		switch e.Error.Code {
-		case "bridge_busy", "bridge_instance_changed", "method_not_allowed", "host_callback_failed", "bridge_stopping", "invalid_event_cursor":
+		case "bridge_busy", "bridge_instance_changed", "method_not_allowed", "host_callback_failed", "bridge_stopping", "invalid_event_cursor",
+			"generation_not_supported", "generation_request_invalid", "generation_delivery_unknown", "generation_candidates_invalid",
+			"account_binding_changed", "account_not_found", "account_identity_unavailable", "account_disabled":
 			return errors.New(e.Error.Code)
 		}
 		return errors.New("host_callback_failed")
@@ -154,12 +158,29 @@ func (c *Client) Handshake(ctx context.Context) (Hello, error) {
 	}
 	if err == nil {
 		c.instance.Store(h.Instance)
+		generationInstance := ""
+		if h.PromptGeneration {
+			generationInstance = h.Instance
+		}
+		c.generationInstance.Store(generationInstance)
 	}
 	return h, err
+}
+func (c *Client) SupportsPromptGeneration() bool {
+	instance, _ := c.instance.Load().(string)
+	generationInstance, _ := c.generationInstance.Load().(string)
+	return instance != "" && instance == generationInstance
 }
 func (c *Client) Call(ctx context.Context, method string, request, response any) error {
 	switch method {
 	case "host.auth.list", "host.auth.get_runtime", "host.auth.get":
+	case "host.model.execute_stream", "host.model.stream_read", "host.model.stream_close":
+		instance, _ := c.instance.Load().(string)
+		generationInstance, _ := c.generationInstance.Load().(string)
+		if instance == "" || instance != generationInstance {
+			return errors.New("generation_not_supported")
+		}
+		return c.exchangeFor(ctx, method, request, response, instance)
 	default:
 		return errors.New("method_not_allowed")
 	}
@@ -169,8 +190,6 @@ func (c *Client) Call(ctx context.Context, method string, request, response any)
 		}
 	}
 	err := c.exchange(ctx, method, request, response)
-	// Every supported call is read-only. A new native instance requires a fresh
-	// handshake; no model or stream action is ever replayed here.
 	if err != nil && err.Error() == "bridge_instance_changed" {
 		if _, err = c.Handshake(ctx); err == nil {
 			return c.exchange(ctx, method, request, response)

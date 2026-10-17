@@ -39,6 +39,7 @@ type authEntry struct {
 	Provider    string `json:"provider"`
 	Type        string `json:"type"`
 	Disabled    bool   `json:"disabled"`
+	Unavailable bool   `json:"unavailable"`
 	RuntimeOnly bool   `json:"runtime_only"`
 }
 
@@ -54,9 +55,13 @@ func (c *CPA) Accounts(ctx context.Context) ([]store.Account, error) {
 	}
 	seen := map[string]bool{}
 	counts := map[string]int{}
+	indexes := map[string]int{}
 	for _, a := range list.Files {
 		if store.ValidID(a.ID) {
 			counts[a.ID]++
+		}
+		if a.Index != "" {
+			indexes[a.Index]++
 		}
 	}
 	accounts := []store.Account{}
@@ -74,8 +79,10 @@ func (c *CPA) Accounts(ctx context.Context) ([]store.Account, error) {
 		status := "available"
 		if a.Disabled {
 			status = "disabled"
+		} else if a.Unavailable {
+			status = "unavailable"
 		}
-		if a.Index == "" || a.RuntimeOnly || counts[a.ID] > 1 {
+		if a.Index == "" || a.RuntimeOnly || counts[a.ID] > 1 || indexes[a.Index] > 1 {
 			status = "binding_unavailable"
 			a.Index = ""
 		}
@@ -106,6 +113,10 @@ func (c *CPA) binding(ctx context.Context, a store.Account) (credential, error) 
 	return cred, nil
 }
 func (c *CPA) readBinding(ctx context.Context, a store.Account) (credential, error) {
+	return c.readBindingFor(ctx, a, false)
+}
+
+func (c *CPA) readBindingFor(ctx context.Context, a store.Account, requireAvailable bool) (credential, error) {
 	var runtime struct {
 		Auth authEntry `json:"auth"`
 	}
@@ -113,6 +124,12 @@ func (c *CPA) readBinding(ctx context.Context, a store.Account) (credential, err
 		return credential{}, err
 	}
 	r := runtime.Auth
+	if requireAvailable && r.Disabled {
+		return credential{}, errors.New("account_disabled")
+	}
+	if requireAvailable && r.Unavailable {
+		return credential{}, errors.New("account_identity_unavailable")
+	}
 	if r.ID != a.ID || r.Index != a.AuthIndex || r.RuntimeOnly || (r.Provider != "codex" && !(r.Provider == "" && r.Type == "codex")) {
 		return credential{}, errors.New("account_binding_changed")
 	}

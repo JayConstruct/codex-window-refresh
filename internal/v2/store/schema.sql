@@ -1,6 +1,6 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 4 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 5 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
 CREATE TABLE IF NOT EXISTS accounts(
  id TEXT PRIMARY KEY, auth_index TEXT NOT NULL, status TEXT NOT NULL,
  quota TEXT, observed_at TEXT, updated_at TEXT NOT NULL
@@ -60,6 +60,20 @@ END;
 CREATE TABLE IF NOT EXISTS query_settings(
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, config TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS model_settings(
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, config TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS model_settings_insert AFTER INSERT ON model_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS model_settings_update AFTER UPDATE ON model_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TABLE IF NOT EXISTS prompt_generations(
+ id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, request_hash TEXT NOT NULL,
+ account_id TEXT NOT NULL, auth_index TEXT NOT NULL, binding TEXT NOT NULL, model TEXT NOT NULL,
+ count INTEGER NOT NULL, phase TEXT NOT NULL, error_code TEXT NOT NULL DEFAULT '',
+ candidates TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS prompt_generations_queue ON prompt_generations(phase,created_at);
+CREATE TRIGGER IF NOT EXISTS prompt_generations_insert AFTER INSERT ON prompt_generations BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS prompt_generations_update AFTER UPDATE ON prompt_generations BEGIN UPDATE view_state SET revision=revision+1; END;
 CREATE TABLE IF NOT EXISTS query_plans(
  job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
  trigger TEXT NOT NULL, automatic INTEGER NOT NULL, delay_min INTEGER NOT NULL, delay_max INTEGER NOT NULL

@@ -111,7 +111,7 @@ function panel(respond, options = {}) {
     removeAttribute(name) { this.attributes.delete(name); }
     addEventListener(name, callback) { this.listeners.set(name, callback); }
   }
-  const elements = new Map(), timers = new Map(), calls = [], events = new Map();
+  const elements = new Map(), timers = new Map(), calls = [], events = new Map(), storage = options.storage || {};
   let nextTimer = 0;
   const get = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
   get('accounts-filter').value = 'all'; get('key').value = 'fixture-key';
@@ -119,7 +119,7 @@ function panel(respond, options = {}) {
   const panels = nav.map(node => { const panel = new Element(); panel.dataset.view = node.dataset.page; return panel; });
   const walk = node => [node, ...node.children.flatMap(walk)];
   const context = vm.createContext({
-    document: {getElementById: get, createElement: tag => new Element(tag), createTextNode: text => { const node = new Element('#text'); node.textContent = text; return node; },
+    document: {documentElement: get('document-root'), getElementById: get, createElement: tag => new Element(tag), createTextNode: text => { const node = new Element('#text'); node.textContent = text; return node; },
       querySelectorAll: selector => {
         if (selector === '[data-page]') return nav;
         if (selector === '[data-view]') return panels;
@@ -129,7 +129,7 @@ function panel(respond, options = {}) {
         return attribute ? nodes.filter(node => Object.hasOwn(node.dataset, attribute)) : [];
       }},
     location: options.location || location, navigator: {userAgent: 'fixture'},
-    localStorage: {getItem: name => options.storage?.[name] ?? null},
+    localStorage: {getItem: name => storage[name] ?? null, setItem: (name, value) => { if (options.storageBlocked) throw new Error('storage unavailable'); storage[name] = value; }},
     fetch: async (url, settings) => {
       calls.push({url, ...settings}); const response = await respond(url, settings, calls);
       return {ok: response[0] < 400, status: response[0], json: async () => response[1]};
@@ -144,9 +144,42 @@ function panel(respond, options = {}) {
     const entry = [...timers.entries()].find(([, timer]) => timer.delay === delay);
     assert.ok(entry, 'missing timer ' + delay); timers.delete(entry[0]); await entry[1].fn();
   }
-  return {get, timers, calls, nav, panels, events, tick};
+  return {get, timers, calls, nav, panels, events, tick, storage};
 }
 function basic(url) { return url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
+
+test('sidebar collapse is local, reversible and restores its mount-specific preference', async () => {
+  const storage = {}, ui = panel(basic, {storage});
+  assert.equal(ui.get('app-sidebar').dataset.collapsed, 'false');
+  assert.equal(ui.get('sidebar-toggle').attributes.get('aria-expanded'), 'true');
+  ui.get('sidebar-toggle').onclick();
+  assert.equal(ui.get('app-sidebar').dataset.collapsed, 'true');
+  assert.equal(ui.get('sidebar-toggle').attributes.get('aria-label'), '展开侧栏');
+  assert.equal(ui.get('sidebar-toggle').attributes.get('aria-expanded'), 'false');
+  assert.equal(storage['cwr-v2-sidebar:/v0/management/codex-window-refresh/v2'], 'true');
+  assert.equal(ui.calls.length, 0);
+  const restored = panel(basic, {storage});
+  assert.equal(restored.get('app-sidebar').dataset.collapsed, 'true');
+  restored.get('sidebar-toggle').onclick();
+  assert.equal(restored.get('app-sidebar').dataset.collapsed, 'false');
+  assert.equal(restored.get('sidebar-toggle').attributes.get('aria-expanded'), 'true');
+  assert.equal(restored.get('sidebar-toggle-label').textContent, '收起侧栏');
+  assert.equal(restored.calls.length, 0);
+  const otherMount = panel(basic, {storage, location: {...location, pathname: '/another' + location.pathname}});
+  assert.equal(otherMount.get('app-sidebar').dataset.collapsed, 'false');
+});
+test('sidebar remains usable when browser storage is blocked and navigation keeps accessible labels', () => {
+  const ui = panel(basic, {storageBlocked: true});
+  assert.doesNotThrow(() => ui.get('sidebar-toggle').onclick());
+  assert.equal(ui.get('app-sidebar').dataset.collapsed, 'true');
+  for (const item of ui.nav) {
+    assert.ok(item.attributes.get('aria-label')); assert.ok(item.attributes.get('title'));
+  }
+  ui.nav.find(node => node.dataset.page === 'query').listeners.get('click')();
+  assert.equal(ui.get('page-title').textContent, '额度查询');
+  assert.equal(ui.get('app-sidebar').dataset.collapsed, 'true');
+  assert.equal(ui.calls.length, 0);
+});
 
 test('opening without host credentials does not send requests or show sample data', () => {
   const ui = panel(basic);
@@ -386,16 +419,165 @@ test('overview settings populate editor without extra reads or writes and model 
   assert.match(ui.get('account-query-note').textContent, /按账号随机延迟/);
   assert.equal(ui.calls.some(call => call.url.endsWith('/settings') || call.method === 'POST'), false);
 });
-test('home switches stage a draft, retain saved state and never save on navigation', async () => {
-  const ui = panel(url => url.endsWith('/overview') ? [200, configuredOverview()] : [200, accountPage()]);
-  await ui.get('connect').onclick(); ui.get('five-hour-query').checked = true; await ui.get('five-hour-query').onchange();
-  assert.equal(ui.get('page-title').textContent, '额度查询'); assert.equal(ui.get('settings-five-hour').checked, true);
-  assert.equal(ui.get('five-hour-query').checked, false); assert.equal(ui.get('settings-save').disabled, false);
-  assert.match(ui.get('settings-diff').textContent, /关闭 → 开启/);
-  ui.nav.find(node => node.dataset.page === 'overview').listeners.get('click')();
+test('home switches save only their selected rule immediately without leaving overview', async () => {
+  for (const [id, field, editor] of [['five-hour-query', 'on_five_hour_expiry', 'settings-five-hour'], ['weekly-query', 'on_weekly_expiry', 'settings-weekly']]) {
+    let settings = querySettings();
+    const ui = panel((url, options) => {
+      if (url.endsWith('/settings') && options.method === 'POST') {
+        const request = JSON.parse(options.body);
+        assert.deepEqual(Object.keys(request).sort(), ['config', 'revision']);
+        assert.equal(request.revision, settings.revision);
+        settings = querySettings(settings.revision + 1, request.config); return [200, settings];
+      }
+      return url.endsWith('/overview') ? [200, configuredOverview(settings)] : [200, accountPage(settings.view_revision)];
+    });
+    await ui.get('connect').onclick();
+    for (const checked of [true, false]) {
+      ui.get(id).checked = checked; await ui.get(id).onchange();
+      assert.equal(ui.get('page-title').textContent, '运行总览');
+      assert.equal(ui.get(id).checked, checked); assert.equal(ui.get(editor).checked, checked);
+      assert.equal(ui.get(id).disabled, false); assert.equal(ui.get('settings-save').disabled, true);
+      assert.deepEqual(settings.config, {...queryConfig(), [field]: checked});
+      assert.match(ui.get('rules-message').textContent, /已.*并保存/);
+      assert.equal(ui.get('auto-wake').disabled, true);
+    }
+    assert.equal(ui.calls.filter(call => call.method === 'POST').length, 2);
+    await ui.get(id).onchange(); await ui.tick(5000);
+    assert.equal(ui.calls.filter(call => call.method === 'POST').length, 2);
+  }
+});
+test('home save preserves dirty editor fields but never sends them to the backend', async () => {
+  let settings = querySettings();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/settings') && options.method === 'POST') {
+      settings = querySettings(settings.revision + 1, JSON.parse(options.body).config); return [200, settings];
+    }
+    return url.endsWith('/overview') ? [200, configuredOverview(settings)] : [200, accountPage(settings.view_revision)];
+  });
+  await ui.get('connect').onclick(); edit(ui, 'settings-interval', '20'); edit(ui, 'settings-delay-min', '17'); edit(ui, 'settings-weekly', true);
+  ui.get('five-hour-query').checked = true; await ui.get('five-hour-query').onchange();
+  assert.deepEqual(settings.config, {...queryConfig(), on_five_hour_expiry: true});
+  assert.equal(ui.get('settings-interval').value, '20'); assert.equal(ui.get('settings-delay-min').value, '17');
+  assert.equal(ui.get('settings-weekly').checked, true); assert.equal(ui.get('settings-five-hour').checked, true);
+  assert.equal(ui.get('settings-conflict').hidden, true); assert.equal(ui.get('settings-save').disabled, true);
+  assert.match(ui.get('settings-message').textContent, /仍为草稿/);
+  edit(ui, 'settings-interval', '90'); await submitSettings(ui);
+  const request = JSON.parse(ui.calls.filter(call => call.method === 'POST')[1].body);
+  assert.equal(request.revision, 2); assert.equal(request.config.interval_seconds, 90);
+  assert.equal(request.config.on_five_hour_expiry, true); assert.equal(request.config.on_weekly_expiry, true);
+});
+test('pending home save disables both switches and editor saves without duplicate writes', async () => {
+  let complete;
+  const ui = panel((url, options) => {
+    if (options.method === 'POST') return new Promise(resolve => { complete = () => resolve([200, querySettings(2, JSON.parse(options.body).config)]); });
+    return url.endsWith('/overview') ? [200, configuredOverview()] : [200, accountPage()];
+  });
+  await ui.get('connect').onclick(); edit(ui, 'settings-interval', '90');
+  ui.get('five-hour-query').checked = true; const pending = ui.get('five-hour-query').onchange(); await flush();
+  assert.equal(ui.get('five-hour-query').checked, true); assert.equal(ui.get('five-hour-query').disabled, true);
+  assert.equal(ui.get('weekly-query').disabled, true); assert.equal(ui.get('settings-save').disabled, true);
+  assert.equal(ui.get('five-hour-query').attributes.get('aria-busy'), 'true');
+  ui.get('weekly-query').checked = true; await ui.get('weekly-query').onchange(); await submitSettings(ui);
+  assert.equal(ui.get('weekly-query').checked, false); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  complete(); await pending;
+  assert.equal(ui.get('five-hour-query').checked, true); assert.equal(ui.get('five-hour-query').disabled, false);
+  assert.equal(ui.get('settings-interval').value, '90'); assert.equal(ui.get('settings-save').disabled, false);
+});
+test('rejected home saves roll back switches and display errors in place', async () => {
+  for (const [status, error] of [[400, 'invalid_query_settings'], [503, 'storage_unavailable']]) {
+    const ui = panel((url, options) => options.method === 'POST' ? [status, {error}] : url.endsWith('/overview') ? [200, configuredOverview()] : [200, accountPage()]);
+    await ui.get('connect').onclick(); ui.get('weekly-query').checked = true; await ui.get('weekly-query').onchange();
+    assert.equal(ui.get('weekly-query').checked, false); assert.equal(ui.get('weekly-query').disabled, false);
+    assert.equal(ui.get('page-title').textContent, '运行总览'); assert.equal(ui.get('rules-message').hidden, false);
+    assert.match(ui.get('rules-message').textContent, /开关未保存/); assert.equal(ui.get('rules-reload').hidden, true);
+    assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  }
+});
+test('conflicting home save requires an explicit read and never overwrites unrelated server settings or drafts', async () => {
+  let settings = querySettings(), conflict = true;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/settings')) {
+      if (options.method === 'POST') {
+        if (conflict) { settings = querySettings(2, {...queryConfig(), interval_seconds: 180, on_weekly_expiry: true}); return [409, {error: 'settings_conflict'}]; }
+        assert.equal(JSON.parse(options.body).revision, 2);
+        settings = querySettings(3, JSON.parse(options.body).config);
+      }
+      return [200, settings];
+    }
+    return url.endsWith('/overview') ? [200, configuredOverview(settings)] : [200, accountPage(settings.view_revision)];
+  });
+  await ui.get('connect').onclick(); edit(ui, 'settings-interval', '90');
+  ui.get('five-hour-query').checked = true; await ui.get('five-hour-query').onchange();
+  assert.equal(ui.get('five-hour-query').checked, false); assert.equal(ui.get('five-hour-query').disabled, true);
+  assert.equal(ui.get('rules-reload').hidden, false); assert.match(ui.get('rules-message').textContent, /设置已变化/);
+  await ui.tick(5000); await ui.get('five-hour-query').onchange();
+  assert.equal(ui.get('five-hour-query').disabled, true); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  await ui.get('rules-reload').onclick();
+  assert.equal(ui.get('page-title').textContent, '运行总览'); assert.equal(ui.get('weekly-query').checked, true);
+  assert.equal(ui.get('settings-interval').value, '90'); assert.equal(ui.get('settings-conflict').hidden, false);
+  assert.equal(ui.get('five-hour-query').disabled, false); conflict = false;
+  ui.get('five-hour-query').checked = true; await ui.get('five-hour-query').onchange();
+  assert.equal(settings.config.interval_seconds, 180); assert.equal(settings.config.on_weekly_expiry, true);
+  assert.equal(settings.config.on_five_hour_expiry, true); assert.equal(ui.get('settings-interval').value, '90');
+  assert.equal(ui.get('settings-conflict').hidden, false); assert.equal(ui.get('settings-save').disabled, true);
+});
+test('lost home save acknowledgement stays locked through polling until explicitly verified without retry', async () => {
+  let settings = querySettings();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/settings')) {
+      if (options.method === 'POST') { settings = querySettings(2, JSON.parse(options.body).config); throw new Error('lost response'); }
+      return [200, settings];
+    }
+    return url.endsWith('/overview') ? [200, configuredOverview(settings)] : [200, accountPage(settings.view_revision)];
+  });
+  await ui.get('connect').onclick(); ui.get('weekly-query').checked = true; await ui.get('weekly-query').onchange();
+  assert.equal(ui.get('weekly-query').checked, false); assert.equal(ui.get('weekly-query').disabled, true);
+  assert.match(ui.get('rules-message').textContent, /尚未确认/); assert.equal(ui.get('rules-reload').hidden, false);
   await ui.tick(5000);
-  assert.equal(ui.get('settings-five-hour').checked, true); assert.equal(ui.get('settings-status').textContent, '未保存草稿');
-  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  assert.equal(ui.get('weekly-query').checked, true); assert.equal(ui.get('weekly-query').disabled, true);
+  edit(ui, 'settings-interval', '90'); await submitSettings(ui); await ui.get('weekly-query').onchange();
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  await ui.get('rules-reload').onclick();
+  assert.equal(ui.get('weekly-query').disabled, false); assert.equal(ui.get('settings-interval').value, '90');
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('late home save cannot replace newer settings observed while it was pending', async () => {
+  let settings = querySettings(), complete;
+  const ui = panel((url, options) => {
+    if (options.method === 'POST') return new Promise(resolve => { complete = () => resolve([200, querySettings(2, JSON.parse(options.body).config)]); });
+    return url.endsWith('/overview') ? [200, configuredOverview(settings)] : [200, accountPage(settings.view_revision)];
+  });
+  await ui.get('connect').onclick(); ui.get('weekly-query').checked = true;
+  const pending = ui.get('weekly-query').onchange(); await flush();
+  settings = querySettings(3, {...queryConfig(), interval_seconds: 180}); await ui.tick(5000);
+  complete(); await pending;
+  assert.equal(ui.get('weekly-query').checked, false); assert.equal(ui.get('weekly-query').disabled, true);
+  assert.equal(ui.get('settings-interval').value, '180'); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('home switches can save browser-unsupported server timezone aliases without editing them', async () => {
+  const config = {...queryConfig(), timezone: 'Factory'};
+  const ui = panel((url, options) => options.method === 'POST' ? [200, querySettings(2, JSON.parse(options.body).config)] : url.endsWith('/overview') ? [200, configuredOverview(querySettings(1, config))] : [200, accountPage()]);
+  await ui.get('connect').onclick(); ui.get('weekly-query').checked = true; await ui.get('weekly-query').onchange();
+  assert.equal(ui.get('weekly-query').checked, true); assert.equal(ui.get('weekly-query').disabled, false);
+  assert.deepEqual(JSON.parse(ui.calls.find(call => call.method === 'POST').body).config, {...config, on_weekly_expiry: true});
+});
+test('failed verification reads keep home switches locked and preserve the draft', async () => {
+  const ui = panel((url, options) => {
+    if (url.endsWith('/settings')) return options.method === 'POST' ? [409, {error: 'settings_conflict'}] : [503, {error: 'storage_unavailable'}];
+    return url.endsWith('/overview') ? [200, configuredOverview()] : [200, accountPage()];
+  });
+  await ui.get('connect').onclick(); edit(ui, 'settings-interval', '90');
+  ui.get('weekly-query').checked = true; await ui.get('weekly-query').onchange();
+  await ui.get('rules-reload').onclick();
+  assert.equal(ui.get('weekly-query').disabled, true); assert.equal(ui.get('rules-reload').hidden, false);
+  assert.equal(ui.get('settings-interval').value, '90'); assert.match(ui.get('rules-message').textContent, /读取设置失败/);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('home save authentication failure disconnects instead of retrying writes', async () => {
+  const ui = panel((url, options) => options.method === 'POST' ? [401, {error: 'unauthorized'}] : url.endsWith('/overview') ? [200, configuredOverview()] : [200, accountPage()]);
+  await ui.get('connect').onclick(); ui.get('weekly-query').checked = true; await ui.get('weekly-query').onchange();
+  assert.equal(ui.get('login-section').hidden, false); assert.equal(ui.get('weekly-query').disabled, true);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
 });
 test('polling updates saved settings without overwriting dirty draft or allowing stale saves', async () => {
   let settings = querySettings();
@@ -607,4 +789,306 @@ test('randomized bulk submission sends no client delay, schedule, settings or mo
   assert.equal(posts.length, 1); assert.deepEqual(JSON.parse(posts[0].body), {kind: 'quota_query', account_id: ''});
   assert.match(ui.get('notice').textContent, /每个账号由后台随机延迟并持久排队/);
   assert.equal(ui.calls.some(call => /model|wake|completion/.test(call.url)), false);
+});
+
+const {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview} = require('../../../internal/v2/daemon/web/panel.js');
+const modelConfig = overrides => ({...modelDefaults, phrases: [], ...overrides});
+const modelSettings = (revision = 1, config = modelConfig(), instance = 'a') => ({...view(instance, revision), revision, config});
+const modelOverview = (instance = 'a', capable = true, canGenerate = true) => ({...overview(), ...view(instance, 20), capabilities: {quota_query: true, model_settings: capable, prompt_generation: canGenerate, model_execution: false}});
+const submitModels = ui => ui.get('model-settings-form').onsubmit({preventDefault() {}});
+const submitCandidates = ui => ui.get('generation-form').onsubmit({preventDefault() {}});
+async function openModels(ui) {
+  await ui.get('connect').onclick();
+  ui.nav.find(node => node.dataset.page === 'models').listeners.get('click')(); await flush();
+}
+function configureCandidateRequest(ui) {
+  ui.get('generation-account').value = 'codex-01'; ui.get('generation-model').value = 'actual-model';
+  ui.get('generation-count').value = '3'; ui.get('generation-consent').checked = true;
+  ui.get('generation-consent').onchange();
+}
+function modelResponse(url, settings = modelSettings(), instance = 'a') {
+  if (url.endsWith('/model-settings')) return [200, settings];
+  return url.endsWith('/overview') ? [200, modelOverview(instance)] : [200, {...accountPage(), ...view(instance)}];
+}
+
+test('model validation enforces UTF-8 bytes, controls, prompt strategies and phrase uniqueness', () => {
+  const draft = modelConfigDraft(modelConfig());
+  assert.deepEqual(validateModelDraft(draft).errors, {});
+  for (const value of ['one two', 'model\n', 'x'.repeat(201), '你'.repeat(67), 'model\u0085']) assert.ok(validateModelDraft({...draft, default_model: value}).errors.default_model);
+  for (const value of ['', ' \n ', '你'.repeat(2731), 'hello\x00', 'hello\u0085']) assert.ok(validateModelDraft({...draft, default_prompt: value}).errors.default_prompt);
+  assert.deepEqual(validateModelDraft({...draft, default_prompt: '一行\n二行\t补充\r\n'}).errors, {});
+  assert.ok(validateModelDraft({...draft, prompt_mode: 'other'}).errors.prompt_mode);
+  assert.ok(validateModelDraft({...draft, prompt_mode: 'random'}).errors.phrases);
+  for (const value of ['重复\n 重复 ', '你'.repeat(171), 'a\tb', 'a\u2028b', Array.from({length: 201}, (_, index) => '短句' + index).join('\n')]) assert.ok(validateModelDraft({...draft, phrases: value}).errors.phrases);
+  assert.ok(validateModelDraft({...draft, phrases: Array.from({length: 200}, (_, index) => String(index) + 'x'.repeat(340)).join('\n')}).errors.total);
+  assert.deepEqual(validateModelDraft({...draft, phrases: ' \n你好\r\n 再见 \n', prompt_mode: 'random'}).config.phrases, ['你好', '再见']);
+});
+test('model phrase import/export and deduplication are pure and preserve first occurrence order', () => {
+  const phrases = parseModelPhrases(' 一句 \r\n\r另句\n一句\n');
+  assert.deepEqual(phrases, ['一句', '另句', '一句']);
+  assert.deepEqual(deduplicateModelPhrases(phrases), ['一句', '另句']);
+  assert.deepEqual(phrases, ['一句', '另句', '一句']);
+  assert.equal(exportModelPhrases(phrases), '一句\n另句\n一句\n');
+  assert.equal(exportModelPhrases([]), '');
+});
+test('model preview resolves overrides and inheritance and random preview uses only local crypto', () => {
+  const config = modelConfig({default_model: 'base', five_hour_prompt: '五小时专用', weekly_model: 'weekly-only'});
+  assert.deepEqual(modelPromptPreview(config, 'five_hour'), {model: 'base', prompt: '五小时专用', modelInherited: true, promptInherited: false, mode: 'fixed'});
+  const weekly = modelPromptPreview(config, 'weekly');
+  assert.equal(weekly.model, 'weekly-only'); assert.equal(weekly.prompt, modelDefaults.default_prompt); assert.equal(weekly.promptInherited, true);
+  const random = {...config, prompt_mode: 'random', phrases: ['第一句', '第二句']};
+  assert.equal(modelPromptPreview(random, 'five_hour', {getRandomValues: bytes => bytes.fill(0)}).prompt, '第一句');
+  assert.throws(() => modelPromptPreview(random, 'default', {}), /随机/);
+  assert.throws(() => modelPromptPreview({...random, phrases: []}), /至少/);
+});
+test('model settings load only on explicit navigation and capabilities gate configuration and generation independently', async () => {
+  const ui = panel(url => modelResponse(url)); await ui.get('connect').onclick(); await ui.tick(5000);
+  assert.equal(ui.calls.some(call => call.url.includes('/model-settings')), false);
+  ui.nav.find(node => node.dataset.page === 'models').listeners.get('click')(); await flush();
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/model-settings')).length, 1);
+  assert.equal(ui.get('model-default-prompt').value, modelDefaults.default_prompt);
+  assert.equal(ui.get('generation-fields').disabled, false); assert.equal(ui.get('auto-wake').disabled, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  const absent = panel(url => url.endsWith('/overview') ? [200, modelOverview('a', false, false)] : [200, accountPage()]); await openModels(absent);
+  assert.equal(absent.calls.some(call => call.url.includes('/model-settings')), false);
+  assert.equal(absent.get('model-fields').disabled, true); assert.equal(absent.get('generation-fields').disabled, true);
+  await submitModels(absent); configureCandidateRequest(absent); await submitCandidates(absent);
+  assert.equal(absent.calls.some(call => call.method === 'POST'), false);
+});
+test('model settings poll only while visible, update clean drafts and preserve dirty drafts on conflict', async () => {
+  let settings = modelSettings();
+  const ui = panel(url => modelResponse(url, settings)); await openModels(ui);
+  settings = modelSettings(2, modelConfig({default_model: 'new'})); await ui.tick(5000);
+  assert.equal(ui.get('model-default').value, 'new');
+  edit(ui, 'model-default', 'local-draft'); settings = modelSettings(3, modelConfig({default_model: 'remote'})); await ui.tick(5000);
+  assert.equal(ui.get('model-default').value, 'local-draft'); assert.equal(ui.get('model-conflict').hidden, false);
+  assert.equal(ui.get('model-save').disabled, true); await submitModels(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  ui.nav.find(node => node.dataset.page === 'overview').listeners.get('click')(); const reads = ui.calls.length; await ui.tick(5000);
+  assert.equal(ui.calls.slice(reads).some(call => call.url.endsWith('/model-settings')), false);
+});
+test('model saves use independent revision/config and never submit query settings, jobs or generation', async () => {
+  let settings = modelSettings();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings') && options.method === 'POST') { settings = modelSettings(2, JSON.parse(options.body).config); return [200, settings]; }
+    return modelResponse(url, settings);
+  });
+  await openModels(ui); edit(ui, 'model-default', 'actual-model'); edit(ui, 'model-five-hour-prompt', '早上好');
+  edit(ui, 'model-phrases', ' 你好 \n再见\n'); edit(ui, 'model-prompt-mode', 'random');
+  assert.match(ui.get('model-diff').textContent, /actual-model/); await submitModels(ui);
+  const writes = ui.calls.filter(call => call.method === 'POST'); assert.equal(writes.length, 1);
+  assert.ok(writes[0].url.endsWith('/model-settings'));
+  assert.deepEqual(JSON.parse(writes[0].body), {revision: 1, config: modelConfig({default_model: 'actual-model', five_hour_prompt: '早上好', prompt_mode: 'random', phrases: ['你好', '再见']})});
+  assert.equal(ui.get('model-save').disabled, true); assert.match(ui.get('model-message').textContent, /配置已保存/);
+  assert.equal(ui.get('auto-wake').disabled, true);
+});
+test('model no-op normalized saves accept unchanged revisions without inventing a conflict', async () => {
+  const settings = modelSettings(2, modelConfig({phrases: ['你好']}));
+  const ui = panel(url => modelResponse(url, settings)); await openModels(ui);
+  edit(ui, 'model-phrases', ' 你好 \n'); await submitModels(ui);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(ui.get('model-conflict').hidden, true); assert.equal(ui.get('model-phrases').value, '你好');
+});
+test('model imports and local previews do not write, while destructive edits require explicit confirmation', async () => {
+  const ui = panel(url => modelResponse(url), {crypto: {getRandomValues: bytes => bytes.fill(0)}}); await openModels(ui);
+  ui.get('model-transfer').value = ' 一句\r\n另句\n一句'; ui.get('model-import').onclick();
+  assert.equal(ui.get('model-phrases').value, '一句\n另句\n一句'); assert.equal(ui.get('model-validation').hidden, false);
+  ui.get('model-deduplicate').onclick(); assert.equal(ui.get('model-phrases').value, '一句\n另句\n一句');
+  assert.equal(ui.get('model-confirmation').hidden, false); ui.get('model-confirm-action').onclick();
+  assert.equal(ui.get('model-phrases').value, '一句\n另句');
+  ui.get('model-export').onclick(); assert.equal(ui.get('model-transfer').value, '一句\n另句\n');
+  edit(ui, 'model-default', 'actual-model'); edit(ui, 'model-prompt-mode', 'random');
+  ui.get('model-preview-rule').value = 'weekly'; ui.get('model-preview').onclick();
+  assert.match(ui.get('model-preview-result').textContent, /继承默认模型/); assert.match(ui.get('model-preview-result').textContent, /一句/);
+  ui.get('model-clear').onclick(); ui.get('model-cancel-action').onclick(); assert.equal(ui.get('model-phrases').value, '一句\n另句');
+  ui.get('model-clear').onclick(); ui.get('model-confirm-action').onclick(); assert.equal(ui.get('model-phrases').value, '');
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('model form validation blocks direct invalid submission and unsupported random preview is text-only', async () => {
+  const ui = panel(url => modelResponse(url)); await openModels(ui);
+  edit(ui, 'model-default', 'bad model'); edit(ui, 'model-default-prompt', ''); await submitModels(ui);
+  assert.equal(ui.get('model-default').attributes.get('aria-invalid'), 'true'); assert.equal(ui.get('model-save').disabled, true);
+  edit(ui, 'model-default', 'good'); edit(ui, 'model-default-prompt', '<script>alert(1)</script>');
+  edit(ui, 'model-prompt-mode', 'random'); edit(ui, 'model-phrases', '<img src=x onerror=alert(1)>'); ui.get('model-preview').onclick();
+  assert.match(ui.get('model-preview-result').textContent, /随机/);
+  assert.equal(ui.get('model-preview-result').children.length, 0); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('model conflict and lost acknowledgement preserve drafts until explicit verification without automatic retry', async () => {
+  for (const lost of [false, true]) {
+    let settings = modelSettings();
+    const ui = panel((url, options) => {
+      if (url.endsWith('/model-settings') && options.method === 'POST') {
+        settings = modelSettings(2, modelConfig({default_model: 'server'}));
+        if (lost) throw new Error('lost acknowledgement');
+        return [409, {error: 'model_settings_conflict'}];
+      }
+      return modelResponse(url, settings);
+    });
+    await openModels(ui); edit(ui, 'model-default', 'draft'); await submitModels(ui);
+    assert.equal(ui.get('model-default').value, 'draft'); assert.equal(ui.get('model-save').disabled, true);
+    await ui.tick(5000); await submitModels(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+    await ui.get('model-reload').onclick(); assert.equal(ui.get('model-default').value, 'server');
+    assert.equal(ui.get('model-conflict').hidden, true); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  }
+});
+test('model storage failures remain editable and failed verification cannot unlock an ambiguous save', async () => {
+  for (const code of ['invalid_model_settings', 'storage_unavailable']) {
+    const ui = panel((url, options) => options.method === 'POST' ? [code === 'storage_unavailable' ? 503 : 400, {error: code}] : modelResponse(url));
+    await openModels(ui); edit(ui, 'model-default', 'draft'); await submitModels(ui);
+    assert.equal(ui.get('model-default').value, 'draft'); assert.equal(ui.get('model-save').disabled, false);
+  }
+  let failRead = false;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings') && (failRead || options.method === 'POST')) { failRead = true; return [409, {error: 'model_settings_conflict'}]; }
+    return modelResponse(url);
+  });
+  await openModels(ui); edit(ui, 'model-default', 'draft'); await submitModels(ui); await ui.get('model-reload').onclick();
+  assert.equal(ui.get('model-save').disabled, true); assert.equal(ui.get('model-default').value, 'draft');
+});
+test('model restart and delayed responses cannot overwrite dirty drafts or unlock old-instance saves', async () => {
+  let instance = 'a', settings = modelSettings(), release;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings') && options.method === 'POST') return new Promise(resolve => { release = () => resolve([200, modelSettings(2, JSON.parse(options.body).config)]); });
+    return modelResponse(url, settings, instance);
+  });
+  await openModels(ui); edit(ui, 'model-default', 'draft'); const saving = submitModels(ui); await flush();
+  instance = 'b'; settings = modelSettings(0, modelConfig(), instance); await ui.tick(5000); release(); await saving;
+  assert.equal(ui.get('model-default').value, 'draft'); assert.equal(ui.get('model-save').disabled, true);
+  await submitModels(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  await ui.get('model-reload').onclick(); assert.equal(ui.get('model-default').value, '');
+});
+test('candidate generation requires capability, valid fields and explicit quota consent', async () => {
+  const ui = panel(url => modelResponse(url)); await openModels(ui); await submitCandidates(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  configureCandidateRequest(ui); ui.get('generation-count').value = '21'; await submitCandidates(ui);
+  ui.get('generation-count').value = '2'; ui.get('generation-model').value = 'bad model'; await submitCandidates(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false); assert.match(ui.get('generation-message').textContent, /有效/);
+  ui.get('model-default').value = 'real-default'; ui.get('generation-use-default').onclick(); assert.equal(ui.get('generation-model').value, 'real-default');
+});
+test('candidate generation submits exactly once, polls reads and stages only explicitly selected candidates', async () => {
+  let phase = 'queued';
+  const ui = panel((url, options) => {
+    if (url.includes('/prompt-generations')) return [options.method === 'POST' ? 202 : 200, {...view(), job_id: 'gen-one', phase, candidates: phase === 'completed' ? ['你好', '<img src=x onerror=alert(1)>', '再见'] : []}];
+    return modelResponse(url);
+  });
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  assert.equal(ui.get('generation-fields').disabled, true); await submitCandidates(ui);
+  phase = 'running'; await ui.tick(5000); phase = 'completed'; await ui.tick(5000);
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 1);
+  assert.deepEqual(JSON.parse(posts[0].body), {account_id: 'codex-01', model: 'actual-model', count: 3});
+  assert.equal(posts[0].headers['Idempotency-Key'], 'fixture-idempotency-key');
+  assert.equal(ui.get('generation-results').hidden, false); assert.equal(ui.get('model-phrases').value, '');
+  const first = ui.get('generation-candidates').children[1].children[0]; first.checked = true; first.onchange(); ui.get('generation-apply').onclick();
+  assert.equal(ui.get('model-phrases').value, '<img src=x onerror=alert(1)>'); assert.equal(ui.get('model-save').disabled, false);
+  assert.match(ui.get('generation-message').textContent, /尚未保存/); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(ui.get('generation-candidates').children[1].children[1].children.length, 0);
+});
+test('candidate all-select and navigation preserve results without implicitly applying or saving them', async () => {
+  const ui = panel((url, options) => url.includes('/prompt-generations') ? [200, {...view(), job_id: 'gen-two', phase: 'completed', candidates: ['第一句', '第二句']}] : modelResponse(url));
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  ui.nav.find(node => node.dataset.page === 'overview').listeners.get('click')(); ui.nav.find(node => node.dataset.page === 'models').listeners.get('click')(); await flush();
+  assert.equal(ui.get('generation-results').hidden, false); assert.equal(ui.get('model-phrases').value, '');
+  ui.get('generation-select-all').onclick(); ui.get('generation-apply').onclick();
+  assert.equal(ui.get('model-phrases').value, '第一句\n第二句'); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('lost generation acknowledgement never automatically retries and explicit verification keeps the exact key and body', async () => {
+  let posts = 0;
+  const ui = panel((url, options) => {
+    if (url.includes('/prompt-generations')) {
+      if (++posts === 1) throw new Error('lost acknowledgement');
+      return [202, {...view(), job_id: 'gen-original', phase: 'queued', candidates: []}];
+    }
+    return modelResponse(url);
+  });
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui); await ui.tick(5000);
+  assert.equal(posts, 1); assert.equal(ui.get('generation-verify').hidden, false); assert.equal(ui.get('generation-submit').disabled, true);
+  ui.get('generation-account').value = 'different-account'; ui.get('generation-model').value = 'different-model'; await submitCandidates(ui);
+  assert.equal(posts, 1); await ui.get('generation-verify').onclick(); assert.equal(posts, 2);
+  const requests = ui.calls.filter(call => call.method === 'POST');
+  assert.equal(requests[0].body, requests[1].body); assert.equal(requests[0].headers['Idempotency-Key'], requests[1].headers['Idempotency-Key']);
+  assert.match(ui.get('generation-message').textContent, /任务已接受/);
+});
+test('unknown generation results can only be read and never resent or replaced by a new request', async () => {
+  const ui = panel((url, options) => url.includes('/prompt-generations') ? [200, {...view(), job_id: 'gen-unknown', phase: 'unknown', candidates: []}] : modelResponse(url));
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  assert.equal(ui.get('generation-submit').disabled, true); assert.match(ui.get('generation-message').textContent, /可能已消耗/);
+  await submitCandidates(ui); await ui.get('generation-verify').onclick(); await ui.tick(5000);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(ui.calls.filter(call => call.url.includes('/prompt-generations?job_id=')).length, 1);
+});
+test('generation task read failures retry only GET and unavailable or rejected backends do not fabricate candidates', async () => {
+  let polls = 0;
+  const ui = panel((url, options) => {
+    if (url.includes('/prompt-generations')) {
+      if (options.method === 'POST') return [202, {...view(), job_id: 'gen-retry', phase: 'queued', candidates: []}];
+      if (++polls === 1) throw new Error('temporary read error');
+      return [200, {...view(), job_id: 'gen-retry', phase: 'failed', error_code: 'quota_authentication_failed', candidates: []}];
+    }
+    return modelResponse(url);
+  });
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui); await ui.tick(5000);
+  assert.match(ui.get('generation-message').textContent, /仅读取|读取生成任务失败/); await ui.tick(5000);
+  assert.equal(ui.get('generation-results').hidden, true); assert.equal(ui.get('generation-consent').checked, false);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  const rejected = panel((url, options) => url.includes('/prompt-generations') ? [503, {error: 'prompt_generation_unavailable'}] : modelResponse(url));
+  await openModels(rejected); configureCandidateRequest(rejected); await submitCandidates(rejected);
+  assert.equal(rejected.get('generation-results').hidden, true); assert.match(rejected.get('generation-message').textContent, /未提供/);
+  assert.equal(rejected.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('a backend restart prevents uncertain generation intents from being posted to a new instance', async () => {
+  let instance = 'a';
+  const ui = panel((url, options) => {
+    if (url.includes('/prompt-generations')) throw new Error('unknown acceptance');
+    return modelResponse(url, modelSettings(1, modelConfig(), instance), instance);
+  });
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui); instance = 'b'; await ui.tick(5000);
+  assert.equal(ui.get('generation-verify').disabled, true); assert.match(ui.get('generation-message').textContent, /实例已更换/);
+  await ui.get('generation-verify').onclick(); await submitCandidates(ui);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('failed verification and storage errors cannot release an uncertain generation for a fresh request', async () => {
+  let attempts = 0;
+  const ui = panel((url, options) => {
+    if (url.includes('/prompt-generations')) {
+      attempts++;
+      return attempts === 1 ? [503, {error: 'storage_unavailable'}] : [409, {error: 'idempotency_conflict'}];
+    }
+    return modelResponse(url);
+  });
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  assert.equal(ui.get('generation-submit').disabled, true); await ui.get('generation-verify').onclick();
+  assert.equal(ui.get('generation-submit').disabled, true); assert.equal(ui.get('generation-verify').hidden, false);
+  configureCandidateRequest(ui); await submitCandidates(ui); assert.equal(attempts, 2);
+  const writes = ui.calls.filter(call => call.method === 'POST'); assert.equal(writes[0].body, writes[1].body);
+  assert.equal(writes[0].headers['Idempotency-Key'], writes[1].headers['Idempotency-Key']);
+});
+test('missing generation jobs become read-only unknown results and cannot be regenerated automatically', async () => {
+  const ui = panel((url, options) => url.includes('/prompt-generations') ? options.method === 'POST' ? [202, {...view(), job_id: 'gone', phase: 'queued', candidates: []}] : [404, {error: 'not_found'}] : modelResponse(url));
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui); await ui.tick(5000);
+  assert.match(ui.get('generation-message').textContent, /可能已消耗/); assert.equal(ui.get('generation-submit').disabled, true);
+  const reads = ui.calls.filter(call => call.url.includes('/prompt-generations?')).length; await ui.tick(5000);
+  assert.equal(ui.calls.filter(call => call.url.includes('/prompt-generations?')).length, reads);
+  await ui.get('generation-verify').onclick(); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+test('disconnecting an in-flight model save requires explicit verification after reconnect', async () => {
+  let release;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings') && options.method === 'POST') return new Promise(resolve => { release = () => resolve([200, modelSettings(2, JSON.parse(options.body).config)]); });
+    return modelResponse(url);
+  });
+  await openModels(ui); edit(ui, 'model-default', 'pending'); const pending = submitModels(ui); await flush();
+  ui.get('disconnect').onclick(); ui.get('key').value = 'fixture-key'; await ui.get('connect').onclick(); release(); await pending;
+  assert.equal(ui.get('model-default').value, 'pending'); assert.equal(ui.get('model-save').disabled, true);
+  await submitModels(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  await ui.get('model-reload').onclick(); assert.equal(ui.get('model-default').value, '');
+});
+test('model and candidate writes never automatically retry after authentication expires', async () => {
+  for (const candidate of [false, true]) {
+    const ui = panel((url, options) => options.method === 'POST' ? [401, {error: 'unauthorized'}] : modelResponse(url));
+    await openModels(ui);
+    if (candidate) { configureCandidateRequest(ui); await submitCandidates(ui); }
+    else { edit(ui, 'model-default', 'draft'); await submitModels(ui); }
+    assert.equal(ui.get('login-section').hidden, false); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+    assert.equal(ui.get(candidate ? 'generation-submit' : 'model-save').disabled, true);
+  }
 });

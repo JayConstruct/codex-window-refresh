@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"codex-window-refresh/internal/v2/policy"
 )
 
 func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
@@ -25,7 +27,7 @@ func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := strings.Split(schema, "CREATE INDEX IF NOT EXISTS jobs_retention")[0]
-	old = strings.Replace(old, "SELECT 4 WHERE NOT EXISTS", "SELECT 1 WHERE NOT EXISTS", 1)
+	old = strings.Replace(old, "SELECT 5 WHERE NOT EXISTS", "SELECT 1 WHERE NOT EXISTS", 1)
 	if _, err = db.Exec(old); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +45,7 @@ func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
 		t.Fatal(id, existing, err)
 	}
 	var version int
-	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 4 {
+	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 5 {
 		t.Fatal(version, err)
 	}
 }
@@ -64,7 +66,7 @@ func TestVersionTwoMigrationKeepsQuotaAndAddsBindingState(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := strings.Split(schema, "CREATE TABLE IF NOT EXISTS account_bindings")[0]
-	old = strings.Replace(old, "SELECT 4 WHERE NOT EXISTS", "SELECT 2 WHERE NOT EXISTS", 1)
+	old = strings.Replace(old, "SELECT 5 WHERE NOT EXISTS", "SELECT 2 WHERE NOT EXISTS", 1)
 	if _, err = db.Exec(old); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +120,7 @@ func TestVersionThreeMigrationKeepsLegacyQueueBindingsAndReceipts(t *testing.T) 
 	_, err = database.Exec(`DROP TRIGGER query_timer_outcome;
  DROP TABLE query_schedule; DROP TABLE query_plans; DROP TABLE query_settings;
  DROP TABLE query_run_bindings; DROP TABLE query_baselines; DROP TABLE query_timers;
- DROP TABLE query_scheduler_cursor; UPDATE schema_version SET version=3`)
+ DROP TABLE query_scheduler_cursor; DROP TABLE model_settings; DROP TABLE prompt_generations; UPDATE schema_version SET version=3`)
 	if err != nil {
 		database.Close()
 		t.Fatal(err)
@@ -140,5 +142,82 @@ func TestVersionThreeMigrationKeepsLegacyQueueBindingsAndReceipts(t *testing.T) 
 	run, err := storage.Claim(ctx)
 	if err != nil || run.Account.Binding != account.Binding || run.Account.AuthIndex != account.AuthIndex {
 		t.Fatal(run, err)
+	}
+}
+
+func TestVersionFourMigrationPreservesQueryConfigurationAndSchedule(t *testing.T) {
+	dir := privateDir(t)
+	storage, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	account := Account{ID: "schema-four", AuthIndex: "schema-four-index", Binding: "schema-four-binding", Status: "available"}
+	if err = storage.SyncInventory(ctx, []Account{account}); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := storage.QuerySettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.Config.Delay = policy.Delay{Min: 300, Max: 300}
+	settings.Config.Weekly = true
+	settings, err = storage.SaveQuerySettings(ctx, settings.Revision, settings.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobID, _, err := storage.CreateQuery(ctx, "schema-four-receipt", "schema-four-hash", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := storage.Job(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = storage.Expand(ctx, job, []Account{account}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := storage.Job(ctx, jobID)
+	if err != nil || len(before.Items) != 1 || before.Items[0].ScheduledAt == "" {
+		t.Fatal(before, err)
+	}
+	if _, err = storage.db.Exec("DROP TABLE model_settings; DROP TABLE prompt_generations; UPDATE schema_version SET version=4"); err != nil {
+		t.Fatal(err)
+	}
+	if err = storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	storage, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	var version int
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 5 {
+		t.Fatal(version, err)
+	}
+	models, err := storage.ModelSettings(ctx)
+	if err != nil || models.Revision != 0 || models.Config.DefaultPrompt != policy.DefaultModel().DefaultPrompt {
+		t.Fatal(models, err)
+	}
+	queries, err := storage.QuerySettings(ctx)
+	if err != nil || queries.Revision != settings.Revision || queries.Config.Delay.Min != 300 || !queries.Config.Weekly {
+		t.Fatal(queries, err)
+	}
+	after, err := storage.Job(ctx, jobID)
+	if err != nil || after.Items[0].ScheduledAt != before.Items[0].ScheduledAt || after.Items[0].Phase != "queued" {
+		t.Fatal(before, after, err)
+	}
+	replayed, existing, err := storage.CreateQuery(ctx, "schema-four-receipt", "schema-four-hash", "")
+	if err != nil || !existing || replayed != jobID {
+		t.Fatal(replayed, existing, err)
+	}
+	accounts, err := storage.Accounts(ctx, "", 10)
+	if err != nil || len(accounts) != 1 || accounts[0].AuthIndex != account.AuthIndex {
+		t.Fatal(accounts, err)
+	}
+	var binding string
+	if err = storage.db.QueryRow("SELECT binding FROM account_bindings WHERE account_id=?", account.ID).Scan(&binding); err != nil || binding != account.Binding {
+		t.Fatal(binding, err)
 	}
 }

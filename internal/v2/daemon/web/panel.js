@@ -207,8 +207,51 @@
     if (Array.isArray(job.items)) return {total: job.items.length, completed: job.items.filter(item => item.phase === 'completed').length, failed: job.items.filter(item => item.phase === 'failed').length};
     return {total: job.total ?? job.total_items ?? 0, completed: job.completed ?? job.completed_items ?? 0, failed: job.failed ?? job.failed_items ?? 0};
   }
+  const modelDefaults = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', prompt_mode: 'fixed', phrases: []};
+  function parseModelPhrases(text) {
+    return text.split(/\r\n|\n|\r/).map(phrase => phrase.trim()).filter(Boolean);
+  }
+  function exportModelPhrases(phrases) { return phrases.length ? phrases.join('\n') + '\n' : ''; }
+  function deduplicateModelPhrases(phrases) { return [...new Set(phrases)]; }
+  function modelConfigDraft(config) { return {...config, phrases: config.phrases.join('\n')}; }
+  function validateModelDraft(draft) {
+    const errors = {}, config = {}, bytes = value => new TextEncoder().encode(value).length;
+    for (const name of ['default_model', 'five_hour_model', 'weekly_model']) {
+      config[name] = draft[name];
+      if (typeof draft[name] !== 'string' || bytes(draft[name]) > 200 || /[\s\p{Cc}]/u.test(draft[name])) errors[name] = '模型标识最多 200 字节，不能包含空白或控制字符';
+    }
+    for (const name of ['default_prompt', 'five_hour_prompt', 'weekly_prompt']) {
+      config[name] = draft[name];
+      if (typeof draft[name] !== 'string' || bytes(draft[name]) > 8192 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u.test(draft[name]) || name === 'default_prompt' && !draft[name].trim()) errors[name] = '提示词最多 8192 字节，仅允许换行、回车和制表控制字符，默认提示词不能为空';
+    }
+    config.prompt_mode = draft.prompt_mode;
+    if (!['fixed', 'random'].includes(draft.prompt_mode)) errors.prompt_mode = '请选择固定提示词或随机短句';
+    config.phrases = typeof draft.phrases === 'string' ? parseModelPhrases(draft.phrases) : [];
+    if (typeof draft.phrases !== 'string' || config.phrases.length > 200 || config.phrases.some(phrase => bytes(phrase) > 512 || /[\p{Cc}\u2028\u2029]/u.test(phrase))) errors.phrases = '短句最多 200 条，每条为不超过 512 字节的单行文本，不能包含控制字符';
+    else if (new Set(config.phrases).size !== config.phrases.length) errors.phrases = '存在重复短句，请先检查或确认去重';
+    else if (draft.prompt_mode === 'random' && !config.phrases.length) errors.phrases = '随机模式至少需要一条短句';
+    if (Object.values(config).reduce((total, value) => total + (Array.isArray(value) ? value.reduce((sum, phrase) => sum + bytes(phrase), 0) : typeof value === 'string' ? bytes(value) : 0), 0) > 65536) errors.total = '配置文本总量不能超过 65536 字节';
+    return {errors, config};
+  }
+  function modelPromptPreview(config, rule = 'default', crypto) {
+    const prefix = {five_hour: 'five_hour', weekly: 'weekly'}[rule];
+    const modelOverride = prefix && config[prefix + '_model'], promptOverride = prefix && config[prefix + '_prompt'];
+    const preview = {model: modelOverride || config.default_model, prompt: promptOverride || config.default_prompt,
+      modelInherited: !!prefix && !modelOverride, promptInherited: !!prefix && !promptOverride, mode: config.prompt_mode};
+    if (config.prompt_mode !== 'random') return preview;
+    if (!config.phrases.length) throw new Error('随机模式至少需要一条短句');
+    if (typeof crypto?.getRandomValues !== 'function') throw new Error('浏览器缺少安全随机能力，无法预览随机短句');
+    const bytes = new Uint8Array(4), limit = Math.floor(4294967296 / config.phrases.length) * config.phrases.length;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      crypto.getRandomValues(bytes);
+      const value = bytes[0] * 16777216 + bytes[1] * 65536 + bytes[2] * 256 + bytes[3];
+      if (value < limit) return {...preview, prompt: config.phrases[value % config.phrases.length], promptInherited: false};
+    }
+    throw new Error('无法生成随机预览，请稍后重试');
+  }
   function message(code) { return codes[code] || '请求失败，请查看诊断信息'; }
   if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText};
+  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview});
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
@@ -219,9 +262,27 @@
   let overviewData = null, accountsData = [], accountsRevision = 0, accountsViewRevision = -1, cursor = '', nextCursor = '', previousCursors = [], pageStart = 0, filteredTotal = null;
   let filterTimer, filterSequence = 0, updatingAccounts = false, syncing = false;
   let savedSettings = null, settingsBase = null, settingsLoading = false, settingsSaving = false, settingsConflict = false, activePage = 'overview';
+  let settingsNeedsVerification = false, savingRule = null;
+  let modelBase = null, savedModelSettings = null, modelLoading = false, modelSaving = false, modelConflict = false, modelNeedsVerification = false, modelConfirmation = '';
+  let generationIntent = null, generationTask = null, generationSubmitting = false, generationReading = false, generationUnconfirmed = false, generationUnknown = false;
+  const generationSelected = new Set();
+  const modelFields = {default_model: 'model-default', default_prompt: 'model-default-prompt', five_hour_model: 'model-five-hour', five_hour_prompt: 'model-five-hour-prompt', weekly_model: 'model-weekly', weekly_prompt: 'model-weekly-prompt', prompt_mode: 'model-prompt-mode', phrases: 'model-phrases'};
+  codes.invalid_model_settings = '模型与提示词设置无效，请检查字段';
+  codes.model_settings_conflict = '后台模型配置已变化，请重新读取并丢弃草稿后再编辑';
+  Object.assign(codes, {prompt_generation_unavailable: '后台未提供候选生成功能', invalid_prompt_generation: '生成参数无效，请检查账号、模型和数量', generation_account_unavailable: '生成账号不可用或凭据绑定已变化，请检查账号状态', generation_response_invalid: '模型返回的候选短句无效', generation_request_rejected: '模型请求被拒绝', generation_interrupted: '生成被中断，可能已消耗额度', generation_outcome_unknown: '生成结果未知，可能已消耗额度', idempotency_key_required: '缺少有效的请求标识', job_id_required: '缺少有效的生成任务标识'});
   const settingsFields = {automatic: 'settings-automatic', fiveHour: 'settings-five-hour', weekly: 'settings-weekly', interval: 'settings-interval', timezone: 'settings-timezone', delayMin: 'settings-delay-min', delayMax: 'settings-delay-max', excluded: 'settings-excluded'};
   const pending = new Map(), controllers = new Set(), queryBusy = new Set(), unresolved = new Map();
   const setText = (id, text) => { if ($(id)) $(id).textContent = text; };
+  const sidebarPreference = 'cwr-v2-sidebar:' + base;
+  function renderSidebar(collapsed, persist = false) {
+    $('app-sidebar').dataset.collapsed = String(collapsed);
+    document.documentElement?.classList.toggle('sidebar-collapsed', collapsed);
+    const label = collapsed ? '展开侧栏' : '收起侧栏';
+    $('sidebar-toggle').setAttribute('aria-expanded', String(!collapsed));
+    $('sidebar-toggle').setAttribute('aria-label', label); $('sidebar-toggle').setAttribute('title', label);
+    setText('sidebar-toggle-label', label);
+    if (persist) { try { context.localStorage.setItem(sidebarPreference, String(collapsed)); } catch {} }
+  }
   function element(tag, className, text) {
     const item = document.createElement(tag);
     if (className) item.className = className;
@@ -234,6 +295,7 @@
   }
   function notice(text) { if ($('notice')) { $('notice').hidden = !text; $('notice').textContent = text; } }
   function clearError() { $('error').hidden = true; $('error').textContent = ''; }
+  function ruleMessage(text) { setText('rules-message', text); $('rules-message').hidden = !text; }
   function settingsSupported() { return overviewData?.capabilities?.query_settings === true; }
   function readDraft() {
     return Object.fromEntries(Object.entries(settingsFields).map(([name, id]) => [name, ['automatic', 'fiveHour', 'weekly'].includes(name) ? $(id).checked === true : $(id).value]));
@@ -265,7 +327,7 @@
     const supported = settingsSupported(), dirty = draftDirty(), draft = readDraft();
     const errors = settingsBase ? validateQueryDraft(draft).errors : {};
     $('settings-fields').disabled = !connected || !supported || !settingsBase || settingsSaving || settingsLoading;
-    $('settings-save').disabled = !connected || !supported || !dirty || !!Object.keys(errors).length || settingsConflict || settingsSaving || settingsLoading;
+    $('settings-save').disabled = !connected || !supported || !dirty || !!Object.keys(errors).length || settingsConflict || settingsNeedsVerification || settingsSaving || settingsLoading;
     $('settings-reload').disabled = !connected || !supported || settingsSaving || settingsLoading;
     for (const [name, id] of Object.entries(settingsFields)) $(id).setAttribute('aria-invalid', errors[name] ? 'true' : 'false');
     setText('settings-validation', Object.values(errors).join('；')); $('settings-validation').hidden = !Object.keys(errors).length;
@@ -283,27 +345,32 @@
       if (!dirty) diff.append(element('p', '', '暂无修改。只有点击“保存并应用”才会写入后台。'));
     } else diff.append(element('p', '', connected && !supported ? '当前后台未提供查询设置能力，不能保存规则。' : '连接后读取已保存设置'));
     for (const [id, name] of [['five-hour-query', 'on_five_hour_expiry'], ['weekly-query', 'on_weekly_expiry']]) {
-      $(id).checked = savedSettings?.config?.[name] === true;
-      $(id).disabled = !connected || !supported || settingsSaving || settingsLoading;
+      $(id).checked = savingRule?.field === name ? savingRule.checked : savedSettings?.config?.[name] === true;
+      $(id).disabled = !connected || !supported || !savedSettings || settingsNeedsVerification || settingsSaving || settingsLoading;
+      $(id).setAttribute('aria-busy', savingRule?.field === name ? 'true' : 'false');
     }
     $('auto-wake').checked = false; $('auto-wake').disabled = true;
-    setText('rules-status', connected && supported ? '查询可配置' : '尚未接入');
+    $('rules-reload').hidden = !connected || !supported || !settingsNeedsVerification && !!savedSettings;
+    $('rules-reload').disabled = !connected || settingsSaving || settingsLoading;
+    setText('rules-status', !connected || !supported ? '尚未接入' : settingsSaving ? '保存中…' : settingsLoading ? '读取中…' : settingsNeedsVerification ? '需要核实' : '即改即存');
     setText('settings-save', settingsSaving ? '保存中…' : '保存并应用');
   }
   async function reloadSettings(discard = false) {
     if (!connected || !settingsSupported() || settingsLoading || settingsSaving) return false;
-    const current = generation, sequence = views.begin('settings'); settingsLoading = true; renderSettings();
+    const current = generation, sequence = views.begin('settings'), verifying = settingsNeedsVerification; settingsLoading = true; renderSettings();
     try {
       const data = await api('/settings');
       if (current !== generation || !views.accept('settings', sequence, data)) return false;
       if (!applySettings(data, discard)) return false;
+      settingsNeedsVerification = false;
+      if (verifying) ruleMessage('已重新读取后台设置，请核对开关状态。未重复提交任何更改。');
       setText('settings-message', discard ? '已重新加载后台设置并丢弃草稿，尚未写入任何更改。' : '已读取后台设置；修改后请预览差异并保存。');
       return true;
-    } catch (error) { if (current === generation) setText('settings-message', message(error.code)); return false; }
+    } catch (error) { if (current === generation) { setText('settings-message', message(error.code)); ruleMessage('读取设置失败：' + message(error.code)); } return false; }
     finally { if (current === generation) { settingsLoading = false; renderSettings(); } }
   }
   async function saveSettings() {
-    if (!connected || !settingsSupported() || settingsSaving || settingsLoading || settingsConflict || !draftDirty()) return;
+    if (!connected || !settingsSupported() || settingsSaving || settingsLoading || settingsConflict || settingsNeedsVerification || !draftDirty()) return;
     if (settingsBase.instance_id !== views.instance) { settingsConflict = true; renderSettings(); return; }
     const validated = validateQueryDraft(readDraft());
     if (Object.keys(validated.errors).length) { renderSettings(); return; }
@@ -317,16 +384,226 @@
       views.barrier(); setText('settings-message', '已保存并应用。后台将按此规则持续执行额度查询，不发送模型请求。');
     } catch (error) {
       if (current !== generation) return;
-      if (['settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code)) settingsConflict = true;
+      if (['settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code)) {
+        settingsConflict = true; settingsNeedsVerification = true;
+        ruleMessage('查询设置保存失败或结果未确认，请先重新读取后台设置。');
+      }
       setText('settings-message', message(['network', 'timeout', 'invalid_response'].includes(error.code) ? 'settings_unconfirmed' : error.code));
     } finally { if (current === generation) { settingsSaving = false; renderSettings(); } }
   }
-  async function stageRule(name, checked) {
-    if (!connected || !settingsSupported() || settingsSaving || settingsLoading) { renderSettings(); return; }
-    navigate('query', false);
-    if ((!settingsBase || settingsBase.instance_id !== views.instance) && !await reloadSettings()) return;
-    $(settingsFields[name]).checked = checked;
-    setText('settings-message', '已修改草稿，请核对差异后点击“保存并应用”。后台设置尚未改变。'); renderSettings();
+  async function toggleRule(name, checked) {
+    const field = {fiveHour: 'on_five_hour_expiry', weekly: 'on_weekly_expiry'}[name];
+    if (!field || !connected || !settingsSupported() || !savedSettings || settingsSaving || settingsLoading || settingsNeedsVerification) { renderSettings(); return; }
+    const basis = savedSettings;
+    if (basis.instance_id !== views.instance) { settingsNeedsVerification = true; ruleMessage('后台已重启，请重新读取设置后再调整开关。'); renderSettings(); return; }
+    if (basis.config[field] === checked) { renderSettings(); return; }
+    const current = generation, sequence = views.begin('settings'), draft = readDraft();
+    const rebase = !settingsConflict && settingsBase?.instance_id === basis.instance_id && settingsBase.revision === basis.revision;
+    const original = settingsBase ? configDraft(settingsBase.config) : null;
+    const config = {...basis.config, [field]: checked}, label = name === 'fiveHour' ? '5 小时到期查询' : '周限额到期查询';
+    settingsSaving = true; savingRule = {field, checked}; renderSettings(); ruleMessage('正在保存' + label + '…');
+    try {
+      const data = await api('/settings', {method: 'POST', body: JSON.stringify({revision: basis.revision, config})});
+      if (current !== generation) return;
+      if (data.instance_id !== basis.instance_id || data.config?.[field] !== checked || data.revision <= basis.revision || !views.accept('settings', sequence, data)) throw Object.assign(new Error('settings_unconfirmed'), {code: 'settings_unconfirmed'});
+      if (!applySettings(data, rebase)) throw Object.assign(new Error('settings_conflict'), {code: 'settings_conflict'});
+      if (rebase) {
+        for (const [name, id] of Object.entries(settingsFields)) {
+          if (draft[name] === original[name]) continue;
+          if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else $(id).value = draft[name];
+        }
+      }
+      views.barrier(); ruleMessage(label + '已' + (checked ? '开启' : '关闭') + '并保存。');
+      setText('settings-message', draftDirty() ? '总览开关已保存；编辑器中的其他修改仍为草稿，尚未应用。' : '总览开关已保存并应用。');
+    } catch (error) {
+      if (current !== generation) return;
+      const uncertain = ['settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code);
+      if (uncertain) settingsNeedsVerification = true;
+      ruleMessage(error.code === 'settings_conflict' ? '后台设置已变化，本次开关未保存。请重新读取后再调整。' : uncertain ? '保存结果尚未确认，已恢复最后已知状态。请重新读取核实，不要重复提交。' : '开关未保存：' + message(error.code));
+    } finally { if (current === generation) { settingsSaving = false; savingRule = null; renderSettings(); } }
+  }
+  function modelSupported() { return overviewData?.capabilities?.model_settings === true; }
+  function readModelDraft() { return Object.fromEntries(Object.entries(modelFields).map(([name, id]) => [name, $(id).value])); }
+  function modelDirty() {
+    if (!modelBase) return false;
+    const original = modelConfigDraft(modelBase.config), draft = readModelDraft();
+    return Object.keys(modelFields).some(name => draft[name] !== original[name]);
+  }
+  function fillModelDraft(data) {
+    const draft = modelConfigDraft(data.config);
+    for (const [name, id] of Object.entries(modelFields)) $(id).value = draft[name];
+    modelBase = data;
+  }
+  function applyModelSettings(data, discard = false) {
+    const config = data?.config;
+    if (!Number.isSafeInteger(data?.revision) || data.revision < 0 || typeof data.instance_id !== 'string' || !config ||
+      Object.keys(modelFields).filter(name => name !== 'phrases').some(name => typeof config[name] !== 'string') ||
+      !Array.isArray(config.phrases) || config.phrases.some(phrase => typeof phrase !== 'string' || !phrase.trim() || phrase !== phrase.trim() || /[\r\n\u2028\u2029]/u.test(phrase)) ||
+      Object.keys(validateModelDraft(modelConfigDraft(config)).errors).length) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+    if (savedModelSettings?.instance_id === data.instance_id && savedModelSettings.revision > data.revision) return false;
+    const dirty = modelDirty();
+    savedModelSettings = data;
+    if (discard || !dirty) { fillModelDraft(data); modelConflict = false; modelConfirmation = ''; }
+    else if (modelBase.instance_id !== data.instance_id || modelBase.revision !== data.revision) modelConflict = true;
+    renderModelSettings(); return true;
+  }
+  function renderModelSettings() {
+    const supported = modelSupported(), dirty = modelDirty(), draft = readModelDraft(), errors = modelBase ? validateModelDraft(draft).errors : {};
+    const locked = !connected || !supported || !modelBase || modelSaving || modelLoading;
+    $('model-fields').disabled = locked;
+    $('model-save').disabled = locked || !dirty || !!Object.keys(errors).length || modelConflict || modelNeedsVerification;
+    $('model-reload').disabled = !connected || !supported || modelSaving || modelLoading;
+    for (const [name, id] of Object.entries(modelFields)) $(id).setAttribute('aria-invalid', errors[name] ? 'true' : 'false');
+    setText('model-validation', Object.values(errors).join('；')); $('model-validation').hidden = !Object.keys(errors).length;
+    $('model-conflict').hidden = !modelConflict && !modelNeedsVerification;
+    setText('model-status', !connected ? '等待连接' : !supported ? '尚未接入' : modelSaving ? '保存中' : modelLoading ? '读取中' : modelNeedsVerification ? '需要核实' : modelConflict ? '设置冲突' : dirty ? '未保存草稿' : savedModelSettings ? '版本 ' + savedModelSettings.revision : '尚未读取');
+    setText('model-save', modelSaving ? '保存中…' : '保存配置');
+    setText('model-phrase-count', parseModelPhrases(draft.phrases).length + ' / 200 条');
+    $('model-preview').disabled = locked || !!Object.keys(errors).length;
+    for (const id of ['model-import', 'model-export', 'model-deduplicate', 'model-clear', 'model-confirm-action', 'model-cancel-action']) $(id).disabled = locked;
+    $('model-confirmation').hidden = !modelConfirmation;
+    setText('model-confirmation-text', modelConfirmation === 'clear' ? '确认清空短句池草稿？保存后才影响后台。' : '确认去除重复短句并保留首次出现的顺序？保存后才影响后台。');
+    const diff = $('model-diff'); diff.replaceChildren();
+    if (modelBase) {
+      const original = modelConfigDraft(modelBase.config), labels = {default_model: '默认模型', default_prompt: '默认提示词', five_hour_model: '五小时模型覆盖', five_hour_prompt: '五小时提示词覆盖', weekly_model: '周模型覆盖', weekly_prompt: '周提示词覆盖', prompt_mode: '提示词策略', phrases: '短句池'};
+      const display = (name, value) => name === 'prompt_mode' ? value === 'random' ? '随机短句' : '固定提示词' : value || (name === 'default_model' ? '未指定模型' : name === 'phrases' ? '空' : '继承默认');
+      for (const name of Object.keys(modelFields)) {
+        if (draft[name] === original[name]) continue;
+        const row = element('div', 'settings-diff-row model-diff-row');
+        row.append(element('strong', '', labels[name]), element('span', '', display(name, original[name]) + ' → ' + display(name, draft[name]))); diff.append(row);
+      }
+      if (!dirty) diff.append(element('p', '', '暂无修改。编辑、导入和本地预览均不写入后台，也不发送模型请求。'));
+    } else diff.append(element('p', '', connected && !supported ? '当前后台未提供模型配置能力。' : '进入本页后读取已保存配置。'));
+    renderGeneration();
+  }
+  async function reloadModelSettings(discard = false, explicit = false) {
+    if (!connected || !modelSupported() || modelLoading || modelSaving || modelNeedsVerification && !explicit) return false;
+    const current = generation, sequence = views.begin('model-settings'); modelLoading = true; renderModelSettings();
+    try {
+      const data = await api('/model-settings');
+      if (current !== generation || !views.accept('model-settings', sequence, data)) return false;
+      if (!applyModelSettings(data, discard)) return false;
+      if (explicit) modelNeedsVerification = false;
+      if (explicit || !modelDirty()) setText('model-message', discard ? '已重新读取后台配置并丢弃草稿，未重复提交任何更改。' : '已读取配置；修改后请检查差异并明确保存。');
+      return true;
+    } catch (error) { if (current === generation) setText('model-message', '读取配置失败：' + message(error.code)); return false; }
+    finally { if (current === generation) { modelLoading = false; renderModelSettings(); } }
+  }
+  async function saveModelSettings() {
+    if (!connected || !modelSupported() || modelSaving || modelLoading || modelConflict || modelNeedsVerification || !modelDirty()) return;
+    const basis = modelBase, validated = validateModelDraft(readModelDraft());
+    if (Object.keys(validated.errors).length) { renderModelSettings(); return; }
+    if (basis.instance_id !== views.instance) { modelConflict = true; setText('model-message', '后台已重启，请重新读取配置后再保存。'); renderModelSettings(); return; }
+    const current = generation, sequence = views.begin('model-settings'); modelSaving = true; renderModelSettings(); setText('model-message', '正在保存模型与提示词配置…');
+    try {
+      const data = await api('/model-settings', {method: 'POST', body: JSON.stringify({revision: basis.revision, config: validated.config})});
+      if (current !== generation) return;
+      if (data.instance_id !== basis.instance_id || views.instance !== basis.instance_id || data.revision < basis.revision ||
+        !views.accept('model-settings', sequence, data) || Object.keys(modelFields).some(name => JSON.stringify(data.config?.[name]) !== JSON.stringify(validated.config[name]))) throw Object.assign(new Error('settings_unconfirmed'), {code: 'settings_unconfirmed'});
+      if (!applyModelSettings(data, true)) throw Object.assign(new Error('settings_conflict'), {code: 'settings_conflict'});
+      views.barrier(); setText('model-message', '配置已保存，本次未发送模型请求。候选生成需单独确认，自动唤醒仍未接入。');
+    } catch (error) {
+      if (current !== generation) return;
+      if (['model_settings_conflict', 'settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code)) { modelConflict = true; modelNeedsVerification = true; }
+      setText('model-message', message(['network', 'timeout', 'invalid_response'].includes(error.code) ? 'settings_unconfirmed' : error.code));
+    } finally { if (current === generation) { modelSaving = false; renderModelSettings(); } }
+  }
+  function modelDraftChanged() {
+    modelConfirmation = ''; renderModelSettings(); setText('model-message', '草稿尚未保存。请检查差异后保存，本地预览不调用模型。');
+    setText('model-preview-result', '草稿已修改，请重新生成本地预览。');
+  }
+  function previewModel() {
+    if (!connected || !modelSupported() || !modelBase || modelSaving || modelLoading) return;
+    const validated = validateModelDraft(readModelDraft());
+    if (Object.keys(validated.errors).length) { renderModelSettings(); return; }
+    try {
+      const preview = modelPromptPreview(validated.config, $('model-preview-rule').value, context.crypto);
+      setText('model-preview-result', '实际模型：' + (preview.model || '未指定（配置可保存，执行尚未接入）') + (preview.modelInherited ? ' · 继承默认模型' : '') + '\n提示词来源：' + (preview.mode === 'random' ? '本地随机短句' : preview.promptInherited ? '继承默认提示词' : '固定提示词') + '\n实际提示词：\n' + preview.prompt + '\n\n仅为当前草稿的本地预览，未发送模型请求。');
+    } catch (error) { setText('model-preview-result', error.message || '本地预览失败'); }
+  }
+  function generationSupported() { return overviewData?.capabilities?.prompt_generation === true; }
+  function generationActive() { return ['queued', 'running'].includes(generationTask?.phase); }
+  function renderGeneration() {
+    const supported = generationSupported(), locked = !connected || !supported || generationSubmitting || generationReading || generationActive() || generationUnconfirmed || generationUnknown;
+    $('generation-fields').disabled = locked;
+    $('generation-submit').disabled = locked || !$('generation-consent').checked;
+    $('generation-verify').hidden = !generationUnconfirmed && !generationUnknown;
+    $('generation-verify').disabled = !connected || !supported || generationSubmitting || generationReading || generationUnknown && !generationTask?.job_id;
+    const phases = {queued: '等待生成', running: '生成中', completed: '候选已就绪', failed: '生成失败', unknown: '结果未知'};
+    setText('generation-status', !connected ? '等待连接' : !supported ? '尚未接入' : generationSubmitting ? '提交中' : generationUnconfirmed ? '需要核实' : generationUnknown ? '结果未知' : phases[generationTask?.phase] || '按需生成');
+    if (!supported) setText('generation-message', '当前后台尚未提供候选生成功能，不会发送模型请求。');
+    const candidates = generationTask?.phase === 'completed' ? generationTask.candidates || [] : [];
+    $('generation-results').hidden = !candidates.length;
+    $('generation-candidates').replaceChildren();
+    candidates.forEach((phrase, index) => {
+      const label = element('label', 'generation-candidate'), checkbox = element('input');
+      checkbox.type = 'checkbox'; checkbox.checked = generationSelected.has(index);
+      checkbox.disabled = !connected || !supported;
+      checkbox.setAttribute('aria-label', '选择候选短句 ' + (index + 1));
+      checkbox.onchange = () => { if (checkbox.checked) generationSelected.add(index); else generationSelected.delete(index); renderGeneration(); };
+      label.append(checkbox, element('span', '', phrase)); $('generation-candidates').append(label);
+    });
+    $('generation-select-all').disabled = !connected || !supported || !candidates.length;
+    $('generation-apply').disabled = !connected || !supported || !modelSupported() || !modelBase || modelSaving || modelLoading || !generationSelected.size;
+  }
+  function acceptGeneration(data, expectedID = '') {
+    const phases = ['queued', 'running', 'completed', 'failed', 'unknown'];
+    if (typeof data?.job_id !== 'string' || !data.job_id || expectedID && data.job_id !== expectedID || data.instance_id !== views.instance || !phases.includes(data.phase) ||
+      data.candidates !== undefined && (!Array.isArray(data.candidates) || data.candidates.length > 20 || data.candidates.some(phrase => typeof phrase !== 'string' || !phrase.trim() || new TextEncoder().encode(phrase).length > 512 || /[\p{Cc}\u2028\u2029]/u.test(phrase))) ||
+      data.phase === 'completed' && !data.candidates?.length) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+    if (generationTask?.job_id !== data.job_id || generationTask.phase !== data.phase) generationSelected.clear();
+    generationTask = data; generationUnconfirmed = false; generationUnknown = data.phase === 'unknown';
+    if (data.phase === 'completed') { $('generation-consent').checked = false; setText('generation-message', '候选已生成。请勾选后加入短句池草稿；尚未保存配置。'); }
+    else if (data.phase === 'failed') { $('generation-consent').checked = false; setText('generation-message', '生成任务失败：' + (codes[data.error_code] || '请查看后台诊断信息') + '。重新生成需要再次明确确认消耗额度。'); }
+    else if (data.phase === 'unknown') setText('generation-message', '生成结果未知，可能已消耗额度。禁止重复发送；可核实已有任务，不会创建新的模型请求。');
+    else setText('generation-message', '任务已接受，正在后台' + (data.phase === 'queued' ? '排队' : '生成') + '。关闭或切换页面不会重发模型请求。');
+  }
+  async function submitGeneration(verify = false) {
+    if (!connected || !generationSupported() || generationSubmitting || generationReading) return;
+    if (verify && generationTask?.job_id) return pollGeneration(true);
+    if (generationUnknown) return;
+    if (verify ? !generationUnconfirmed || !generationIntent : generationUnconfirmed || generationActive() || !$('generation-consent').checked) return;
+    if (!verify) {
+      const account = $('generation-account').value.trim(), model = $('generation-model').value, rawCount = $('generation-count').value;
+      const count = /^\d+$/.test(rawCount) ? Number(rawCount) : NaN;
+      if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account) || !model || new TextEncoder().encode(model).length > 200 || /[\s\p{Cc}]/u.test(model) || !Number.isSafeInteger(count) || count < 1 || count > 20) { setText('generation-message', '请输入有效账号 ID、无空白的实际模型标识及 1–20 的整数数量，并确认消耗额度。'); return; }
+      try { generationIntent = {key: requestID(context.crypto), body: JSON.stringify({account_id: account, model, count}), instance: views.instance}; }
+      catch (error) { setText('generation-message', message(error.code)); return; }
+      generationTask = null; generationSelected.clear();
+    }
+    if (generationIntent.instance !== views.instance) { generationUnknown = true; setText('generation-message', '后台实例已更换，原任务可能已消耗额度。为避免重复调用，不再重发生成请求。'); renderGeneration(); return; }
+    const current = generation; generationSubmitting = true; renderGeneration(); setText('generation-message', verify ? '正在使用原请求标识核实同一任务，不更换账号、模型或数量…' : '正在提交一次明确确认的模型请求…');
+    try {
+      const data = await api('/prompt-generations', {method: 'POST', headers: {'Idempotency-Key': generationIntent.key}, body: generationIntent.body});
+      if (current !== generation) return;
+      acceptGeneration(data);
+    } catch (error) {
+      if (current !== generation) return;
+      if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed'].includes(error.code) || error.status >= 500 && error.code !== 'prompt_generation_unavailable') {
+        generationUnconfirmed = true; setText('generation-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请点击“核实同一任务”显式使用原标识和原参数核实。');
+      } else { generationUnconfirmed = false; $('generation-consent').checked = false; setText('generation-message', '生成请求未接受：' + message(error.code)); }
+    } finally { if (current === generation) { generationSubmitting = false; renderGeneration(); } }
+  }
+  async function pollGeneration(explicit = false) {
+    if (!connected || !generationSupported() || generationSubmitting || generationReading || !generationTask?.job_id || !explicit && !generationActive()) return;
+    const current = generation, expectedID = generationTask.job_id; generationReading = true; renderGeneration();
+    try {
+      const data = await api('/prompt-generations?job_id=' + encodeURIComponent(expectedID));
+      if (current !== generation || generationTask?.job_id !== expectedID) return;
+      acceptGeneration(data, expectedID);
+    } catch (error) {
+      if (current !== generation) return;
+      if ([404, 410].includes(error.status)) { generationUnknown = true; generationTask = {...generationTask, phase: 'unknown'}; setText('generation-message', '无法核实原生成任务，可能已消耗额度。不会重发或创建新请求。'); }
+      else setText('generation-message', '读取生成任务失败：' + message(error.code) + '。仅重试读取，不会重发模型请求。');
+    } finally { if (current === generation) { generationReading = false; renderGeneration(); } }
+  }
+  function applyGenerationCandidates() {
+    if ($('generation-apply').disabled || !connected || !modelBase || modelSaving || modelLoading || generationTask?.phase !== 'completed') return;
+    const chosen = generationTask.candidates.filter((phrase, index) => generationSelected.has(index));
+    if (!chosen.length) return;
+    const current = parseModelPhrases($('model-phrases').value);
+    $('model-phrases').value = [...current, ...chosen].join('\n'); generationSelected.clear();
+    modelDraftChanged(); renderGeneration(); setText('generation-message', '已将所选候选加入短句池草稿，尚未保存。请检查重复项与差异后保存配置。');
   }
   function setConnection(text) {
     setText('connection', text);
@@ -343,13 +620,20 @@
     if ($('more')) { $('more').hidden = true; $('more').disabled = !connected; }
     for (const button of document.querySelectorAll('[data-action="batch"]')) button.disabled = !connected || queryBusy.has('batch');
     renderSettings();
+    renderModelSettings();
+    renderGeneration();
   }
   function stop() {
     generation++; connected = false; connecting = false; key = '';
     clearTimeout(pollTimer); clearTimeout(filterTimer);
     for (const controller of controllers) controller.abort();
     controllers.clear(); queryBusy.clear(); pending.clear();
-    refreshing = false; updatingAccounts = false; syncing = false; settingsLoading = false; settingsSaving = false;
+    refreshing = false; updatingAccounts = false; syncing = false; settingsLoading = false; settingsSaving = false; settingsNeedsVerification = false; savingRule = null;
+    if (modelSaving) { modelConflict = true; modelNeedsVerification = true; }
+    modelLoading = false; modelSaving = false; modelConfirmation = '';
+    if (generationSubmitting && generationIntent) generationUnconfirmed = true;
+    generationSubmitting = false; generationReading = false;
+    ruleMessage('');
     $('login-section').hidden = false;
     setText('auto-status', '尚未连接');
     $('auto-status').dataset.state = 'offline';
@@ -582,6 +866,14 @@
       if (draftDirty()) settingsConflict = true;
       else { savedSettings = null; settingsBase = null; }
     }
+    if (savedModelSettings && savedModelSettings.instance_id !== data.instance_id) {
+      if (modelDirty()) modelConflict = true;
+      else { savedModelSettings = null; modelBase = null; }
+      renderModelSettings();
+    }
+    if (generationIntent && generationIntent.instance !== data.instance_id && !generationTask?.job_id && generationUnconfirmed) {
+      generationUnknown = true; setText('generation-message', '后台实例已更换，原生成任务可能已消耗额度；不会向新实例重发请求。');
+    }
     if (data.query_settings && settingsSupported()) applySettings({...data.query_settings, instance_id: data.instance_id, view_revision: data.view_revision});
     renderOverview(); return data;
   }
@@ -611,6 +903,7 @@
         await accounts(forceAccounts || !cursor, data.accounts_revision);
       }
       await pollJobs();
+      if (activePage === 'models') { await reloadModelSettings(); await pollGeneration(); }
       if (current !== generation) return;
       updateTimes();
       setText('auto-status', '数据自动更新'); $('auto-status').dataset.state = 'online'; setConnection('独立后台已连接 · 页面每 5 秒更新'); clearError();
@@ -646,6 +939,7 @@
       await accounts(true);
       if (current !== generation) return;
       if (activePage === 'query' && settingsSupported() && !savedSettings) await reloadSettings();
+      if (activePage === 'models') { await reloadModelSettings(); await pollGeneration(); }
       clearError(); monitor(current);
     } catch (error) {
       if (current !== generation && error.code !== 'unauthorized') return;
@@ -712,6 +1006,7 @@
     document.title = '窗口助手 · ' + pages[name][0];
     if (connected) { renderTasks(); renderDiagnostics(); }
     if (name === 'query' && loadSettings && connected && settingsSupported() && (!savedSettings || savedSettings.instance_id !== views.instance)) void reloadSettings();
+    if (name === 'models' && loadSettings && connected) { void reloadModelSettings(); void pollGeneration(); }
   }
   function changeFilter() {
     clearTimeout(filterTimer); filterSequence++;
@@ -719,6 +1014,14 @@
     const current = generation;
     filterTimer = setTimeout(() => { if (current === generation && connected) void accounts(true).catch(report); }, 200);
   }
+  $('sidebar-toggle').onclick = () => renderSidebar($('app-sidebar').dataset.collapsed !== 'true', true);
+  for (const button of document.querySelectorAll('[data-page]')) {
+    if (!Object.hasOwn(pages, button.dataset.page)) continue;
+    button.setAttribute('title', pages[button.dataset.page][0]); button.setAttribute('aria-label', pages[button.dataset.page][0]);
+  }
+  let sidebarCollapsed = false;
+  try { sidebarCollapsed = context.localStorage.getItem(sidebarPreference) === 'true'; } catch {}
+  renderSidebar(sidebarCollapsed);
   $('connect').onclick = () => connect($('key').value);
   $('key').addEventListener('keydown', event => { if (event.key === 'Enter') void connect($('key').value); });
   if ($('disconnect')) $('disconnect').onclick = () => { stop(); setConnection('已断开，后台仍持续运行'); setText('metric-status', '未连接'); };
@@ -731,9 +1034,48 @@
   $('refresh').onclick = () => refresh(true); $('sync').onclick = syncInventory;
   $('query-settings-form').onsubmit = event => { event.preventDefault(); return saveSettings(); };
   $('settings-reload').onclick = () => reloadSettings(true);
+  $('rules-reload').onclick = () => reloadSettings();
+  $('model-settings-form').onsubmit = event => { event.preventDefault(); return saveModelSettings(); };
+  $('model-reload').onclick = () => reloadModelSettings(true, true);
+  for (const id of Object.values(modelFields)) $(id).addEventListener('input', modelDraftChanged);
+  $('model-preview').onclick = previewModel;
+  $('model-preview-rule').addEventListener('change', () => setText('model-preview-result', '规则已修改，请重新生成本地预览。'));
+  $('model-import').onclick = () => {
+    if ($('model-import').disabled) return;
+    const text = $('model-transfer').value;
+    if (new TextEncoder().encode(text).length > 65536) { setText('model-message', '导入文本超过 65536 字节，请拆分后再导入。'); return; }
+    const phrases = parseModelPhrases(text);
+    if (!phrases.length) { setText('model-message', '请先粘贴非空的纯文本短句。'); return; }
+    $('model-phrases').value = [...parseModelPhrases($('model-phrases').value), ...phrases].join('\n');
+    modelDraftChanged(); setText('model-message', '已追加导入草稿；尚未去重，也未保存后台。');
+  };
+  $('model-export').onclick = () => {
+    if ($('model-export').disabled) return;
+    $('model-transfer').value = exportModelPhrases(parseModelPhrases($('model-phrases').value));
+    setText('model-message', '纯文本已显示在导入 / 导出区，可选择复制；未修改后台。');
+  };
+  for (const [id, action] of [['model-deduplicate', 'deduplicate'], ['model-clear', 'clear']]) $(id).onclick = () => {
+    if ($(id).disabled) return;
+    modelConfirmation = action; renderModelSettings();
+  };
+  $('model-cancel-action').onclick = () => { modelConfirmation = ''; renderModelSettings(); };
+  $('model-confirm-action').onclick = () => {
+    if ($('model-confirm-action').disabled || !modelConfirmation) return;
+    $('model-phrases').value = modelConfirmation === 'clear' ? '' : deduplicateModelPhrases(parseModelPhrases($('model-phrases').value)).join('\n');
+    modelDraftChanged();
+  };
+  $('generation-form').onsubmit = event => { event.preventDefault(); return submitGeneration(); };
+  $('generation-verify').onclick = () => submitGeneration(true);
+  $('generation-consent').onchange = renderGeneration;
+  $('generation-use-default').onclick = () => { if (!$('generation-fields').disabled) $('generation-model').value = $('model-default').value; };
+  $('generation-select-all').onclick = () => {
+    if ($('generation-select-all').disabled) return;
+    generationTask.candidates.forEach((phrase, index) => generationSelected.add(index)); renderGeneration();
+  };
+  $('generation-apply').onclick = applyGenerationCandidates;
   for (const id of Object.values(settingsFields)) $(id).addEventListener('input', () => { renderSettings(); setText('settings-message', '草稿尚未保存，请核对差异后保存。'); });
-  $('five-hour-query').onchange = () => stageRule('fiveHour', $('five-hour-query').checked);
-  $('weekly-query').onchange = () => stageRule('weekly', $('weekly-query').checked);
+  $('five-hour-query').onchange = () => toggleRule('fiveHour', $('five-hour-query').checked);
+  $('weekly-query').onchange = () => toggleRule('weekly', $('weekly-query').checked);
   $('accounts-search').addEventListener('input', changeFilter); $('accounts-filter').addEventListener('change', changeFilter);
   $('next').onclick = async () => {
     if (!connected || updatingAccounts || !nextCursor) return;

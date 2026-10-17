@@ -1,5 +1,5 @@
-/* Read-only CPA ABI 1 / schema 6 bridge. No rules, credentials on disk, model
- * execution, or Go runtime. All ordinary host callbacks are local auth reads.
+/* CPA ABI 1 / schema 6 bridge. No rules, credentials on disk, or Go runtime.
+ * Host callbacks permit local auth reads and explicitly pinned manual streams.
  * The independent daemon performs HTTP and owns all durable business state. */
 #define _GNU_SOURCE
 #include "json_api.h"
@@ -26,6 +26,7 @@
 #define HTTP_BODY_LIMIT (2u<<20)
 #define WORKERS 10
 #define HOST_CALLS 8
+#define MODEL_LEASE_SECONDS 120
 #define QUEUE 32
 #define MGMT "/v0/management/codex-window-refresh/v2/"
 #define RESOURCE "/v0/resource/plugins/codex-window-refresh/"
@@ -57,6 +58,12 @@ static pthread_cond_t available=PTHREAD_COND_INITIALIZER,drained=PTHREAD_COND_IN
 static pthread_t accept_thread,workers[WORKERS];
 static int listener=-1,owner_lock=-1,stopping=1,running=0,live=0,queued[QUEUE],qhead=0,qsize=0,created=0,initialized=0;
 static int host_active;
+static pthread_cond_t streams_changed=PTHREAD_COND_INITIALIZER;
+static struct {
+    char id[257];
+    int used,reading,closing,closed;
+    time_t touched,retry_at;
+} streams[HOST_CALLS];
 static char bridge_path[sizeof(((struct sockaddr_un*)0)->sun_path)],daemon_path[sizeof(bridge_path)],instance[65];
 static char process_identity[128];
 static int identify_process(void) {
@@ -167,6 +174,101 @@ static int peer(int fd) {
     socklen_t n=sizeof(cred);
     return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,&cred,&n)==0&&cred.uid==geteuid();
 }
+static int bounded_text(J*value,size_t limit) {
+    const char*text=string(value);
+    if(!text||!text[0]||strlen(text)>limit)return 0;
+    int visible=0;
+    for(const unsigned char*next=(const unsigned char*)text;*next;next++) {
+        if(*next<32||*next==127)return 0;
+        if(*next!=' ')visible=1;
+    }
+    return visible;
+}
+static int equals(J*value,const char*expected) {
+    const char*text=string(value);
+    return text&&!strcmp(text,expected);
+}
+static int model_payload(J*payload) {
+    const char*body=string(field(payload,"body"));
+    const char*model=string(field(payload,"model"));
+    if(!equals(field(payload,"forced_provider"),"codex")||!equals(field(payload,"entry_protocol"),"openai-response")||!equals(field(payload,"exit_protocol"),"codex")||!bounded_text(field(payload,"auth_id"),256)||!bounded_text(field(payload,"model"),200)||json_object_get_type(field(payload,"stream"))!=1||!json_object_get_int(field(payload,"stream"))||!body)return 0;
+    if(strpbrk(model," \t\n\r\v\f"))return 0;
+    size_t length=strlen(body);
+    if(!length||length>65536||length%4)return 0;
+    int padding=0;
+    for(size_t index=0;index<length;index++) {
+        unsigned char next=(unsigned char)body[index];
+        if(next=='='&&index>=length-2)padding++;
+        else if(padding||!((next>='A'&&next<='Z')||(next>='a'&&next<='z')||(next>='0'&&next<='9')||next=='+'||next=='/'))return 0;
+    }
+    return padding<=2;
+}
+static J *host_callback(const char*method,J*payload) {
+    const char*raw=json_object_to_json_string_ext(payload,0);
+    Buffer result={0};
+    int status=host.call(host.host_ctx,method,(const uint8_t*)raw,strlen(raw),&result);
+    J*response=NULL;
+    if(!status&&result.ptr&&result.len<=FRAME_LIMIT)response=parse(result.ptr,result.len);
+    if(result.ptr)host.free_buffer(result.ptr,result.len);
+    J*success=field(response,"ok");
+    if(!success||json_object_get_type(success)!=1||!json_object_get_int(success)) {
+        json_object_put(response);
+        return error("host_callback_failed");
+    }
+    return response;
+}
+static void *stream_reaper(void*arg) {
+    (void)arg;
+    pthread_mutex_lock(&queue_mu);
+    for(;;) {
+        int slot=-1,pending=0;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC,&now);
+        for(int index=0;index<HOST_CALLS;index++) {
+            if(!streams[index].used)continue;
+            pending=1;
+            if(streams[index].id[0]&&!streams[index].closing&&now.tv_sec>=streams[index].retry_at&&(stopping||streams[index].retry_at||now.tv_sec-streams[index].touched>=MODEL_LEASE_SECONDS)&&host_active<HOST_CALLS) {
+                slot=index;
+                break;
+            }
+        }
+        if(slot>=0) {
+            char id[257];
+            strcpy(id,streams[slot].id);
+            streams[slot].closing=1;
+            host_active++;
+            pthread_mutex_unlock(&queue_mu);
+            J*payload=json_object_new_object();
+            json_object_object_add(payload,"stream_id",json_object_new_string(id));
+            J*response=host_callback("host.model.stream_close",payload);
+            int released=json_object_get_int(field(response,"ok"));
+            json_object_put(response);
+            json_object_put(payload);
+            pthread_mutex_lock(&queue_mu);
+            host_active--;
+            if(released) {
+                streams[slot].closed=1;
+                if(!streams[slot].reading)memset(&streams[slot],0,sizeof(streams[slot]));
+            }
+            else {
+                clock_gettime(CLOCK_MONOTONIC,&now);
+                streams[slot].closing=0;
+                streams[slot].retry_at=now.tv_sec+1;
+            }
+            continue;
+        }
+        if(stopping&&!pending&&!host_active) {
+            live--;
+            pthread_cond_broadcast(&drained);
+            pthread_mutex_unlock(&queue_mu);
+            return NULL;
+        }
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME,&deadline);
+        deadline.tv_sec++;
+        pthread_cond_timedwait(&streams_changed,&queue_mu,&deadline);
+    }
+}
 static J *rpc(J*req) {
     const char*method=string(field(req,"method"));
     if(json_object_get_int(field(req,"protocol_version"))!=1||!method)return error("bridge_protocol_incompatible");
@@ -175,6 +277,7 @@ static J *rpc(J*req) {
         json_object_object_add(j,"protocol_version",json_object_new_int(1));
         json_object_object_add(j,"bridge_instance_id",json_object_new_string(instance));
         json_object_object_add(j,"read_only",json_object_new_boolean(1));
+        json_object_object_add(j,"prompt_generation_supported",json_object_new_boolean(1));
         json_object_object_add(j,"version",json_object_new_string(CWR_VERSION));
         json_object_object_add(j,"max_host_calls",json_object_new_int(HOST_CALLS));
         pthread_mutex_lock(&queue_mu);
@@ -191,10 +294,14 @@ static J *rpc(J*req) {
     if(!strcmp(method,"bridge.events.pull"))return cwr_events_pull(field(req,"payload"),instance,process_identity);
     if(!strcmp(method,"bridge.events.ack"))return cwr_events_ack(field(req,"payload"));
     if(!strcmp(method,"bridge.bindings.replace"))return cwr_bindings_replace(field(req,"payload"));
-    if(strcmp(method,"host.auth.list")&&strcmp(method,"host.auth.get")&&strcmp(method,"host.auth.get_runtime"))return error("method_not_allowed");
+    int execute=!strcmp(method,"host.model.execute_stream"),read_stream=!strcmp(method,"host.model.stream_read"),close_stream=!strcmp(method,"host.model.stream_close");
+    int model=execute||read_stream||close_stream;
+    if(!model&&strcmp(method,"host.auth.list")&&strcmp(method,"host.auth.get")&&strcmp(method,"host.auth.get_runtime"))return error("method_not_allowed");
     J*payload=field(req,"payload");
     if(!payload||json_object_get_type(payload)!=4)return error("invalid_payload");
-    if(strcmp(method,"host.auth.list")) {
+    if(execute&&!model_payload(payload))return error("invalid_payload");
+    if((read_stream||close_stream)&&!bounded_text(field(payload,"stream_id"),256))return error("invalid_payload");
+    if(!model&&strcmp(method,"host.auth.list")) {
         const char*index=string(field(payload,"auth_index"));
         if(!index||!index[0]||strlen(index)>256)return error("invalid_payload");
     }
@@ -203,25 +310,55 @@ static J *rpc(J*req) {
     pthread_mutex_lock(&queue_mu);
     int stopped=stopping;
     int busy=host_active>=HOST_CALLS;
+    int slot=-1;
+    if(!stopped&&!busy&&model) {
+        for(int index=0;index<HOST_CALLS;index++) {
+            if(execute?!streams[index].used:(streams[index].used&&!strcmp(streams[index].id,string(field(payload,"stream_id"))))) {
+                slot=index;
+                break;
+            }
+        }
+        if(slot<0||(!execute&&(streams[slot].closing||(read_stream&&streams[slot].reading)))) {
+            pthread_mutex_unlock(&queue_mu);
+            return error(execute?"bridge_busy":"model_stream_unavailable");
+        }
+        if(execute)streams[slot].used=1;
+        if(read_stream)streams[slot].reading=1;
+        if(close_stream)streams[slot].closing=1;
+    }
     if(!stopped&&!busy)host_active++;
     pthread_mutex_unlock(&queue_mu);
     if(stopped)return error("bridge_stopping");
     if(busy)return error("bridge_busy");
-    const char*raw=json_object_to_json_string_ext(payload,0);
-    Buffer result= {
-        0
-    };
-    int status=host.call(host.host_ctx,method,(const uint8_t*)raw,strlen(raw),&result);
+    J*response=host_callback(method,payload);
     pthread_mutex_lock(&queue_mu);
     host_active--;
+    if(model) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC,&now);
+        streams[slot].touched=now.tv_sec;
+        if(execute) {
+            J*id=field(field(response,"result"),"stream_id");
+            if(bounded_text(id,256))strcpy(streams[slot].id,string(id));
+            else {
+                memset(&streams[slot],0,sizeof(streams[slot]));
+                json_object_put(response);
+                response=error("host_callback_failed");
+            }
+        }
+        if(read_stream)streams[slot].reading=0;
+        if(close_stream) {
+            if(json_object_get_int(field(response,"ok")))streams[slot].closed=1;
+            else {
+                streams[slot].closing=0;
+                streams[slot].retry_at=now.tv_sec+1;
+            }
+        }
+        if(streams[slot].closed&&!streams[slot].reading)memset(&streams[slot],0,sizeof(streams[slot]));
+    }
+    pthread_cond_broadcast(&streams_changed);
     pthread_mutex_unlock(&queue_mu);
-    J*response=NULL;
-    if(!status&&result.ptr&&result.len<=FRAME_LIMIT)response=parse(result.ptr,result.len);
-    if(result.ptr)host.free_buffer(result.ptr,result.len);
-    if(!response)return error("host_callback_failed");
-    // Host failures can contain tokens or upstream bodies. Do not forward them.
-    J*success=field(response,"ok");
-    if(!success||json_object_get_type(success)!=1||!json_object_get_int(success)) {
+    if(read_stream&&field(field(response,"result"),"error")&&!equals(field(field(response,"result"),"error"),"")) {
         json_object_put(response);
         return error("host_callback_failed");
     }
@@ -310,6 +447,7 @@ static int stop_runtime(int bounded) {
         qsize--;
     }
     pthread_cond_broadcast(&available);
+    pthread_cond_broadcast(&streams_changed);
     pthread_mutex_unlock(&queue_mu);
     shutdown(listener,SHUT_RDWR);
     struct timespec deadline;
@@ -388,7 +526,7 @@ static int start_runtime(void) {
         pthread_mutex_lock(&queue_mu);
         live++;
         pthread_mutex_unlock(&queue_mu);
-        if(pthread_create(&workers[i],NULL,worker,NULL)) {
+        if(pthread_create(&workers[i],NULL,i==WORKERS-1?stream_reaper:worker,NULL)) {
             pthread_mutex_lock(&queue_mu);
             live--;
             stopping=1;
@@ -403,6 +541,7 @@ static int start_runtime(void) {
         pthread_mutex_lock(&queue_mu);
         stopping=1;
         pthread_cond_broadcast(&available);
+        pthread_cond_broadcast(&streams_changed);
         pthread_mutex_unlock(&queue_mu);
         for(int i=0;i<created;i++)pthread_join(workers[i],NULL);
         goto fail;
@@ -435,9 +574,9 @@ static char *base64(const unsigned char*in,size_t n) {
     out[j]=0;
     return out;
 }
-static unsigned char *unbase64(const char*in,size_t *size) {
+static unsigned char *unbase64(const char*in,size_t *size,size_t limit) {
     size_t n=strlen(in);
-    if(n%4||n>8192)return NULL;
+    if(n%4||n>((limit+2)/3)*4)return NULL;
     unsigned char*out=malloc(n/4*3+1);
     if(!out)return NULL;
     size_t j=0;
@@ -459,6 +598,10 @@ static unsigned char *unbase64(const char*in,size_t *size) {
         out[j++]=(v>>16)&255;
         if(pads<2)out[j++]=(v>>8)&255;
         if(pads<1)out[j++]=v&255;
+    }
+    if(j>limit) {
+        free(out);
+        return NULL;
     }
     *size=j;
     out[j]=0;
@@ -523,8 +666,8 @@ static J *proxy(J*req) {
     char endpoint[128];
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
-        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings");
-        int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings");
+        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations");
+        int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations");
         if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
     }
@@ -562,7 +705,7 @@ static J *proxy(J*req) {
     unsigned char*request_body=NULL;
     const char*body=string(field(req,"Body"));
     if(body) {
-        request_body=unbase64(body,&body_size);
+        request_body=unbase64(body,&body_size,!strcmp(endpoint,"/api/v2/model-settings")?(128u<<10):6144);
         if(!request_body)goto invalid;
     }
     struct curl_slist*headers=NULL;
@@ -639,13 +782,13 @@ static J *registration(void) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations"
     };
-    for(int i=0;i<7;i++) {
+    for(int i=0;i<11;i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);
-        json_object_object_add(item,"Method",json_object_new_string(i>=3&&i!=5?"POST":"GET"));
+        json_object_object_add(item,"Method",json_object_new_string(i==3||i==4||i==6||i==8||i==10?"POST":"GET"));
         json_object_object_add(item,"Path",json_object_new_string(path));
         json_object_array_add(list,item);
     }

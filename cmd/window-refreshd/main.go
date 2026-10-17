@@ -73,7 +73,7 @@ func run() error {
 			server.Close()
 		}
 	}()
-	fmt.Fprintln(os.Stderr, "window-refreshd: read-only prototype ready")
+	fmt.Fprintln(os.Stderr, "window-refreshd: quota backend and manual candidate generation ready")
 	err = server.Serve(listener)
 	stop()
 	<-workerDone

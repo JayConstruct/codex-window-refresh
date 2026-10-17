@@ -1,7 +1,7 @@
 """Actual dlopen -> private native RPC -> Go daemon -> SQLite smoke tests.
 
-The fake host exposes local fixture accounts with missing credentials, so this
-suite cannot issue upstream HTTP or model requests. Successful HTTP normalization
+The fake host exposes local fixture accounts with missing credentials and opt-in
+in-memory model streams, so this suite cannot issue upstream HTTP or model requests. Successful HTTP normalization
 is separately covered by executor/source_test.go with an injected transport.
 """
 import base64
@@ -60,6 +60,16 @@ class NativeBridge(unittest.TestCase):
         self.calls = 0
         self.frees = 0
         self.models = 0
+        self.expected_models = 0
+        self.allow_models = False
+        self.model_reads = 0
+        self.model_closes = 0
+        self.model_streams = {}
+        self.model_requests = []
+        self.model_error = False
+        self.block_model_read = False
+        self.block_model_close = False
+        self.model_close_error = False
         self.entered = threading.Event()
         self.release = threading.Event()
         self.release.set()
@@ -100,6 +110,10 @@ class NativeBridge(unittest.TestCase):
         self.assertIn('/healthz', [r['Path'] for r in routes['result']['Resources']])
         self.assertIn({'Method': 'POST', 'Path': '/v0/management/codex-window-refresh/v2/sync'},
                       routes['result']['Routes'])
+        for endpoint in ('model-settings', 'prompt-generations'):
+            for method in ('GET', 'POST'):
+                self.assertIn({'Method': method, 'Path': '/v0/management/codex-window-refresh/v2/'+endpoint},
+                              routes['result']['Routes'])
 
     @contextlib.contextmanager
     def cpa_resources(self, registration=None):
@@ -164,12 +178,14 @@ class NativeBridge(unittest.TestCase):
 
     def cleanup(self):
         self.release.set()
+        self.model_close_error = False
         if self.process:
             self.process.terminate()
             self.process.communicate(timeout=10)
         self.api.shutdown()
         self.assertEqual(self.calls, self.frees, 'host-owned buffer leak')
-        self.assertEqual(self.models, 0, 'model side effect')
+        self.assertEqual(self.models, self.expected_models, 'unexpected model execute side effect')
+        self.assertFalse(self.model_streams, 'unreleased fixture model streams')
         # All native threads must be joined before dlclose. This is a C library,
         # without RTLD_NODELETE or a retained Go runtime.
         import _ctypes
@@ -188,10 +204,41 @@ class NativeBridge(unittest.TestCase):
         self.calls += 1
         method = method.decode()
         req = json.loads(C.string_at(request, size))
-        if 'model' in method:
-            self.models += 1
-            return 1
-        if method == 'host.auth.list':
+        success = True
+        if method.startswith('host.model.'):
+            self.assertTrue(self.allow_models, 'model callback without explicit fixture opt-in')
+            if method == 'host.model.execute_stream':
+                self.models += 1
+                self.model_requests.append(req)
+                stream_id = f'fixture-model-{self.models}'
+                self.model_streams[stream_id] = 0
+                value = {'stream_id': stream_id, 'status_code': 200, 'headers': {}}
+            elif method == 'host.model.stream_read':
+                self.model_reads += 1
+                self.assertIn(req['stream_id'], self.model_streams)
+                if self.block_model_read:
+                    self.entered.set()
+                    self.release.wait(20)
+                payload = ('data: '+json.dumps({'type': 'response.output_text.delta', 'delta': '["清风入怀","星光相伴"]'})+'\n\n'
+                           'data: '+json.dumps({'type': 'response.completed', 'response': {'status': 'completed'}})+'\n\n')
+                value = {'payload': base64.b64encode(payload.encode()).decode(), 'done': True,
+                         'error': 'secret-upstream-token' if self.model_error else ''}
+            elif method == 'host.model.stream_close':
+                self.model_closes += 1
+                self.assertIn(req['stream_id'], self.model_streams)
+                if self.block_model_close:
+                    self.entered.set()
+                    self.release.wait(20)
+                if self.model_close_error:
+                    success = False
+                    value = {'error': 'secret-close-token'}
+                else:
+                    del self.model_streams[req['stream_id']]
+                    self.release.set()
+                    value = {}
+            else:
+                return 1
+        elif method == 'host.auth.list':
             value = {'files': [{'id': name, 'auth_index': name, 'provider': 'codex'} for name in ('a', 'b')]}
         elif method == 'host.auth.get_runtime':
             if req['auth_index'] == 'slow':
@@ -202,7 +249,7 @@ class NativeBridge(unittest.TestCase):
             value = {'auth_index': req['auth_index'], 'json': {'type': 'codex', 'account_id': 'fixture-upstream'}}
         else:
             return 1
-        raw = json.dumps({'ok': True, 'result': value}).encode()
+        raw = json.dumps({'ok': success, 'result': value}).encode()
         result.contents.ptr = self.libc.malloc(len(raw))
         result.contents.len = len(raw)
         C.memmove(result.contents.ptr, raw, len(raw))
@@ -427,7 +474,7 @@ class NativeBridge(unittest.TestCase):
         hello = self.rpc('bridge.hello')['result']
         self.assertTrue(hello['read_only'])
         instance = hello['bridge_instance_id']
-        self.assertEqual(self.rpc('host.model.execute_stream', {}, instance)['error']['code'], 'method_not_allowed')
+        self.assertEqual(self.rpc('host.model.execute_stream', {}, instance)['error']['code'], 'invalid_payload')
         self.assertEqual(self.rpc('host.auth.list', {}, 'old-instance')['error']['code'], 'bridge_instance_changed')
         self.release.clear()
         result = []
@@ -445,6 +492,227 @@ class NativeBridge(unittest.TestCase):
             conn.sendall(struct.pack('!I', (4 << 20)+1))
             size = struct.unpack('!I', self.read(conn, 4))[0]
             self.assertEqual(json.loads(self.read(conn, size))['error']['code'], 'invalid_frame')
+
+    @staticmethod
+    def model_request():
+        return {'forced_provider': 'codex', 'auth_id': 'a', 'entry_protocol': 'openai-response',
+                'exit_protocol': 'codex', 'stream': True, 'model': 'fixture-model',
+                'body': base64.b64encode(b'{"model":"fixture-model","stream":true}').decode()}
+
+    def test_manual_model_stream_pin_validation_ownership_and_redaction(self):
+        hello = self.rpc('bridge.hello')['result']
+        self.assertTrue(hello['prompt_generation_supported'])
+        instance = hello['bridge_instance_id']
+        original = self.model_request()
+        for field in ('forced_provider', 'auth_id', 'entry_protocol', 'exit_protocol', 'stream', 'model', 'body'):
+            request = original.copy()
+            del request[field]
+            self.assertEqual(self.rpc('host.model.execute_stream', request, instance)['error']['code'], 'invalid_payload')
+        for field, value in [('forced_provider', 'antigravity'), ('auth_id', ''), ('auth_id', 'a'*257),
+                             ('entry_protocol', 'chat'), ('exit_protocol', 'openai-response'),
+                             ('stream', False), ('stream', 1), ('model', '   '), ('model', 'has space'),
+                             ('model', 'has\ttab'), ('model', 'a'*201),
+                             ('body', '!bad'), ('body', 'a'*65540), ('body', ''), ('body', 'A===')]:
+            request = dict(original, **{field: value})
+            self.assertEqual(self.rpc('host.model.execute_stream', request, instance)['error']['code'], 'invalid_payload')
+        for method in ('host.model.execute', 'host.model.list', 'host.stream.close'):
+            self.assertEqual(self.rpc(method, original, instance)['error']['code'], 'method_not_allowed')
+        for method in ('host.model.stream_read', 'host.model.stream_close'):
+            self.assertEqual(self.rpc(method, {'stream_id': 'other-plugin-stream'}, instance)['error']['code'], 'model_stream_unavailable')
+            self.assertEqual(self.rpc(method, {'stream_id': ''}, instance)['error']['code'], 'invalid_payload')
+        self.assertEqual(self.calls, 0)
+        self.allow_models = True
+        self.expected_models = 1
+        opened = self.rpc('host.model.execute_stream', original, instance)
+        self.assertTrue(opened['ok'], opened)
+        stream = {'stream_id': opened['result']['stream_id']}
+        self.assertEqual(self.model_requests, [original])
+        self.assertTrue(self.rpc('host.model.stream_read', stream, instance)['ok'])
+        self.model_error = True
+        failed = self.rpc('host.model.stream_read', stream, instance)
+        self.assertEqual(failed['error']['code'], 'host_callback_failed')
+        self.assertNotIn('secret', json.dumps(failed))
+        self.assertTrue(self.rpc('host.model.stream_close', stream, instance)['ok'])
+        self.assertEqual(self.rpc('host.model.stream_close', stream, instance)['error']['code'], 'model_stream_unavailable')
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 2, 1))
+
+    def test_model_stream_quiesce_closes_and_unblocks_read_without_reexecute(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.allow_models = True
+        self.expected_models = 1
+        stream = self.rpc('host.model.execute_stream', self.model_request(), instance)['result']['stream_id']
+        self.block_model_read = True
+        self.release.clear()
+        replies = []
+        worker = threading.Thread(target=lambda: replies.append(self.rpc('host.model.stream_read', {'stream_id': stream}, instance)))
+        worker.start()
+        self.assertTrue(self.entered.wait(3))
+        started = time.monotonic()
+        self.assertTrue(self.call('plugin.quiesce', {})['ok'])
+        self.assertLess(time.monotonic()-started, 5)
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(replies[0]['ok'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+        self.assertTrue(self.call('plugin.register', {'schema_version': 6})['ok'])
+        new_instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.assertNotEqual(instance, new_instance)
+        self.assertEqual(self.rpc('host.model.stream_read', {'stream_id': stream}, new_instance)['error']['code'], 'model_stream_unavailable')
+        self.assertEqual(self.models, 1)
+
+    def test_model_stream_handles_bounded_and_quiesce_releases_abandoned_results(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.allow_models = True
+        self.expected_models = 8
+        for _ in range(8):
+            self.assertTrue(self.rpc('host.model.execute_stream', self.model_request(), instance)['ok'])
+        self.assertEqual(self.rpc('host.model.execute_stream', self.model_request(), instance)['error']['code'], 'bridge_busy')
+        self.assertTrue(self.rpc('host.auth.list', {}, instance)['ok'])
+        self.assertTrue(self.call('plugin.quiesce', {})['ok'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (8, 0, 8))
+
+    def test_model_stream_cleanup_keeps_native_ownership_until_callback_returns(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.allow_models = True
+        self.expected_models = 1
+        self.assertTrue(self.rpc('host.model.execute_stream', self.model_request(), instance)['ok'])
+        self.block_model_close = True
+        self.release.clear()
+        started = time.monotonic()
+        paused = self.call('plugin.quiesce', {})
+        self.assertFalse(paused['ok'])
+        self.assertEqual(paused['error']['code'], 'bridge_still_draining')
+        self.assertLess(time.monotonic()-started, 6)
+        self.assertTrue(self.entered.is_set())
+        self.assertTrue((self.runtime/'bridge.sock').exists())
+        self.release.set()
+        self.assertTrue(self.call('plugin.quiesce', {})['ok'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 0, 1))
+
+    def test_failed_model_close_keeps_ownership_and_throttles_cleanup_without_reexecute(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.allow_models = True
+        self.expected_models = 1
+        stream = self.rpc('host.model.execute_stream', self.model_request(), instance)['result']['stream_id']
+        self.model_close_error = True
+        result = self.rpc('host.model.stream_close', {'stream_id': stream}, instance)
+        self.assertEqual(result['error']['code'], 'host_callback_failed')
+        self.assertNotIn('secret', json.dumps(result))
+        started = time.monotonic()
+        paused = self.call('plugin.quiesce', {})
+        self.assertFalse(paused['ok'])
+        self.assertEqual(paused['error']['code'], 'bridge_still_draining')
+        self.assertLess(time.monotonic()-started, 6)
+        self.assertIn(stream, self.model_streams)
+        self.assertTrue((self.runtime/'bridge.sock').exists())
+        self.assertLessEqual(self.model_closes, 7)
+        self.model_close_error = False
+        self.assertTrue(self.call('plugin.quiesce', {})['ok'])
+        self.assertGreaterEqual(self.model_closes, 2)
+        self.assertEqual((self.models, self.model_reads), (1, 0))
+
+    def test_model_settings_save_and_fake_candidate_generation_survive_restart(self):
+        self.start_daemon()
+        self.wait_activity(0)
+        status, settings = self.management('model-settings')
+        self.assertEqual(status, 200)
+        self.assertEqual(settings['revision'], 0)
+        settings['config'].update(default_model='fixture-model', default_prompt='海'*2000, five_hour_model='five-hour-fixture',
+                                  five_hour_prompt='五小时提示词', weekly_model='weekly-fixture',
+                                  weekly_prompt='每周提示词', prompt_mode='random', phrases=['静候花开', '清风徐来'])
+        request = {'revision': settings['revision'], 'config': settings['config']}
+        status, saved = self.management('model-settings', 'POST', request)
+        self.assertEqual(status, 200)
+        self.assertEqual(saved['revision'], 1)
+        status, _ = self.management('model-settings', 'POST', request)
+        self.assertEqual(status, 409)
+        self.assertEqual(self.models, 0)
+        self.allow_models = True
+        self.expected_models = 1
+        request = {'account_id': 'a', 'model': 'fixture-model', 'count': 2}
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, accepted = self.management('prompt-generations', 'POST', request, 'candidate-exactly-once')
+            if status == 202:
+                break
+            self.assertEqual(status, 409)
+            time.sleep(.025)
+        self.assertEqual(status, 202, accepted)
+        job_id = accepted['job_id']
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, result = self.management('prompt-generations', query={'job_id': [job_id]})
+            self.assertEqual(status, 200)
+            if result['phase'] not in ('queued', 'running'):
+                break
+            time.sleep(.025)
+        self.assertEqual(result['phase'], 'completed', result)
+        self.assertEqual(result['candidates'], ['清风入怀', '星光相伴'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+        self.assertEqual(self.model_requests[0]['auth_id'], 'a')
+        self.assertEqual(self.model_requests[0]['forced_provider'], 'codex')
+        self.assertEqual(self.model_requests[0]['exit_protocol'], 'codex')
+        status, replay = self.management('prompt-generations', 'POST', request, 'candidate-exactly-once')
+        self.assertEqual(status, 202)
+        self.assertEqual(replay['job_id'], job_id)
+        self.stop_daemon()
+        self.start_daemon()
+        status, restored = self.management('model-settings')
+        self.assertEqual(status, 200)
+        self.assertEqual(restored['config'], saved['config'])
+        status, replay = self.management('prompt-generations', 'POST', request, 'candidate-exactly-once')
+        self.assertEqual(status, 202)
+        self.assertEqual(replay['job_id'], job_id)
+        self.assertEqual(replay['phase'], 'completed')
+        status, after = self.management('model-settings')
+        self.assertEqual(after['config']['phrases'], ['静候花开', '清风徐来'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+
+    def test_inflight_model_generation_crash_recovers_unknown_without_reexecute(self):
+        self.start_daemon()
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, overview = self.management('overview')
+            if status == 200 and overview.get('inventory', {}).get('status') == 'ready':
+                break
+            time.sleep(.025)
+        self.assertEqual(overview['inventory']['status'], 'ready')
+        self.allow_models = True
+        self.expected_models = 1
+        self.block_model_read = True
+        self.release.clear()
+        request = {'account_id': 'a', 'model': 'fixture-model', 'count': 2}
+        status, accepted = self.management('prompt-generations', 'POST', request, 'interrupted-candidate')
+        self.assertEqual(status, 202, accepted)
+        self.assertTrue(self.entered.wait(5))
+        job_id = accepted['job_id']
+        status, inflight = self.management('prompt-generations', query={'job_id': [job_id]})
+        self.assertEqual(status, 200)
+        self.assertEqual(inflight['phase'], 'running')
+        self.process.kill()
+        self.process.communicate(timeout=5)
+        self.process = None
+        self.assertTrue(self.call('plugin.quiesce', {})['ok'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+        self.assertTrue(self.call('plugin.register', {'schema_version': 6})['ok'])
+        self.start_daemon()
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, restored = self.management('prompt-generations', query={'job_id': [job_id]})
+            if status == 200:
+                break
+            self.assertEqual(status, 503)
+            time.sleep(.025)
+        self.assertEqual(status, 200)
+        self.assertEqual(restored['phase'], 'unknown')
+        self.assertEqual(restored['candidates'], [])
+        self.assertEqual(restored['error_code'], 'generation_interrupted')
+        status, replay = self.management('prompt-generations', 'POST', request, 'interrupted-candidate')
+        self.assertEqual(status, 202)
+        self.assertEqual(replay['job_id'], job_id)
+        self.assertEqual(replay['phase'], 'unknown')
+        time.sleep(.3)
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
 
     def test_event_control_survives_all_host_callback_slots_being_blocked(self):
         hello = self.rpc('bridge.hello')['result']

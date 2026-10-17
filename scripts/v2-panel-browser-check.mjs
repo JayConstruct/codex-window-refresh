@@ -14,8 +14,11 @@ const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-pr
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], reads = [], exceptions = [], pageErrors = [];
 const jobs = new Map();
-let accountReadGate;
+let accountReadGate, settingsPostGate, settingsReadGate;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
+let modelRevision = 0, modelConflictOnce = false;
+let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', prompt_mode: 'fixed', phrases: []};
+const generations = new Map();
 let queryConfig = {timezone: 'Asia/Shanghai', automatic: false, interval_seconds: 300, on_five_hour_expiry: false,
   on_weekly_expiry: false, random_delay: {min_seconds: 5, max_seconds: 60}, excluded_hours: []};
 const observed = () => new Date().toISOString();
@@ -36,6 +39,7 @@ accounts[0].pending_query = {phase: 'queued', scheduled_at: later(90), trigger: 
 for (const job of fixtureJobs) jobs.set(job.id, {...job, job_id: job.id, items: (job.target ? accounts.filter(account => account.id === job.target) : accounts).map((account, index) => ({account_id: account.id, phase: index < job.querying ? 'running' : 'queued', scheduled_at: job.scheduled_at, trigger: job.trigger, hold_reason: job.hold_reason || ''}))});
 const identity = () => ({instance_id: 'local-browser-fixture', view_revision: revision});
 const settings = () => ({...identity(), revision: settingsRevision, config: queryConfig});
+const modelSettings = () => ({...identity(), revision: modelRevision, config: modelConfig});
 function json(response, status, body) {
   response.writeHead(status, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'}); response.end(JSON.stringify(body));
 }
@@ -43,6 +47,11 @@ async function waitFor(check, message, timeout = 12000) {
   const until = Date.now() + timeout;
   while (Date.now() < until) { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 50)); }
   throw new Error(message);
+}
+function gate(outcome = 'success') {
+  const pending = {started: false, outcome};
+  pending.promise = new Promise(resolve => { pending.release = resolve; });
+  return pending;
 }
 try {
   let executable = process.env.CHROME_BIN;
@@ -70,13 +79,40 @@ try {
         let body = ''; for await (const chunk of request) body += chunk;
         posts.push({resource, body, headers: request.headers});
         if (resource === 'sync') { revision++; json(response, 202, {status: 'queued'}); return; }
+        if (resource === 'model-settings') {
+          const data = JSON.parse(body);
+          assert.deepEqual(Object.keys(data).sort(), ['config', 'revision']);
+          assert.deepEqual(Object.keys(data.config).sort(), ['default_model', 'default_prompt', 'five_hour_model', 'five_hour_prompt', 'weekly_model', 'weekly_prompt', 'prompt_mode', 'phrases'].sort());
+          if (modelConflictOnce) { modelConflictOnce = false; modelRevision++; revision++; modelConfig = {...modelConfig, default_model: 'fixture-concurrent-model'}; }
+          if (data.revision !== modelRevision) { json(response, 409, {error: 'model_settings_conflict'}); return; }
+          modelConfig = data.config; modelRevision++; revision++; json(response, 200, modelSettings()); return;
+        }
+        if (resource === 'prompt-generations') {
+          const data = JSON.parse(body), key = request.headers['idempotency-key'];
+          assert.deepEqual(Object.keys(data).sort(), ['account_id', 'count', 'model']);
+          assert.ok(key); assert.equal(typeof data.account_id, 'string'); assert.equal(typeof data.model, 'string');
+          assert.ok(Number.isInteger(data.count) && data.count >= 1 && data.count <= 20);
+          const existing = [...generations.values()].find(job => job.key === key);
+          if (existing) { assert.equal(existing.request, body); json(response, 202, existing); return; }
+          const job = {...identity(), job_id: 'candidate-job-' + generations.size, phase: 'queued', error_code: '', candidates: [], account_id: data.account_id, model: data.model, count: data.count, key, request: body, created_at: observed(), updated_at: observed()};
+          generations.set(job.job_id, job); json(response, 202, job); return;
+        }
         if (resource === 'settings') {
           const data = JSON.parse(body);
           assert.deepEqual(Object.keys(data).sort(), ['config', 'revision']);
           assert.deepEqual(Object.keys(data.config).sort(), ['automatic', 'excluded_hours', 'interval_seconds', 'on_five_hour_expiry', 'on_weekly_expiry', 'random_delay', 'timezone']);
+          const held = settingsPostGate;
+          if (held) { held.started = true; await held.promise; }
+          if (held?.outcome === 'reject') { json(response, 400, {error: 'invalid_query_settings'}); return; }
           if (settingsConflictOnce) { settingsConflictOnce = false; settingsRevision++; revision++; queryConfig = {...queryConfig, interval_seconds: 180}; }
           if (data.revision !== settingsRevision) { json(response, 409, {error: 'settings_conflict'}); return; }
-          queryConfig = data.config; settingsRevision++; revision++; json(response, 200, settings()); return;
+          queryConfig = data.config; settingsRevision++; revision++;
+          if (held?.outcome === 'disconnect') {
+            response.writeHead(200, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'});
+            response.write('{"instance_id":');
+            setTimeout(() => response.destroy(), 50); return;
+          }
+          json(response, 200, settings()); return;
         }
         if (resource !== 'jobs') { json(response, 404, {error: 'not_found'}); return; }
         const data = JSON.parse(body);
@@ -93,10 +129,20 @@ try {
         json(response, 202, {job_id: id, instance_id: 'local-browser-fixture'}); return;
       }
       reads.push(request.url);
-      if (resource === 'settings') { json(response, 200, settings()); return; }
+      if (resource === 'model-settings') { json(response, 200, modelSettings()); return; }
+      if (resource === 'prompt-generations') {
+        const job = generations.get(url.searchParams.get('job_id'));
+        if (!job) { json(response, 404, {error: 'not_found'}); return; }
+        if (job.phase === 'queued') { job.phase = 'completed'; job.candidates = Array.from({length: job.count}, (_, index) => '浏览器候选短句 ' + (index + 1)); job.updated_at = observed(); }
+        json(response, 200, {...job, ...identity()}); return;
+      }
+      if (resource === 'settings') {
+        if (settingsReadGate) { settingsReadGate.started = true; await settingsReadGate.promise; }
+        json(response, 200, settings()); return;
+      }
       if (resource === 'overview') {
         json(response, 200, {...identity(), version: '0.2.0-rc.4', accounts_revision: accountsRevision, query_settings: {revision: settingsRevision, config: queryConfig}, read_only: true, query_concurrency: 8,
-          capabilities: {quota_query: true, passive_quota: true, model_execution: false, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true}, activity: {connected: true},
+          capabilities: {quota_query: true, passive_quota: true, model_execution: false, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true}, activity: {connected: true},
           inventory: {status: 'ready', last_success_at: observed()}, dashboard: {total: 24, available: 20, disabled: 2, unavailable: 2, capacity: 16, unknown_quota: 4, errors: 2,
             tasks: {active: 3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
             recent_events: [{kind: 'quota_query', at: observed(), account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: observed(), account_id: '', phase: 'queued'}, {kind: 'inventory', at: observed(), phase: 'ready'}]}}); return;
@@ -156,6 +202,43 @@ try {
       button.click(); return true;
     })()`), 'Button did not become enabled: ' + id);
   }
+  async function assertOverviewRules() {
+    assert.equal(await evaluate('document.querySelector("[data-view=overview]").hidden'), false, 'Home switch navigated away from the overview');
+    assert.equal(await evaluate('document.querySelector("[data-view=query]").hidden'), true, 'Home switch opened the settings editor');
+    assert.equal(await evaluate('document.getElementById("auto-wake").disabled && !document.getElementById("auto-wake").checked'), true, 'Automatic wake must remain unavailable');
+    assert.equal(await evaluate('document.getElementById("rules-message").getAttribute("role")'), 'status');
+    assert.equal(await evaluate('document.getElementById("rules-message").hidden'), false, 'Overview rule feedback is hidden');
+    assert.notEqual(await evaluate('document.getElementById("rules-message").textContent.trim()'), '', 'Overview rule feedback is empty');
+  }
+  async function assertRulesLocked() {
+    assert.equal(await evaluate('document.getElementById("five-hour-query").disabled && document.getElementById("weekly-query").disabled'), true, 'Both home switches must be locked');
+    const count = posts.length;
+    await evaluate('for(const id of ["five-hour-query","weekly-query"]){const field=document.getElementById(id);field.click();field.dispatchEvent(new Event("change"));}');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(posts.length, count, 'Locked home switches dispatched another write');
+  }
+  async function editorDraft() {
+    return evaluate('Array.from(document.querySelectorAll("#settings-fields input, #settings-fields select, #settings-fields textarea"), field => [field.id, field.type === "checkbox" ? field.checked : field.value])');
+  }
+  async function verifyRules(draft) {
+    const postCount = posts.length, readCount = reads.filter(path => path.endsWith('/settings')).length;
+    settingsReadGate = gate();
+    await clickWhenEnabled('rules-reload');
+    await waitFor(() => settingsReadGate.started, 'Rules reload did not GET settings');
+    await assertOverviewRules();
+    await assertRulesLocked();
+    assert.equal(await evaluate('document.getElementById("rules-reload").disabled'), true, 'Verification button was not locked');
+    await evaluate('document.getElementById("rules-reload").click()');
+    assert.deepEqual(await editorDraft(), draft, 'Starting verification discarded editor drafts');
+    settingsReadGate.release(); settingsReadGate = undefined;
+    await waitFor(() => evaluate('!document.getElementById("five-hour-query").disabled && !document.getElementById("weekly-query").disabled && document.getElementById("rules-reload").hidden'), 'GET settings did not unlock home switches');
+    await assertOverviewRules();
+    assert.equal(posts.length, postCount, 'Verification dispatched a write');
+    assert.equal(reads.filter(path => path.endsWith('/settings')).length, readCount + 1, 'Verification did not issue exactly one settings read');
+    assert.deepEqual(await editorDraft(), draft, 'Verification discarded editor drafts');
+    assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), queryConfig.on_five_hour_expiry, 'Verification did not restore the actual five-hour state');
+    assert.equal(await evaluate('document.getElementById("weekly-query").checked'), queryConfig.on_weekly_expiry, 'Verification did not restore the actual weekly state');
+  }
   async function screenshot(name) {
     await mkdir(output, {recursive: true});
     const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
@@ -180,39 +263,73 @@ try {
   assert.equal(await evaluate('document.body.textContent.includes("近期活跃用户")'), false);
   assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Desktop overflow');
   await screenshot('desktop.png');
+  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'true');
+  const mainBeforeCollapse = await evaluate('document.querySelector(".main-content").getBoundingClientRect().left');
+  await evaluate('document.getElementById("sidebar-toggle").click()');
+  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'false');
+  assert.equal(await evaluate('Math.round(document.getElementById("app-sidebar").getBoundingClientRect().width)'), 76);
+  assert.ok(await evaluate('document.querySelector(".main-content").getBoundingClientRect().left') < mainBeforeCollapse);
+  assert.equal(await evaluate('document.querySelector(".nav-item[data-page=models]").getAttribute("aria-label")'), '模型与提示词');
+  assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'Collapsed desktop overflow');
+  await screenshot('sidebar-collapsed.png');
+  await cdp('Page.reload');
+  await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length===6'), 'Reload did not reconnect after sidebar collapse');
+  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'false', 'Collapsed preference was not restored');
+  assert.equal(posts.length, 0, 'Collapsing or reloading sidebar dispatched a write');
+  await evaluate('document.getElementById("sidebar-toggle").click()');
+  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'true');
   for (const page of ['accounts', 'query', 'wake', 'models', 'history', 'diagnostics', 'overview']) {
     await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
     assert.equal(await evaluate(`document.querySelector('[data-view="${page}"]').hidden`), false, 'Navigation failed: ' + page);
   }
   assert.equal(posts.length, 0, 'Navigating dispatched a write');
   assert.equal(reads.some(path => path.endsWith('/settings')), false, 'Overview config should avoid redundant settings reads');
+  const initialConfig = structuredClone(queryConfig);
+  settingsPostGate = gate();
   await evaluate('document.getElementById("five-hour-query").click()');
-  assert.equal(await evaluate('document.querySelector("[data-view=query]").hidden'), false);
+  await waitFor(() => settingsPostGate.started, 'Home switch did not POST settings directly');
+  assert.deepEqual(JSON.parse(posts[0].body), {revision: 1, config: {...initialConfig, on_five_hour_expiry: true}});
+  await assertOverviewRules();
+  await assertRulesLocked();
+  assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), true, 'Pending home switch lost its intended state');
+  assert.equal(await evaluate('document.getElementById("settings-five-hour").checked'), false, 'Pending home switch modified the editor');
+  const readsBeforeRuleSave = reads.filter(path => path.endsWith('/overview')).length;
+  await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > readsBeforeRuleSave, 'Pending rule save was not polled');
+  await assertRulesLocked();
+  settingsPostGate.release(); settingsPostGate = undefined;
+  await waitFor(() => evaluate('document.getElementById("five-hour-query").checked && !document.getElementById("five-hour-query").disabled'), 'Home switch save not applied');
+  await assertOverviewRules();
+  assert.match(await evaluate('document.getElementById("rules-message").textContent'), /已.*(?:保存|应用|生效)/);
+  assert.equal(posts.length, 1, 'Home switch submitted more than once');
+  assert.equal(settingsRevision, 2);
+  assert.deepEqual(queryConfig, {...initialConfig, on_five_hour_expiry: true});
+  assert.equal(reads.some(path => path.endsWith('/settings')), false, 'Direct save ignored the overview settings snapshot');
+  await evaluate('document.querySelector("[data-page=query]").click()');
   assert.equal(await evaluate('document.getElementById("settings-five-hour").checked'), true);
-  assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), false, 'Home switch must reflect saved state');
+  assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), true, 'Home switch must reflect saved state');
   await evaluate('document.getElementById("settings-interval").value="90";document.getElementById("settings-interval").dispatchEvent(new Event("input"))');
   const readsBeforeDraft = reads.filter(path => path.endsWith('/overview')).length;
   await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > readsBeforeDraft, 'Settings did not receive actual polling');
   assert.equal(await evaluate('document.getElementById("settings-interval").value'), '90', 'Polling overwrote a dirty draft');
   await evaluate('document.querySelector("[data-page=overview]").click();document.querySelector("[data-page=query]").click()');
   assert.equal(await evaluate('document.getElementById("settings-interval").value'), '90', 'Navigation lost the draft');
-  assert.equal(posts.length, 0, 'Editing dispatched an automatic write');
+  assert.equal(posts.length, 1, 'Editing dispatched an automatic write');
   await evaluate('for(const [id,value] of [["settings-interval","20"],["settings-delay-max","4"],["settings-timezone","Mars/Colony"],["settings-excluded","00:00-01:00, 00:30-02:00"]]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event("input"));}');
   assert.equal(await evaluate('document.getElementById("settings-save").disabled'), true);
   assert.equal(await evaluate('document.getElementById("settings-validation").hidden'), false);
   await evaluate('document.getElementById("query-settings-form").dispatchEvent(new Event("submit",{cancelable:true}))');
-  assert.equal(posts.length, 0, 'Invalid settings were submitted');
+  assert.equal(posts.length, 1, 'Invalid settings were submitted');
   await evaluate('for(const [id,value] of [["settings-interval","60"],["settings-delay-min","0"],["settings-delay-max","60"],["settings-timezone","Asia/Shanghai"],["settings-excluded","23:00-07:00, 12:00-13:00"]]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event("input"));}');
   assert.match(await evaluate('document.getElementById("settings-diff").textContent'), /300 → 60/);
   await screenshot('query-settings-desktop.png');
   await evaluate('document.getElementById("settings-save").click()');
   await waitFor(() => evaluate('document.getElementById("settings-message").textContent.startsWith("已保存并应用")'), 'Settings save not acknowledged');
-  const settingsPost = posts.find(post => post.resource === 'settings');
-  assert.deepEqual(JSON.parse(settingsPost.body), {revision: 1, config: {...queryConfig}});
+  const settingsPost = posts.filter(post => post.resource === 'settings')[1];
+  assert.deepEqual(JSON.parse(settingsPost.body), {revision: 2, config: {...queryConfig}});
   assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), true);
   queryConfig = {...queryConfig, automatic: true, interval_seconds: 120, on_weekly_expiry: true}; settingsRevision++; revision++;
   await waitFor(() => evaluate('document.getElementById("settings-interval").value==="120" && document.getElementById("settings-weekly").checked'), 'Clean editor did not follow backend settings polling');
-  assert.equal(posts.filter(post => post.resource === 'settings').length, 1, 'Polling wrote settings');
+  assert.equal(posts.filter(post => post.resource === 'settings').length, 2, 'Polling wrote settings');
   await evaluate('document.getElementById("settings-interval").value="90";document.getElementById("settings-interval").dispatchEvent(new Event("input"))');
   settingsConflictOnce = true;
   await evaluate('document.getElementById("settings-save").click()');
@@ -224,7 +341,7 @@ try {
   await evaluate('document.getElementById("settings-reload").click()');
   await waitFor(() => evaluate('document.getElementById("settings-interval").value==="180" && document.getElementById("settings-conflict").hidden'), 'Explicit reload did not discard conflicting draft');
   assert.ok(reads.some(path => path.endsWith('/settings')), 'Reload did not read actual settings endpoint');
-  assert.equal(posts.filter(post => post.resource === 'settings').length, 2, 'Conflict was automatically retried');
+  assert.equal(posts.filter(post => post.resource === 'settings').length, 3, 'Conflict was automatically retried');
   queryConfig = {...queryConfig, timezone: 'Factory'}; settingsRevision++; revision++;
   await waitFor(() => evaluate('document.getElementById("settings-timezone").value==="Factory"'), 'Server timezone alias broke overview polling');
   assert.equal(await evaluate('document.getElementById("error").hidden && document.getElementById("metric-total").textContent==="24"'), true, 'Unsupported browser timezone made the overview unusable');
@@ -233,6 +350,101 @@ try {
   assert.equal(await evaluate('document.getElementById("error").hidden'), true, 'Server timezone alias broke explicit settings reload');
   queryConfig = {...queryConfig, timezone: 'Asia/Shanghai'}; settingsRevision++; revision++;
   await waitFor(() => evaluate('document.getElementById("settings-timezone").value==="Asia/Shanghai" && document.getElementById("settings-validation").hidden'), 'Supported timezone did not recover the editor');
+  await evaluate('for(const [id,value] of [["settings-interval","90"],["settings-timezone","UTC"],["settings-delay-min","9"],["settings-delay-max","45"],["settings-excluded","01:00-02:00"]]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event("input"));}for(const id of ["settings-automatic","settings-five-hour","settings-weekly"]){const field=document.getElementById(id);field.checked=false;field.dispatchEvent(new Event("input"));}');
+  const isolatedDraft = await editorDraft(), savedBeforeWeekly = structuredClone(queryConfig), revisionBeforeWeekly = settingsRevision;
+  assert.deepEqual(isolatedDraft.map(([id]) => id), ['settings-automatic', 'settings-five-hour', 'settings-weekly', 'settings-interval', 'settings-timezone', 'settings-delay-min', 'settings-delay-max', 'settings-excluded'], 'Draft snapshot omitted settings fields');
+  assert.equal(posts.filter(post => post.resource === 'settings').length, 3, 'Editor draft dispatched a write');
+  await evaluate('document.querySelector("[data-page=overview]").click()');
+  settingsPostGate = gate();
+  await clickWhenEnabled('weekly-query');
+  await waitFor(() => settingsPostGate.started, 'Weekly home switch did not save');
+  assert.deepEqual(JSON.parse(posts.at(-1).body), {revision: revisionBeforeWeekly, config: {...savedBeforeWeekly, on_weekly_expiry: false}}, 'Weekly save included unrelated editor drafts');
+  await assertOverviewRules();
+  await assertRulesLocked();
+  assert.equal(await evaluate('document.getElementById("weekly-query").checked'), false, 'Pending weekly switch lost its intended state');
+  assert.equal(await evaluate('document.getElementById("settings-fields").disabled && document.getElementById("settings-save").disabled'), true, 'Editor can race a home switch save');
+  assert.deepEqual(await editorDraft(), isolatedDraft, 'Pending weekly save modified editor drafts');
+  settingsPostGate.release(); settingsPostGate = undefined;
+  await waitFor(() => evaluate('!document.getElementById("weekly-query").checked && !document.getElementById("weekly-query").disabled'), 'Weekly home save not applied');
+  await assertOverviewRules();
+  assert.match(await evaluate('document.getElementById("rules-message").textContent'), /周限额到期查询已关闭并保存/);
+  assert.deepEqual(queryConfig, {...savedBeforeWeekly, on_weekly_expiry: false}, 'Weekly save changed other saved settings');
+  assert.equal(settingsRevision, revisionBeforeWeekly + 1);
+  assert.deepEqual(await editorDraft(), isolatedDraft, 'Successful weekly save discarded unrelated drafts');
+  const savedBeforeFailure = structuredClone(queryConfig), revisionBeforeFailure = settingsRevision;
+  settingsPostGate = gate('reject');
+  await clickWhenEnabled('five-hour-query');
+  await waitFor(() => settingsPostGate.started, 'Rejected home switch was not submitted');
+  assert.deepEqual(JSON.parse(posts.at(-1).body), {revision: revisionBeforeFailure, config: {...savedBeforeFailure, on_five_hour_expiry: false}});
+  await assertRulesLocked();
+  settingsPostGate.release(); settingsPostGate = undefined;
+  await waitFor(() => evaluate('!document.getElementById("five-hour-query").disabled && document.getElementById("rules-message").textContent.includes("未保存")'), 'Known failure did not restore the home switch');
+  await assertOverviewRules();
+  assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), true, 'Known failure did not restore saved state');
+  assert.equal(await evaluate('document.getElementById("rules-reload").hidden'), true, 'Known rejection was treated as an unknown result');
+  assert.deepEqual(queryConfig, savedBeforeFailure);
+  assert.equal(settingsRevision, revisionBeforeFailure);
+  assert.deepEqual(await editorDraft(), isolatedDraft, 'Rejected save discarded editor drafts');
+  settingsConflictOnce = true;
+  await clickWhenEnabled('five-hour-query');
+  await waitFor(() => evaluate('!document.getElementById("rules-reload").hidden && document.getElementById("rules-message").textContent.includes("后台设置已变化")'), 'Home 409 did not offer verification');
+  assert.deepEqual(JSON.parse(posts.at(-1).body), {revision: revisionBeforeFailure, config: {...savedBeforeFailure, on_five_hour_expiry: false}});
+  await assertOverviewRules();
+  assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), true, '409 did not restore last-known state');
+  await assertRulesLocked();
+  const postsAfterRuleConflict = posts.length, readsBeforeRuleConflict = reads.filter(path => path.endsWith('/overview')).length;
+  await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > readsBeforeRuleConflict, 'Home conflict was not polled');
+  await assertRulesLocked();
+  assert.equal(posts.length, postsAfterRuleConflict, 'Home conflict was automatically retried');
+  assert.deepEqual(await editorDraft(), isolatedDraft, 'Home conflict polling discarded editor drafts');
+  assert.equal(await evaluate('document.getElementById("settings-conflict").hidden'), false, 'Backend revision conflict was not retained in the editor');
+  await verifyRules(isolatedDraft);
+  assert.equal(await evaluate('document.getElementById("settings-conflict").hidden'), false, 'Rules verification cleared the editor conflict');
+  const revisionBeforeDisconnect = settingsRevision, savedBeforeDisconnect = structuredClone(queryConfig);
+  settingsPostGate = gate('disconnect');
+  await clickWhenEnabled('five-hour-query');
+  await waitFor(() => settingsPostGate.started, 'Uncertain home switch was not submitted');
+  assert.deepEqual(JSON.parse(posts.at(-1).body), {revision: revisionBeforeDisconnect, config: {...savedBeforeDisconnect, on_five_hour_expiry: false}}, 'Home save used the stale editor revision/config');
+  await assertRulesLocked();
+  settingsPostGate.release(); settingsPostGate = undefined;
+  try {
+    await waitFor(() => evaluate('!document.getElementById("rules-reload").hidden && document.getElementById("rules-message").textContent.includes("尚未确认")'), 'Disconnected response did not require verification');
+  } catch (error) {
+    throw new Error(error.message + ': ' + JSON.stringify(await evaluate('({message:document.getElementById("rules-message").textContent,reloadHidden:document.getElementById("rules-reload").hidden,disabled:document.getElementById("five-hour-query").disabled,status:document.getElementById("rules-status").textContent})')), {cause: error});
+  }
+  await assertOverviewRules();
+  assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), true, 'Unknown result did not restore last-known state');
+  assert.equal(queryConfig.on_five_hour_expiry, false, 'Disconnect fixture must commit before dropping the response');
+  assert.equal(settingsRevision, revisionBeforeDisconnect + 1);
+  await assertRulesLocked();
+  const postsAfterDisconnect = posts.length, readsBeforeDisconnect = reads.filter(path => path.endsWith('/overview')).length;
+  await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > readsBeforeDisconnect, 'Unknown home save was not polled');
+  await assertRulesLocked();
+  assert.equal(posts.length, postsAfterDisconnect, 'Unknown home save was automatically retried');
+  await verifyRules(isolatedDraft);
+  assert.equal(await evaluate('document.getElementById("settings-conflict").hidden'), false, 'Unknown-result verification cleared the editor conflict');
+  await evaluate('document.querySelector("[data-page=query]").click()');
+  assert.deepEqual(await editorDraft(), isolatedDraft, 'Navigation after rules verification discarded editor drafts');
+  await evaluate('document.getElementById("settings-reload").click()');
+  await waitFor(() => evaluate('document.getElementById("settings-interval").value==="180" && document.getElementById("settings-conflict").hidden'), 'Explicit editor reload did not discard the preserved draft');
+  await evaluate('document.getElementById("settings-interval").value="150";document.getElementById("settings-interval").dispatchEvent(new Event("input"))');
+  const uncertainEditorDraft = await editorDraft(), revisionBeforeEditorSave = settingsRevision, savedBeforeEditorSave = structuredClone(queryConfig);
+  assert.equal(posts.filter(post => post.resource === 'settings').length, 7, 'Editing or rules verification dispatched a write');
+  settingsPostGate = gate('disconnect');
+  await clickWhenEnabled('settings-save');
+  await waitFor(() => settingsPostGate.started, 'Explicit editor save did not submit');
+  assert.deepEqual(JSON.parse(posts.at(-1).body), {revision: revisionBeforeEditorSave, config: {...savedBeforeEditorSave, interval_seconds: 150}});
+  settingsPostGate.release(); settingsPostGate = undefined;
+  await waitFor(() => evaluate('document.getElementById("settings-message").textContent.includes("尚未确认") && !document.getElementById("rules-reload").hidden'), 'Unknown editor save did not require verification');
+  await evaluate('document.querySelector("[data-page=overview]").click()');
+  await assertOverviewRules();
+  await assertRulesLocked();
+  await verifyRules(uncertainEditorDraft);
+  assert.equal(await evaluate('document.getElementById("settings-conflict").hidden'), false, 'Editor save uncertainty was cleared without discarding its draft');
+  await evaluate('document.querySelector("[data-page=query]").click();document.getElementById("settings-reload").click()');
+  await waitFor(() => evaluate('document.getElementById("settings-interval").value==="150" && document.getElementById("settings-conflict").hidden'), 'Explicit editor reload did not resolve its uncertain save');
+  assert.equal(posts.filter(post => post.resource === 'settings').length, 8, 'Settings were automatically retried');
+  assert.equal(settingsRevision, 11, 'Unexpected settings revision after explicit saves and verification');
   await evaluate('document.querySelector("[data-page=overview]").click()');
   const countdownBefore = await evaluate('document.querySelector(".query-pending").textContent');
   await new Promise(resolve => setTimeout(resolve, 2100));
@@ -278,6 +490,54 @@ try {
   await waitFor(() => evaluate('document.getElementById("accounts").rows.length===6'), 'Search did not reset');
   accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.querySelector("progress").value===11'), 'Background refresh not applied');
+  await evaluate('document.querySelector("[data-page=models]").click()');
+  await waitFor(() => evaluate('!document.getElementById("model-fields").disabled'), 'Model settings did not load');
+  const modelWritesBeforeEditing = posts.length;
+  await evaluate('for(const [id,value] of [["model-default","fixture-model"],["model-phrases","第一句\\n第二句\\n第一句"],["model-prompt-mode","random"]]){const node=document.getElementById(id);node.value=value.replaceAll("\\\\n","\\n");node.dispatchEvent(new Event("input"));}');
+  assert.equal(await evaluate('document.getElementById("model-save").disabled'), true, 'Duplicate phrases were accepted');
+  await evaluate('document.getElementById("model-deduplicate").click()');
+  assert.equal(await evaluate('document.getElementById("model-confirmation").hidden'), false, 'Deduplication lacked confirmation');
+  await evaluate('document.getElementById("model-confirm-action").click()');
+  assert.equal(await evaluate('document.getElementById("model-phrases").value.split("\\n").length'), 2);
+  await evaluate('document.getElementById("model-transfer").value="第三句";document.getElementById("model-import").click()');
+  assert.equal(await evaluate('document.getElementById("model-phrases").value.split("\\n").length'), 3);
+  await evaluate('document.getElementById("model-export").click()');
+  assert.match(await evaluate('document.getElementById("model-transfer").value'), /第三句/);
+  await evaluate('document.getElementById("model-preview-rule").value="five_hour";document.getElementById("model-preview").click()');
+  assert.match(await evaluate('document.getElementById("model-preview-result").textContent'), /fixture-model/);
+  assert.match(await evaluate('document.getElementById("model-preview-result").textContent'), /继承默认模型/);
+  assert.equal(posts.length, modelWritesBeforeEditing, 'Local phrase editing or preview dispatched a request');
+  await screenshot('model-settings-desktop.png');
+  await clickWhenEnabled('model-save');
+  await waitFor(async () => modelRevision === 1 && await evaluate('!document.getElementById("model-fields").disabled && document.getElementById("model-save").disabled && document.getElementById("model-message").textContent.startsWith("配置已保存")'), 'Model settings were not saved');
+  assert.equal(modelConfig.default_model, 'fixture-model'); assert.equal(modelConfig.phrases.length, 3);
+  assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'model-settings').body), {revision: 0, config: modelConfig});
+  await evaluate('document.getElementById("model-default").value="unsaved-model";document.getElementById("model-default").dispatchEvent(new Event("input"))');
+  const modelReadsBeforePoll = reads.filter(path => path.endsWith('/model-settings')).length;
+  await waitFor(() => reads.filter(path => path.endsWith('/model-settings')).length > modelReadsBeforePoll, 'Active model editor did not poll saved settings');
+  assert.equal(await evaluate('document.getElementById("model-default").value'), 'unsaved-model', 'Polling overwrote model draft');
+  modelConflictOnce = true;
+  await clickWhenEnabled('model-save');
+  await waitFor(() => evaluate('!document.getElementById("model-conflict").hidden'), 'Model settings conflict not displayed');
+  assert.equal(await evaluate('document.getElementById("model-default").value'), 'unsaved-model');
+  assert.equal(posts.filter(post => post.resource === 'model-settings').length, 2, 'Model save retried automatically');
+  await clickWhenEnabled('model-reload');
+  await waitFor(() => evaluate('document.getElementById("model-default").value === "fixture-concurrent-model" && document.getElementById("model-conflict").hidden'), 'Explicit model reload did not resolve conflict');
+  const poolBeforeGeneration = [...modelConfig.phrases];
+  await evaluate('for(const [id,value] of [["generation-account","codex-01"],["generation-model","fixture-model"],["generation-count","2"]]){const node=document.getElementById(id);node.value=value;node.dispatchEvent(new Event("input"));}');
+  assert.equal(await evaluate('document.getElementById("generation-submit").disabled'), true, 'Generation does not require consent');
+  await evaluate('document.getElementById("generation-consent").click()');
+  await clickWhenEnabled('generation-submit');
+  await waitFor(() => evaluate('!document.getElementById("generation-results").hidden'), 'Generated candidates did not appear');
+  assert.equal(posts.filter(post => post.resource === 'prompt-generations').length, 1, 'Model generation submitted more than once');
+  assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'prompt-generations').body), {account_id: 'codex-01', model: 'fixture-model', count: 2});
+  assert.deepEqual(modelConfig.phrases, poolBeforeGeneration, 'Generation replaced saved pool automatically');
+  assert.equal(await evaluate('document.getElementById("generation-apply").disabled'), true, 'Candidates were selected without confirmation');
+  await evaluate('document.getElementById("generation-select-all").click();document.getElementById("generation-apply").click()');
+  assert.match(await evaluate('document.getElementById("model-phrases").value'), /浏览器候选短句 1/);
+  assert.deepEqual(modelConfig.phrases, poolBeforeGeneration, 'Applying candidates automatically saved settings');
+  await screenshot('model-generation-desktop.png');
+  await evaluate('document.querySelector("[data-page=overview]").click()');
   for (const width of [768, 390]) {
     await cdp('Emulation.setDeviceMetricsOverride', {width, height: 844, deviceScaleFactor: 1, mobile: false});
     const layout = await evaluate('({width:document.documentElement.clientWidth,scroll:document.documentElement.scrollWidth,wide:Array.from(document.querySelectorAll("body *")).filter(node=>!node.closest(".navigation,.table-scroll")).map(node=>({tag:node.tagName,id:node.id,classes:typeof node.className==="string"?node.className:"",right:Math.round(node.getBoundingClientRect().right)})).filter(node=>node.right>document.documentElement.clientWidth+1).slice(0,12)})');
@@ -287,6 +547,17 @@ try {
     await evaluate('document.querySelector("[data-page=query]").click()');
     assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Settings page overflow at ' + width);
     await screenshot('query-settings-' + width + '.png');
+    await evaluate('document.querySelector("[data-page=models]").click()');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Model editor overflow at ' + width);
+    await screenshot('model-settings-' + width + '.png');
+    if (width === 390) {
+      await evaluate('document.getElementById("sidebar-toggle").click()');
+      assert.equal(await evaluate('getComputedStyle(document.getElementById("primary-navigation")).display'), 'none', 'Mobile navigation did not collapse');
+      assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'Collapsed mobile overflow');
+      await screenshot('sidebar-collapsed-mobile.png');
+      await evaluate('document.getElementById("sidebar-toggle").click()');
+      assert.notEqual(await evaluate('getComputedStyle(document.getElementById("primary-navigation")).display'), 'none', 'Mobile navigation did not expand');
+    }
     await evaluate('document.querySelector("[data-page=overview]").click()');
   }
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
@@ -297,11 +568,17 @@ try {
   assert.equal(reads.length, readCount, 'Authentication failure kept polling');
   assert.equal(exceptions.length, 0, JSON.stringify(exceptions));
   assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
-  assert.equal(posts.every(post => ['settings', 'jobs', 'sync'].includes(post.resource)), true, 'Unexpected API write');
-  console.log('V2 browser checks passed: desktop/mobile layout, settings validation/drafts/save/conflict/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging and authentication.');
+  assert.equal(posts.filter(post => post.resource === 'settings').length, 8, 'Unexpected settings write after browser checks');
+  assert.equal(posts.filter(post => post.resource === 'model-settings').length, 2, 'Unexpected model settings write count');
+  assert.equal(posts.filter(post => post.resource === 'prompt-generations').length, 1, 'Unexpected generation write count');
+  assert.equal(posts.length, 14, 'Unexpected total API write count');
+  assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations'].includes(post.resource)), true, 'Unexpected API write');
+  console.log('V2 browser checks passed: desktop/mobile layout, direct overview settings saves/locking/draft isolation/rejections/conflicts/unknown-result GET verification, explicit editor saves, settings validation/drafts/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging and authentication.');
   console.log('Local fixture screenshots: ' + output);
 } finally {
   accountReadGate?.release();
+  settingsPostGate?.release();
+  settingsReadGate?.release();
   if (socket) socket.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) {
     browser.kill('SIGTERM');

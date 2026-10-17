@@ -98,8 +98,8 @@ func TestQuerySchedulerDefaultsOffAndRequiresFreshBoundInventory(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(settings.Config, policy.DefaultQuery()) {
 		t.Fatalf("defaults: %+v, %v", settings, err)
 	}
-	if version := queryTestCount(t, store, "SELECT version FROM schema_version"); version != 4 {
-		t.Fatalf("schema version = %d, want 4", version)
+	if version := queryTestCount(t, store, "SELECT version FROM schema_version"); version != 5 {
+		t.Fatalf("schema version = %d, want 5", version)
 	}
 	account := queryTestAccount("account")
 	if err = store.SyncInventory(ctx, []Account{account}); err != nil {

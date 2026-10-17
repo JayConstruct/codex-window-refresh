@@ -1,5 +1,4 @@
-// Package daemon hosts the independent read-only backend. It has no model
-// execution entry point and cannot dispatch model requests.
+// Package daemon hosts quota queries and explicitly requested candidate generation.
 package daemon
 
 import (
@@ -43,6 +42,8 @@ type Service struct {
 	options          Options
 	instance         string
 	wake             chan struct{}
+	generationWake   chan struct{}
+	generationError  atomic.Bool
 	expanderError    atomic.Value
 	maintenanceError atomic.Bool
 	schedulerError   atomic.Value
@@ -59,7 +60,13 @@ func New(st *store.Store, source executor.Source, o Options) (*Service, error) {
 	if o.Retention.HistoryAge < time.Hour || o.Retention.HistoryAge > 365*24*time.Hour || o.Retention.TerminalJobs < 1 || o.Retention.TerminalJobs > 50000 {
 		return nil, errors.New("invalid_retention_options")
 	}
-	s := &Service{Store: st, source: source, options: o, instance: store.ID(), wake: make(chan struct{}, 1), workerErrors: make([]atomic.Bool, o.QueryConcurrency)}
+	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := st.RecoverGenerations(recoverCtx)
+	recoverCancel()
+	if err != nil {
+		return nil, err
+	}
+	s := &Service{Store: st, source: source, options: o, instance: store.ID(), wake: make(chan struct{}, 1), generationWake: make(chan struct{}, 1), workerErrors: make([]atomic.Bool, o.QueryConcurrency)}
 	s.expanderError.Store("")
 	s.schedulerError.Store("")
 	return s, nil
@@ -88,6 +95,8 @@ func (s *Service) Run(ctx context.Context) {
 	go func() { defer workers.Done(); s.expand(ctx) }()
 	workers.Add(1)
 	go func() { defer workers.Done(); s.schedule(ctx) }()
+	workers.Add(1)
+	go func() { defer workers.Done(); s.generate(ctx) }()
 	for i := 0; i < s.options.QueryConcurrency; i++ {
 		workers.Add(1)
 		go func() { defer workers.Done(); s.worker(ctx, i) }()
@@ -106,6 +115,9 @@ func (s *Service) maintenance(ctx context.Context) {
 	}
 }
 func (s *Service) lastError() string {
+	if s.generationError.Load() {
+		return "storage_unavailable"
+	}
 	if code := s.schedulerError.Load().(string); code != "" {
 		return code
 	}
@@ -264,7 +276,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 503, "storage_unavailable")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]bool{"quota_query": true, "model_execution": false, "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]bool{"quota_query": true, "model_execution": false, "prompt_generation": s.generationSupported(), "model_settings": true, "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+	case "GET /api/v2/model-settings", "POST /api/v2/model-settings":
+		s.modelSettings(w, r)
+	case "GET /api/v2/prompt-generations", "POST /api/v2/prompt-generations":
+		s.promptGenerations(w, r)
 	case "GET /api/v2/settings", "POST /api/v2/settings":
 		s.querySettings(w, r)
 	case "POST /api/v2/sync":
