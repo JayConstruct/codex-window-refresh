@@ -32,9 +32,10 @@ var javascript []byte
 var stylesheet []byte
 
 type Options struct {
-	QueryConcurrency int
-	QueryTimeout     time.Duration
-	Retention        store.Retention
+	QueryConcurrency     int
+	QueryTimeout         time.Duration
+	Retention            store.Retention
+	RequestInventorySync func() bool
 }
 type Service struct {
 	Store            *store.Store
@@ -44,6 +45,7 @@ type Service struct {
 	wake             chan struct{}
 	expanderError    atomic.Value
 	maintenanceError atomic.Bool
+	schedulerError   atomic.Value
 	workerErrors     []atomic.Bool
 }
 
@@ -59,6 +61,7 @@ func New(st *store.Store, source executor.Source, o Options) (*Service, error) {
 	}
 	s := &Service{Store: st, source: source, options: o, instance: store.ID(), wake: make(chan struct{}, 1), workerErrors: make([]atomic.Bool, o.QueryConcurrency)}
 	s.expanderError.Store("")
+	s.schedulerError.Store("")
 	return s, nil
 }
 func (s *Service) notify() {
@@ -83,6 +86,8 @@ func (s *Service) Run(ctx context.Context) {
 	go func() { defer workers.Done(); s.maintenance(ctx) }()
 	workers.Add(1)
 	go func() { defer workers.Done(); s.expand(ctx) }()
+	workers.Add(1)
+	go func() { defer workers.Done(); s.schedule(ctx) }()
 	for i := 0; i < s.options.QueryConcurrency; i++ {
 		workers.Add(1)
 		go func() { defer workers.Done(); s.worker(ctx, i) }()
@@ -101,6 +106,9 @@ func (s *Service) maintenance(ctx context.Context) {
 	}
 }
 func (s *Service) lastError() string {
+	if code := s.schedulerError.Load().(string); code != "" {
+		return code
+	}
 	if s.maintenanceError.Load() {
 		return "storage_unavailable"
 	}
@@ -256,7 +264,15 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 503, "storage_unavailable")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]bool{"quota_query": true, "model_execution": false, "activity_tracking": true, "passive_quota": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]bool{"quota_query": true, "model_execution": false, "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+	case "GET /api/v2/settings", "POST /api/v2/settings":
+		s.querySettings(w, r)
+	case "POST /api/v2/sync":
+		if s.options.RequestInventorySync == nil || !s.options.RequestInventorySync() {
+			apiError(w, 503, "inventory_sync_unavailable")
+			return
+		}
+		writeJSON(w, 202, map[string]any{"status": "queued", "read_only": true, "instance_id": s.instance})
 	case "GET /healthz":
 		if err := s.Store.Check(r.Context()); err != nil {
 			apiError(w, 503, "storage_unavailable")
@@ -267,6 +283,24 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		s.createJob(w, r)
 	case "GET /api/v2/jobs":
 		id := r.URL.Query().Get("job_id")
+		if id == "" && !r.URL.Query().Has("job_id") {
+			limit := 20
+			if raw := r.URL.Query().Get("limit"); raw != "" {
+				var err error
+				limit, err = strconv.Atoi(raw)
+				if err != nil || limit < 1 || limit > 100 {
+					apiError(w, 400, "invalid_limit")
+					return
+				}
+			}
+			page, err := s.Store.RecentJobsPage(r.Context(), limit)
+			if err != nil {
+				apiError(w, 503, "storage_unavailable")
+				return
+			}
+			writeJSON(w, 200, map[string]any{"jobs": page.Jobs, "view_revision": page.Revision, "instance_id": s.instance})
+			return
+		}
 		if !store.ValidID(id) {
 			apiError(w, 400, "job_id_required")
 			return
@@ -283,6 +317,17 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		j.InstanceID = s.instance
 		writeJSON(w, 200, j)
 	case "GET /api/v2/accounts":
+		search, status := r.URL.Query().Get("search"), r.URL.Query().Get("status")
+		if len(search) > 256 || strings.ContainsAny(search, "\x00\r\n") {
+			apiError(w, 400, "invalid_search")
+			return
+		}
+		switch status {
+		case "", "all", "available", "disabled", "unavailable", "attention":
+		default:
+			apiError(w, 400, "invalid_status")
+			return
+		}
 		limit := 100
 		if raw := r.URL.Query().Get("limit"); raw != "" {
 			n, err := strconv.Atoi(raw)
@@ -305,7 +350,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 400, "revision_required")
 			return
 		}
-		page, err := s.Store.AccountPage(r.Context(), r.URL.Query().Get("after"), limit, expected)
+		page, err := s.Store.AccountPageFiltered(r.Context(), r.URL.Query().Get("after"), limit, expected, search, status)
 		if err != nil {
 			status := 503
 			if errors.Is(err, store.ErrViewChanged) {
@@ -339,7 +384,7 @@ func (s *Service) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 	canonical, _ := json.Marshal(req)
 	sum := sha256.Sum256(canonical)
-	id, existing, err := s.Store.Create(r.Context(), key, hex.EncodeToString(sum[:]), req.AccountID)
+	id, existing, err := s.Store.CreateQuery(r.Context(), key, hex.EncodeToString(sum[:]), req.AccountID)
 	if err != nil {
 		status := 503
 		if errors.Is(err, store.ErrConflict) {

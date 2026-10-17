@@ -98,6 +98,8 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(len(menus), 1)
         self.assertEqual(menus[0]['Path'], '/status')
         self.assertIn('/healthz', [r['Path'] for r in routes['result']['Resources']])
+        self.assertIn({'Method': 'POST', 'Path': '/v0/management/codex-window-refresh/v2/sync'},
+                      routes['result']['Routes'])
 
     @contextlib.contextmanager
     def cpa_resources(self, registration=None):
@@ -568,6 +570,7 @@ class NativeBridge(unittest.TestCase):
             self.assertFalse(old_dropin.exists())
             self.assertFalse((cpa/'plugins/codex-window-refresh-v0.1.0-rc.28.so').exists())
             self.assertFalse((actual_paths['root']/'backups').exists())
+            self.query_delay(0, 0)
             status, accepted = self.management('jobs', 'POST', {'kind': 'quota_query'}, 'update-preserves-job')
             self.assertEqual(status, 202)
             job_id = accepted['job_id']
@@ -639,6 +642,7 @@ class NativeBridge(unittest.TestCase):
         page = self.call('management.handle', {'Method': 'GET', 'Path': '/v0/resource/plugins/codex-window-refresh/status'})['result']
         self.assertEqual(page['StatusCode'], 200)
         self.assertIn('账号额度', base64.b64decode(page['Body']).decode())
+        self.query_delay(0, 0)
         status, accepted = self.management('jobs', 'POST', {'kind': 'quota_query'}, 'persistent-key')
         self.assertEqual(status, 202)
         job_id = accepted['job_id']
@@ -667,6 +671,104 @@ class NativeBridge(unittest.TestCase):
         self.assertTrue(self.call('plugin.reconfigure', {'schema_version': 6})['ok'])
         status, _ = self.management('overview')
         self.assertEqual(status, 200)
+
+    def query_delay(self, minimum, maximum):
+        status, settings = self.management('settings')
+        self.assertEqual(status, 200)
+        settings['config']['random_delay'] = {'min_seconds': minimum, 'max_seconds': maximum}
+        status, saved = self.management('settings', 'POST', {'revision': settings['revision'], 'config': settings['config']})
+        self.assertEqual(status, 200)
+        return saved
+
+    def test_query_settings_and_persisted_delay_never_dispatch_models(self):
+        self.start_daemon()
+        status, settings = self.management('settings')
+        self.assertEqual(status, 200)
+        self.assertFalse(settings['config']['automatic'])
+        self.assertFalse(settings['config']['on_five_hour_expiry'])
+        self.assertFalse(settings['config']['on_weekly_expiry'])
+        self.assertEqual(settings['config']['random_delay'], {'min_seconds': 5, 'max_seconds': 60})
+        saved = self.query_delay(60, 60)
+        status, accepted = self.management('jobs', 'POST', {'kind': 'quota_query'}, 'delayed-batch')
+        self.assertEqual(status, 202)
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, job = self.management('jobs', query={'job_id': [accepted['job_id']]})
+            if job.get('items'):
+                break
+            time.sleep(.02)
+        self.assertEqual(len(job['items']), 2)
+        self.assertTrue(all(item['phase']=='queued' and item['scheduled_at'] for item in job['items']))
+        schedule = {item['account_id']: item['scheduled_at'] for item in job['items']}
+        self.assertEqual(self.models, 0)
+        status, _ = self.management('settings', 'POST', {'revision': 0, 'config': saved['config']})
+        self.assertEqual(status, 409)
+        self.process.terminate()
+        self.process.communicate(timeout=10)
+        self.process = None
+        self.start_daemon()
+        status, restored = self.management('jobs', query={'job_id': [accepted['job_id']]})
+        self.assertEqual(status, 200)
+        self.assertEqual(schedule, {item['account_id']: item['scheduled_at'] for item in restored['items']})
+        status, immediate = self.management('jobs', 'POST', {'kind': 'quota_query', 'account_id': 'a'}, 'promote-single')
+        self.assertEqual(status, 202)
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            _, single = self.management('jobs', query={'job_id': [immediate['job_id']]})
+            if single['phase']=='failed':
+                break
+            time.sleep(.02)
+        self.assertEqual(single['phase'], 'failed')
+        self.assertEqual(single['items'][0]['error_code'], 'quota_credential_missing')
+        _, batch = self.management('jobs', query={'job_id': [accepted['job_id']]})
+        self.assertEqual(next(item for item in batch['items'] if item['account_id']=='a')['phase'], 'failed')
+        self.assertEqual(next(item for item in batch['items'] if item['account_id']=='b')['phase'], 'queued')
+        self.assertEqual(self.models, 0)
+
+    def test_dashboard_sync_and_filters_do_not_create_quota_or_model_jobs(self):
+        self.start_daemon()
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, overview = self.management('overview')
+            if status == 200 and overview['inventory']['status'] == 'ready':
+                break
+            time.sleep(.02)
+        self.assertEqual(status, 200)
+        self.assertEqual(overview['inventory']['status'], 'ready')
+        summary = overview['dashboard']
+        self.assertEqual(summary['total'], 2)
+        self.assertEqual(summary['available'], 2)
+        self.assertEqual(summary['disabled'], 0)
+        self.assertEqual(summary['capacity'], 0)
+        self.assertEqual(summary['unknown_quota'], 2)
+        self.assertEqual(summary['tasks'], {'active': 0, 'querying': 0})
+        self.assertEqual(summary['recent_jobs'], [])
+        self.assertEqual(summary['recent_events'][0]['kind'], 'inventory')
+        previous_sync = overview['inventory']['last_success_at']
+        status, accepted = self.management('sync', 'POST')
+        self.assertEqual(status, 202)
+        self.assertEqual(accepted['status'], 'queued')
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            _, overview = self.management('overview')
+            if overview['inventory']['last_success_at'] != previous_sync:
+                break
+            time.sleep(.02)
+        self.assertNotEqual(overview['inventory']['last_success_at'], previous_sync)
+        status, page = self.management('accounts', query={'search': ['A'], 'status': ['available'], 'limit': ['6']})
+        self.assertEqual(status, 200)
+        self.assertEqual(page['total'], 2)
+        self.assertEqual(page['filter_total'], 1)
+        self.assertEqual([account['id'] for account in page['accounts']], ['a'])
+        status, page = self.management('accounts', query={'status': ['disabled'], 'limit': ['6']})
+        self.assertEqual(status, 200)
+        self.assertEqual(page['filter_total'], 0)
+        self.assertEqual(page['accounts'], [])
+        status, jobs = self.management('jobs')
+        self.assertEqual(status, 200)
+        self.assertEqual(jobs['jobs'], [])
+        self.assertEqual(self.models, 0)
+        self.assertEqual(self.management('sync')[0], 404)
 
     def test_proxy_preserves_body_query_and_status_but_strips_credentials(self):
         captured = {}

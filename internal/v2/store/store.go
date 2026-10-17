@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"codex-window-refresh/internal/v2/policy"
 	quotaevidence "codex-window-refresh/internal/v2/quota"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -35,28 +36,35 @@ var ErrJobExpired = errors.New("job_expired")
 const MaxPendingItems = 4096
 
 type Account struct {
-	ID         string          `json:"id"`
-	AuthIndex  string          `json:"-"`
-	Binding    string          `json:"-"`
-	Status     string          `json:"status"`
-	Quota      json.RawMessage `json:"quota,omitempty"`
-	ObservedAt string          `json:"observed_at,omitempty"`
+	ID           string          `json:"id"`
+	AuthIndex    string          `json:"-"`
+	Binding      string          `json:"-"`
+	Status       string          `json:"status"`
+	Quota        json.RawMessage `json:"quota,omitempty"`
+	ObservedAt   string          `json:"observed_at,omitempty"`
+	PendingQuery *PendingQuery   `json:"pending_query,omitempty"`
 }
 type Item struct {
-	AccountID string `json:"account_id"`
-	Phase     string `json:"phase"`
-	ErrorCode string `json:"error_code,omitempty"`
+	AccountID   string `json:"account_id"`
+	Phase       string `json:"phase"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	ScheduledAt string `json:"scheduled_at,omitempty"`
+	Trigger     string `json:"trigger,omitempty"`
+	HoldReason  string `json:"hold_reason,omitempty"`
 }
 type Job struct {
-	InstanceID string `json:"instance_id,omitempty"`
-	Revision   uint64 `json:"view_revision"`
-	ID         string `json:"job_id"`
-	Target     string `json:"account_id,omitempty"`
-	Phase      string `json:"phase"`
-	ErrorCode  string `json:"error_code,omitempty"`
-	CreatedAt  string `json:"created_at"`
-	UpdatedAt  string `json:"updated_at"`
-	Items      []Item `json:"items"`
+	InstanceID  string `json:"instance_id,omitempty"`
+	Revision    uint64 `json:"view_revision"`
+	ID          string `json:"job_id"`
+	Target      string `json:"account_id,omitempty"`
+	Phase       string `json:"phase"`
+	ErrorCode   string `json:"error_code,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+	Items       []Item `json:"items"`
+	Trigger     string `json:"trigger,omitempty"`
+	ScheduledAt string `json:"scheduled_at,omitempty"`
+	HoldReason  string `json:"hold_reason,omitempty"`
 }
 type Run struct {
 	ID      string
@@ -136,7 +144,7 @@ func Open(dir string) (*Store, error) {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
-		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 3 {
+		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 4 {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
@@ -147,7 +155,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	if _, err = migration.Exec(schema); err == nil {
-		_, err = migration.Exec("UPDATE schema_version SET version=3")
+		_, err = migration.Exec("UPDATE schema_version SET version=4")
 	}
 	if err == nil {
 		err = migration.Commit()
@@ -159,7 +167,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	var version int
-	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 3 {
+	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 4 {
 		s.Close()
 		return nil, errors.New("unsupported_database_schema")
 	}
@@ -191,6 +199,16 @@ func (s *Store) write(ctx context.Context, fn func(*sql.Tx) error) error {
 	return tx.Commit()
 }
 func (s *Store) Create(ctx context.Context, key, hash, target string) (string, bool, error) {
+	return s.create(ctx, key, hash, target, nil)
+}
+func (s *Store) CreateQuery(ctx context.Context, key, hash, target string) (string, bool, error) {
+	trigger := "manual_batch"
+	if target != "" {
+		trigger = "manual_single"
+	}
+	return s.create(ctx, key, hash, target, &QueryPlan{Trigger: trigger})
+}
+func (s *Store) create(ctx context.Context, key, hash, target string, plan *QueryPlan) (string, bool, error) {
 	id, existing := ID(), false
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		var receiptHash string
@@ -242,7 +260,18 @@ func (s *Store) Create(ctx context.Context, key, hash, target string) (string, b
 			return err
 		}
 		_, err = tx.ExecContext(ctx, "INSERT INTO jobs(id,idempotency_key,request_hash,target,phase,created_at,updated_at) VALUES(?,?,?,?,'queued',?,?)", id, key, hash, target, stamp, stamp)
-		return err
+		if err != nil || plan == nil {
+			return err
+		}
+		settings, err := readQuerySettings(ctx, tx)
+		if err != nil {
+			return err
+		}
+		copy := *plan
+		if target == "" {
+			copy.Min, copy.Max = settings.Config.Delay.Min, settings.Config.Delay.Max
+		}
+		return insertQueryPlan(ctx, tx, id, copy)
 	})
 	return id, existing, err
 }
@@ -279,6 +308,11 @@ func (s *Store) Expand(ctx context.Context, j Job, accounts []Account) error {
 		if expanded != 0 {
 			return nil
 		}
+		plan, err := readQueryPlan(ctx, tx, j.ID, j.Target)
+		if err != nil {
+			return err
+		}
+		scheduled := time.Now().UTC()
 		selected := []Account{}
 		for _, a := range accounts {
 			if j.Target == "" || j.Target == a.ID {
@@ -304,16 +338,7 @@ func (s *Store) Expand(ctx context.Context, j Job, accounts []Account) error {
 			if _, err := tx.ExecContext(ctx, "INSERT INTO accounts(id,auth_index,status,updated_at) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET quota=CASE WHEN accounts.auth_index=excluded.auth_index THEN accounts.quota ELSE NULL END,observed_at=CASE WHEN accounts.auth_index=excluded.auth_index THEN accounts.observed_at ELSE NULL END,auth_index=excluded.auth_index,status=excluded.status,updated_at=excluded.updated_at", a.ID, a.AuthIndex, a.Status, now()); err != nil {
 				return err
 			}
-			var run string
-			err := tx.QueryRowContext(ctx, "SELECT id FROM query_runs WHERE account_id=? AND auth_index=? AND phase='running'", a.ID, a.AuthIndex).Scan(&run)
-			phase := "queued"
-			var runArg any
-			if err == nil {
-				phase, runArg = "running", run
-			} else if !errors.Is(err, sql.ErrNoRows) {
-				return err
-			}
-			if _, err = tx.ExecContext(ctx, "INSERT INTO job_items(job_id,account_id,phase,run_id) VALUES(?,?,?,?)", j.ID, a.ID, phase, runArg); err != nil {
+			if err := insertQueryItem(ctx, tx, j.ID, a, plan, scheduled); err != nil {
 				return err
 			}
 		}
@@ -324,27 +349,12 @@ func (s *Store) Expand(ctx context.Context, j Job, accounts []Account) error {
 		if code != "" {
 			phase = "failed"
 		}
-		_, err := tx.ExecContext(ctx, "UPDATE jobs SET expanded=1,phase=?,error_code=?,updated_at=? WHERE id=?", phase, code, now(), j.ID)
+		_, err = tx.ExecContext(ctx, "UPDATE jobs SET expanded=1,phase=?,error_code=?,updated_at=? WHERE id=?", phase, code, now(), j.ID)
 		return err
 	})
 }
 func (s *Store) Claim(ctx context.Context) (Run, error) {
-	r := Run{ID: ID()}
-	err := s.write(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT a.id,a.auth_index,a.status,COALESCE(b.binding,'') FROM job_items i JOIN accounts a ON a.id=i.account_id LEFT JOIN account_bindings b ON b.account_id=a.id JOIN jobs j ON j.id=i.job_id WHERE i.phase='queued' AND NOT EXISTS(SELECT 1 FROM query_runs r WHERE r.account_id=i.account_id AND r.phase='running') ORDER BY j.created_at,i.account_id LIMIT 1`).Scan(&r.Account.ID, &r.Account.AuthIndex, &r.Account.Status, &r.Account.Binding)
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO query_runs(id,account_id,auth_index,phase,started_at) VALUES(?,?,?,'running',?)", r.ID, r.Account.ID, r.Account.AuthIndex, now()); err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, "UPDATE job_items SET phase='running',run_id=? WHERE account_id=? AND phase='queued'", r.ID, r.Account.ID)
-		return err
-	})
-	return r, err
+	return s.ClaimAt(ctx, time.Now().UTC())
 }
 func (s *Store) Finish(ctx context.Context, r Run, quota json.RawMessage, code string) error {
 	if code == "" && !json.Valid(quota) {
@@ -427,8 +437,7 @@ func (s *Store) Finish(ctx context.Context, r Run, quota json.RawMessage, code s
 		if _, err = tx.ExecContext(ctx, "UPDATE job_items SET phase=?,error_code=? WHERE run_id=?", phase, code, r.ID); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE jobs SET phase=CASE WHEN EXISTS(SELECT 1 FROM job_items i WHERE i.job_id=jobs.id AND i.phase='failed') THEN 'failed' ELSE 'completed' END,updated_at=? WHERE expanded=1 AND phase='running' AND NOT EXISTS(SELECT 1 FROM job_items i WHERE i.job_id=jobs.id AND i.phase IN ('queued','running'))`, now())
-		return err
+		return finishQueryJobs(ctx, tx, time.Now().UTC())
 	})
 }
 
@@ -449,15 +458,32 @@ func (s *Store) Job(ctx context.Context, id string) (Job, error) {
 	if err != nil {
 		return j, err
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT account_id,phase,error_code FROM job_items WHERE job_id=? ORDER BY account_id", id)
+	plan, err := readQueryPlan(ctx, tx, id, j.Target)
+	if err != nil {
+		return j, err
+	}
+	j.Trigger = plan.Trigger
+	settings, err := readQuerySettings(ctx, tx)
+	if err != nil {
+		return j, err
+	}
+	rows, err := tx.QueryContext(ctx, "SELECT i.account_id,i.phase,i.error_code,COALESCE(q.scheduled_at,''),COALESCE(p.trigger,?) FROM job_items i LEFT JOIN query_schedule q ON q.job_id=i.job_id AND q.account_id=i.account_id LEFT JOIN query_plans p ON p.job_id=i.job_id WHERE i.job_id=? ORDER BY i.account_id", plan.Trigger, id)
 	if err != nil {
 		return j, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var i Item
-		if err = rows.Scan(&i.AccountID, &i.Phase, &i.ErrorCode); err != nil {
+		if err = rows.Scan(&i.AccountID, &i.Phase, &i.ErrorCode, &i.ScheduledAt, &i.Trigger); err != nil {
 			return j, err
+		}
+		if i.Phase == "queued" {
+			if j.ScheduledAt == "" || i.ScheduledAt < j.ScheduledAt {
+				j.ScheduledAt = i.ScheduledAt
+			}
+			if plan.Automatic && !settings.Config.Allowed(time.Now()) {
+				i.HoldReason = "excluded_hours"
+			}
 		}
 		j.Items = append(j.Items, i)
 	}
@@ -465,6 +491,15 @@ func (s *Store) Job(ctx context.Context, id string) (Job, error) {
 		return j, err
 	}
 	rows.Close()
+	for _, item := range j.Items {
+		if item.Phase == "running" {
+			j.HoldReason = ""
+			break
+		}
+		if item.HoldReason != "" {
+			j.HoldReason = item.HoldReason
+		}
+	}
 	return j, tx.Commit()
 }
 func (s *Store) Accounts(ctx context.Context, after string, limit int) ([]Account, error) {
@@ -491,7 +526,7 @@ func (s *Store) Accounts(ctx context.Context, after string, limit int) ([]Accoun
 // Public errors are fixed classifications. SQL and filesystem error strings
 // belong to local diagnosis, never API payloads that could expose paths/data.
 func PublicError(err error) string {
-	for _, known := range []error{ErrConflict, ErrBusy, ErrNotFound, ErrViewChanged, ErrJobExpired} {
+	for _, known := range []error{ErrConflict, ErrBusy, ErrNotFound, ErrViewChanged, ErrJobExpired, ErrSettingsConflict, policy.ErrInvalid} {
 		if errors.Is(err, known) {
 			return known.Error()
 		}

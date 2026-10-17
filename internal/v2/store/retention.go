@@ -55,6 +55,8 @@ func (s *Store) Prune(ctx context.Context, at time.Time, p Retention) error {
 			query string
 			args  []any
 		}{
+			{query: "DELETE FROM query_timers WHERE rowid IN(SELECT t.rowid FROM query_timers t LEFT JOIN accounts a ON a.id=t.account_id LEFT JOIN account_bindings b ON b.account_id=a.id WHERE a.id IS NULL OR a.status='removed' OR COALESCE(b.binding,'')!=t.binding LIMIT 256)"},
+			{query: "DELETE FROM query_baselines WHERE rowid IN(SELECT q.rowid FROM query_baselines q LEFT JOIN accounts a ON a.id=q.account_id LEFT JOIN account_bindings b ON b.account_id=a.id WHERE a.id IS NULL OR a.status='removed' OR COALESCE(b.binding,'')!=q.binding LIMIT 256)"},
 			{query: "DELETE FROM query_runs WHERE id IN(SELECT r.id FROM query_runs r WHERE r.phase!='running' AND NOT EXISTS(SELECT 1 FROM job_items i WHERE i.run_id=r.id) LIMIT 256)"},
 			{query: "DELETE FROM activity_requests WHERE rowid IN(SELECT rowid FROM activity_requests WHERE phase='completed' AND last_event_at<? LIMIT 256)", args: []any{at.UTC().Add(-24 * time.Hour).Format("2006-01-02T15:04:05.000000000Z")}},
 			{query: "DELETE FROM activity_requests WHERE rowid IN(SELECT rowid FROM activity_requests WHERE phase='completed' ORDER BY last_event_at DESC LIMIT -1 OFFSET 8192)"},

@@ -1,6 +1,6 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 3 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 4 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
 CREATE TABLE IF NOT EXISTS accounts(
  id TEXT PRIMARY KEY, auth_index TEXT NOT NULL, status TEXT NOT NULL,
  quota TEXT, observed_at TEXT, updated_at TEXT NOT NULL
@@ -53,10 +53,46 @@ CREATE TABLE IF NOT EXISTS job_receipts(
  idempotency_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, job_id TEXT NOT NULL,
  expires_at INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO job_receipts SELECT idempotency_key,request_hash,id,unixepoch(created_at)+2592000 FROM jobs;
 CREATE INDEX IF NOT EXISTS receipts_expiry ON job_receipts(expires_at);
 CREATE TRIGGER IF NOT EXISTS accounts_insert AFTER INSERT ON accounts BEGIN
  UPDATE view_state SET revision=revision+1,accounts_revision=accounts_revision+1;
+END;
+CREATE TABLE IF NOT EXISTS query_settings(
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL, config TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS query_plans(
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+ trigger TEXT NOT NULL, automatic INTEGER NOT NULL, delay_min INTEGER NOT NULL, delay_max INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS query_schedule(
+ job_id TEXT NOT NULL, account_id TEXT NOT NULL, scheduled_at TEXT NOT NULL,
+ auth_index TEXT NOT NULL, binding TEXT NOT NULL,
+ PRIMARY KEY(job_id,account_id),
+ FOREIGN KEY(job_id,account_id) REFERENCES job_items(job_id,account_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS scheduled_queries ON query_schedule(scheduled_at);
+CREATE TABLE IF NOT EXISTS query_run_bindings(
+ run_id TEXT PRIMARY KEY REFERENCES query_runs(id) ON DELETE CASCADE, binding TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS query_baselines(
+ account_id TEXT PRIMARY KEY, binding TEXT NOT NULL,
+ five_hour_reset TEXT NOT NULL DEFAULT '', weekly_reset TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS query_timers(
+ account_id TEXT NOT NULL, kind TEXT NOT NULL, binding TEXT NOT NULL, cycle TEXT NOT NULL,
+ next_at TEXT NOT NULL, job_id TEXT NOT NULL, phase TEXT NOT NULL,
+ attempts INTEGER NOT NULL, updated_at TEXT NOT NULL,
+ PRIMARY KEY(account_id,kind)
+);
+CREATE TABLE IF NOT EXISTS query_scheduler_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),account_id TEXT NOT NULL);
+INSERT OR IGNORE INTO query_scheduler_cursor VALUES(1,'');
+CREATE TRIGGER IF NOT EXISTS query_settings_insert AFTER INSERT ON query_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS query_settings_update AFTER UPDATE ON query_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS query_schedule_insert AFTER INSERT ON query_schedule BEGIN UPDATE view_state SET revision=revision+1; END;
+DROP TRIGGER IF EXISTS query_timer_outcome;
+CREATE TRIGGER query_timer_outcome AFTER UPDATE ON jobs BEGIN
+ UPDATE query_timers SET phase=COALESCE((SELECT i.phase FROM job_items i WHERE i.job_id=NEW.id AND i.account_id=query_timers.account_id),NEW.phase),updated_at=NEW.updated_at
+ WHERE job_id=NEW.id AND phase IN ('queued','running','blocked');
 END;
 CREATE TRIGGER IF NOT EXISTS accounts_delete AFTER DELETE ON accounts BEGIN
  UPDATE view_state SET revision=revision+1,accounts_revision=accounts_revision+1;
@@ -93,3 +129,5 @@ CREATE TRIGGER IF NOT EXISTS inventory_update AFTER UPDATE ON inventory_state
  WHEN OLD.status IS NOT NEW.status OR OLD.error_code IS NOT NEW.error_code BEGIN
  UPDATE view_state SET revision=revision+1;
 END;
+INSERT OR IGNORE INTO job_receipts SELECT idempotency_key,request_hash,id,unixepoch(created_at)+2592000 FROM jobs
+WHERE NOT EXISTS(SELECT 1 FROM query_plans p WHERE p.job_id=jobs.id AND p.automatic=1);

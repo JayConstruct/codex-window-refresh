@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,112 @@ import (
 	"codex-window-refresh/internal/v2/hostlink"
 	"codex-window-refresh/internal/v2/store"
 )
+
+type requestedInventory struct {
+	accountCalls  atomic.Int32
+	identityCalls atomic.Int32
+}
+
+func (inventory *requestedInventory) Accounts(context.Context) ([]store.Account, error) {
+	inventory.accountCalls.Add(1)
+	return []store.Account{{ID: "account", AuthIndex: "index", Status: "available"}}, nil
+}
+
+func (inventory *requestedInventory) Identity(_ context.Context, account store.Account) (store.Account, error) {
+	inventory.identityCalls.Add(1)
+	account.Binding = "identity-proof"
+	return account, nil
+}
+
+type requestedLink struct {
+	fixtureLink
+	published chan []store.Account
+}
+
+func (*requestedLink) Handshake(context.Context) (hostlink.Hello, error) {
+	return hostlink.Hello{Instance: "bridge", PassiveQuota: true}, nil
+}
+
+func (link *requestedLink) PublishBindings(_ context.Context, _ string, accounts []store.Account) error {
+	link.published <- accounts
+	return nil
+}
+
+func TestRequestedInventorySyncWakesBackgroundLoopAndPreservesIdentityProof(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	link := &requestedLink{published: make(chan []store.Account, 4)}
+	inventory := &requestedInventory{}
+	consumer := &Consumer{Store: st, Link: link, Inventory: inventory, lastInventory: time.Now(), inventoryInstance: "bridge"}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); consumer.inventoryLoop(ctx) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-link.published:
+		t.Fatal("fresh inventory refreshed without a request")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !consumer.RequestInventorySync() {
+		t.Fatal("supported inventory request rejected")
+	}
+	select {
+	case accounts := <-link.published:
+		if len(accounts) != 1 || accounts[0].Binding != "identity-proof" || inventory.identityCalls.Load() != 1 || inventory.accountCalls.Load() != 1 {
+			t.Fatal("refresh skipped identity proof", accounts)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not wake inventory loop")
+	}
+	view, err := st.Overview(context.Background())
+	if err != nil || view.Inventory.Status != "ready" || view.Inventory.LastSuccessAt == "" {
+		t.Fatal(view, err)
+	}
+}
+
+func TestInventoryRequestsCoalesceAndUnsupportedRequestsFail(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, consumer := range []*Consumer{{}, {Store: st, Link: &fixtureLink{}, Inventory: inventoryFixture{}}} {
+		if consumer.RequestInventorySync() {
+			t.Fatal("unsupported consumer returned successful queue receipt")
+		}
+	}
+	consumer := &Consumer{Store: st, Link: &requestedLink{}, Inventory: inventoryFixture{}}
+	for range 100 {
+		if !consumer.RequestInventorySync() {
+			t.Fatal("request failed")
+		}
+	}
+	if len(consumer.inventoryRequests()) != 1 {
+		t.Fatal("requests were not bounded and coalesced")
+	}
+}
+
+func TestInventoryUpdatesWithoutPageOrRequestAfterBackgroundInterval(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	link := &requestedLink{published: make(chan []store.Account, 1)}
+	consumer := &Consumer{Store: st, Link: link, Inventory: &requestedInventory{}, lastInventory: time.Now().Add(-31 * time.Second), inventoryInstance: "bridge"}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); consumer.inventoryLoop(ctx) }()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-link.published:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background sync depended on an open page")
+	}
+}
 
 type fixtureLink struct {
 	ackFail      bool

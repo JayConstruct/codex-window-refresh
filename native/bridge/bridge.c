@@ -523,7 +523,9 @@ static J *proxy(J*req) {
     char endpoint[128];
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
-        if((strcmp(tail,"overview")&&strcmp(tail,"accounts")&&strcmp(tail,"jobs"))||(strcmp(method,"GET")&&!(strcmp(method,"POST")==0&&strcmp(tail,"jobs")==0)))return http_error(404,"not_found");
+        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings");
+        int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings");
+        if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
     }
     else if(!strncmp(path,RESOURCE,strlen(RESOURCE))&&strcmp(method,"GET")==0) {
@@ -542,9 +544,9 @@ static J *proxy(J*req) {
     snprintf(target,sizeof(target),"http://localhost%s",endpoint);
     J*query=field(req,"Query");
     const char*allowed[]= {
-        "job_id","after","limit","revision"
+        "job_id","after","limit","revision","search","status"
     };
-    for(int i=0;i<4;i++) {
+    for(int i=0;i<6;i++) {
         J*v=field(query,allowed[i]);
         if(!v)continue;
         if(json_object_get_type(v)!=5||json_object_array_length(v)!=1)goto invalid;
@@ -637,13 +639,13 @@ static J *registration(void) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs"
+        "overview","accounts","jobs","jobs","sync","settings","settings"
     };
-    for(int i=0;i<4;i++) {
+    for(int i=0;i<7;i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);
-        json_object_object_add(item,"Method",json_object_new_string(i==3?"POST":"GET"));
+        json_object_object_add(item,"Method",json_object_new_string(i>=3&&i!=5?"POST":"GET"));
         json_object_object_add(item,"Path",json_object_new_string(path));
         json_object_array_add(list,item);
     }

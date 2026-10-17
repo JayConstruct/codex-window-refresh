@@ -37,6 +37,8 @@ type Overview struct {
 	AccountsRevision uint64          `json:"accounts_revision"`
 	Activity         ActivitySummary `json:"activity"`
 	Inventory        InventoryStatus `json:"inventory"`
+	Dashboard        Dashboard       `json:"dashboard"`
+	QuerySettings    QuerySettings   `json:"query_settings"`
 }
 
 const cursorSQL = "SELECT bridge_instance,host_process,sequence,loss_epoch,status,reason,connected,connection_error,last_seen FROM event_state WHERE singleton=1"
@@ -80,6 +82,15 @@ func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	// The unmodified host has no authoritative in-flight snapshot. Continuity
 	// proves delivery since observation began, not a complete initial baseline.
 	o.Activity.BaselineComplete = false
+	o.QuerySettings, err = readQuerySettings(ctx, tx)
+	if err != nil {
+		return o, err
+	}
+	o.QuerySettings.ViewRevision = o.Revision
+	o.Dashboard, err = readDashboard(ctx, tx, o.Revision, o.AccountsRevision, o.Inventory)
+	if err != nil {
+		return o, err
+	}
 	return o, tx.Commit()
 }
 func (s *Store) EventDisconnected(ctx context.Context, code string) error {

@@ -46,7 +46,8 @@ func run() error {
 	link := &hostlink.Client{Path: filepath.Join(runtime, "bridge.sock")}
 	source := &executor.CPA{Host: link}
 	defer source.Close()
-	service, err := daemon.New(st, source, daemon.Options{QueryConcurrency: concurrency, QueryTimeout: timeout, Retention: store.Retention{HistoryAge: historyAge, TerminalJobs: terminalJobs}})
+	consumer := &ingest.Consumer{Store: st, Link: link, Inventory: source}
+	service, err := daemon.New(st, source, daemon.Options{QueryConcurrency: concurrency, QueryTimeout: timeout, Retention: store.Retention{HistoryAge: historyAge, TerminalJobs: terminalJobs}, RequestInventorySync: consumer.RequestInventorySync})
 	if err != nil {
 		return err
 	}
@@ -61,7 +62,6 @@ func run() error {
 	workerDone := make(chan struct{})
 	go func() { defer close(workerDone); service.Run(ctx) }()
 	eventsDone := make(chan struct{})
-	consumer := &ingest.Consumer{Store: st, Link: link, Inventory: source}
 	go func() { defer close(eventsDone); consumer.Run(ctx) }()
 	stopped := make(chan struct{})
 	go func() {

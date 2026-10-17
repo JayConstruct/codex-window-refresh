@@ -25,6 +25,29 @@ type Consumer struct {
 	}
 	lastInventory     time.Time
 	inventoryInstance string
+	syncOnce          sync.Once
+	syncRequests      chan struct{}
+}
+
+func (c *Consumer) inventoryRequests() chan struct{} {
+	c.syncOnce.Do(func() { c.syncRequests = make(chan struct{}, 1) })
+	return c.syncRequests
+}
+
+func (c *Consumer) RequestInventorySync() bool {
+	if c.Inventory == nil || c.Link == nil || c.Store == nil {
+		return false
+	}
+	if _, ok := c.Link.(interface {
+		PublishBindings(context.Context, string, []store.Account) error
+	}); !ok {
+		return false
+	}
+	select {
+	case c.inventoryRequests() <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 func (c *Consumer) Step(ctx context.Context) error {
@@ -98,12 +121,25 @@ func (c *Consumer) Run(ctx context.Context) {
 }
 
 func (c *Consumer) inventoryLoop(ctx context.Context) {
+	requests := c.inventoryRequests()
+	requested := false
 	for ctx.Err() == nil {
+		select {
+		case <-requests:
+			requested = true
+		default:
+		}
 		refresh, cancel := context.WithTimeout(ctx, 60*time.Second)
 		hello, err := c.Link.Handshake(refresh)
 		delay := time.Second
-		if err == nil && hello.PassiveQuota && (hello.Instance != c.inventoryInstance || time.Since(c.lastInventory) >= 30*time.Second) {
+		if err == nil && !hello.PassiveQuota {
+			err = &protocolError{}
+		}
+		if err == nil && (requested || hello.Instance != c.inventoryInstance || time.Since(c.lastInventory) >= 30*time.Second) {
 			err = c.syncInventory(refresh, hello.Instance)
+			if err == nil {
+				requested = false
+			}
 		}
 		cancel()
 		if err != nil {
@@ -121,6 +157,9 @@ func (c *Consumer) inventoryLoop(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-timer.C:
+		case <-requests:
+			timer.Stop()
+			requested = true
 		}
 	}
 }

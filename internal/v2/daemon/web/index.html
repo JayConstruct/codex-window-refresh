@@ -1,7 +1,145 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Codex Window Refresh v2</title><link rel="stylesheet" href="panel.css"></head>
-<body><main><p class="eyebrow">CODEX WINDOW REFRESH · V2</p><h1>账号额度</h1><p>独立后台。支持手动查询和正常业务额度观测。</p><p id="inventory" role="status">CPA 账号尚未同步。</p>
-<section><label for="key">CPA 管理密钥</label><div class="row"><input id="key" type="password" autocomplete="off" placeholder="仅保留在当前页面内存中"><button id="connect">连接</button></div><p id="connection" role="status">尚未连接</p><p id="activity" role="status">活动观测尚未连接。</p></section>
-<section><h2>查询额度</h2><label for="account">账号 ID</label><div class="row"><input id="account" placeholder="留空查询全部 Codex 账号"><button id="query" disabled>创建查询任务</button></div><p id="job" role="status">尚无任务</p><p id="error" role="alert"></p></section>
-<section><div class="row"><h2>账号结果</h2><button id="refresh" disabled>刷新</button></div><div id="accounts">连接后读取已保存结果。</div><button id="more" hidden>加载更多</button></section>
-</main><script src="panel.js"></script></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>窗口助手 · 运行总览</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="icon-window" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 10h18M10 3v7"/></symbol>
+    <symbol id="icon-home" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7M5 9v12h5v-7h4v7h5V9"/></symbol>
+    <symbol id="icon-accounts" viewBox="0 0 24 24"><ellipse cx="10" cy="5" rx="7" ry="3"/><path d="M3 5v12c0 2 3 3 7 3M3 11c0 2 3 3 7 3M17 5v5"/><circle cx="17" cy="17" r="4"/><path d="m15 17 1 1 3-3"/></symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0M4 17c0 4 16 4 16 0"/></symbol>
+    <symbol id="icon-wake" viewBox="0 0 24 24"><path d="M8 6h8l3 5-3 9H8l-3-9ZM8 6V3m8 3V3M2 10h3m14 0h3M2 16h4m12 0h4M12 6v14"/></symbol>
+    <symbol id="icon-message" viewBox="0 0 24 24"><path d="M5 3h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-9l-6 4v-4H3V5a2 2 0 0 1 2-2ZM7 8h10M7 12h7"/></symbol>
+    <symbol id="icon-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 2v6m10-6v6M3 11h18"/></symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24"><path d="m9 3 1-1h4l1 4 4 1 3 4-3 3v4l-4 1-2 3-4-2-4-1v-4l-3-3 2-4 4-1Z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 8a8 8 0 0 0-14-3L3 8m0-5v5h5M4 16a8 8 0 0 0 14 3l3-3m0 5v-5h-5"/></symbol>
+    <symbol id="icon-play" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8 6 4-6 4Z"/></symbol>
+    <symbol id="icon-users" viewBox="0 0 24 24"><circle cx="10" cy="7" r="4"/><path d="M2 21v-3a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v3ZM17 3a4 4 0 0 1 0 8m3 3a6 6 0 0 1 2 5v2"/></symbol>
+    <symbol id="icon-warning" viewBox="0 0 24 24"><path d="m10 3-9 16a2 2 0 0 0 2 3h18a2 2 0 0 0 2-3L14 3a2 2 0 0 0-4 0Z"/><path d="M12 8v6m0 3v1"/></symbol>
+    <symbol id="icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v1"/></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="7"/><path d="m15 15 6 6"/></symbol>
+    <symbol id="icon-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+    <symbol id="icon-chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+    <symbol id="icon-lock" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="12" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4m-4 5v3"/></symbol>
+  </svg>
+
+  <aside class="sidebar" aria-label="主导航">
+    <a class="brand" href="#" data-page="overview" aria-label="窗口助手首页">
+      <svg class="brand-icon icon" aria-hidden="true"><use href="#icon-window"/></svg>
+      <span class="brand-copy"><span class="brand-name">窗口助手 <span class="version">V2</span></span><span class="brand-caption">账号额度与窗口管理</span></span>
+    </a>
+    <nav class="navigation" aria-label="功能页面">
+      <button type="button" class="nav-item active" data-page="overview" aria-current="page"><svg class="icon" aria-hidden="true"><use href="#icon-home"/></svg><span>运行总览</span></button>
+      <button type="button" class="nav-item" data-page="accounts"><svg class="icon" aria-hidden="true"><use href="#icon-accounts"/></svg><span>账号额度</span></button>
+      <button type="button" class="nav-item" data-page="query"><svg class="icon" aria-hidden="true"><use href="#icon-database"/></svg><span>额度查询</span></button>
+      <button type="button" class="nav-item" data-page="wake"><svg class="icon" aria-hidden="true"><use href="#icon-wake"/></svg><span>模型唤醒</span></button>
+      <button type="button" class="nav-item" data-page="models"><svg class="icon" aria-hidden="true"><use href="#icon-message"/></svg><span>模型与提示词</span></button>
+      <button type="button" class="nav-item" data-page="history"><svg class="icon" aria-hidden="true"><use href="#icon-calendar"/></svg><span>计划与历史</span></button>
+      <button type="button" class="nav-item" data-page="diagnostics"><svg class="icon" aria-hidden="true"><use href="#icon-settings"/></svg><span>诊断与设置</span></button>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="sidebar-status"><span class="status-dot" aria-hidden="true"></span><strong id="sidebar-connection">CPA 未连接</strong></div>
+      <p>独立后台 · 持续运行</p>
+      <button type="button" id="disconnect" class="text-button disconnect-button" hidden>断开连接</button>
+    </div>
+  </aside>
+
+  <main class="main-content">
+    <div class="breadcrumb">工作台 <span aria-hidden="true">/</span> <span id="breadcrumb">运行总览</span></div>
+    <header class="page-header">
+      <div><h1 id="page-title">运行总览</h1><p id="page-description">掌握账号额度与实时任务</p></div>
+      <div class="header-actions">
+        <div class="auto-update" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="auto-status">连接后自动更新</span><span class="update-separator" aria-hidden="true">·</span><time id="last-updated">尚未同步</time></div>
+        <button type="button" id="sync" class="button button-outline" disabled><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>同步 CPA</button>
+        <button type="button" id="refresh" class="button button-icon" aria-label="刷新页面数据" title="刷新页面数据" disabled><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg></button>
+      </div>
+    </header>
+
+    <section id="login-section" class="login-card card" aria-labelledby="login-title">
+      <div class="login-intro"><span class="login-icon"><svg class="icon" aria-hidden="true"><use href="#icon-lock"/></svg></span><div><h2 id="login-title">连接 CPA 管理服务</h2><p>使用管理密钥读取真实数据，密钥仅保留在当前页面内存中。</p></div></div>
+      <div class="login-controls"><label for="key" class="sr-only">CPA 管理密钥</label><input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="输入 CPA 管理密钥"><button type="button" id="connect" class="button button-primary">连接</button></div>
+      <p id="connection" class="connection-message" role="status">尚未连接</p>
+    </section>
+    <p id="error" class="feedback feedback-error" role="alert" hidden></p>
+    <p id="notice" class="feedback feedback-notice" role="status" hidden></p>
+
+    <section data-view="overview" aria-label="运行总览">
+      <div class="metrics">
+        <article class="metric-card card"><span class="metric-icon teal"><svg class="icon" aria-hidden="true"><use href="#icon-play"/></svg></span><div class="metric-copy"><h2>运行状态</h2><strong id="metric-status" class="metric-value metric-state">未连接</strong><p id="metric-status-detail">连接后读取后台状态</p></div></article>
+        <article class="metric-card card"><span class="metric-icon blue"><svg class="icon" aria-hidden="true"><use href="#icon-users"/></svg></span><div class="metric-copy"><h2>账号总数</h2><strong id="metric-total" class="metric-value">—</strong><p id="metric-total-detail">等待 CPA 账号同步</p></div></article>
+        <article class="metric-card card" title="仅统计5分钟内核实的可用窗口；未知或过期证据不计入"><span class="metric-icon teal"><svg class="icon" aria-hidden="true"><use href="#icon-database"/></svg></span><div class="metric-copy"><h2>可用容量</h2><strong id="metric-capacity" class="metric-value">—</strong><p id="metric-capacity-detail">当前可用账号</p></div></article>
+        <article class="metric-card card"><span class="metric-icon amber"><svg class="icon" aria-hidden="true"><use href="#icon-warning"/></svg></span><div class="metric-copy"><h2>异常信息</h2><strong id="metric-errors" class="metric-value">—</strong><button type="button" class="text-button diagnostic-link" data-page="diagnostics"><span id="metric-errors-detail">查看诊断详情</span><svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg></button></div></article>
+      </div>
+      <div class="inventory-banner"><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg><p id="inventory" role="status">页面关闭后，后台仍会持续同步 CPA；连接后显示最近同步状态。</p></div>
+      <div class="overview-grid">
+        <div id="overview-account-slot" class="account-slot">
+          <section id="account-card" class="account-card card" aria-labelledby="accounts-title">
+            <div class="account-toolbar"><div class="account-heading"><h2 id="accounts-title">账号额度</h2><span id="accounts-count" class="muted">— 个账号</span></div><div class="account-actions"><div class="search-field"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><label for="accounts-search" class="sr-only">搜索账号</label><input id="accounts-search" type="search" placeholder="搜索账号" autocomplete="off"></div><label for="accounts-filter" class="sr-only">筛选账号状态</label><select id="accounts-filter"><option value="all">全部状态</option><option value="available">正常</option><option value="disabled">已禁用</option><option value="unavailable">暂不可用</option><option value="attention">需要关注</option></select><button type="button" id="query" class="button button-primary" disabled>批量查询</button></div></div>
+            <p id="account-query-note" class="section-description">单账号立即查询 · 批量查询以后台当前能力为准</p>
+            <div class="table-scroll" tabindex="0" role="region" aria-label="账号额度表格，可横向滚动">
+              <table class="accounts-table"><thead><tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col">5 小时剩余</th><th scope="col">周剩余</th><th scope="col">最近更新</th><th scope="col">操作</th></tr></thead><tbody id="accounts"><tr><td class="empty-state" colspan="6"><svg class="icon empty-icon" aria-hidden="true"><use href="#icon-accounts"/></svg><strong>等待连接 CPA</strong><span>连接后自动读取账号与已保存的额度数据</span></td></tr></tbody></table>
+            </div>
+            <footer class="account-footer"><p><svg class="icon" aria-hidden="true"><use href="#icon-info"/></svg>额度查询不发送模型请求</p><div class="pagination"><span id="accounts-page-info">尚无账号数据</span><button type="button" id="more" class="button button-small" hidden>加载更多</button><button type="button" id="previous" class="button button-icon button-small" aria-label="上一页" disabled><svg class="icon flip" aria-hidden="true"><use href="#icon-chevron"/></svg></button><button type="button" id="next" class="button button-icon button-small" aria-label="下一页" disabled><svg class="icon" aria-hidden="true"><use href="#icon-chevron"/></svg></button></div></footer>
+          </section>
+        </div>
+        <div class="overview-aside">
+          <section class="tasks-card card" aria-labelledby="tasks-title"><div class="card-heading"><h2 id="tasks-title">实时任务</h2><span id="tasks-count" class="muted">0 项</span></div><div id="tasks" class="task-list" aria-live="polite"><p class="empty-state">连接后显示真实查询任务</p></div><div class="card-bottom"><button type="button" class="text-button" data-page="history">查看全部计划<svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div></section>
+          <section class="rules-card card" aria-labelledby="rules-title"><div class="card-heading"><h2 id="rules-title">查询与唤醒</h2><span id="rules-status" class="planned-badge">等待连接</span></div><div class="switch-list"><label class="switch-row" for="five-hour-query"><span>5 小时到期查询</span><input id="five-hour-query" class="switch" type="checkbox" role="switch" aria-describedby="feature-note" disabled></label><label class="switch-row" for="weekly-query"><span>周限额到期查询</span><input id="weekly-query" class="switch" type="checkbox" role="switch" aria-describedby="feature-note" disabled></label><label class="switch-row" for="auto-wake"><span>自动唤醒 · 尚未接入</span><input id="auto-wake" class="switch" type="checkbox" role="switch" aria-describedby="feature-note" disabled></label></div><p id="feature-note" class="feature-note">查询开关显示已保存设置；修改后需前往编辑器确认保存。模型唤醒尚未接入。</p><div class="rule-summary"><svg class="icon" aria-hidden="true"><use href="#icon-info"/></svg><p>额度查询不发送模型请求<br>关闭页面不停止后台任务</p><button type="button" id="edit-rules" class="text-button" data-page="query">编辑规则<svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div></section>
+        </div>
+      </div>
+      <section class="recent-card card" aria-labelledby="recent-title"><h2 id="recent-title">最近事件</h2><div id="recent-events" class="event-list" aria-live="polite"><p class="muted">尚无事件，连接后显示当前会话的真实更新。</p></div></section>
+    </section>
+
+    <section data-view="accounts" aria-label="账号额度" hidden><div id="accounts-page-slot" class="account-slot"></div></section>
+
+    <section data-view="query" aria-label="额度查询" hidden>
+      <div class="detail-grid"><section class="card detail-card" aria-labelledby="single-query-title"><div class="card-heading"><h2 id="single-query-title">手动查询</h2><span class="status-badge available">不发送模型请求</span></div><p class="section-description">指定账号立即查询，也可在账号列表中逐个操作。</p><label for="account" class="field-label">账号 ID</label><div class="input-row"><input id="account" type="text" placeholder="输入 CPA 中的完整账号 ID" autocomplete="off" aria-describedby="single-query-help"><button type="button" id="query-single" class="button button-primary" disabled>立即查询</button></div><p id="single-query-help" class="field-help">手动单账号查询不添加随机延迟，可提前执行该账号的排队查询，不解除账号禁用。</p><div class="query-batch"><div><h3>手动批量查询</h3><p id="batch-query-note" class="muted">执行方式以当前后台能力及任务反馈为准。</p></div><button type="button" class="button button-outline" data-action="batch" disabled>批量查询</button></div><div class="job-status"><h3>查询进度</h3><p id="job" role="status">尚无任务</p></div><p class="info-note"><svg class="icon" aria-hidden="true"><use href="#icon-info"/></svg>页面自动更新只读取后台数据，不额外发起额度查询。随机期限由后台生成并持久保存。</p></section>
+      <section class="card detail-card settings-card" aria-labelledby="automatic-query-title">
+        <div class="card-heading"><h2 id="automatic-query-title">额度查询设置</h2><span id="settings-status" class="planned-badge">等待连接</span></div>
+        <p class="section-description">定期和到期查询独立开关。自动查询与手动批量查询按账号随机延迟，单账号查询立即执行。</p>
+        <form id="query-settings-form" novalidate>
+          <fieldset id="settings-fields" disabled>
+            <legend class="sr-only">自动查询与随机延迟</legend>
+            <div class="settings-switches">
+              <label class="switch-row" for="settings-automatic"><span>定期自动查询</span><input id="settings-automatic" class="switch" type="checkbox" role="switch"></label>
+              <label class="switch-row" for="settings-five-hour"><span>5 小时到期查询</span><input id="settings-five-hour" class="switch" type="checkbox" role="switch"></label>
+              <label class="switch-row" for="settings-weekly"><span>周限额到期查询</span><input id="settings-weekly" class="switch" type="checkbox" role="switch"></label>
+            </div>
+            <div class="settings-grid">
+              <div><label for="settings-interval" class="field-label">定期查询间隔（秒）</label><input id="settings-interval" type="number" min="30" max="3600" step="1" aria-describedby="settings-validation"><p class="field-help">30–3600 秒</p></div>
+              <div><label for="settings-timezone" class="field-label">时区</label><input id="settings-timezone" type="text" placeholder="Asia/Shanghai" autocomplete="off" spellcheck="false" aria-describedby="settings-validation"><p class="field-help">IANA 时区，排除时段按此计算</p></div>
+              <div><label for="settings-delay-min" class="field-label">最小随机延迟（秒）</label><input id="settings-delay-min" type="number" min="0" max="86400" step="1" aria-describedby="settings-validation"></div>
+              <div><label for="settings-delay-max" class="field-label">最大随机延迟（秒）</label><input id="settings-delay-max" type="number" min="0" max="86400" step="1" aria-describedby="settings-validation"></div>
+              <div class="settings-wide"><label for="settings-excluded" class="field-label">排除时段</label><input id="settings-excluded" type="text" placeholder="00:00-08:00, 12:00-13:00" autocomplete="off" spellcheck="false" aria-describedby="settings-excluded-help settings-validation"><p id="settings-excluded-help" class="field-help">HH:mm-HH:mm，英文逗号分隔；支持跨夜及结束时间 24:00。不可重叠，留空表示不排除。</p></div>
+            </div>
+          </fieldset>
+          <p id="settings-validation" class="settings-validation" role="alert" hidden></p>
+          <p id="settings-conflict" class="settings-conflict" role="alert" hidden>后台设置已变化。草稿已保留，请重新加载并丢弃草稿后再编辑，避免覆盖其他修改。</p>
+          <div class="settings-preview"><h3>保存前差异预览</h3><div id="settings-diff" aria-live="polite">连接后读取已保存设置</div></div>
+          <p id="settings-message" class="field-help" role="status">打开页面和修改草稿不会写入后台。</p>
+          <div class="settings-actions"><button id="settings-save" class="button button-primary" type="submit" disabled>保存并应用</button><button id="settings-reload" class="button button-outline" type="button" disabled>重新加载并丢弃草稿</button></div>
+        </form>
+      </section></div>
+    </section>
+
+    <section data-view="wake" aria-label="模型唤醒" hidden>
+      <section class="card detail-card planned-panel"><span class="planned-icon"><svg class="icon" aria-hidden="true"><use href="#icon-wake"/></svg></span><div class="planned-heading"><h2>实时唤醒规则</h2><span class="planned-badge">尚未接入</span></div><p class="section-description">当前后台未接入模型唤醒，不会因为额度查询而发送模型请求。</p><div class="planned-features"><article><h3>日常重置 · 实时判断</h3><p>计划在确认窗口重置后，结合账号状态、额度、允许时段和已保存规则判断，满足条件则立即唤醒。</p></article><article><h3>启动同步 · 分散执行</h3><p>计划对启动时发现的多个符合条件账号分别设置随机延迟，执行前再次检查，避免重复唤醒。</p></article><article><h3>手动唤醒与容量准备</h3><p>保留指定账号手动唤醒、周重置和每日容量准备的目标方案，尚无可执行入口。</p></article></div><div class="planned-actions"><button type="button" class="button button-primary" disabled>手动唤醒 · 尚未接入</button><button type="button" class="button" data-page="query">前往额度查询<svg class="icon" aria-hidden="true"><use href="#icon-arrow"/></svg></button></div></section>
+    </section>
+
+    <section data-view="models" aria-label="模型与提示词" hidden>
+      <section class="card detail-card planned-panel"><span class="planned-icon"><svg class="icon" aria-hidden="true"><use href="#icon-message"/></svg></span><div class="planned-heading"><h2>模型与提示词</h2><span class="planned-badge">尚未接入</span></div><p class="section-description">模型配置和短句生成尚未接入，本页不保存或应用配置。</p><div class="planned-features"><article><h3>模型与规则提示词</h3><p>计划支持默认模型、默认提示词，以及五小时与周重置规则的独立配置。</p></article><article><h3>随机短句池</h3><p>计划支持固定提示词、短句编辑和随机选择。</p></article><article><h3>短句候选生成</h3><p>计划使用可用模型生成候选，经确认后应用；当前不会发送生成请求。</p></article></div><button type="button" class="button" disabled>配置入口尚未开放</button></section>
+    </section>
+
+    <section data-view="history" aria-label="计划与历史" hidden><section class="card detail-card"><div class="card-heading"><h2>任务记录</h2><span class="muted">真实后台任务</span></div><p class="section-description">查看已获取的查询任务、执行进度和失败原因。自动唤醒计划尚未接入。</p><div id="history-list" class="history-list"><p class="empty-state">尚无任务记录</p></div></section></section>
+
+    <section data-view="diagnostics" aria-label="诊断与设置" hidden><div class="detail-grid"><section class="card detail-card"><div class="card-heading"><h2>连接诊断</h2><svg class="icon muted" aria-hidden="true"><use href="#icon-settings"/></svg></div><div id="diagnostics-content" class="diagnostics-list"><p class="empty-state">连接后显示后台实际状态</p></div></section><section class="card detail-card"><div class="card-heading"><h2>功能边界</h2></div><ul class="feature-list"><li><strong>数据来自真实后台</strong><span>未连接时不展示模拟账号或虚构指标。</span></li><li><strong>额度查询与模型请求分离</strong><span>当前额度查询不执行模型唤醒，不解除账号禁用。</span></li><li><strong>后台独立运行</strong><span>关闭页面不停止后台同步，重开页面后读取最新数据。</span></li><li><strong>查询能力以后台为准</strong><span id="diagnostic-query-note">连接后核实自动查询和随机延迟能力。模型唤醒及提示词配置尚未接入。</span></li></ul></section></div></section>
+    <footer class="page-footer"><span>窗口助手 V2 · 真实后台数据</span><span>额度查询与模型请求分离</span></footer>
+  </main>
+  <script src="panel.js"></script>
+</body>
+</html>

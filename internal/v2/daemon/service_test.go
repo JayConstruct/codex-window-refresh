@@ -10,11 +10,101 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"codex-window-refresh/internal/v2/store"
 )
+
+type dashboardSource struct {
+	accountCalls atomic.Int32
+	queryCalls   atomic.Int32
+}
+
+func (source *dashboardSource) Accounts(context.Context) ([]store.Account, error) {
+	source.accountCalls.Add(1)
+	return nil, errors.New("unexpected_accounts_call")
+}
+
+func (source *dashboardSource) Query(context.Context, store.Account) (json.RawMessage, error) {
+	source.queryCalls.Add(1)
+	return nil, errors.New("unexpected_quota_call")
+}
+
+func TestDashboardAndSyncAreBoundedReadOnlyAndNeverQueryUpstream(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	source := &dashboardSource{}
+	var syncRequests atomic.Int32
+	service, err := New(st, source, Options{QueryConcurrency: 2, QueryTimeout: time.Second, RequestInventorySync: func() bool {
+		syncRequests.Add(1)
+		return true
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err = st.SyncInventory(ctx, []store.Account{{ID: "Alpha", AuthIndex: "one", Status: "available"}, {ID: "Beta", AuthIndex: "two", Status: "disabled"}, {ID: "Other", Status: "binding_unavailable"}}); err != nil {
+		t.Fatal(err)
+	}
+	accepted(t, service, "Alpha", "durable-summary")
+	w := request(service, "GET", "/api/v2/overview", "", "")
+	var view struct {
+		Revision         uint64          `json:"view_revision"`
+		AccountsRevision uint64          `json:"accounts_revision"`
+		ReadOnly         bool            `json:"read_only"`
+		Dashboard        store.Dashboard `json:"dashboard"`
+		Capabilities     map[string]bool `json:"capabilities"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &view) != nil || !view.ReadOnly || view.Capabilities["model_execution"] || !view.Capabilities["inventory_sync"] || view.Dashboard.Total != 3 || view.Dashboard.Available != 1 || view.Dashboard.Disabled != 1 || view.Dashboard.Unavailable != 1 || view.Dashboard.Tasks.Active != 1 || view.Revision != view.Dashboard.Revision || view.AccountsRevision != view.Dashboard.AccountsRevision || len(view.Dashboard.ActiveJobs) != 1 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	w = request(service, "GET", "/api/v2/accounts?limit=6&search=ALP&status=available", "", "")
+	var page store.AccountPage
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &page) != nil || len(page.Accounts) != 1 || page.Accounts[0].ID != "Alpha" || page.Total != 3 || page.FilterTotal != 1 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	w = request(service, "GET", "/api/v2/jobs?limit=1", "", "")
+	var list struct {
+		Revision uint64             `json:"view_revision"`
+		Jobs     []store.JobSummary `json:"jobs"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &list) != nil || len(list.Jobs) != 1 || strings.Contains(w.Body.String(), "\"items\"") || list.Revision != view.Revision {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	for _, path := range []string{"/api/v2/jobs?limit=101", "/api/v2/jobs?limit=0", "/api/v2/jobs?limit=oops", "/api/v2/accounts?status=running", "/api/v2/accounts?search=" + strings.Repeat("x", 257)} {
+		if w = request(service, "GET", path, "", ""); w.Code != 400 {
+			t.Fatal("invalid filter accepted", path, w.Code, w.Body.String())
+		}
+	}
+	if w = request(service, "POST", "/api/v2/sync", "", ""); w.Code != 202 || !strings.Contains(w.Body.String(), `"status":"queued"`) || syncRequests.Load() != 1 {
+		t.Fatal(w.Code, w.Body.String(), syncRequests.Load())
+	}
+	if source.accountCalls.Load() != 0 || source.queryCalls.Load() != 0 {
+		t.Fatal("control API performed upstream or inventory work synchronously")
+	}
+}
+
+func TestSyncRejectsUnsupportedOrUnavailableConsumer(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	for _, callback := range []func() bool{nil, func() bool { return false }} {
+		service, err := New(st, failedSource{}, Options{QueryConcurrency: 1, QueryTimeout: time.Second, RequestInventorySync: callback})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := request(service, "POST", "/api/v2/sync", "", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "inventory_sync_unavailable") {
+			t.Fatal("unsupported source pretended to sync", w.Code, w.Body.String())
+		}
+	}
+}
 
 type slowSource struct {
 	entered chan struct{}
@@ -141,6 +231,14 @@ func TestAccountAPIRequiresConsistentPaginationAndReportsActivityScope(t *testin
 		t.Fatal(err)
 	}
 	defer st.Close()
+	settings, err := st.QuerySettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings.Config.Delay.Min, settings.Config.Delay.Max = 0, 0
+	if _, err = st.SaveQuerySettings(context.Background(), settings.Revision, settings.Config); err != nil {
+		t.Fatal(err)
+	}
 	s, _ := New(st, failedSource{}, Options{QueryConcurrency: 8, QueryTimeout: time.Second})
 	id := accepted(t, s, "", "pages")
 	j, _ := st.Job(context.Background(), id)
