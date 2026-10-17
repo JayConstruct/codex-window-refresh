@@ -46,6 +46,21 @@ type authEntry struct {
 	RuntimeOnly bool   `json:"runtime_only"`
 }
 
+func accountStatus(entry authEntry) string {
+	if entry.Disabled || entry.Status == "disabled" {
+		return "disabled"
+	}
+	if entry.Unavailable {
+		return "unavailable"
+	}
+	switch entry.Status {
+	case "", "active":
+		return "available"
+	default:
+		return "unavailable"
+	}
+}
+
 func (c *CPA) Accounts(ctx context.Context) ([]store.Account, error) {
 	var list struct {
 		Files []authEntry `json:"files"`
@@ -79,12 +94,7 @@ func (c *CPA) Accounts(ctx context.Context) ([]store.Account, error) {
 			continue
 		}
 		seen[a.ID] = true
-		status := "available"
-		if a.Disabled {
-			status = "disabled"
-		} else if a.Unavailable {
-			status = "unavailable"
-		}
+		status := accountStatus(a)
 		if a.Index == "" || a.RuntimeOnly || counts[a.ID] > 1 || indexes[a.Index] > 1 {
 			status = "binding_unavailable"
 			a.Index = ""
@@ -103,6 +113,7 @@ type credential struct {
 	ProxyCamel string `json:"proxyUrl"`
 	ProxyDash  string `json:"proxy-url"`
 	ProxyUpper string `json:"proxyURL"`
+	status     string
 }
 
 func (c *CPA) binding(ctx context.Context, a store.Account) (credential, error) {
@@ -127,10 +138,11 @@ func (c *CPA) readBindingFor(ctx context.Context, a store.Account, requireAvaila
 		return credential{}, err
 	}
 	r := runtime.Auth
-	if requireAvailable && (r.Disabled || r.Status == "disabled") {
+	status := accountStatus(r)
+	if requireAvailable && status == "disabled" {
 		return credential{}, errors.New("account_disabled")
 	}
-	if requireAvailable && (r.Unavailable || r.Status == "unavailable") {
+	if requireAvailable && status != "available" {
 		return credential{}, errors.New("account_identity_unavailable")
 	}
 	if r.ID != a.ID || r.Index != a.AuthIndex || r.RuntimeOnly || (r.Provider != "codex" && !(r.Provider == "" && r.Type == "codex")) {
@@ -152,6 +164,9 @@ func (c *CPA) readBindingFor(ctx context.Context, a store.Account, requireAvaila
 		cred.Token = cred.Fallback
 	}
 	cred.Fallback = ""
+	if r.Status != "" || r.Disabled || r.Unavailable {
+		cred.status = status
+	}
 	return cred, nil
 }
 
@@ -168,6 +183,9 @@ func (c *CPA) Identity(ctx context.Context, a store.Account) (store.Account, err
 		return a, err
 	}
 	a.Binding = bindingID(a, cred.Upstream)
+	if cred.status != "" && a.Status != "binding_unavailable" {
+		a.Status = cred.status
+	}
 	return a, nil
 }
 func (c *CPA) client(cred credential) (*http.Client, error) {

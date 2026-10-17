@@ -15,6 +15,8 @@ import (
 	"codex-window-refresh/internal/v2/store"
 )
 
+const wakeInstructions = "You are a concise coding assistant. Answer the user's request directly. No tools, file access, or command execution are available; do not claim otherwise."
+
 func (c *CPA) WakeAvailable() bool {
 	if c.Host == nil {
 		return false
@@ -53,6 +55,7 @@ func (c *CPA) ExecuteWake(ctx context.Context, account store.Account, model, pro
 	}
 	payload := map[string]any{
 		"model": model, "stream": true, "store": false,
+		"instructions": wakeInstructions, "tool_choice": "none",
 		"input": []any{map[string]any{"role": "user", "content": []any{map[string]string{"type": "input_text", "text": prompt}}}},
 	}
 	var buffer bytes.Buffer

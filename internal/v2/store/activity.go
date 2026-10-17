@@ -55,6 +55,7 @@ func (s *Store) EventCursor(ctx context.Context) (EventCursor, error) {
 }
 func (s *Store) Overview(ctx context.Context) (Overview, error) {
 	var o Overview
+	o.Inventory.RefreshIntervalSeconds = int(InventoryRefreshInterval / time.Second)
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return o, err

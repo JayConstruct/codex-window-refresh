@@ -361,7 +361,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch status {
-		case "", "all", "available", "disabled", "unavailable", "attention":
+		case "", "all", "available", "disabled", "unavailable", "attention", "quota_exhausted", "quota_restricted":
 		default:
 			apiError(w, 400, "invalid_status")
 			return

@@ -14,7 +14,7 @@ const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-pr
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], reads = [], exceptions = [], pageErrors = [];
 const jobs = new Map();
-let accountReadGate, settingsPostGate, settingsReadGate;
+let accountReadGate, settingsPostGate, settingsReadGate, modelReadGate, wakeReadGate;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
@@ -46,6 +46,11 @@ const fixtureJobs = [
 accounts[0].pending_query = {phase: 'queued', scheduled_at: later(90), trigger: 'manual_batch', job_id: 'fixture-bulk', hold_reason: ''};
 for (const job of fixtureJobs) jobs.set(job.id, {...job, job_id: job.id, items: (job.target ? accounts.filter(account => account.id === job.target) : accounts).map((account, index) => ({account_id: account.id, phase: index < job.querying ? 'running' : 'queued', scheduled_at: job.scheduled_at, trigger: job.trigger, hold_reason: job.hold_reason || ''}))});
 const identity = () => ({instance_id: 'local-browser-fixture', view_revision: revision});
+function accountDisplayStatus(account) {
+  if (account.status !== 'available') return account.status;
+  if (['five_hour', 'weekly'].some(name => account.quota?.[name]?.Remaining?.Value === 0)) return 'quota_exhausted';
+  return account.quota?.permission === 'blocked' ? 'quota_restricted' : 'available';
+}
 const settings = () => ({...identity(), revision: settingsRevision, config: queryConfig});
 const modelSettings = () => ({...identity(), revision: modelRevision, config: modelConfig});
 function json(response, status, body) {
@@ -79,6 +84,15 @@ try {
         response.writeHead(200, {'Content-Type': name === 'status' ? 'text/html; charset=utf-8' : name.endsWith('.js') ? 'text/javascript' : 'text/css',
           'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"});
         response.end(await readFile(join(root, 'internal/v2/daemon/web', filenames[name]))); return;
+      }
+      if (url.pathname === '/cpa/v0/management/auth-files' || url.pathname === '/cpa/v0/management/auth-files/models') {
+        if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
+        assert.equal(request.method, 'GET'); reads.push(url.pathname + url.search);
+        if (url.pathname.endsWith('/models')) {
+          assert.equal(url.searchParams.get('name'), 'codex-01');
+          json(response, 200, {models: [{id: 'fixture-codex-catalog'}, {id: 'fixture-codex-other'}]});
+        } else json(response, 200, {files: [{id: 'codex-01', name: 'codex-01.json', provider: 'codex', auth_index: 'fixture-index', disabled: false}]});
+        return;
       }
       if (!url.pathname.startsWith(api)) { response.writeHead(404); response.end(); return; }
       if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
@@ -152,7 +166,10 @@ try {
         json(response, 202, {job_id: id, instance_id: 'local-browser-fixture'}); return;
       }
       reads.push(request.url);
-      if (resource === 'wake-settings') { json(response, 200, {...identity(), revision: wakeRevision, config: wakeConfig}); return; }
+      if (resource === 'wake-settings') {
+        if (wakeReadGate) { wakeReadGate.started = true; await wakeReadGate.promise; }
+        json(response, 200, {...identity(), revision: wakeRevision, config: wakeConfig}); return;
+      }
       if (resource === 'wake-jobs') {
         const id = url.searchParams.get('job_id');
         if (!id) { assert.equal(url.searchParams.get('limit'), '20'); json(response, 200, {...identity(), jobs: [...wakeJobs.values()]}); return; }
@@ -161,7 +178,10 @@ try {
         json(response, 200, {...identity(), ...job}); return;
       }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
-      if (resource === 'model-settings') { json(response, 200, modelSettings()); return; }
+      if (resource === 'model-settings') {
+        if (modelReadGate) { modelReadGate.started = true; await modelReadGate.promise; }
+        json(response, 200, modelSettings()); return;
+      }
       if (resource === 'prompt-generations') {
         const job = generations.get(url.searchParams.get('job_id'));
         if (!job) { json(response, 404, {error: 'not_found'}); return; }
@@ -184,7 +204,7 @@ try {
         if (accountReadGate) { accountReadGate.started = true; await accountReadGate.promise; }
         if (url.searchParams.has('after') && Number(url.searchParams.get('revision')) !== accountsRevision) { json(response, 409, {error: 'view_changed'}); return; }
         const search = (url.searchParams.get('search') || '').toLowerCase(), status = url.searchParams.get('status') || 'all';
-        const filtered = accounts.filter(account => account.id.toLowerCase().includes(search) && (status === 'all' || status === account.status || status === 'attention' && (account.status === 'unavailable' || account.quota?.permission === 'blocked')));
+        const filtered = accounts.filter(account => account.id.toLowerCase().includes(search) && (status === 'all' || status === accountDisplayStatus(account) || status === 'attention' && !['available', 'disabled'].includes(accountDisplayStatus(account))));
         const page = filtered.filter(account => account.id > (url.searchParams.get('after') || '')).slice(0, Number(url.searchParams.get('limit') || 6));
         const last = page.at(-1)?.id, next = filtered.some(account => account.id > last) ? last : '';
         json(response, 200, {...identity(), accounts_revision: accountsRevision, accounts: page, next_after: next, total: 24, filter_total: filtered.length}); return;
@@ -203,7 +223,11 @@ try {
     if (browser.exitCode !== null || browser.signalCode !== null) throw new Error('Chromium exited: ' + log);
     try { port = (await readFile(join(temporary, 'DevToolsActivePort'), 'utf8')).split('\n')[0]; return !!port; } catch { return false; }
   }, 'Chromium did not start', 30000);
-  const target = (await (await fetch('http://127.0.0.1:' + port + '/json/list')).json()).find(target => target.type === 'page');
+  let target;
+  await waitFor(async () => {
+    target = (await (await fetch('http://127.0.0.1:' + port + '/json/list')).json()).find(target => target.type === 'page' && target.webSocketDebuggerUrl);
+    return !!target;
+  }, 'Chromium page target did not become ready', 30000);
   socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   let serial = 0;
@@ -523,9 +547,34 @@ try {
   await waitFor(() => evaluate('document.getElementById("accounts").rows.length===6'), 'Search did not reset');
   accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.querySelector("progress").value===11'), 'Background refresh not applied');
+  const writesBeforeStatus = posts.length;
+  accounts[0].status = 'disabled'; revision++; accountsRevision++;
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="已禁用"'), 'Periodic host state did not update disabled badge');
+  accounts[0].status = 'available'; accounts[0].quota.five_hour.Remaining.Value = 0; revision++; accountsRevision++;
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="额度耗尽"'), 'Quota evidence did not update exhausted badge');
+  await evaluate('document.getElementById("accounts-filter").value="quota_exhausted";document.getElementById("accounts-filter").dispatchEvent(new Event("change"))');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows.length===1 && document.getElementById("accounts").rows[0].textContent.includes("codex-01")'), 'Exhausted status filter did not select the depleted account');
+  accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
+  await waitFor(() => evaluate('document.getElementById("accounts").textContent.includes("没有符合条件的账号")'), 'Recovered quota remained in exhausted filter');
+  await evaluate('document.getElementById("accounts-filter").value="all";document.getElementById("accounts-filter").dispatchEvent(new Event("change"))');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge")?.textContent==="正常"'), 'Recovered quota did not restore normal badge');
+  assert.equal(posts.length, writesBeforeStatus, 'Status polling issued an upstream query or model write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 1, 'Overview or quota actions refreshed the generation directory');
   await evaluate('document.querySelector("[data-page=models]").click()');
   await waitFor(() => evaluate('!document.getElementById("model-fields").disabled'), 'Model settings did not load');
+  const beforeCatalog = posts.length;
+  await evaluate('document.getElementById("model-catalog-account").value="codex-01";document.getElementById("model-catalog-account").dispatchEvent(new Event("input"))');
+  await clickWhenEnabled('model-catalog-refresh');
+  await waitFor(() => evaluate('document.getElementById("wake-model-options").options.length===2'), 'CPA registered model suggestions did not load');
+  assert.equal(posts.length, beforeCatalog, 'Reading model catalog sent a write');
+  assert.equal(await evaluate('document.getElementById("model-default").value'), '', 'Catalog automatically picked a wake model');
+  modelReadGate = gate();
+  await evaluate('const prompt=document.getElementById("model-default-prompt");prompt.focus();prompt.setSelectionRange(2,5);document.getElementById("refresh").click()');
+  await waitFor(() => modelReadGate.started, 'Model background read did not start');
+  assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("model-default-prompt").selectionStart,document.getElementById("model-default-prompt").selectionEnd,document.getElementById("model-fields").disabled]'), ['model-default-prompt', 2, 5, false], 'Background model poll stole focus or cursor');
+  modelReadGate.release(); modelReadGate = undefined;
+  await waitFor(() => evaluate('!document.getElementById("sync").disabled'), 'Model poll did not finish');
+  assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("model-default-prompt").selectionStart,document.getElementById("model-default-prompt").selectionEnd]'), ['model-default-prompt', 2, 5], 'Completed unchanged model poll reset the cursor');
   await waitFor(() => evaluate('document.getElementById("generation-account-options").options.length===3'), 'Generation directory did not load');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 1, 'Opening models fetched the directory more than once');
   assert.equal(await evaluate('document.getElementById("generation-account").value'), '', 'Directory silently selected an account');
@@ -606,6 +655,11 @@ try {
   await waitFor(() => evaluate('!document.getElementById("auto-wake").disabled'), 'Wake capability did not enable overview controls');
   await evaluate('document.querySelector("[data-page=wake]").click()');
   await waitFor(() => evaluate('!document.getElementById("wake-settings-fields").disabled'), 'Wake settings did not load');
+  wakeReadGate = gate();
+  await evaluate('const input=document.getElementById("wake-per-user");input.focus();document.getElementById("refresh").click()');
+  await waitFor(() => wakeReadGate.started, 'Wake background read did not start');
+  assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("wake-settings-fields").disabled]'), ['wake-per-user', false], 'Wake polling disabled the focused input');
+  wakeReadGate.release(); wakeReadGate = undefined;
   assert.equal(posts.length, beforeWakeReads, 'Wake opening or reads dispatched a write');
   assert.equal(await evaluate('document.getElementById("wake-enabled").checked'), false, 'Automatic wake was not off by default');
   assert.equal(await evaluate('document.getElementById("wake-manual-submit").disabled'), true, 'Manual wake lacked spend consent');
@@ -693,6 +747,8 @@ try {
   accountReadGate?.release();
   settingsPostGate?.release();
   settingsReadGate?.release();
+  modelReadGate?.release();
+  wakeReadGate?.release();
   if (socket) socket.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) {
     browser.kill('SIGTERM');

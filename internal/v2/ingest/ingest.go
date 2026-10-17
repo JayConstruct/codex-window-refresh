@@ -135,7 +135,7 @@ func (c *Consumer) inventoryLoop(ctx context.Context) {
 		if err == nil && !hello.PassiveQuota {
 			err = &protocolError{}
 		}
-		if err == nil && (requested || hello.Instance != c.inventoryInstance || time.Since(c.lastInventory) >= 30*time.Second) {
+		if err == nil && (requested || hello.Instance != c.inventoryInstance || time.Since(c.lastInventory) >= store.InventoryRefreshInterval) {
 			err = c.syncInventory(refresh, hello.Instance)
 			if err == nil {
 				requested = false

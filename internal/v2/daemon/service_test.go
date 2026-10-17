@@ -68,6 +68,15 @@ func TestDashboardAndSyncAreBoundedReadOnlyAndNeverQueryUpstream(t *testing.T) {
 	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &page) != nil || len(page.Accounts) != 1 || page.Accounts[0].ID != "Alpha" || page.Total != 3 || page.FilterTotal != 1 {
 		t.Fatal(w.Code, w.Body.String())
 	}
+	if page.Accounts[0].DisplayStatus != "available" || page.Accounts[0].StatusObservedAt == "" {
+		t.Fatal("account status projection omitted", page)
+	}
+	for _, status := range []string{"quota_exhausted", "quota_restricted"} {
+		w = request(service, "GET", "/api/v2/accounts?status="+status, "", "")
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &page) != nil || page.FilterTotal != 0 {
+			t.Fatal("quota status filter rejected or guessed exhaustion", status, w.Code, w.Body.String())
+		}
+	}
 	w = request(service, "GET", "/api/v2/jobs?limit=1", "", "")
 	var list struct {
 		Revision uint64             `json:"view_revision"`

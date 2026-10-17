@@ -31,16 +31,17 @@ const (
 // Inactive requires adapter-specific positive evidence; zero usage alone is not
 // sufficient. CycleID is a durable local identifier, not a raw reset timestamp.
 type WindowEvidence struct {
-	Kind           WindowKind
-	State          WindowState
-	CycleID        string
-	ResetAt        time.Time
-	Remaining      *QuotaAmount
-	ConfirmedAt    time.Time
-	Source         string
-	OperationID    OperationID
-	ReadStartedSeq uint64
-	AcceptedSeq    uint64
+	Kind              WindowKind
+	State             WindowState
+	CycleID           string
+	ResetAt           time.Time
+	ResetAfterSeconds *int64 `json:",omitempty"`
+	Remaining         *QuotaAmount
+	ConfirmedAt       time.Time
+	Source            string
+	OperationID       OperationID
+	ReadStartedSeq    uint64
+	AcceptedSeq       uint64
 }
 
 // Units remain as reported by the upstream (percent, tokens, etc.).

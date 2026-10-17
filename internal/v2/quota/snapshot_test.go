@@ -38,6 +38,9 @@ func TestPartialEvidenceAndSlowQueryKeepFieldBoundaries(t *testing.T) {
 	if s.Fields["weekly"].ObservedAt.Equal(s.Fields["five_hour"].ObservedAt) {
 		t.Fatal("absent field gained freshness")
 	}
+	if s.FiveHour.ResetAfterSeconds == nil || *s.FiveHour.ResetAfterSeconds != 2900 || s.Weekly.ResetAfterSeconds == nil || *s.Weekly.ResetAfterSeconds != 30000 {
+		t.Fatal("reported countdown did not survive normalization and field merge")
+	}
 	repeated, changed, err := Merge(final, partial)
 	if err != nil || changed || string(repeated) != string(final) {
 		t.Fatal("replayed event changed evidence")

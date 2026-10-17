@@ -36,14 +36,16 @@ var ErrJobExpired = errors.New("job_expired")
 const MaxPendingItems = 4096
 
 type Account struct {
-	ID           string          `json:"id"`
-	Provider     string          `json:"provider,omitempty"`
-	AuthIndex    string          `json:"-"`
-	Binding      string          `json:"-"`
-	Status       string          `json:"status"`
-	Quota        json.RawMessage `json:"quota,omitempty"`
-	ObservedAt   string          `json:"observed_at,omitempty"`
-	PendingQuery *PendingQuery   `json:"pending_query,omitempty"`
+	ID               string          `json:"id"`
+	Provider         string          `json:"provider,omitempty"`
+	AuthIndex        string          `json:"-"`
+	Binding          string          `json:"-"`
+	Status           string          `json:"status"`
+	DisplayStatus    string          `json:"display_status,omitempty"`
+	StatusObservedAt string          `json:"status_observed_at,omitempty"`
+	Quota            json.RawMessage `json:"quota,omitempty"`
+	ObservedAt       string          `json:"observed_at,omitempty"`
+	PendingQuery     *PendingQuery   `json:"pending_query,omitempty"`
 }
 type Item struct {
 	AccountID   string `json:"account_id"`

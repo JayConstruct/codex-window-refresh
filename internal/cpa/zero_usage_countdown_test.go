@@ -41,3 +41,30 @@ func TestZeroUsageFiveHourCountdownRecognizesActivation(t *testing.T) {
 		}
 	}
 }
+
+func TestQuotaPreservesReportedCountdown(t *testing.T) {
+	at := time.Unix(1800000000, 750000000).UTC()
+	for _, minutes := range []int{300, 10080} {
+		full := int64(minutes * 60)
+		for _, seconds := range []int64{0, 1, full - 1, full, full + 1} {
+			t.Run(fmt.Sprintf("%d/%d", minutes, seconds), func(t *testing.T) {
+				reset := at.Unix() + seconds
+				if seconds == full {
+					reset--
+				}
+				raw := []byte(fmt.Sprintf(`{"rate_limit":{"primary_window":{"used_percent":0,"window_minutes":%d,"reset_at":%d,"reset_after_seconds":%d}}}`, minutes, reset, seconds))
+				observation, err := ParseQuota(raw, core.QuotaRead{}, at, core.ObservationQuery, core.AccountState{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				window := observation.FiveHour
+				if minutes == 10080 {
+					window = observation.Weekly
+				}
+				if window == nil || window.ResetAfterSeconds == nil || *window.ResetAfterSeconds != seconds || window.ResetAt.Unix() != reset {
+					t.Fatalf("reported countdown lost: %+v", window)
+				}
+			})
+		}
+	}
+}

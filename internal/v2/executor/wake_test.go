@@ -112,7 +112,7 @@ func TestWakeCapabilityIsCachedIndependentAndFailClosed(t *testing.T) {
 	}
 }
 
-func TestWakePinsCodexWithOnlyExactPromptAndDiscardsOutput(t *testing.T) {
+func TestWakePinsCodexWithExactUserPromptAndDiscardsOutput(t *testing.T) {
 	cpa, host, account := wakeFixture()
 	prompt := "用一句话回复 <你好> & 欢迎。\n保持简短。"
 	if err := cpa.ExecuteWake(context.Background(), account, "gpt-fixture", prompt); err != nil {
@@ -123,8 +123,12 @@ func TestWakePinsCodexWithOnlyExactPromptAndDiscardsOutput(t *testing.T) {
 		t.Fatalf("unsafe request=%+v model=%d read=%d close=%d", request, host.executes, host.reads, host.closes)
 	}
 	var body map[string]json.RawMessage
-	if json.Unmarshal(host.requestBody, &body) != nil || len(body) != 4 || string(body["stream"]) != "true" || string(body["store"]) != "false" || string(body["model"]) != `"gpt-fixture"` {
+	if json.Unmarshal(host.requestBody, &body) != nil || len(body) != 6 || string(body["stream"]) != "true" || string(body["store"]) != "false" || string(body["model"]) != `"gpt-fixture"` || string(body["tool_choice"]) != `"none"` {
 		t.Fatalf("unexpected body=%s", host.requestBody)
+	}
+	var instructions string
+	if json.Unmarshal(body["instructions"], &instructions) != nil || instructions != wakeInstructions {
+		t.Fatalf("missing coding-assistant instructions: %s", body["instructions"])
 	}
 	var input []struct {
 		Role    string `json:"role"`

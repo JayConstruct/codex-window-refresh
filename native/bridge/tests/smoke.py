@@ -162,17 +162,18 @@ class NativeBridge(unittest.TestCase):
         spec.loader.exec_module(installer)
         self.start_daemon()
         self.wait_activity(0)
-        version = 'v' + self.rpc('bridge.hello')['result']['version']
+        version = (ROOT/'release/v2-version.txt').read_text().strip()
+        bridge_version = 'v' + self.rpc('bridge.hello')['result']['version']
         for omitted in ('Author', 'GitHubRepository'):
             broken = self.call('plugin.register', {'schema_version': 6})
             del broken['result']['metadata'][omitted]
             with self.cpa_resources(broken) as url:
                 # The original installer accepted both live sockets in this state.
                 with self.assertRaisesRegex(installer.InstallError, 'CPA 未注册'):
-                    installer.probe(self.runtime, version, os.getpid(), version,
+                    installer.probe(self.runtime, version, os.getpid(), bridge_version,
                                     url+'/v0/resource/plugins/codex-window-refresh/healthz')
         with self.cpa_resources() as url:
-            ready = installer.probe(self.runtime, version, os.getpid(), version,
+            ready = installer.probe(self.runtime, version, os.getpid(), bridge_version,
                                     url+'/v0/resource/plugins/codex-window-refresh/healthz')
             self.assertEqual(ready['version'], version)
             with contextlib.closing(http.client.HTTPConnection('127.0.0.1', int(url.rsplit(':', 1)[1]))) as conn:
@@ -1114,9 +1115,11 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(request['model'], saved['config']['default_model'])
         body = json.loads(base64.b64decode(request['body']))
         self.assertEqual(body, {'model': saved['config']['default_model'], 'stream': True, 'store': False,
+                               'instructions': "You are a concise coding assistant. Answer the user's request directly. No tools, file access, or command execution are available; do not claim otherwise.",
+                               'tool_choice': 'none',
                                'input': [{'role': 'user', 'content': [{'type': 'input_text',
                                           'text': saved['config']['default_prompt']}]}]})
-        self.assertNotIn('instructions', body)
+        self.assertNotIn('tools', body)
         status, replay = self.management('wake-jobs', 'POST', {'account_id': 'a'}, 'wake-exact-saved-prompt')
         self.assertEqual((status, replay['job_id']), (202, job_id))
         self.emit_wake_fixture_quota('wake-active-evidence', 3000)

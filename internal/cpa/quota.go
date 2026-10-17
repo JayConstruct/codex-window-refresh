@@ -194,6 +194,7 @@ func classifyWindow(w quotaWindow, read core.QuotaRead, at time.Time, class core
 		cycle = b.CycleID
 	}
 	evidence := &core.WindowEvidence{Kind: kind, State: state, CycleID: cycle, ResetAt: reset, Remaining: &core.QuotaAmount{Value: 100 - *w.UsedPercent, Unit: "percent"}, ConfirmedAt: at, Source: "cpa_wham_usage", ReadStartedSeq: read.ReadStartedSeq}
+	evidence.ResetAfterSeconds = after
 	if class == core.ObservationExecution {
 		evidence.Source = "cpa_execution_quota"
 	}

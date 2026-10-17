@@ -5,10 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"codex-window-refresh/internal/v2/events"
 	"codex-window-refresh/internal/v2/quota"
 )
+
+const InventoryRefreshInterval = 30 * time.Second
 
 func (s *Store) SyncInventory(ctx context.Context, accounts []Account) error {
 	if len(accounts) > 10000 {
@@ -50,9 +53,10 @@ func (s *Store) SyncInventory(ctx context.Context, accounts []Account) error {
 }
 
 type InventoryStatus struct {
-	Status        string `json:"status"`
-	ErrorCode     string `json:"error_code,omitempty"`
-	LastSuccessAt string `json:"last_success_at,omitempty"`
+	Status                 string `json:"status"`
+	ErrorCode              string `json:"error_code,omitempty"`
+	LastSuccessAt          string `json:"last_success_at,omitempty"`
+	RefreshIntervalSeconds int    `json:"refresh_interval_seconds"`
 }
 
 func (s *Store) InventoryFailed(ctx context.Context) error {

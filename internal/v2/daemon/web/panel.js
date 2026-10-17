@@ -135,14 +135,23 @@
     const window = quota?.[name], remaining = window?.Remaining, value = remaining?.Value;
     const percent = remaining?.Unit === 'percent' && typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
     const source = quota?.fields?.[name]?.source || window?.Source || quota?.source;
-    return {percent, amount: percent === null && remaining?.Unit !== 'percent' && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + ' ' + (remaining.Unit || '') : '', reset: resetText(window?.ResetAt, now), source: sourceText(source), observedAt: quota?.fields?.[name]?.observed_at || window?.ConfirmedAt || quota?.observed_at};
+    const observedAt = quota?.fields?.[name]?.observed_at || window?.ConfirmedAt || quota?.observed_at;
+    const seconds = Number.isSafeInteger(window?.ResetAfterSeconds) ? window.ResetAfterSeconds : Math.floor(timestamp(window?.ResetAt) / 1000) - Math.floor(timestamp(window?.ConfirmedAt || observedAt) / 1000);
+    const fullWindow = seconds === {five_hour: 18000, weekly: 604800}[name];
+    return {percent, amount: percent === null && remaining?.Unit !== 'percent' && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + ' ' + (remaining.Unit || '') : '', reset: fullWindow ? '' : resetText(window?.ResetAt, now), source: sourceText(source), observedAt};
   }
   function accountStatus(account) {
     if (account.status === 'disabled') return {label: '已禁用', kind: 'disabled'};
     if (account.status === 'removed') return {label: '已移除', kind: 'disabled'};
     if (account.status === 'binding_unavailable') return {label: '身份待核实', kind: 'unavailable'};
     if (account.status === 'unavailable') return {label: '暂不可用', kind: 'unavailable'};
-    if (account.quota?.permission === 'blocked') return {label: '额度受限', kind: 'attention'};
+    if (account.status !== 'available') return {label: '状态未知', kind: 'unavailable'};
+    const empty = ['five_hour', 'weekly'].some(name => {
+      const remaining = account.quota?.[name]?.Remaining;
+      return remaining?.Unit === 'percent' && remaining.Value === 0;
+    });
+    if (account.display_status === 'quota_exhausted' || empty) return {label: '额度耗尽', kind: 'attention'};
+    if (account.display_status === 'quota_restricted' || account.quota?.permission === 'blocked') return {label: '额度受限', kind: 'attention'};
     return {label: '正常', kind: 'available'};
   }
   const phaseNames = {queued: '等待查询', blocked: '等待 CPA', running: '查询中', completed: '查询完成', failed: '查询失败', cancelled: '已取消'};
@@ -236,6 +245,16 @@
     return {total: job.total ?? job.total_items ?? 0, completed: job.completed ?? job.completed_items ?? 0, failed: job.failed ?? job.failed_items ?? 0};
   }
   const modelDefaults = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
+  const codexPromptPreset = '请用一句话解释 Git 中 commit 和 push 的区别，不运行命令、不读取文件。';
+  function resolveModelAccount(data, id, provider) {
+    const invalid = () => { throw Object.assign(new Error('model_catalog_account_invalid'), {code: 'model_catalog_account_invalid'}); };
+    if (typeof id !== 'string' || !id.trim() || new TextEncoder().encode(id).length > 256 || /[\p{Cc}]/u.test(id) || !['codex', 'antigravity'].includes(provider) || !data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.files) || data.files.length > 10000 || data.files.some(account => !account || typeof account !== 'object' || Array.isArray(account))) return invalid();
+    const matches = data.files.filter(account => account?.id === id);
+    if (matches.length !== 1 || data.files.some(account => account?.id !== id && account?.name === id)) return invalid();
+    const account = matches[0];
+    if (account.provider !== provider || ['disabled', 'runtime_only'].some(name => account[name] !== undefined && account[name] !== false) || typeof account.auth_index !== 'string' || !account.auth_index.trim() || /[\p{Cc}]/u.test(account.auth_index)) return invalid();
+    return {id, provider, index: account.auth_index};
+  }
   function parseModelPhrases(text) {
     return text.split(/\r\n|\n|\r/).map(phrase => phrase.trim()).filter(Boolean);
   }
@@ -281,6 +300,7 @@
   if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText};
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {wakeDefaults, wakeConfigDraft, validateWakeDraft});
+  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
@@ -292,16 +312,19 @@
   let filterTimer, filterSequence = 0, updatingAccounts = false, syncing = false;
   let savedSettings = null, settingsBase = null, settingsLoading = false, settingsSaving = false, settingsConflict = false, activePage = 'overview';
   let settingsNeedsVerification = false, savingRule = null;
-  let modelBase = null, savedModelSettings = null, modelLoading = false, modelSaving = false, modelConflict = false, modelNeedsVerification = false, modelConfirmation = '';
+  let modelBase = null, savedModelSettings = null, modelLoading = false, modelPolling = false, modelSaving = false, modelConflict = false, modelNeedsVerification = false, modelConfirmation = '';
+  const modelCatalogs = {wake: {sequence: 0, loading: false}, generation: {sequence: 0, loading: false}};
+  let modelCatalogInstance = '';
   let generationIntent = null, generationTask = null, generationSubmitting = false, generationReading = false, generationUnconfirmed = false, generationUnknown = false;
   let generationCatalog = null, generationCatalogLoading = false, generationCatalogError = '', generationCatalogAttempt = '', generationCatalogSequence = 0, generationAccountIdentity = null;
-  let savedWakeSettings = null, wakeBase = null, wakeLoading = false, wakeSaving = false, wakeConflict = false, wakeNeedsVerification = false, wakeSettingsAttempt = '', wakeSavingEnabled = null;
+  let savedWakeSettings = null, wakeBase = null, wakeLoading = false, wakePolling = false, wakeSaving = false, wakeConflict = false, wakeNeedsVerification = false, wakeSettingsAttempt = '', wakeSavingEnabled = null;
   let wakeIntent = null, wakeTask = null, wakeSubmitting = false, wakeReading = false, wakeUnconfirmed = false, wakeUnknown = false, wakeJobsLoading = false, wakeJobs = [];
   const wakeFields = {enabled: 'wake-enabled', fiveHour: 'wake-five-hour', weekly: 'wake-weekly', timezone: 'wake-timezone', delayMin: 'wake-delay-min', delayMax: 'wake-delay-max', allowed: 'wake-allowed', perUser: 'wake-per-user', maximum: 'wake-max-accounts', daily: 'wake-daily', dailyWindow: 'wake-daily-window', dailyTarget: 'wake-daily-target'};
   const wakePhases = {queued: '等待执行', checking: '查询并核实额度', prepared: '已准备', sending: '正在发送模型请求', verifying: '核实执行结果', completed: '已完成', skipped: '已跳过', failed: '执行失败', unknown: '结果未知', cancelled: '已取消'};
   Object.assign(codes, {invalid_wake_request: '手动唤醒参数无效，请检查 Codex 账号 ID', wake_model_missing: '请先独立保存实际可用的唤醒模型，再确认执行'});
   const wakeReasons = {manual: '手动唤醒', manual_single: '手动唤醒', five_hour_reset: '五小时重置', weekly_reset: '周额度重置', startup: '启动分散唤醒', daily: '每日容量准备', daily_capacity: '每日容量准备'};
   Object.assign(codes, {wake_settings_unavailable: '后台未提供唤醒设置能力', wake_unavailable: '后台未提供模型唤醒能力', invalid_wake_settings: '唤醒设置无效，请检查字段', wake_settings_conflict: '唤醒设置已在后台变化，请重新读取核实', invalid_wake_job: '手动唤醒参数无效', wake_account_unavailable: '唤醒账号不可用或绑定已变化', wake_model_unavailable: '请先保存实际可用的唤醒模型', wake_outcome_unknown: '唤醒结果未知，可能已消耗额度，禁止重发', wake_interrupted: '唤醒被中断，请核实原任务，禁止重发', wake_request_rejected: '模型请求未被接受', wake_quota_unknown: '额度证据未知，跳过模型请求', wake_active_window: '账号已有活动窗口，无需重复唤醒'});
+  Object.assign(codes, {model_catalog_account_invalid: '账号身份、提供方或文件别名无法唯一核实，请刷新账号目录后重试', model_catalog_unavailable: 'CPA 未提供账号模型目录，可继续手动填写模型', model_catalog_changed: '账号目录或绑定已变化，请重新读取模型'});
   const generationSelected = new Set();
   const modelFields = {default_model: 'model-default', default_prompt: 'model-default-prompt', five_hour_model: 'model-five-hour', five_hour_prompt: 'model-five-hour-prompt', weekly_model: 'model-weekly', weekly_prompt: 'model-weekly-prompt', generation_prompt: 'generation-prompt', prompt_mode: 'model-prompt-mode', phrases: 'model-phrases'};
   codes.invalid_model_settings = '模型与提示词设置无效，请检查字段';
@@ -343,7 +366,7 @@
   function fillDraft(data) {
     const draft = configDraft(data.config);
     for (const [name, id] of Object.entries(settingsFields)) {
-      if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else $(id).value = draft[name];
+      if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else if ($(id).value !== draft[name]) $(id).value = draft[name];
     }
     settingsBase = data;
   }
@@ -473,7 +496,7 @@
   function fillWakeDraft(data) {
     const draft = wakeConfigDraft(data.config);
     for (const [name, id] of Object.entries(wakeFields)) {
-      if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else $(id).value = draft[name];
+      if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else if ($(id).value !== draft[name]) $(id).value = draft[name];
     }
     wakeBase = data; $('wake-settings-consent').checked = false;
   }
@@ -526,8 +549,10 @@
     renderManualWake();
   }
   async function reloadWakeSettings(discard = false, explicit = false) {
-    if (!connected || !wakeSettingsSupported() || wakeLoading || wakeSaving || wakeNeedsVerification && !explicit) return false;
-    const current = generation, sequence = views.begin('wake-settings'); wakeLoading = true; wakeSettingsAttempt = views.instance; renderWakeSettings();
+    if (!connected || !wakeSettingsSupported() || wakeLoading || wakePolling || wakeSaving || wakeNeedsVerification && !explicit) return false;
+    const current = generation, sequence = views.begin('wake-settings');
+    wakeLoading = discard || explicit || !wakeBase; wakePolling = !wakeLoading;
+    wakeSettingsAttempt = views.instance; renderWakeSettings();
     try {
       const data = await api('/wake-settings');
       if (current !== generation || !views.accept('wake-settings', sequence, data) || !applyWakeSettings(data, discard)) return false;
@@ -537,7 +562,7 @@
     } catch (error) {
       if (current === generation) { setText('wake-settings-message', '读取唤醒设置失败：' + message(error.code)); wakeOverviewMessage('读取唤醒设置失败：' + message(error.code)); }
       return false;
-    } finally { if (current === generation) { wakeLoading = false; renderWakeSettings(); } }
+    } finally { if (current === generation) { wakeLoading = false; wakePolling = false; renderWakeSettings(); } }
   }
   function ensureWakeSettings() { if (wakeSettingsSupported() && wakeSettingsAttempt !== views.instance) void reloadWakeSettings(); }
   async function saveWakeSettings(direct = false, checked = false) {
@@ -689,7 +714,7 @@
   function fillModelDraft(data) {
     const draft = modelConfigDraft(data.config);
     if ($('generation-prompt').value !== draft.generation_prompt) $('generation-consent').checked = false;
-    for (const [name, id] of Object.entries(modelFields)) $(id).value = draft[name];
+    for (const [name, id] of Object.entries(modelFields)) if ($(id).value !== draft[name]) $(id).value = draft[name];
     modelBase = data;
   }
   function applyModelSettings(data, discard = false) {
@@ -735,8 +760,9 @@
     renderGeneration();
   }
   async function reloadModelSettings(discard = false, explicit = false) {
-    if (!connected || !modelSupported() || modelLoading || modelSaving || modelNeedsVerification && !explicit) return false;
-    const current = generation, sequence = views.begin('model-settings'); modelLoading = true; renderModelSettings();
+    if (!connected || !modelSupported() || modelLoading || modelPolling || modelSaving || modelNeedsVerification && !explicit) return false;
+    const current = generation, sequence = views.begin('model-settings');
+    modelLoading = discard || explicit || !modelBase; modelPolling = !modelLoading; renderModelSettings();
     try {
       const data = await api('/model-settings');
       if (current !== generation || !views.accept('model-settings', sequence, data)) return false;
@@ -745,7 +771,7 @@
       if (explicit || !modelDirty()) setText('model-message', discard ? '已重新读取后台配置并丢弃草稿，未重复提交任何更改。' : '已读取配置；修改后请检查差异并明确保存。');
       return true;
     } catch (error) { if (current === generation) setText('model-message', '读取配置失败：' + message(error.code)); return false; }
-    finally { if (current === generation) { modelLoading = false; renderModelSettings(); } }
+    finally { if (current === generation) { modelLoading = false; modelPolling = false; renderModelSettings(); } }
   }
   async function saveModelSettings() {
     if (!connected || !modelSupported() || modelSaving || modelLoading || modelConflict || modelNeedsVerification || !modelDirty()) return;
@@ -804,6 +830,7 @@
   }
   async function reloadGenerationAccounts() {
     if (!connected || !generationCatalogSupported() || generationCatalogLoading) return;
+    clearModelCatalog('generation');
     const current = generation, instance = views.instance, sequence = ++generationCatalogSequence;
     generationCatalogLoading = true; generationCatalogAttempt = instance; generationCatalogError = ''; renderGeneration();
     try {
@@ -831,6 +858,70 @@
   }
   function ensureGenerationAccounts() {
     if (generationCatalogSupported() && generationCatalogAttempt !== views.instance) void reloadGenerationAccounts();
+  }
+  async function boundedManagementJSON(response) {
+    const invalid = () => Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+    if (!response.body?.getReader) {
+      const data = await response.json();
+      if (new TextEncoder().encode(JSON.stringify(data)).length > 4 * 1024 * 1024) throw invalid();
+      return data;
+    }
+    const reader = response.body.getReader(), decoder = new TextDecoder('utf-8', {fatal: true});
+    let size = 0, text = '';
+    try {
+      while (true) {
+        const result = await reader.read();
+        if (result.done) break;
+        size += result.value.byteLength;
+        if (size > 4 * 1024 * 1024) { await reader.cancel(); throw invalid(); }
+        text += decoder.decode(result.value, {stream: true});
+      }
+      return JSON.parse(text + decoder.decode());
+    } finally { reader.releaseLock(); }
+  }
+  function clearModelCatalog(kind) {
+    const state = modelCatalogs[kind]; state.sequence++; state.loading = false;
+    $(kind === 'wake' ? 'wake-model-options' : 'generation-model-options').replaceChildren();
+    setText(kind === 'wake' ? 'model-catalog-status' : 'generation-model-status', '按所选账号读取 CPA 已注册模型，不查询额度、不试发模型。');
+  }
+  function renderModelCatalogs() {
+    if (modelCatalogInstance !== views.instance) {
+      clearModelCatalog('wake'); clearModelCatalog('generation'); modelCatalogInstance = views.instance;
+    }
+    $('model-catalog-account').disabled = !connected || !modelSupported();
+    $('model-catalog-refresh').disabled = !connected || !modelSupported() || modelCatalogs.wake.loading;
+    $('generation-refresh-models').disabled = !connected || !generationSupported() || modelCatalogs.generation.loading || !generationAccountState().allowed;
+    $('model-codex-preset').disabled = $('model-fields').disabled;
+  }
+  async function reloadAccountModels(kind) {
+    const state = modelCatalogs[kind], target = kind === 'wake' ? 'model-catalog-account' : 'generation-account';
+    const status = kind === 'wake' ? 'model-catalog-status' : 'generation-model-status';
+    if (!connected || state.loading || kind === 'generation' && !generationAccountState().allowed) return;
+    clearModelCatalog(kind);
+    const id = $(target).value.trim(), provider = kind === 'wake' ? 'codex' : generationAccountState().provider;
+    const sequence = state.sequence, current = generation, instance = views.instance;
+    const currentRequest = () => current === generation && sequence === state.sequence && instance === views.instance && $(target).value.trim() === id && (kind === 'wake' || generationAccountState().provider === provider);
+    state.loading = true; renderModelCatalogs(); setText(status, '正在读取并核对 CPA 本地模型目录…');
+    try {
+      const before = resolveModelAccount(await api('/auth-files', {}, true), id, provider);
+      if (!currentRequest()) return;
+      const data = await api('/auth-files/models?name=' + encodeURIComponent(id), {}, true);
+      if (!currentRequest()) return;
+      if (!Array.isArray(data.models) || data.models.length > 2000) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      const models = [...new Set(data.models.map(model => {
+        if (typeof model?.id !== 'string' || !model.id || new TextEncoder().encode(model.id).length > 200 || /[\s\p{Cc}]/u.test(model.id)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+        return model.id;
+      }))];
+      const after = resolveModelAccount(await api('/auth-files', {}, true), id, provider);
+      if (!currentRequest()) return;
+      if (before.index !== after.index) throw Object.assign(new Error('model_catalog_changed'), {code: 'model_catalog_changed'});
+      $(kind === 'wake' ? 'wake-model-options' : 'generation-model-options').replaceChildren(...models.map(id => { const option = element('option'); option.value = id; return option; }));
+      setText(status, models.length ? '已读取 ' + models.length + ' 个 CPA 注册模型；请选择或手动填写，不自动保存，也不保证实时权限。' : '该账号暂无 CPA 注册模型，可手动填写已确认可用的模型；未试发请求。');
+    } catch (error) {
+      if (currentRequest()) setText(status, '读取模型失败：' + message(error.status === 404 ? 'model_catalog_unavailable' : error.code));
+    } finally {
+      if (current === generation && sequence === state.sequence) { state.loading = false; renderModelCatalogs(); }
+    }
   }
   function generationActive() { return ['queued', 'running'].includes(generationTask?.phase); }
   function renderGeneration() {
@@ -863,6 +954,7 @@
     });
     $('generation-select-all').disabled = !connected || !supported || !candidates.length;
     $('generation-apply').disabled = !connected || !supported || !modelSupported() || !modelBase || modelSaving || modelLoading || !generationSelected.size;
+    renderModelCatalogs();
   }
   function acceptGeneration(data, expectedID = '') {
     const phases = ['queued', 'running', 'completed', 'failed', 'unknown'];
@@ -943,6 +1035,7 @@
     renderSettings();
     renderModelSettings();
     renderGeneration();
+    renderModelCatalogs();
   }
   function stop() {
     generation++; connected = false; connecting = false; key = '';
@@ -951,14 +1044,15 @@
     controllers.clear(); queryBusy.clear(); pending.clear();
     refreshing = false; updatingAccounts = false; syncing = false; settingsLoading = false; settingsSaving = false; settingsNeedsVerification = false; savingRule = null;
     if (modelSaving) { modelConflict = true; modelNeedsVerification = true; }
-    modelLoading = false; modelSaving = false; modelConfirmation = '';
+    modelLoading = false; modelPolling = false; modelSaving = false; modelConfirmation = '';
     if (generationSubmitting && generationIntent) generationUnconfirmed = true;
     generationSubmitting = false; generationReading = false;
     if (wakeSaving) { wakeConflict = true; wakeNeedsVerification = true; }
     if (wakeSubmitting && wakeIntent) wakeUnconfirmed = true;
-    wakeLoading = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false; wakeSettingsAttempt = '';
+    wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false; wakeSettingsAttempt = '';
     $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false; $('wake-manual-consent').checked = false;
     generationCatalogSequence++; generationCatalog = null; generationCatalogLoading = false; generationCatalogError = ''; generationCatalogAttempt = '';
+    clearModelCatalog('wake'); clearModelCatalog('generation');
     $('generation-account-options').replaceChildren();
     ruleMessage('');
     $('login-section').hidden = false;
@@ -968,20 +1062,21 @@
     for (const button of document.querySelectorAll('.account-query')) button.disabled = true;
     for (const button of document.querySelectorAll('.task-open')) button.disabled = true;
   }
-  async function api(path, options = {}) {
+  async function api(path, options = {}, management = false) {
     if (!key) throw Object.assign(new Error('unauthorized'), {code: 'unauthorized'});
     const current = generation, controller = new AbortController();
     controllers.add(controller);
     let timedOut = false;
     const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 10000);
     try {
-      const response = await fetch(base + path, {...options, headers: {'Authorization': 'Bearer ' + key, 'Accept': 'application/json', ...(options.body ? {'Content-Type': 'application/json'} : {}), ...(options.headers || {})}, credentials: 'omit', redirect: 'error', cache: 'no-store', signal: controller.signal});
+      const endpoint = management ? base.slice(0, -'/codex-window-refresh/v2'.length) : base;
+      const response = await fetch(endpoint + path, {...options, headers: {'Authorization': 'Bearer ' + key, 'Accept': 'application/json', ...(options.body ? {'Content-Type': 'application/json'} : {}), ...(options.headers || {})}, credentials: 'omit', redirect: 'error', cache: 'no-store', signal: controller.signal});
       if (current !== generation) throw Object.assign(new Error('stale'), {code: 'stale'});
       if (response.status === 401 || response.status === 403) {
         stop(); setConnection('认证失效，请重新连接');
         throw Object.assign(new Error('unauthorized'), {code: 'unauthorized', status: response.status});
       }
-      const data = await response.json();
+      const data = management ? await boundedManagementJSON(response) : await response.json();
       if (current !== generation) throw Object.assign(new Error('stale'), {code: 'stale'});
       if (!response.ok) throw Object.assign(new Error('request_failed'), {code: typeof data?.error === 'string' && Object.hasOwn(codes, data.error) ? data.error : 'network', status: response.status});
       if (data === null || typeof data !== 'object' || Array.isArray(data)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
@@ -1004,11 +1099,15 @@
       line.append(progress, element('span', 'quota-percent', Number(view.percent.toFixed(1)) + '%')); cell.append(line);
     } else cell.append(element('span', 'quota-amount', view.amount || '—'));
     if (quota?.[name]) {
-      const reset = element('small', 'quota-reset', view.reset), source = element('small', 'quota-source sr-only', view.source + ' · ' + age(view.observedAt));
+      const source = element('small', 'quota-source sr-only', view.source + ' · ' + age(view.observedAt));
       cell.title = view.source + ' · ' + age(view.observedAt);
-      reset.dataset.resetAt = quota[name].ResetAt || '';
+      if (view.reset) {
+        const reset = element('small', 'quota-reset', view.reset);
+        reset.dataset.resetAt = quota[name].ResetAt || '';
+        cell.append(reset);
+      }
       source.dataset.observedAt = view.observedAt || ''; source.dataset.quotaSource = view.source;
-      cell.append(reset, source);
+      cell.append(source);
     } else cell.append(element('small', 'quota-reset', '尚无额度数据'));
     return cell;
   }
@@ -1019,6 +1118,7 @@
       name.append(element('strong', '', account.id));
       const status = element('td'), value = accountStatus(account);
       status.append(badge(value.label, value.kind));
+      status.title = (account.status_observed_at ? 'CPA 状态：' + age(account.status_observed_at) + '同步。' : '') + (value.kind === 'attention' ? '额度状态来自最近一次额度观测；重置或恢复需重新核实，不以本地倒计时自动恢复正常。' : '后台定时同步 CPA 账号状态。');
       const five = element('td'), weekly = element('td'), observed = element('td'), action = element('td');
       five.append(renderQuota(account.quota, 'five_hour')); weekly.append(renderQuota(account.quota, 'weekly'));
       const observedAge = element('span', 'observed-age', age(account.observed_at)); observedAge.dataset.observedAt = account.observed_at || '';
@@ -1124,14 +1224,14 @@
     setText('metric-status', ready ? '运行中' : connected ? '等待 CPA' : '未连接');
     setText('metric-status-detail', ready ? '后台独立运行' : connected ? '保留已保存数据' : '请连接管理接口');
     setText('metric-total', stats ? String(stats.total) : '—');
-    setText('metric-total-detail', stats ? stats.available + ' 正常 · ' + stats.disabled + ' 禁用 · ' + stats.unavailable + ' 暂不可用' : '等待同步账号');
+    setText('metric-total-detail', stats ? (stats.normal ?? stats.available) + ' 正常 · ' + stats.disabled + ' 禁用 · ' + (stats.quota_exhausted || 0) + ' 额度耗尽 · ' + (stats.quota_restricted || 0) + ' 额度受限 · ' + stats.unavailable + ' 暂不可用' : '等待同步账号');
     setText('metric-capacity', stats ? stats.capacity + ' / ' + stats.available : '— / —');
     setText('metric-capacity-detail', stats ? '已核实可用窗口 · ' + (stats.unknown_quota || 0) + ' 待核实' : '等待额度观测');
     setText('metric-errors', stats ? String(stats.errors + (data.last_error ? 1 : 0)) : '—');
     setText('metric-errors-detail', stats?.errors || data?.last_error ? '查看诊断详情' : stats ? '当前无已报告异常' : '等待后台数据');
     setText('last-updated', data?.inventory?.last_success_at ? age(data.inventory.last_success_at) + '同步 CPA' : '尚未同步 CPA');
     if (data) {
-      setText('inventory', ready ? '页面关闭后，后台仍持续同步 CPA 并保存正常业务中的额度信息。' : 'CPA 账号同步尚未就绪；后台会自动重试，保留已保存结果。');
+      setText('inventory', ready ? '账号状态每 ' + (data.inventory.refresh_interval_seconds || 30) + ' 秒同步 CPA；页面关闭后继续。额度耗尽由最近额度观测核实，查询仍按已保存规则执行。' : 'CPA 账号同步尚未就绪；后台会自动重试，保留已保存结果。');
       const automatic = data.capabilities?.automatic_quota_query === true, randomized = data.capabilities?.randomized_quota_query === true;
       setText('feature-note', (automatic ? '查询开关即改即存。' : '自动查询尚未接入。') + (automaticWakeSupported() ? '自动唤醒开关直接保存；开启前须确认模型额度消耗。详细规则在唤醒页独立保存。' : '当前后台尚未提供自动模型唤醒。'));
       setText('account-query-note', randomized ? '单账号立即查询 · 批量按账号随机延迟，后台持久排队' : '单账号立即查询 · 批量查询由后台执行');
@@ -1145,6 +1245,7 @@
     const rows = [
       ['后台版本', data?.version || '尚未连接'], ['后台实例', data?.instance_id || '—'],
       ['CPA 账号同步', inventory?.status === 'ready' ? '已连接' : '等待同步'],
+      ['账号状态同步间隔', inventory?.refresh_interval_seconds ? inventory.refresh_interval_seconds + ' 秒（页面关闭后继续）' : '连接后核实'],
       ['CPA 接入连接', data?.activity?.connected ? '已连接' : '等待连接'],
       ['最近成功同步', inventory?.last_success_at ? new Date(inventory.last_success_at).toLocaleString('zh-CN', {hour12: false}) : '—'],
       ['额度查询并发', data?.query_concurrency ? String(data.query_concurrency) : '—'],
@@ -1378,6 +1479,14 @@
   $('rules-reload').onclick = () => reloadSettings();
   $('model-settings-form').onsubmit = event => { event.preventDefault(); return saveModelSettings(); };
   $('model-reload').onclick = () => reloadModelSettings(true, true);
+  $('model-catalog-refresh').onclick = () => reloadAccountModels('wake');
+  $('generation-refresh-models').onclick = () => reloadAccountModels('generation');
+  $('model-catalog-account').oninput = () => { clearModelCatalog('wake'); renderModelCatalogs(); };
+  $('model-codex-preset').onclick = () => {
+    if ($('model-fields').disabled) return;
+    $('model-default-prompt').value = codexPromptPreset; modelDraftChanged();
+    setText('model-message', '已填入 Codex 风格编程短问句，仅修改草稿；保存后才用于唤醒，不读取文件或运行命令。');
+  };
   for (const id of Object.values(modelFields)) $(id).addEventListener('input', () => {
     if (id === 'generation-prompt') {
       if ($('generation-prompt').disabled) return;
@@ -1425,6 +1534,7 @@
   $('generation-refresh-accounts').onclick = reloadGenerationAccounts;
   $('generation-account').oninput = () => {
     if ($('generation-fields').disabled) return;
+    clearModelCatalog('generation');
     const id = $('generation-account').value.trim(), selected = generationCatalog?.accounts.find(account => account.id === id);
     if (selected?.provider === 'antigravity' && generationAccountIdentity?.provider !== 'antigravity' || selected && generationAccountIdentity && selected.provider !== generationAccountIdentity.provider) $('generation-model').value = '';
     if (selected) generationAccountIdentity = {id: selected.id, provider: selected.provider};

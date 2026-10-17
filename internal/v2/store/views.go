@@ -8,6 +8,13 @@ import (
 	"strings"
 )
 
+const accountDisplayStatusSQL = `CASE WHEN status!='available' THEN status
+ WHEN json_valid(quota) THEN CASE WHEN
+ (json_type(quota,'$.five_hour.Remaining.Value') IN ('integer','real') AND json_extract(quota,'$.five_hour.Remaining.Value')=0 AND json_extract(quota,'$.five_hour.Remaining.Unit')='percent') OR
+ (json_type(quota,'$.weekly.Remaining.Value') IN ('integer','real') AND json_extract(quota,'$.weekly.Remaining.Value')=0 AND json_extract(quota,'$.weekly.Remaining.Unit')='percent')
+ THEN 'quota_exhausted' WHEN json_extract(quota,'$.permission')='blocked' THEN 'quota_restricted' ELSE 'available' END
+ ELSE 'available' END`
+
 type AccountPage struct {
 	InstanceID       string    `json:"instance_id,omitempty"`
 	Revision         uint64    `json:"view_revision"`
@@ -31,12 +38,14 @@ func (s *Store) AccountPageFiltered(ctx context.Context, after string, limit int
 	filter := "status!='removed' AND instr(lower(id),lower(?))>0"
 	switch status {
 	case "", "all":
-	case "available", "disabled":
-		filter += " AND status='" + status + "'"
+	case "disabled":
+		filter += " AND status='disabled'"
+	case "available", "quota_exhausted", "quota_restricted":
+		filter += " AND (" + accountDisplayStatusSQL + ")='" + status + "'"
 	case "unavailable":
 		filter += " AND status NOT IN ('available','disabled')"
 	case "attention":
-		filter += " AND (status NOT IN ('available','disabled') OR CASE WHEN json_valid(quota) THEN json_extract(quota,'$.permission')='blocked' ELSE 0 END)"
+		filter += " AND (" + accountDisplayStatusSQL + ") NOT IN ('available','disabled')"
 	default:
 		return page, errors.New("invalid_account_filter")
 	}
@@ -63,7 +72,7 @@ func (s *Store) AccountPageFiltered(ctx context.Context, after string, limit int
 	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM accounts WHERE "+filter+" AND id<=?", search, after).Scan(&page.Offset); err != nil {
 		return page, err
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT id,auth_index,status,COALESCE(quota,''),COALESCE(observed_at,'') FROM accounts WHERE "+filter+" AND id>? ORDER BY id LIMIT ?", search, after, limit+1)
+	rows, err := tx.QueryContext(ctx, "SELECT id,auth_index,status,"+accountDisplayStatusSQL+",updated_at,COALESCE(quota,''),COALESCE(observed_at,'') FROM accounts WHERE "+filter+" AND id>? ORDER BY id LIMIT ?", search, after, limit+1)
 	if err != nil {
 		return page, err
 	}
@@ -71,7 +80,7 @@ func (s *Store) AccountPageFiltered(ctx context.Context, after string, limit int
 	for rows.Next() {
 		var a Account
 		var quota string
-		if err = rows.Scan(&a.ID, &a.AuthIndex, &a.Status, &quota, &a.ObservedAt); err != nil {
+		if err = rows.Scan(&a.ID, &a.AuthIndex, &a.Status, &a.DisplayStatus, &a.StatusObservedAt, &quota, &a.ObservedAt); err != nil {
 			return page, err
 		}
 		if quota != "" {

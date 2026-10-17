@@ -60,6 +60,9 @@ type Dashboard struct {
 	AccountsRevision uint64           `json:"accounts_revision"`
 	Total            int              `json:"total"`
 	Available        int              `json:"available"`
+	Normal           int              `json:"normal"`
+	QuotaExhausted   int              `json:"quota_exhausted"`
+	QuotaRestricted  int              `json:"quota_restricted"`
 	Disabled         int              `json:"disabled"`
 	Unavailable      int              `json:"unavailable"`
 	Capacity         int              `json:"capacity"`
@@ -192,18 +195,26 @@ func (s *Store) Dashboard(ctx context.Context) (Dashboard, error) {
 
 func readDashboard(ctx context.Context, tx *sql.Tx, revision, accountsRevision uint64, inventory InventoryStatus) (Dashboard, error) {
 	dashboard := Dashboard{Revision: revision, AccountsRevision: accountsRevision, RecentJobs: []JobSummary{}, ActiveJobs: []JobSummary{}, RecentEvents: []DashboardEvent{}}
-	rows, err := tx.QueryContext(ctx, "SELECT status,COALESCE(quota,'') FROM accounts WHERE status!='removed'")
+	rows, err := tx.QueryContext(ctx, "SELECT status,"+accountDisplayStatusSQL+",COALESCE(quota,'') FROM accounts WHERE status!='removed'")
 	if err != nil {
 		return dashboard, err
 	}
 	defer rows.Close()
 	at := time.Now()
 	for rows.Next() {
-		var status, raw string
-		if err = rows.Scan(&status, &raw); err != nil {
+		var status, display, raw string
+		if err = rows.Scan(&status, &display, &raw); err != nil {
 			return dashboard, err
 		}
 		dashboard.Total++
+		switch display {
+		case "available":
+			dashboard.Normal++
+		case "quota_exhausted":
+			dashboard.QuotaExhausted++
+		case "quota_restricted":
+			dashboard.QuotaRestricted++
+		}
 		switch status {
 		case "available":
 			dashboard.Available++

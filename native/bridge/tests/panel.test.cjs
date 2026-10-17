@@ -85,6 +85,56 @@ test('past reset times await verification and disabled is not confused with depl
   assert.equal(accountStatus({status: 'available', quota: {permission: 'blocked'}}).label, '额度受限');
   assert.equal(accountStatus({status: 'unavailable'}).label, '暂不可用');
 });
+test('account badges distinguish depletion, restrictions and host state without guessing recovery', () => {
+  const exhausted = {status: 'available', quota: {permission: 'allowed', five_hour: {ResetAt: '2000-01-01T00:00:00Z', Remaining: {Value: 0, Unit: 'percent'}}}};
+  assert.equal(accountStatus(exhausted).label, '额度耗尽');
+  assert.equal(accountStatus({...exhausted, status: 'disabled', display_status: 'quota_exhausted'}).label, '已禁用');
+  assert.equal(accountStatus({...exhausted, status: 'binding_unavailable'}).label, '身份待核实');
+  assert.equal(accountStatus({...exhausted, status: 'unavailable'}).label, '暂不可用');
+  assert.equal(accountStatus({status: 'available', quota: {weekly: {Remaining: {Value: 0, Unit: 'percent'}}}}).label, '额度耗尽');
+  assert.equal(accountStatus({status: 'available', display_status: 'quota_exhausted'}).label, '额度耗尽');
+  assert.equal(accountStatus({status: 'available', display_status: 'quota_restricted'}).label, '额度受限');
+  assert.equal(accountStatus({status: 'available', quota: {five_hour: {Remaining: {Value: '0', Unit: 'percent'}}}}).label, '正常');
+  assert.equal(accountStatus({status: 'unexpected'}).label, '状态未知');
+});
+test('full five-hour and weekly placeholders never start a display countdown as time passes', () => {
+  const observed = Date.parse('2026-10-17T12:00:00.750Z');
+  for (const [name, seconds] of [['five_hour', 18000], ['weekly', 604800]]) {
+    const window = {ResetAt: new Date(observed + seconds * 1000).toISOString(), ConfirmedAt: new Date(observed).toISOString(), ResetAfterSeconds: seconds, Remaining: {Value: 100, Unit: 'percent'}};
+    for (const elapsed of [0, 1000, 60000, seconds * 1000 + 1000]) {
+      assert.equal(windowView({[name]: window}, name, observed + elapsed).reset, '');
+    }
+    delete window.ResetAfterSeconds;
+    window.ResetAt = new Date(Math.floor(observed / 1000) * 1000 + seconds * 1000).toISOString();
+    assert.equal(windowView({[name]: window}, name, observed + 60000).reset, '');
+  }
+});
+test('non-full countdowns remain visible independently of percentage, state and window length', () => {
+  const observed = Date.parse('2026-10-17T12:00:00Z');
+  for (const [name, full] of [['five_hour', 18000], ['weekly', 604800]]) {
+    for (const seconds of [0, 1, full - 1, full + 1]) {
+      const window = {ResetAt: new Date(observed + seconds * 1000).toISOString(), ConfirmedAt: new Date(observed).toISOString(), ResetAfterSeconds: seconds, State: 'unknown', Remaining: {Value: 100, Unit: 'percent'}};
+      assert.equal(windowView({[name]: window}, name, observed).reset, resetText(window.ResetAt, observed));
+      delete window.ResetAfterSeconds;
+      assert.equal(windowView({[name]: window}, name, observed).reset, resetText(window.ResetAt, observed));
+    }
+  }
+});
+test('reported countdown takes precedence over rounded absolute timestamps and global observations', () => {
+  const observed = Date.parse('2026-10-17T12:00:00Z');
+  for (const [name, full] of [['five_hour', 18000], ['weekly', 604800]]) {
+    const window = {ResetAt: new Date(observed + (full - 1) * 1000).toISOString(), ConfirmedAt: new Date(observed).toISOString(), ResetAfterSeconds: full};
+    const snapshot = {[name]: window, observed_at: new Date(observed + 60000).toISOString()};
+    assert.equal(windowView(snapshot, name, observed).reset, '');
+    window.ResetAt = new Date(observed + full * 1000).toISOString(); window.ResetAfterSeconds = full - 1;
+    assert.equal(windowView(snapshot, name, observed).reset, resetText(window.ResetAt, observed));
+    delete window.ResetAfterSeconds;
+    assert.equal(windowView(snapshot, name, observed).reset, '');
+    delete window.ConfirmedAt;
+    snapshot.fields = {[name]: {observed_at: new Date(observed).toISOString()}};
+    assert.equal(windowView(snapshot, name, observed).reset, '');
+  }
+});
 test('HTTP deployments can use getRandomValues when randomUUID is unavailable', () => {
   assert.equal(requestID({getRandomValues: bytes => bytes.fill(3)}), '03'.repeat(16));
   assert.equal(requestID({randomUUID() { throw new Error('unavailable'); }, getRandomValues: bytes => bytes.fill(4)}), '04'.repeat(16));
@@ -147,6 +197,29 @@ function panel(respond, options = {}) {
   return {get, timers, calls, nav, panels, events, tick, storage};
 }
 function basic(url) { return url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
+
+test('account rendering and refresh keep full placeholders out of the countdown timer', async () => {
+  const observed = Date.now(), stamp = new Date(observed).toISOString();
+  const quota = (short, week) => ({five_hour: {ResetAfterSeconds: short, ResetAt: new Date(observed + short * 1000).toISOString(), ConfirmedAt: stamp, Remaining: {Value: 100, Unit: 'percent'}}, weekly: {ResetAfterSeconds: week, ResetAt: new Date(observed + week * 1000).toISOString(), ConfirmedAt: stamp, Remaining: {Value: 100, Unit: 'percent'}}});
+  let revision = 0;
+  const snapshots = [quota(18000, 604800), quota(17999, 604800), quota(18000, 604799), quota(18000, 604800)];
+  const ui = panel(url => url.endsWith('/overview') ? [200, overview(++revision)] : [200, accountPage(revision, [{id: 'countdown-account', status: 'available', quota: snapshots[Math.min(revision - 1, snapshots.length - 1)]}])]);
+  const countdowns = node => (Object.hasOwn(node.dataset, 'resetAt') ? [node] : []).concat(node.children.flatMap(countdowns));
+  await ui.get('connect').onclick();
+  assert.equal(countdowns(ui.get('accounts')).length, 0);
+  assert.equal(ui.get('accounts').textContent.includes('100%'), true);
+  await ui.tick(5000);
+  assert.equal(countdowns(ui.get('accounts')).length, 1);
+  assert.match(countdowns(ui.get('accounts'))[0].textContent, /后重置/);
+  await ui.tick(5000);
+  assert.equal(countdowns(ui.get('accounts')).length, 1);
+  assert.match(countdowns(ui.get('accounts'))[0].textContent, /后重置/);
+  await ui.tick(5000);
+  assert.equal(countdowns(ui.get('accounts')).length, 0);
+  await ui.tick(5000);
+  assert.equal(countdowns(ui.get('accounts')).length, 0);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
 
 test('sidebar collapse is local, reversible and restores its mount-specific preference', async () => {
   const storage = {}, ui = panel(basic, {storage});
@@ -220,6 +293,20 @@ test('background quota changes reload the table after the overview revision adva
   await ui.get('connect').onclick(); await ui.tick(5000);
   assert.equal(accounts, 2); assert.match(ui.get('accounts').textContent, /updated/);
   assert.equal(ui.calls.filter(call => call.method === 'POST').length, 0);
+});
+test('periodic status reads update disabled, exhausted and recovered badges without requesting quota', async () => {
+  let revision = 0;
+  const accounts = [{id: 'status-account', status: 'available'}, {id: 'status-account', status: 'disabled'},
+    {id: 'status-account', status: 'available', display_status: 'quota_exhausted', quota: {five_hour: {Remaining: {Value: 0, Unit: 'percent'}}}},
+    {id: 'status-account', status: 'available', display_status: 'available', quota: {five_hour: {Remaining: {Value: 100, Unit: 'percent'}}}}];
+  const ui = panel(url => url.endsWith('/overview') ? [200, {...overview(++revision), inventory: {status: 'ready', refresh_interval_seconds: 30}, dashboard: {...overview().dashboard, normal: 18, quota_exhausted: 1, quota_restricted: 1}}] : [200, accountPage(revision, [accounts[Math.min(revision - 1, 3)]])]);
+  await ui.get('connect').onclick(); assert.match(ui.get('accounts').textContent, /正常/);
+  await ui.tick(5000); assert.match(ui.get('accounts').textContent, /已禁用/);
+  await ui.tick(5000); assert.match(ui.get('accounts').textContent, /额度耗尽/);
+  await ui.tick(5000); assert.match(ui.get('accounts').textContent, /正常/);
+  assert.match(ui.get('inventory').textContent, /30 秒/);
+  assert.match(ui.get('metric-total-detail').textContent, /18 正常.*1 额度耗尽.*1 额度受限/);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
 test('a failed account read is retried even when the overview revision stops changing', async () => {
   let overviews = 0, accountReads = 0;
@@ -817,6 +904,62 @@ function editablePromptResponse(url, settings = modelSettings(1, modelConfig({ge
   if (url.endsWith('/overview')) { const data = modelOverview(); data.capabilities.editable_generation_prompt = true; return [200, data]; }
   return modelResponse(url, settings);
 }
+test('background model reads preserve editable drafts while a slow poll is pending', async () => {
+  let reads = 0, release;
+  const ui = panel(url => url.endsWith('/model-settings') && ++reads > 1 ? new Promise(resolve => { release = () => resolve([200, modelSettings()]); }) : modelResponse(url));
+  await openModels(ui); edit(ui, 'model-default', 'unsaved-model');
+  const pending = ui.tick(5000); await flush();
+  assert.equal(ui.get('model-fields').disabled, false);
+  assert.equal(ui.get('model-default').value, 'unsaved-model');
+  edit(ui, 'model-default-prompt', 'continue editing'); release(); await pending;
+  assert.equal(ui.get('model-default-prompt').value, 'continue editing');
+  assert.equal(ui.get('model-fields').disabled, false);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('CPA model catalog uses exact account identity and never saves or sends a model request', async () => {
+  const account = {id: 'codex/account-01', provider: 'codex', auth_index: 'bound-index', disabled: false};
+  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [account]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: 'actual-model'}, {id: 'other-model'}, {id: 'actual-model'}]}] : modelResponse(url));
+  await openModels(ui);
+  assert.equal(ui.calls.some(call => call.url.includes('/auth-files')), false);
+  ui.get('model-catalog-account').value = account.id; ui.get('model-catalog-account').oninput();
+  await ui.get('model-catalog-refresh').onclick();
+  assert.deepEqual(ui.get('wake-model-options').children.map(node => node.value), ['actual-model', 'other-model']);
+  const reads = ui.calls.filter(call => call.url.includes('/auth-files'));
+  assert.deepEqual(reads.map(call => call.url), ['/v0/management/auth-files', '/v0/management/auth-files/models?name=codex%2Faccount-01', '/v0/management/auth-files']);
+  assert.equal(reads.every(call => call.headers.Authorization === 'Bearer fixture-key' && call.redirect === 'error' && call.credentials === 'omit'), true);
+  assert.equal(ui.get('model-default').value, '');
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('CPA model catalog rejects changed identity and malformed model names without disabling manual inputs', async () => {
+  for (const malformed of [false, true]) {
+    let reads = 0;
+    const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [{id: 'codex-01', provider: 'codex', auth_index: 'index-' + (malformed ? 1 : ++reads)}]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: malformed ? 'bad model' : 'valid-model'}]}] : modelResponse(url));
+    await openModels(ui); ui.get('model-catalog-account').value = 'codex-01';
+    await ui.get('model-catalog-refresh').onclick();
+    assert.equal(ui.get('wake-model-options').children.length, 0);
+    assert.match(ui.get('model-catalog-status').textContent, /读取模型失败/);
+    assert.equal(ui.get('model-fields').disabled, false);
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+test('late model directory replies cannot populate a newly selected account', async () => {
+  let release;
+  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [{id: 'old-account', provider: 'codex', auth_index: 'one'}]}] : url.includes('/auth-files/models?') ? new Promise(resolve => { release = () => resolve([200, {models: [{id: 'old-model'}]}]); }) : modelResponse(url));
+  await openModels(ui); ui.get('model-catalog-account').value = 'old-account';
+  const pending = ui.get('model-catalog-refresh').onclick(); await flush();
+  ui.get('model-catalog-account').value = 'new-account'; ui.get('model-catalog-account').oninput();
+  release(); await pending;
+  assert.equal(ui.get('wake-model-options').children.length, 0);
+  assert.equal(ui.get('model-catalog-refresh').disabled, false);
+});
+test('Codex style preset changes only prompt draft and never saves or generates automatically', async () => {
+  const ui = panel(url => modelResponse(url)); await openModels(ui);
+  assert.equal(ui.get('model-default-prompt').value, modelDefaults.default_prompt);
+  ui.get('model-codex-preset').onclick();
+  assert.match(ui.get('model-default-prompt').value, /Git.*commit.*push/);
+  assert.equal(ui.get('model-save').disabled, false);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
 test('generation prompt validation accepts legacy omissions and empty defaults but enforces bytes and controls', () => {
   const draft = modelConfigDraft(modelConfig());
   assert.equal(draft.generation_prompt, ''); assert.equal(validateModelDraft(draft).config.generation_prompt, '');
@@ -1101,6 +1244,17 @@ test('generation account directory loads only on model navigation and explicit r
   await ui.get('generation-refresh-accounts').onclick();
   assert.equal(ui.calls.filter(call => call.url.endsWith('/generation-accounts')).length, 2);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('Antigravity model suggestions use its own CPA account and never populate Codex wake choices', async () => {
+  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [{id: 'antigravity-01', provider: 'antigravity', auth_index: 'antig-index'}]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: 'antigravity-only-model'}]}] : directoryResponse(url));
+  await openModels(ui); ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-account').oninput();
+  await ui.get('generation-refresh-models').onclick();
+  assert.deepEqual(ui.get('generation-model-options').children.map(node => node.value), ['antigravity-only-model']);
+  assert.equal(ui.get('generation-model').value, '');
+  assert.equal(ui.get('wake-model-options').children.length, 0);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  ui.get('generation-account').value = 'codex-01'; ui.get('generation-account').oninput();
+  assert.equal(ui.get('generation-model-options').children.length, 0);
 });
 test('Antigravity generation uses its exact selected account and model without a client provider or automatic Codex default', async () => {
   const ui = panel((url, options) => url.includes('/prompt-generations') ? [202, {instance_id: 'a', job_id: 'antig-job', phase: 'queued', candidates: []}] : directoryResponse(url));
@@ -1399,6 +1553,17 @@ const submitWake = ui => ui.get('wake-manual-form').onsubmit({preventDefault() {
 async function openWake(ui) {
   await ui.get('connect').onclick(); ui.nav.find(node => node.dataset.page === 'wake').listeners.get('click')(); await flush();
 }
+test('background wake reads do not disable the editor or overwrite in-progress typing', async () => {
+  let reads = 0, release;
+  const ui = panel(url => url.endsWith('/wake-settings') && ++reads > 1 ? new Promise(resolve => { release = () => resolve([200, wakeSettings()]); }) : wakeResponse(url));
+  await openWake(ui); edit(ui, 'wake-per-user', '0.5');
+  const pending = ui.tick(5000); await flush();
+  assert.equal(ui.get('wake-settings-fields').disabled, false);
+  edit(ui, 'wake-per-user', '0.75'); release(); await pending;
+  assert.equal(ui.get('wake-per-user').value, '0.75');
+  assert.equal(ui.get('wake-settings-fields').disabled, false);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
 function configureWakeRequest(ui, account = 'codex-01') {
   ui.get('wake-account').value = account; ui.get('wake-manual-consent').checked = true; ui.get('wake-manual-consent').onchange();
 }

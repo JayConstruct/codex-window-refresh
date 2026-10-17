@@ -120,6 +120,65 @@ func TestInventoryUpdatesWithoutPageOrRequestAfterBackgroundInterval(t *testing.
 	}
 }
 
+type changingStatusInventory struct {
+	disabled atomic.Bool
+}
+
+func (inventory *changingStatusInventory) Accounts(context.Context) ([]store.Account, error) {
+	status := "available"
+	if inventory.disabled.Load() {
+		status = "disabled"
+	}
+	return []store.Account{{ID: "account", AuthIndex: "index", Status: status}}, nil
+}
+
+func (*changingStatusInventory) Identity(_ context.Context, account store.Account) (store.Account, error) {
+	account.Binding = "identity-proof"
+	return account, nil
+}
+
+func TestBackgroundStatusSyncUpdatesAndRestoresDisabledAccountsWithoutAPage(t *testing.T) {
+	storage, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	link := &requestedLink{published: make(chan []store.Account, 4)}
+	inventory := &changingStatusInventory{}
+	consumer := &Consumer{Store: storage, Link: link, Inventory: inventory}
+	if err := consumer.syncInventory(context.Background(), "bridge"); err != nil {
+		t.Fatal(err)
+	}
+	<-link.published
+	inventory.disabled.Store(true)
+	consumer.lastInventory = time.Now().Add(-store.InventoryRefreshInterval - time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); consumer.inventoryLoop(ctx) }()
+	defer func() { cancel(); <-done }()
+	for _, disabled := range []bool{true, false} {
+		if !disabled {
+			inventory.disabled.Store(false)
+			if !consumer.RequestInventorySync() {
+				t.Fatal("supported sync request rejected")
+			}
+		}
+		select {
+		case <-link.published:
+		case <-time.After(2 * time.Second):
+			t.Fatal("account status waited for a browser or quota query")
+		}
+		page, err := storage.AccountPage(context.Background(), "", 10, nil)
+		if err != nil || len(page.Accounts) != 1 || (page.Accounts[0].Status == "disabled") != disabled || page.Accounts[0].StatusObservedAt == "" {
+			t.Fatal(page, err)
+		}
+		view, err := storage.Overview(context.Background())
+		if err != nil || view.Inventory.RefreshIntervalSeconds != 30 || view.Inventory.Status != "ready" {
+			t.Fatal(view, err)
+		}
+	}
+}
+
 type fixtureLink struct {
 	ackFail      bool
 	acknowledged uint64

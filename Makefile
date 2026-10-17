@@ -43,7 +43,7 @@ v2-build:
 
 v2-smoke: v2-build
 	python3 native/bridge/tests/smoke.py
-	node --test native/bridge/tests/panel.test.cjs
+	node --test native/bridge/tests/*.test.cjs
 
 v2-panel-browser-check:
 	node scripts/v2-panel-browser-check.mjs
