@@ -913,12 +913,16 @@ class NativeBridge(unittest.TestCase):
 
     def test_packaged_wake_capability_metadata_preserves_protocol_and_generation(self):
         import tarfile
-        output = self.root/'wake-package'
-        subprocess.run(['python3', str(ROOT/'scripts/package-v2.py'), '--commit', '0'*40,
-                        '--epoch', '0', '--output', str(output)], check=True, stdout=subprocess.PIPE)
-        archives = list(output.glob('*.tar.gz'))
-        self.assertEqual(len(archives), 1)
-        with tarfile.open(archives[0], 'r:gz') as archive:
+        if os.environ.get('CWR_V2_TEST_ARCHIVE'):
+            package = Path(os.environ['CWR_V2_TEST_ARCHIVE'])
+        else:
+            output = self.root/'wake-package'
+            subprocess.run(['python3', str(ROOT/'scripts/package-v2.py'), '--commit', '0'*40,
+                            '--epoch', '0', '--output', str(output)], check=True, stdout=subprocess.PIPE)
+            archives = list(output.glob('*.tar.gz'))
+            self.assertEqual(len(archives), 1)
+            package = archives[0]
+        with tarfile.open(package, 'r:gz') as archive:
             members = [member for member in archive.getmembers() if member.name.endswith('/BUILD-INFO.json')]
             self.assertEqual(len(members), 1)
             info = json.load(archive.extractfile(members[0]))

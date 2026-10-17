@@ -93,6 +93,8 @@ jobs:
     needs: [prepare, build, browser]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    outputs:
+      release_commit: ${{ steps.release-source.outputs.commit }}
     permissions:
       contents: write
     env:
@@ -123,6 +125,11 @@ jobs:
           gh release create "$VERSION" dist/*.tar.gz dist/SHA256SUMS \
             --target "$GITHUB_SHA" --title "Codex Window Refresh v2 $VERSION" \
             --notes-file "docs/releases/$VERSION.md" --prerelease --latest=false
+      - name: Resolve immutable release source
+        id: release-source
+        run: |
+          commit="$(gh api "repos/$GH_REPO/commits/$VERSION" --jq .sha)"
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
   verify-release:
     needs: [prepare, publish]
@@ -141,6 +148,7 @@ jobs:
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       ARCH: ${{ matrix.arch }}
+      RELEASE_COMMIT: ${{ needs.publish.outputs.release_commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -157,7 +165,7 @@ jobs:
           (cd published && grep "  $asset\$" SHA256SUMS | sha256sum -c -)
           tar -xzf "published/$asset" -C published
           package="published/${asset%.tar.gz}"
-          python3 -c 'import json,sys,os; assert json.load(open(sys.argv[1]))["commit"] == os.environ["GITHUB_SHA"]' "$package/BUILD-INFO.json"
+          python3 -c 'import json,sys,os,re; expected=os.environ["RELEASE_COMMIT"]; assert re.fullmatch(r"[0-9a-f]{40}", expected); assert json.load(open(sys.argv[1]))["commit"] == expected' "$package/BUILD-INFO.json"
           cp "$package/window-refreshd" "$package/codex-window-refresh-v2-bridge.so" bin/
           export CWR_V2_TEST_ARCHIVE="$GITHUB_WORKSPACE/published/$asset"
           export CWR_V2_TEST_SUMS="$GITHUB_WORKSPACE/published/SHA256SUMS"
