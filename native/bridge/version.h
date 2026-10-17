@@ -1,1 +1,1 @@
-#define CWR_VERSION "0.2.0-rc.6"
+#define CWR_VERSION "0.2.0-rc.7"

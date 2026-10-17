@@ -227,3 +227,96 @@ func TestPromptCapabilityDoesNotRelaxReadOnlyHandshake(t *testing.T) {
 		t.Fatalf("err=%v supported=%v", err, client.SupportsPromptGeneration())
 	}
 }
+
+func TestGenerationProviderCapabilitiesAndCopies(t *testing.T) {
+	for _, fixture := range []struct {
+		name      string
+		supported bool
+		providers []string
+		want      []string
+	}{
+		{"legacy-supported", true, nil, []string{"codex"}},
+		{"unsupported", false, nil, []string{}},
+		{"explicit-none", true, []string{}, []string{}},
+		{"codex", true, []string{"codex"}, []string{"codex"}},
+		{"antigravity", true, []string{"antigravity"}, []string{"antigravity"}},
+		{"both", true, []string{"codex", "antigravity"}, []string{"codex", "antigravity"}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			client, server := newBridgeTestClient(t, func(bridgeTestRequest) any {
+				result := map[string]any{"protocol_version": 1, "bridge_instance_id": "providers", "read_only": true, "prompt_generation_supported": fixture.supported}
+				if fixture.providers != nil {
+					result["prompt_generation_providers"] = fixture.providers
+				}
+				return map[string]any{"ok": true, "result": result}
+			})
+			hello, err := client.Handshake(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.SupportedGenerationProviders(); !reflect.DeepEqual(got, fixture.want) {
+				t.Fatalf("providers=%v want=%v", got, fixture.want)
+			}
+			if client.SupportsPromptGeneration() != (len(fixture.want) > 0) {
+				t.Fatal("boolean capability disagrees with provider list")
+			}
+			if len(fixture.want) > 0 {
+				hello.GenerationProviders[0] = "corrupted-hello"
+				providers := client.SupportedGenerationProviders()
+				providers[0] = "corrupted-getter"
+				if !reflect.DeepEqual(client.SupportedGenerationProviders(), fixture.want) {
+					t.Fatal("provider cache aliases caller-owned slices")
+				}
+			}
+			if !reflect.DeepEqual(server.calls(), []string{"bridge.hello"}) {
+				t.Fatal("capability getter performed RPC")
+			}
+		})
+	}
+}
+
+func TestInvalidProviderHandshakeRevokesCachedGeneration(t *testing.T) {
+	for _, fixture := range []struct {
+		name      string
+		supported bool
+		providers any
+	}{
+		{"unknown", true, []string{"other"}},
+		{"cross-protocol", true, []string{"openai-response"}},
+		{"duplicate", true, []string{"codex", "codex"}},
+		{"false-with-providers", false, []string{"antigravity"}},
+		{"wrong-type", true, "codex"},
+		{"null", true, nil},
+		{"non-string", true, []any{"codex", 1}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			hellos := 0
+			client, server := newBridgeTestClient(t, func(bridgeTestRequest) any {
+				hellos++
+				if hellos == 1 {
+					return bridgeHello("trusted", true)
+				}
+				return map[string]any{"ok": true, "result": map[string]any{"protocol_version": 1, "bridge_instance_id": "untrusted", "read_only": true,
+					"prompt_generation_supported": fixture.supported, "prompt_generation_providers": fixture.providers}}
+			})
+			if _, err := client.Handshake(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Handshake(context.Background()); err == nil {
+				t.Fatal("invalid providers accepted")
+			}
+			if client.SupportsPromptGeneration() || len(client.SupportedGenerationProviders()) != 0 {
+				t.Fatal("failed handshake retained generation capability")
+			}
+			if instance, _ := client.instance.Load().(string); instance != "trusted" {
+				t.Fatal("failed handshake repinned client")
+			}
+			if err := client.Call(context.Background(), "host.model.execute_stream", struct{}{}, &struct{}{}); err == nil || err.Error() != "generation_not_supported" {
+				t.Fatalf("model dispatch after failed handshake: %v", err)
+			}
+			if !reflect.DeepEqual(server.calls(), []string{"bridge.hello", "bridge.hello"}) {
+				t.Fatal("failed handshake caused model retry")
+			}
+		})
+	}
+}

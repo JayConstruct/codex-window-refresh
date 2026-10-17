@@ -38,6 +38,9 @@ type authEntry struct {
 	Index       string `json:"auth_index"`
 	Provider    string `json:"provider"`
 	Type        string `json:"type"`
+	Email       string `json:"email"`
+	ProjectID   string `json:"project_id"`
+	Status      string `json:"status"`
 	Disabled    bool   `json:"disabled"`
 	Unavailable bool   `json:"unavailable"`
 	RuntimeOnly bool   `json:"runtime_only"`
@@ -124,10 +127,10 @@ func (c *CPA) readBindingFor(ctx context.Context, a store.Account, requireAvaila
 		return credential{}, err
 	}
 	r := runtime.Auth
-	if requireAvailable && r.Disabled {
+	if requireAvailable && (r.Disabled || r.Status == "disabled") {
 		return credential{}, errors.New("account_disabled")
 	}
-	if requireAvailable && r.Unavailable {
+	if requireAvailable && (r.Unavailable || r.Status == "unavailable") {
 		return credential{}, errors.New("account_identity_unavailable")
 	}
 	if r.ID != a.ID || r.Index != a.AuthIndex || r.RuntimeOnly || (r.Provider != "codex" && !(r.Provider == "" && r.Type == "codex")) {

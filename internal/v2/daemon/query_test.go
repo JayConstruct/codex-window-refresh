@@ -64,9 +64,9 @@ func TestQuerySettingsAPIIsValidatedVersionedAndReadOnly(t *testing.T) {
 	response = request(service, "GET", "/api/v2/overview", "", "")
 	var overview struct {
 		Settings     store.QuerySettings `json:"query_settings"`
-		Capabilities map[string]bool     `json:"capabilities"`
+		Capabilities map[string]any      `json:"capabilities"`
 	}
-	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &overview) != nil || !overview.Capabilities["automatic_quota_query"] || !overview.Capabilities["randomized_quota_query"] || overview.Capabilities["model_execution"] || overview.Settings.Revision != saved.Revision {
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &overview) != nil || overview.Capabilities["automatic_quota_query"] != true || overview.Capabilities["randomized_quota_query"] != true || overview.Capabilities["model_execution"] != false || overview.Settings.Revision != saved.Revision {
 		t.Fatal(response.Code, response.Body.String())
 	}
 	if source.accountCalls.Load() != 0 || source.queryCalls.Load() != 0 {

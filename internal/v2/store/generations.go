@@ -51,13 +51,16 @@ func generationAccount(ctx context.Context, tx *sql.Tx, id string) (Account, err
 	return account, err
 }
 
-const generationColumns = "id,account_id,auth_index,binding,model,count,phase,error_code,candidates,created_at,updated_at"
+const generationColumns = "id,account_id,auth_index,binding,provider,model,count,phase,error_code,candidates,created_at,updated_at"
 
 func scanGeneration(row interface{ Scan(...any) error }) (Generation, error) {
 	var generation Generation
 	var candidates string
-	err := row.Scan(&generation.ID, &generation.Account.ID, &generation.Account.AuthIndex, &generation.Account.Binding, &generation.Model, &generation.Count, &generation.Phase, &generation.ErrorCode, &candidates, &generation.CreatedAt, &generation.UpdatedAt)
+	err := row.Scan(&generation.ID, &generation.Account.ID, &generation.Account.AuthIndex, &generation.Account.Binding, &generation.Account.Provider, &generation.Model, &generation.Count, &generation.Phase, &generation.ErrorCode, &candidates, &generation.CreatedAt, &generation.UpdatedAt)
 	if err == nil {
+		if generation.Account.Provider == "" {
+			generation.Account.Provider = "codex"
+		}
 		generation.Account.Status = "available"
 		err = json.Unmarshal([]byte(candidates), &generation.Candidates)
 	}
@@ -75,16 +78,51 @@ func (st *Store) Generation(ctx context.Context, id string) (Generation, error) 
 	return generation, err
 }
 
-func (st *Store) CreateGeneration(ctx context.Context, key string, request GenerationRequest) (Generation, bool, error) {
+func generationRequestHash(key string, request GenerationRequest) (string, error) {
 	if request.Validate() != nil || len(key) < 1 || len(key) > 128 || strings.IndexFunc(key, func(char rune) bool { return char < 33 || char > 126 }) >= 0 {
-		return Generation{}, false, ErrInvalidGeneration
+		return "", ErrInvalidGeneration
 	}
 	raw, _ := json.Marshal(request)
 	sum := sha256.Sum256(raw)
-	hash := hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (st *Store) LookupGeneration(ctx context.Context, key string, request GenerationRequest) (Generation, bool, error) {
+	hash, err := generationRequestHash(key, request)
+	if err != nil {
+		return Generation{}, false, err
+	}
+	var id, previous string
+	err = st.db.QueryRowContext(ctx, "SELECT id,request_hash FROM prompt_generations WHERE idempotency_key=?", key).Scan(&id, &previous)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Generation{}, false, nil
+	}
+	if err != nil {
+		return Generation{}, false, err
+	}
+	if previous != hash {
+		return Generation{}, true, ErrConflict
+	}
+	generation, err := st.Generation(ctx, id)
+	return generation, true, err
+}
+
+func (st *Store) CreateGeneration(ctx context.Context, key string, request GenerationRequest) (Generation, bool, error) {
+	return st.createGeneration(ctx, key, request, nil)
+}
+
+func (st *Store) CreateGenerationFor(ctx context.Context, key string, request GenerationRequest, resolved Account) (Generation, bool, error) {
+	return st.createGeneration(ctx, key, request, &resolved)
+}
+
+func (st *Store) createGeneration(ctx context.Context, key string, request GenerationRequest, resolved *Account) (Generation, bool, error) {
+	hash, err := generationRequestHash(key, request)
+	if err != nil {
+		return Generation{}, false, err
+	}
 	var generation Generation
 	existing := false
-	err := st.write(ctx, func(tx *sql.Tx) error {
+	err = st.write(ctx, func(tx *sql.Tx) error {
 		var id, previous string
 		err := tx.QueryRowContext(ctx, "SELECT id,request_hash FROM prompt_generations WHERE idempotency_key=?", key).Scan(&id, &previous)
 		if err == nil {
@@ -105,13 +143,30 @@ func (st *Store) CreateGeneration(ctx context.Context, key string, request Gener
 		if total >= 1000 || pending >= 64 {
 			return ErrBusy
 		}
-		account, err := generationAccount(ctx, tx, request.AccountID)
-		if err != nil {
-			return err
+		var account Account
+		if resolved != nil {
+			account = *resolved
+			if account.Provider == "" {
+				account.Provider = "codex"
+			}
+			if account.ID != request.AccountID || account.Status != "available" || account.AuthIndex == "" || account.Binding == "" || (account.Provider != "codex" && account.Provider != "antigravity") {
+				return ErrGenerationAccount
+			}
+		}
+		if resolved == nil || account.Provider == "codex" {
+			inventory, err := generationAccount(ctx, tx, request.AccountID)
+			if err != nil {
+				return err
+			}
+			if resolved != nil && (inventory.AuthIndex != account.AuthIndex || inventory.Binding != account.Binding) {
+				return ErrGenerationAccount
+			}
+			account = inventory
+			account.Provider = "codex"
 		}
 		stamp := now()
 		generation = Generation{ID: ID(), Phase: "queued", Candidates: []string{}, CreatedAt: stamp, UpdatedAt: stamp, Account: account, Model: request.Model, Count: request.Count}
-		_, err = tx.ExecContext(ctx, "INSERT INTO prompt_generations(id,idempotency_key,request_hash,account_id,auth_index,binding,model,count,phase,candidates,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,'queued','[]',?,?)", generation.ID, key, hash, account.ID, account.AuthIndex, account.Binding, request.Model, request.Count, stamp, stamp)
+		_, err = tx.ExecContext(ctx, "INSERT INTO prompt_generations(id,idempotency_key,request_hash,account_id,auth_index,binding,provider,model,count,phase,candidates,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'queued','[]',?,?)", generation.ID, key, hash, account.ID, account.AuthIndex, account.Binding, account.Provider, request.Model, request.Count, stamp, stamp)
 		return err
 	})
 	return generation, existing, err
@@ -142,12 +197,16 @@ func (st *Store) ClaimGeneration(ctx context.Context) (Generation, error) {
 		if err != nil {
 			return err
 		}
-		account, err := generationAccount(ctx, tx, generation.Account.ID)
-		if err != nil && !errors.Is(err, ErrGenerationAccount) {
-			return err
-		}
 		generation.Phase = "running"
-		if err != nil || account.AuthIndex != generation.Account.AuthIndex || account.Binding != generation.Account.Binding {
+		valid := generation.Account.Provider == "antigravity" && generation.Account.AuthIndex != "" && generation.Account.Binding != ""
+		if generation.Account.Provider == "codex" {
+			account, accountErr := generationAccount(ctx, tx, generation.Account.ID)
+			if accountErr != nil && !errors.Is(accountErr, ErrGenerationAccount) {
+				return accountErr
+			}
+			valid = accountErr == nil && account.AuthIndex == generation.Account.AuthIndex && account.Binding == generation.Account.Binding
+		}
+		if !valid {
 			generation.Phase = "failed"
 			generation.ErrorCode = "generation_account_unavailable"
 		}

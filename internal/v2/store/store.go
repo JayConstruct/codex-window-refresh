@@ -37,6 +37,7 @@ const MaxPendingItems = 4096
 
 type Account struct {
 	ID           string          `json:"id"`
+	Provider     string          `json:"provider,omitempty"`
 	AuthIndex    string          `json:"-"`
 	Binding      string          `json:"-"`
 	Status       string          `json:"status"`
@@ -144,7 +145,7 @@ func Open(dir string) (*Store, error) {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
-		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 5 {
+		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 6 {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
@@ -155,7 +156,14 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	if _, err = migration.Exec(schema); err == nil {
-		_, err = migration.Exec("UPDATE schema_version SET version=5")
+		var providerColumn int
+		err = migration.QueryRow("SELECT count(*) FROM pragma_table_info('prompt_generations') WHERE name='provider'").Scan(&providerColumn)
+		if err == nil && providerColumn == 0 {
+			_, err = migration.Exec("ALTER TABLE prompt_generations ADD COLUMN provider TEXT NOT NULL DEFAULT 'codex'")
+		}
+		if err == nil {
+			_, err = migration.Exec("UPDATE schema_version SET version=6")
+		}
 	}
 	if err == nil {
 		err = migration.Commit()
@@ -167,7 +175,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	var version int
-	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 5 {
+	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 6 {
 		s.Close()
 		return nil, errors.New("unsupported_database_schema")
 	}

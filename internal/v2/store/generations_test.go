@@ -205,3 +205,133 @@ func TestGenerationValidatesRequestsAndCandidates(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerationAntigravitySnapshotIsIndependentAndDurable(t *testing.T) {
+	ctx := context.Background()
+	dir := privateDir(t)
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := GenerationRequest{AccountID: "antigravity-account", Model: "test-model", Count: 1}
+	account := Account{ID: request.AccountID, Provider: "antigravity", AuthIndex: "antigravity-index", Binding: "antigravity-binding", Status: "available"}
+	first, existing, err := st.CreateGenerationFor(ctx, "antigravity-key", request, account)
+	if err != nil || existing || first.Account.Provider != account.Provider {
+		t.Fatal(first, existing, err)
+	}
+	accounts, err := st.Accounts(ctx, "", 10)
+	if err != nil || len(accounts) != 0 {
+		t.Fatal("generation directory polluted quota inventory", accounts, err)
+	}
+	if err = st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	claim, err := st.ClaimGeneration(ctx)
+	if err != nil || claim.ID != first.ID || claim.Phase != "running" || !reflect.DeepEqual(claim.Account, account) {
+		t.Fatal(claim, err)
+	}
+	if err = st.FinishGeneration(ctx, claim.ID, "completed", "", []string{"hello"}); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := st.Generation(ctx, first.ID)
+	if err != nil || finished.Account.Provider != "antigravity" || finished.Account.Binding != account.Binding {
+		t.Fatal(finished, err)
+	}
+	account.Provider = "codex"
+	account.Binding = "replacement"
+	duplicate, existing, err := st.CreateGenerationFor(ctx, "antigravity-key", request, account)
+	if err != nil || !existing || duplicate.ID != first.ID || duplicate.Account.Provider != "antigravity" || duplicate.Account.Binding != "antigravity-binding" {
+		t.Fatal(duplicate, existing, err)
+	}
+	duplicate, existing, err = st.LookupGeneration(ctx, "antigravity-key", request)
+	if err != nil || !existing || duplicate.ID != first.ID || duplicate.Phase != "completed" {
+		t.Fatal(duplicate, existing, err)
+	}
+}
+
+func TestGenerationResolvedAccountValidationAndCodexFreshness(t *testing.T) {
+	ctx := context.Background()
+	st := openTest(t)
+	request := GenerationRequest{AccountID: "generation-account", Model: "model", Count: 1}
+	base := Account{ID: request.AccountID, Provider: "antigravity", AuthIndex: "index", Binding: "binding", Status: "available"}
+	for _, alter := range []func(*Account){
+		func(account *Account) { account.ID = "another" },
+		func(account *Account) { account.Provider = "unknown-provider" },
+		func(account *Account) { account.Status = "disabled" },
+		func(account *Account) { account.Status = "removed" },
+		func(account *Account) { account.AuthIndex = "" },
+		func(account *Account) { account.Binding = "" },
+	} {
+		account := base
+		alter(&account)
+		if _, _, err := st.CreateGenerationFor(ctx, "rejected", request, account); !errors.Is(err, ErrGenerationAccount) {
+			t.Fatal(account, err)
+		}
+	}
+	base.Provider = "codex"
+	if _, _, err := st.CreateGenerationFor(ctx, "no-inventory", request, base); !errors.Is(err, ErrGenerationAccount) {
+		t.Fatal(err)
+	}
+	generationInventory(t, st, "available", "binding")
+	base.AuthIndex = "generation-index"
+	base.Binding = "replacement"
+	if _, _, err := st.CreateGenerationFor(ctx, "replaced", request, base); !errors.Is(err, ErrGenerationAccount) {
+		t.Fatal(err)
+	}
+	base.Binding = "binding"
+	base.Provider = ""
+	first, _, err := st.CreateGenerationFor(ctx, "legacy-provider", request, base)
+	if err != nil || first.Account.Provider != "codex" {
+		t.Fatal(first, err)
+	}
+	if _, err = st.db.Exec("UPDATE prompt_generations SET provider='' WHERE id=?", first.ID); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := st.Generation(ctx, first.ID)
+	if err != nil || legacy.Account.Provider != "codex" {
+		t.Fatal(legacy, err)
+	}
+	if _, err = st.db.Exec("UPDATE inventory_state SET last_success_at=?", time.Now().Add(-91*time.Second).UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = st.CreateGenerationFor(ctx, "stale", request, base); !errors.Is(err, ErrGenerationAccount) {
+		t.Fatal(err)
+	}
+	if claim, err := st.ClaimGeneration(ctx); err != nil || claim.Phase != "failed" {
+		t.Fatal(claim, err)
+	}
+}
+
+func TestLookupGenerationValidatesWithoutCreatingOrInventory(t *testing.T) {
+	ctx := context.Background()
+	st := openTest(t)
+	request := GenerationRequest{AccountID: "account", Model: "model", Count: 1}
+	if _, existing, err := st.LookupGeneration(ctx, "absent", request); err != nil || existing {
+		t.Fatal(existing, err)
+	}
+	for _, key := range []string{"", "invalid key", strings.Repeat("x", 129), "\x7f"} {
+		if _, _, err := st.LookupGeneration(ctx, key, request); !errors.Is(err, ErrInvalidGeneration) {
+			t.Fatal(key, err)
+		}
+	}
+	if _, _, err := st.LookupGeneration(ctx, "valid", GenerationRequest{}); !errors.Is(err, ErrInvalidGeneration) {
+		t.Fatal(err)
+	}
+	account := Account{ID: request.AccountID, Provider: "antigravity", AuthIndex: "index", Binding: "binding", Status: "available"}
+	if _, _, err := st.CreateGenerationFor(ctx, "existing", request, account); err != nil {
+		t.Fatal(err)
+	}
+	request.Model = "other-model"
+	if _, existing, err := st.LookupGeneration(ctx, "existing", request); !existing || !errors.Is(err, ErrConflict) {
+		t.Fatal(existing, err)
+	}
+	var total int
+	if err := st.db.QueryRow("SELECT count(*) FROM prompt_generations").Scan(&total); err != nil || total != 1 {
+		t.Fatal(total, err)
+	}
+}

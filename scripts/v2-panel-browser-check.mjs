@@ -19,6 +19,11 @@ let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOn
 let modelRevision = 0, modelConflictOnce = false;
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', prompt_mode: 'fixed', phrases: []};
 const generations = new Map();
+const generationAccounts = [
+  {id: 'codex-01', provider: 'codex', status: 'available'},
+  {id: 'antigravity-fixture', provider: 'antigravity', status: 'available'},
+  {id: 'antigravity-disabled', provider: 'antigravity', status: 'disabled'}
+];
 let queryConfig = {timezone: 'Asia/Shanghai', automatic: false, interval_seconds: 300, on_five_hour_expiry: false,
   on_weekly_expiry: false, random_delay: {min_seconds: 5, max_seconds: 60}, excluded_hours: []};
 const observed = () => new Date().toISOString();
@@ -129,6 +134,7 @@ try {
         json(response, 202, {job_id: id, instance_id: 'local-browser-fixture'}); return;
       }
       reads.push(request.url);
+      if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
       if (resource === 'model-settings') { json(response, 200, modelSettings()); return; }
       if (resource === 'prompt-generations') {
         const job = generations.get(url.searchParams.get('job_id'));
@@ -142,7 +148,7 @@ try {
       }
       if (resource === 'overview') {
         json(response, 200, {...identity(), version: '0.2.0-rc.4', accounts_revision: accountsRevision, query_settings: {revision: settingsRevision, config: queryConfig}, read_only: true, query_concurrency: 8,
-          capabilities: {quota_query: true, passive_quota: true, model_execution: false, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true}, activity: {connected: true},
+          capabilities: {quota_query: true, passive_quota: true, model_execution: false, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true, generation_accounts: true, prompt_generation_providers: ['codex', 'antigravity']}, activity: {connected: true},
           inventory: {status: 'ready', last_success_at: observed()}, dashboard: {total: 24, available: 20, disabled: 2, unavailable: 2, capacity: 16, unknown_quota: 4, errors: 2,
             tasks: {active: 3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
             recent_events: [{kind: 'quota_query', at: observed(), account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: observed(), account_id: '', phase: 'queued'}, {kind: 'inventory', at: observed(), phase: 'ready'}]}}); return;
@@ -278,6 +284,7 @@ try {
   assert.equal(posts.length, 0, 'Collapsing or reloading sidebar dispatched a write');
   await evaluate('document.getElementById("sidebar-toggle").click()');
   assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'true');
+  assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 0, 'Overview fetched the generation directory before visiting models');
   for (const page of ['accounts', 'query', 'wake', 'models', 'history', 'diagnostics', 'overview']) {
     await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
     assert.equal(await evaluate(`document.querySelector('[data-view="${page}"]').hidden`), false, 'Navigation failed: ' + page);
@@ -490,8 +497,14 @@ try {
   await waitFor(() => evaluate('document.getElementById("accounts").rows.length===6'), 'Search did not reset');
   accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.querySelector("progress").value===11'), 'Background refresh not applied');
+  assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 1, 'Overview or quota actions refreshed the generation directory');
   await evaluate('document.querySelector("[data-page=models]").click()');
   await waitFor(() => evaluate('!document.getElementById("model-fields").disabled'), 'Model settings did not load');
+  await waitFor(() => evaluate('document.getElementById("generation-account-options").options.length===3'), 'Generation directory did not load');
+  assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 1, 'Opening models fetched the directory more than once');
+  assert.equal(await evaluate('document.getElementById("generation-account").value'), '', 'Directory silently selected an account');
+  assert.match(await evaluate('document.getElementById("generation-account-options").textContent'), /反重力.*已禁用/);
+  assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24', 'Antigravity accounts leaked into quota metrics');
   const modelWritesBeforeEditing = posts.length;
   await evaluate('for(const [id,value] of [["model-default","fixture-model"],["model-phrases","第一句\\n第二句\\n第一句"],["model-prompt-mode","random"]]){const node=document.getElementById(id);node.value=value.replaceAll("\\\\n","\\n");node.dispatchEvent(new Event("input"));}');
   assert.equal(await evaluate('document.getElementById("model-save").disabled'), true, 'Duplicate phrases were accepted');
@@ -515,6 +528,7 @@ try {
   await evaluate('document.getElementById("model-default").value="unsaved-model";document.getElementById("model-default").dispatchEvent(new Event("input"))');
   const modelReadsBeforePoll = reads.filter(path => path.endsWith('/model-settings')).length;
   await waitFor(() => reads.filter(path => path.endsWith('/model-settings')).length > modelReadsBeforePoll, 'Active model editor did not poll saved settings');
+  assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 1, 'Model polling also polled the generation directory');
   assert.equal(await evaluate('document.getElementById("model-default").value'), 'unsaved-model', 'Polling overwrote model draft');
   modelConflictOnce = true;
   await clickWhenEnabled('model-save');
@@ -524,13 +538,26 @@ try {
   await clickWhenEnabled('model-reload');
   await waitFor(() => evaluate('document.getElementById("model-default").value === "fixture-concurrent-model" && document.getElementById("model-conflict").hidden'), 'Explicit model reload did not resolve conflict');
   const poolBeforeGeneration = [...modelConfig.phrases];
-  await evaluate('for(const [id,value] of [["generation-account","codex-01"],["generation-model","fixture-model"],["generation-count","2"]]){const node=document.getElementById(id);node.value=value;node.dispatchEvent(new Event("input"));}');
+  const writesBeforeDirectoryRefresh = posts.length;
+  await evaluate('document.getElementById("generation-account").value="antigravity-disabled";document.getElementById("generation-account").dispatchEvent(new Event("input"))');
+  await evaluate('document.getElementById("generation-consent").click()');
+  assert.equal(await evaluate('document.getElementById("generation-submit").disabled'), true, 'Disabled Antigravity account was allowed');
+  assert.match(await evaluate('document.getElementById("generation-account-help").textContent'), /反重力.*已禁用/);
+  await clickWhenEnabled('generation-refresh-accounts');
+  await waitFor(() => reads.filter(path => path.endsWith('/generation-accounts')).length === 2 && evaluate('!document.getElementById("generation-refresh-accounts").disabled'), 'Explicit generation directory refresh did not finish');
+  assert.equal(await evaluate('document.getElementById("generation-account").value'), 'antigravity-disabled', 'Directory refresh silently replaced disabled selection');
+  assert.equal(posts.length, writesBeforeDirectoryRefresh, 'Directory refresh sent a model or settings write');
+  await evaluate('document.getElementById("generation-account").value="codex-01";document.getElementById("generation-account").dispatchEvent(new Event("input"));document.getElementById("generation-model").value="codex-fixture-model";document.getElementById("generation-account").value="antigravity-fixture";document.getElementById("generation-account").dispatchEvent(new Event("input"))');
+  assert.equal(await evaluate('document.getElementById("generation-model").value'), '', 'Codex model was carried into Antigravity automatically');
+  await evaluate('for(const [id,value] of [["generation-model","antigravity-fixture-model"],["generation-count","2"]]){const node=document.getElementById(id);node.value=value;node.dispatchEvent(new Event("input"));}');
+  assert.match(await evaluate('document.getElementById("generation-consent-label").textContent'), /反重力.*额度/);
   assert.equal(await evaluate('document.getElementById("generation-submit").disabled'), true, 'Generation does not require consent');
   await evaluate('document.getElementById("generation-consent").click()');
   await clickWhenEnabled('generation-submit');
   await waitFor(() => evaluate('!document.getElementById("generation-results").hidden'), 'Generated candidates did not appear');
   assert.equal(posts.filter(post => post.resource === 'prompt-generations').length, 1, 'Model generation submitted more than once');
-  assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'prompt-generations').body), {account_id: 'codex-01', model: 'fixture-model', count: 2});
+  assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'prompt-generations').body), {account_id: 'antigravity-fixture', model: 'antigravity-fixture-model', count: 2});
+  assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24', 'Generation changed quota account totals');
   assert.deepEqual(modelConfig.phrases, poolBeforeGeneration, 'Generation replaced saved pool automatically');
   assert.equal(await evaluate('document.getElementById("generation-apply").disabled'), true, 'Candidates were selected without confirmation');
   await evaluate('document.getElementById("generation-select-all").click();document.getElementById("generation-apply").click()');
@@ -573,7 +600,8 @@ try {
   assert.equal(posts.filter(post => post.resource === 'prompt-generations').length, 1, 'Unexpected generation write count');
   assert.equal(posts.length, 14, 'Unexpected total API write count');
   assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations'].includes(post.resource)), true, 'Unexpected API write');
-  console.log('V2 browser checks passed: desktop/mobile layout, direct overview settings saves/locking/draft isolation/rejections/conflicts/unknown-result GET verification, explicit editor saves, settings validation/drafts/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging and authentication.');
+  assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
+  console.log('V2 browser checks passed: desktop/mobile layout, direct overview settings saves/locking/draft isolation/rejections/conflicts/unknown-result GET verification, explicit editor saves, settings validation/drafts/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging, authentication, local generation directory, disabled Antigravity selection, explicit catalog refresh and one exact Antigravity generation request.');
   console.log('Local fixture screenshots: ' + output);
 } finally {
   accountReadGate?.release();

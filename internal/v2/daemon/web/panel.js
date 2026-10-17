@@ -265,9 +265,11 @@
   let settingsNeedsVerification = false, savingRule = null;
   let modelBase = null, savedModelSettings = null, modelLoading = false, modelSaving = false, modelConflict = false, modelNeedsVerification = false, modelConfirmation = '';
   let generationIntent = null, generationTask = null, generationSubmitting = false, generationReading = false, generationUnconfirmed = false, generationUnknown = false;
+  let generationCatalog = null, generationCatalogLoading = false, generationCatalogError = '', generationCatalogAttempt = '', generationCatalogSequence = 0, generationAccountIdentity = null;
   const generationSelected = new Set();
   const modelFields = {default_model: 'model-default', default_prompt: 'model-default-prompt', five_hour_model: 'model-five-hour', five_hour_prompt: 'model-five-hour-prompt', weekly_model: 'model-weekly', weekly_prompt: 'model-weekly-prompt', prompt_mode: 'model-prompt-mode', phrases: 'model-phrases'};
   codes.invalid_model_settings = '模型与提示词设置无效，请检查字段';
+  codes.generation_accounts_unavailable = '生成账号目录暂不可用，请稍后刷新核实';
   codes.model_settings_conflict = '后台模型配置已变化，请重新读取并丢弃草稿后再编辑';
   Object.assign(codes, {prompt_generation_unavailable: '后台未提供候选生成功能', invalid_prompt_generation: '生成参数无效，请检查账号、模型和数量', generation_account_unavailable: '生成账号不可用或凭据绑定已变化，请检查账号状态', generation_response_invalid: '模型返回的候选短句无效', generation_request_rejected: '模型请求被拒绝', generation_interrupted: '生成被中断，可能已消耗额度', generation_outcome_unknown: '生成结果未知，可能已消耗额度', idempotency_key_required: '缺少有效的请求标识', job_id_required: '缺少有效的生成任务标识'});
   const settingsFields = {automatic: 'settings-automatic', fiveHour: 'settings-five-hour', weekly: 'settings-weekly', interval: 'settings-interval', timezone: 'settings-timezone', delayMin: 'settings-delay-min', delayMax: 'settings-delay-max', excluded: 'settings-excluded'};
@@ -522,11 +524,66 @@
     } catch (error) { setText('model-preview-result', error.message || '本地预览失败'); }
   }
   function generationSupported() { return overviewData?.capabilities?.prompt_generation === true; }
+  function generationCatalogSupported() { return overviewData?.capabilities?.generation_accounts === true; }
+  function generationProviderName(provider) { return provider === 'antigravity' ? '反重力（Antigravity）' : 'Codex'; }
+  function generationProviderSupported(provider) {
+    const providers = overviewData?.capabilities?.prompt_generation_providers;
+    return Array.isArray(providers) ? providers.includes(provider) : provider === 'codex';
+  }
+  function generationAccountState() {
+    const id = $('generation-account').value.trim();
+    if (!generationCatalogSupported()) return {allowed: generationProviderSupported('codex'), provider: 'codex', text: generationProviderSupported('codex') ? '旧版后台未提供账号目录，仅支持手动输入 Codex 账号 ID。' : '当前后台未提供账号目录，且未声明支持手动 Codex 账号生成。'};
+    if (generationCatalogLoading) return {allowed: false, text: '正在读取本地 CPA 账号目录，请稍候。'};
+    if (!generationCatalog || generationCatalog.instance !== views.instance || generationCatalogError) return {allowed: false, text: '账号目录尚未核实，请刷新生成账号。'};
+    if (!id) return {allowed: false, text: '请选择 Codex 或反重力生成账号，不会自动选择。'};
+    const account = generationCatalog.accounts.find(item => item.id === id);
+    if (!account) return {allowed: false, text: '所选账号已移除或不在目录中，请核实；不会自动切换。'};
+    if (generationAccountIdentity?.id === id && generationAccountIdentity.provider !== account.provider) return {allowed: false, text: '所选账号提供方已变化，请重新明确选择并检查模型；不会自动切换。'};
+    const provider = account.provider, label = generationProviderName(provider);
+    if (!generationProviderSupported(provider)) return {allowed: false, provider, text: label + ' · 当前后台尚不支持该提供方生成。'};
+    const statuses = {disabled: '已禁用', unavailable: '暂不可用', binding_unavailable: '无法核实凭据绑定'};
+    return {allowed: account.status === 'available', provider, text: label + ' · ' + (statuses[account.status] || '可用，请填写该提供方实际可用的模型') + '；不会自动回退到其他账号。'};
+  }
+  async function reloadGenerationAccounts() {
+    if (!connected || !generationCatalogSupported() || generationCatalogLoading) return;
+    const current = generation, instance = views.instance, sequence = ++generationCatalogSequence;
+    generationCatalogLoading = true; generationCatalogAttempt = instance; generationCatalogError = ''; renderGeneration();
+    try {
+      const data = await api('/generation-accounts');
+      if (current !== generation || sequence !== generationCatalogSequence || instance !== views.instance) return;
+      const seen = new Set();
+      if (data?.instance_id !== instance || !Array.isArray(data.accounts) || data.accounts.some(account => {
+        if (typeof account?.id !== 'string' || !account.id.trim() || new TextEncoder().encode(account.id).length > 256 || /[\p{Cc}]/u.test(account.id) || seen.has(account.id) || !['codex', 'antigravity'].includes(account.provider) || !['available', 'disabled', 'unavailable', 'binding_unavailable'].includes(account.status)) return true;
+        seen.add(account.id); return false;
+      })) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      generationCatalog = {instance, accounts: data.accounts.map(({id, provider, status}) => ({id, provider, status}))};
+      $('generation-account-options').replaceChildren(...generationCatalog.accounts.map(account => {
+        const option = element('option'); option.value = account.id;
+        option.label = generationProviderName(account.provider) + ' · ' + ({available: '可用', disabled: '已禁用', unavailable: '暂不可用', binding_unavailable: '绑定不可用'}[account.status]);
+        option.textContent = option.label; return option;
+      }));
+      const selected = generationCatalog.accounts.find(account => account.id === $('generation-account').value.trim());
+      if (selected && !generationAccountIdentity) generationAccountIdentity = {id: selected.id, provider: selected.provider};
+    } catch (error) {
+      if (current !== generation || sequence !== generationCatalogSequence || instance !== views.instance) return;
+      generationCatalogError = message(error.code);
+    } finally {
+      if (current === generation && sequence === generationCatalogSequence) { generationCatalogLoading = false; renderGeneration(); }
+    }
+  }
+  function ensureGenerationAccounts() {
+    if (generationCatalogSupported() && generationCatalogAttempt !== views.instance) void reloadGenerationAccounts();
+  }
   function generationActive() { return ['queued', 'running'].includes(generationTask?.phase); }
   function renderGeneration() {
     const supported = generationSupported(), locked = !connected || !supported || generationSubmitting || generationReading || generationActive() || generationUnconfirmed || generationUnknown;
+    const account = generationAccountState();
     $('generation-fields').disabled = locked;
-    $('generation-submit').disabled = locked || !$('generation-consent').checked;
+    $('generation-submit').disabled = locked || !account.allowed || !$('generation-consent').checked;
+    $('generation-refresh-accounts').disabled = !connected || !generationCatalogSupported() || generationCatalogLoading;
+    setText('generation-directory-status', !connected ? '尚未连接，账号目录仅读取本地 CPA，不调用模型。' : !generationCatalogSupported() ? '当前后台没有账号目录；兼容手动输入 Codex 账号。' : generationCatalogLoading ? '正在读取本地 CPA 账号目录，不调用模型…' : generationCatalogError ? '读取账号目录失败：' + generationCatalogError + '。请显式刷新，不会发送模型请求。' : generationCatalog?.instance === views.instance ? '已读取 ' + generationCatalog.accounts.length + ' 个生成账号；与 Codex 额度统计独立。仅显式刷新，不随页面轮询。' : '请刷新生成账号，仅读取本地 CPA，不调用模型。');
+    setText('generation-account-help', account.text);
+    setText('generation-consent-label', '我确认通过' + (account.provider ? ' ' + generationProviderName(account.provider) : '所选账号') + ' 发送一次模型请求，可能消耗该账号额度。');
     $('generation-verify').hidden = !generationUnconfirmed && !generationUnknown;
     $('generation-verify').disabled = !connected || !supported || generationSubmitting || generationReading || generationUnknown && !generationTask?.job_id;
     const phases = {queued: '等待生成', running: '生成中', completed: '候选已就绪', failed: '生成失败', unknown: '结果未知'};
@@ -564,6 +621,7 @@
     if (generationUnknown) return;
     if (verify ? !generationUnconfirmed || !generationIntent : generationUnconfirmed || generationActive() || !$('generation-consent').checked) return;
     if (!verify) {
+      if (!generationAccountState().allowed) { setText('generation-message', '请先核实可用的生成账号与提供方；' + generationAccountState().text); return; }
       const account = $('generation-account').value.trim(), model = $('generation-model').value, rawCount = $('generation-count').value;
       const count = /^\d+$/.test(rawCount) ? Number(rawCount) : NaN;
       if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account) || !model || new TextEncoder().encode(model).length > 200 || /[\s\p{Cc}]/u.test(model) || !Number.isSafeInteger(count) || count < 1 || count > 20) { setText('generation-message', '请输入有效账号 ID、无空白的实际模型标识及 1–20 的整数数量，并确认消耗额度。'); return; }
@@ -633,6 +691,8 @@
     modelLoading = false; modelSaving = false; modelConfirmation = '';
     if (generationSubmitting && generationIntent) generationUnconfirmed = true;
     generationSubmitting = false; generationReading = false;
+    generationCatalogSequence++; generationCatalog = null; generationCatalogLoading = false; generationCatalogError = ''; generationCatalogAttempt = '';
+    $('generation-account-options').replaceChildren();
     ruleMessage('');
     $('login-section').hidden = false;
     setText('auto-status', '尚未连接');
@@ -903,7 +963,7 @@
         await accounts(forceAccounts || !cursor, data.accounts_revision);
       }
       await pollJobs();
-      if (activePage === 'models') { await reloadModelSettings(); await pollGeneration(); }
+      if (activePage === 'models') { ensureGenerationAccounts(); await reloadModelSettings(); await pollGeneration(); }
       if (current !== generation) return;
       updateTimes();
       setText('auto-status', '数据自动更新'); $('auto-status').dataset.state = 'online'; setConnection('独立后台已连接 · 页面每 5 秒更新'); clearError();
@@ -939,7 +999,7 @@
       await accounts(true);
       if (current !== generation) return;
       if (activePage === 'query' && settingsSupported() && !savedSettings) await reloadSettings();
-      if (activePage === 'models') { await reloadModelSettings(); await pollGeneration(); }
+      if (activePage === 'models') { ensureGenerationAccounts(); await reloadModelSettings(); await pollGeneration(); }
       clearError(); monitor(current);
     } catch (error) {
       if (current !== generation && error.code !== 'unauthorized') return;
@@ -1006,7 +1066,7 @@
     document.title = '窗口助手 · ' + pages[name][0];
     if (connected) { renderTasks(); renderDiagnostics(); }
     if (name === 'query' && loadSettings && connected && settingsSupported() && (!savedSettings || savedSettings.instance_id !== views.instance)) void reloadSettings();
-    if (name === 'models' && loadSettings && connected) { void reloadModelSettings(); void pollGeneration(); }
+    if (name === 'models' && loadSettings && connected) { ensureGenerationAccounts(); void reloadModelSettings(); void pollGeneration(); }
   }
   function changeFilter() {
     clearTimeout(filterTimer); filterSequence++;
@@ -1067,7 +1127,19 @@
   $('generation-form').onsubmit = event => { event.preventDefault(); return submitGeneration(); };
   $('generation-verify').onclick = () => submitGeneration(true);
   $('generation-consent').onchange = renderGeneration;
-  $('generation-use-default').onclick = () => { if (!$('generation-fields').disabled) $('generation-model').value = $('model-default').value; };
+  $('generation-refresh-accounts').onclick = reloadGenerationAccounts;
+  $('generation-account').oninput = () => {
+    if ($('generation-fields').disabled) return;
+    const id = $('generation-account').value.trim(), selected = generationCatalog?.accounts.find(account => account.id === id);
+    if (selected?.provider === 'antigravity' && generationAccountIdentity?.provider !== 'antigravity' || selected && generationAccountIdentity && selected.provider !== generationAccountIdentity.provider) $('generation-model').value = '';
+    if (selected) generationAccountIdentity = {id: selected.id, provider: selected.provider};
+    $('generation-consent').checked = false; renderGeneration();
+  };
+  $('generation-use-default').onclick = () => {
+    if ($('generation-fields').disabled) return;
+    $('generation-model').value = $('model-default').value; $('generation-consent').checked = false;
+    setText('generation-message', '已按你的操作填入草稿默认模型，请确认它属于所选账号提供方且实际可用；尚未调用模型。'); renderGeneration();
+  };
   $('generation-select-all').onclick = () => {
     if ($('generation-select-all').disabled) return;
     generationTask.candidates.forEach((phrase, index) => generationSelected.add(index)); renderGeneration();

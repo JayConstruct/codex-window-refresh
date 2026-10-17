@@ -21,18 +21,23 @@ import (
 const MaxFrame = 4 << 20
 
 type Client struct {
-	Path               string
-	instance           atomic.Value
-	generationInstance atomic.Value
+	Path       string
+	instance   atomic.Value
+	generation atomic.Value
+}
+type generationCapability struct {
+	instance  string
+	providers []string
 }
 type Hello struct {
-	Protocol         int    `json:"protocol_version"`
-	Instance         string `json:"bridge_instance_id"`
-	ReadOnly         bool   `json:"read_only"`
-	Events           bool   `json:"events_supported"`
-	HostProcess      string `json:"host_process_id"`
-	PassiveQuota     bool   `json:"passive_quota_supported"`
-	PromptGeneration bool   `json:"prompt_generation_supported"`
+	Protocol            int      `json:"protocol_version"`
+	Instance            string   `json:"bridge_instance_id"`
+	ReadOnly            bool     `json:"read_only"`
+	Events              bool     `json:"events_supported"`
+	HostProcess         string   `json:"host_process_id"`
+	PassiveQuota        bool     `json:"passive_quota_supported"`
+	PromptGeneration    bool     `json:"prompt_generation_supported"`
+	GenerationProviders []string `json:"prompt_generation_providers"`
 }
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -151,33 +156,66 @@ func (c *Client) PublishBindings(ctx context.Context, instance string, accounts 
 }
 
 func (c *Client) Handshake(ctx context.Context) (Hello, error) {
+	c.generation.Store(generationCapability{})
 	var h Hello
-	err := c.exchange(ctx, "bridge.hello", struct{}{}, &h)
+	var raw json.RawMessage
+	err := c.exchange(ctx, "bridge.hello", struct{}{}, &raw)
+	if err == nil && json.Unmarshal(raw, &h) != nil {
+		err = errors.New("bridge_response_invalid")
+	}
+	if err == nil {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(raw, &fields) != nil {
+			err = errors.New("bridge_protocol_incompatible")
+		} else if providers, present := fields["prompt_generation_providers"]; present && (len(bytes.TrimSpace(providers)) == 0 || bytes.TrimSpace(providers)[0] != '[') {
+			err = errors.New("bridge_protocol_incompatible")
+		}
+	}
 	if err == nil && (h.Protocol != 1 || h.Instance == "" || !h.ReadOnly) {
 		err = errors.New("bridge_protocol_incompatible")
 	}
 	if err == nil {
-		c.instance.Store(h.Instance)
-		generationInstance := ""
-		if h.PromptGeneration {
-			generationInstance = h.Instance
+		seen := map[string]bool{}
+		for _, provider := range h.GenerationProviders {
+			if !h.PromptGeneration || (provider != "codex" && provider != "antigravity") || seen[provider] {
+				err = errors.New("bridge_protocol_incompatible")
+				break
+			}
+			seen[provider] = true
 		}
-		c.generationInstance.Store(generationInstance)
+	}
+	if err == nil {
+		c.instance.Store(h.Instance)
+		capability := generationCapability{}
+		if h.PromptGeneration {
+			capability.instance = h.Instance
+			if h.GenerationProviders == nil {
+				h.GenerationProviders = []string{"codex"}
+			}
+			capability.providers = append([]string(nil), h.GenerationProviders...)
+		}
+		c.generation.Store(capability)
 	}
 	return h, err
 }
 func (c *Client) SupportsPromptGeneration() bool {
+	return len(c.SupportedGenerationProviders()) != 0
+}
+func (c *Client) SupportedGenerationProviders() []string {
 	instance, _ := c.instance.Load().(string)
-	generationInstance, _ := c.generationInstance.Load().(string)
-	return instance != "" && instance == generationInstance
+	capability, _ := c.generation.Load().(generationCapability)
+	if instance == "" || instance != capability.instance {
+		return []string{}
+	}
+	return append([]string{}, capability.providers...)
 }
 func (c *Client) Call(ctx context.Context, method string, request, response any) error {
 	switch method {
 	case "host.auth.list", "host.auth.get_runtime", "host.auth.get":
 	case "host.model.execute_stream", "host.model.stream_read", "host.model.stream_close":
 		instance, _ := c.instance.Load().(string)
-		generationInstance, _ := c.generationInstance.Load().(string)
-		if instance == "" || instance != generationInstance {
+		capability, _ := c.generation.Load().(generationCapability)
+		if instance == "" || instance != capability.instance || len(capability.providers) == 0 {
 			return errors.New("generation_not_supported")
 		}
 		return c.exchangeFor(ctx, method, request, response, instance)

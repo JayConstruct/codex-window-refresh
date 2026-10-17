@@ -16,6 +16,75 @@ type candidateGenerator interface {
 	GenerateCandidates(context.Context, store.Account, string, int) ([]string, error)
 }
 
+type generationDirectory interface {
+	GenerationAccounts(context.Context) ([]store.Account, error)
+}
+
+type generationResolver interface {
+	ResolveGenerationAccount(context.Context, string) (store.Account, error)
+}
+
+func (s *Service) generationAccountsSupported() bool {
+	_, ok := s.source.(generationDirectory)
+	return ok
+}
+
+func (s *Service) generationProviders() []string {
+	if source, ok := s.source.(interface{ GenerationProviders() []string }); ok {
+		providers := []string{}
+		seen := map[string]bool{}
+		for _, provider := range source.GenerationProviders() {
+			if (provider == "codex" || provider == "antigravity") && !seen[provider] {
+				providers = append(providers, provider)
+				seen[provider] = true
+			}
+		}
+		return providers
+	}
+	if s.generationSupported() {
+		return []string{"codex"}
+	}
+	return []string{}
+}
+
+func (s *Service) generationAccounts(w http.ResponseWriter, r *http.Request) {
+	source, ok := s.source.(generationDirectory)
+	if !ok {
+		apiError(w, 503, "generation_accounts_unavailable")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	accounts, err := source.GenerationAccounts(ctx)
+	if err != nil || len(accounts) > 10000 {
+		apiError(w, 503, "generation_accounts_unavailable")
+		return
+	}
+	type entry struct {
+		ID       string `json:"id"`
+		Provider string `json:"provider"`
+		Status   string `json:"status"`
+	}
+	entries := []entry{}
+	seen := map[string]bool{}
+	for _, account := range accounts {
+		if account.Provider == "" {
+			account.Provider = "codex"
+		}
+		if !store.ValidID(account.ID) || seen[account.ID] || (account.Provider != "codex" && account.Provider != "antigravity") {
+			apiError(w, 503, "generation_accounts_unavailable")
+			return
+		}
+		seen[account.ID] = true
+		status := account.Status
+		if status != "available" && status != "disabled" && status != "binding_unavailable" {
+			status = "unavailable"
+		}
+		entries = append(entries, entry{ID: account.ID, Provider: account.Provider, Status: status})
+	}
+	writeJSON(w, 200, map[string]any{"instance_id": s.instance, "accounts": entries})
+}
+
 func (s *Service) generationSupported() bool {
 	_, ok := s.source.(candidateGenerator)
 	if source, available := s.source.(interface{ GenerationAvailable() bool }); available {
@@ -44,10 +113,6 @@ func (s *Service) promptGenerations(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, generation)
 		return
 	}
-	if !s.generationSupported() {
-		apiError(w, 503, "prompt_generation_unavailable")
-		return
-	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var request store.GenerationRequest
 	decoder := json.NewDecoder(r.Body)
@@ -61,7 +126,29 @@ func (s *Service) promptGenerations(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 400, "idempotency_key_required")
 		return
 	}
-	generation, _, err := s.Store.CreateGeneration(r.Context(), key, request)
+	generation, existing, err := s.Store.LookupGeneration(r.Context(), key, request)
+	if err == nil && !existing {
+		if !s.generationSupported() {
+			apiError(w, 503, "prompt_generation_unavailable")
+			return
+		}
+		if source, ok := s.source.(generationResolver); ok {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			account, resolveErr := source.ResolveGenerationAccount(ctx, request.AccountID)
+			cancel()
+			if resolveErr != nil {
+				if resolveErr.Error() == "generation_not_supported" {
+					apiError(w, 503, "prompt_generation_unavailable")
+				} else {
+					apiError(w, 409, "generation_account_unavailable")
+				}
+				return
+			}
+			generation, _, err = s.Store.CreateGenerationFor(r.Context(), key, request, account)
+		} else {
+			generation, _, err = s.Store.CreateGeneration(r.Context(), key, request)
+		}
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrConflict):

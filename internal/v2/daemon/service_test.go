@@ -58,9 +58,9 @@ func TestDashboardAndSyncAreBoundedReadOnlyAndNeverQueryUpstream(t *testing.T) {
 		AccountsRevision uint64          `json:"accounts_revision"`
 		ReadOnly         bool            `json:"read_only"`
 		Dashboard        store.Dashboard `json:"dashboard"`
-		Capabilities     map[string]bool `json:"capabilities"`
+		Capabilities     map[string]any  `json:"capabilities"`
 	}
-	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &view) != nil || !view.ReadOnly || view.Capabilities["model_execution"] || !view.Capabilities["inventory_sync"] || view.Dashboard.Total != 3 || view.Dashboard.Available != 1 || view.Dashboard.Disabled != 1 || view.Dashboard.Unavailable != 1 || view.Dashboard.Tasks.Active != 1 || view.Revision != view.Dashboard.Revision || view.AccountsRevision != view.Dashboard.AccountsRevision || len(view.Dashboard.ActiveJobs) != 1 {
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &view) != nil || !view.ReadOnly || view.Capabilities["model_execution"] != false || view.Capabilities["inventory_sync"] != true || view.Dashboard.Total != 3 || view.Dashboard.Available != 1 || view.Dashboard.Disabled != 1 || view.Dashboard.Unavailable != 1 || view.Dashboard.Tasks.Active != 1 || view.Revision != view.Dashboard.Revision || view.AccountsRevision != view.Dashboard.AccountsRevision || len(view.Dashboard.ActiveJobs) != 1 {
 		t.Fatal(w.Code, w.Body.String())
 	}
 	w = request(service, "GET", "/api/v2/accounts?limit=6&search=ALP&status=available", "", "")

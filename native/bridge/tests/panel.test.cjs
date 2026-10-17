@@ -965,6 +965,188 @@ test('candidate generation requires capability, valid fields and explicit quota 
   assert.equal(ui.calls.some(call => call.method === 'POST'), false); assert.match(ui.get('generation-message').textContent, /有效/);
   ui.get('model-default').value = 'real-default'; ui.get('generation-use-default').onclick(); assert.equal(ui.get('generation-model').value, 'real-default');
 });
+const generationDirectory = (instance = 'a', accounts = [
+  {id: 'codex-01', provider: 'codex', status: 'available'},
+  {id: 'antigravity-01', provider: 'antigravity', status: 'available'},
+  {id: 'antigravity-disabled', provider: 'antigravity', status: 'disabled'}
+]) => ({instance_id: instance, accounts});
+const directoryOverview = (instance = 'a') => ({...modelOverview(instance), capabilities: {...modelOverview(instance).capabilities, generation_accounts: true, prompt_generation_providers: ['codex', 'antigravity']}});
+function directoryResponse(url, directory = generationDirectory(), instance = 'a') {
+  if (url.endsWith('/generation-accounts')) return [200, directory];
+  if (url.endsWith('/overview')) return [200, directoryOverview(instance)];
+  return modelResponse(url, modelSettings(1, modelConfig(), instance), instance);
+}
+test('generation account directory loads only on model navigation and explicit refresh without writes or quota changes', async () => {
+  const ui = panel(url => directoryResponse(url));
+  await ui.get('connect').onclick(); await ui.tick(5000);
+  assert.equal(ui.calls.some(call => call.url.endsWith('/generation-accounts')), false);
+  ui.nav.find(node => node.dataset.page === 'models').listeners.get('click')(); await flush();
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/generation-accounts')).length, 1);
+  assert.equal(ui.get('generation-account').value, '');
+  assert.equal(ui.get('metric-total').textContent, '24');
+  assert.match(ui.get('generation-account-options').textContent, /Codex.*反重力.*已禁用/);
+  await ui.tick(5000);
+  ui.nav.find(node => node.dataset.page === 'overview').listeners.get('click')();
+  ui.nav.find(node => node.dataset.page === 'models').listeners.get('click')(); await flush();
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/generation-accounts')).length, 1);
+  await ui.get('generation-refresh-accounts').onclick();
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/generation-accounts')).length, 2);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('Antigravity generation uses its exact selected account and model without a client provider or automatic Codex default', async () => {
+  const ui = panel((url, options) => url.includes('/prompt-generations') ? [202, {instance_id: 'a', job_id: 'antig-job', phase: 'queued', candidates: []}] : directoryResponse(url));
+  await openModels(ui); configureCandidateRequest(ui); ui.get('generation-account').oninput();
+  ui.get('generation-model').value = 'codex-default';
+  ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-account').oninput();
+  assert.equal(ui.get('generation-model').value, ''); assert.equal(ui.get('generation-consent').checked, false);
+  assert.match(ui.get('generation-account-help').textContent, /反重力/);
+  ui.get('model-default').value = 'explicit-default'; ui.get('generation-use-default').onclick();
+  assert.equal(ui.get('generation-model').value, 'explicit-default'); assert.match(ui.get('generation-message').textContent, /确认.*提供方/);
+  ui.get('generation-model').value = 'antigravity-fixture-model'; ui.get('generation-consent').checked = true; ui.get('generation-consent').onchange();
+  assert.match(ui.get('generation-consent-label').textContent, /反重力.*额度/);
+  await submitCandidates(ui); await submitCandidates(ui);
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 1);
+  assert.deepEqual(JSON.parse(posts[0].body), {account_id: 'antigravity-01', model: 'antigravity-fixture-model', count: 3});
+});
+test('unavailable, missing and replaced generation accounts never fall back or silently permit submission', async () => {
+  let directory = generationDirectory();
+  const ui = panel(url => directoryResponse(url, directory)); await openModels(ui); configureCandidateRequest(ui);
+  ui.get('generation-account').value = 'antigravity-disabled'; ui.get('generation-account').oninput();
+  ui.get('generation-model').value = 'model'; ui.get('generation-consent').checked = true; ui.get('generation-consent').onchange();
+  assert.equal(ui.get('generation-submit').disabled, true); assert.match(ui.get('generation-account-help').textContent, /已禁用/); await submitCandidates(ui);
+  ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-account').oninput();
+  ui.get('generation-model').value = 'antig-model';
+  for (const status of ['unavailable', 'binding_unavailable']) {
+    directory = generationDirectory('a', [{id: 'antigravity-01', provider: 'antigravity', status}]);
+    await ui.get('generation-refresh-accounts').onclick();
+    assert.equal(ui.get('generation-account').value, 'antigravity-01'); assert.equal(ui.get('generation-submit').disabled, true);
+  }
+  directory = generationDirectory('a', []); await ui.get('generation-refresh-accounts').onclick();
+  assert.match(ui.get('generation-account-help').textContent, /已移除/);
+  directory = generationDirectory('a', [{id: 'antigravity-01', provider: 'codex', status: 'available'}]);
+  await ui.get('generation-refresh-accounts').onclick(); assert.match(ui.get('generation-account-help').textContent, /提供方已变化/);
+  ui.get('generation-consent').checked = true; await submitCandidates(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  ui.get('generation-account').oninput(); assert.equal(ui.get('generation-model').value, '');
+  assert.match(ui.get('generation-account-help').textContent, /Codex/);
+});
+test('Antigravity catalog entries remain blocked when the backend has not advertised that generation provider', async () => {
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) { const data = directoryOverview(); delete data.capabilities.prompt_generation_providers; return [200, data]; }
+    return directoryResponse(url);
+  });
+  await openModels(ui); configureCandidateRequest(ui); ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-account').oninput();
+  ui.get('generation-model').value = 'model'; ui.get('generation-consent').checked = true; ui.get('generation-consent').onchange();
+  assert.equal(ui.get('generation-submit').disabled, true); assert.match(ui.get('generation-account-help').textContent, /尚不支持/); await submitCandidates(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('explicit provider capabilities also gate Codex entries and legacy manual Codex input', async () => {
+  for (const catalog of [true, false]) {
+    const ui = panel(url => {
+      if (url.endsWith('/overview')) { const data = directoryOverview(); data.capabilities.generation_accounts = catalog; data.capabilities.prompt_generation_providers = ['antigravity']; return [200, data]; }
+      return directoryResponse(url);
+    });
+    await openModels(ui); configureCandidateRequest(ui);
+    assert.equal(ui.get('generation-submit').disabled, true); assert.match(ui.get('generation-account-help').textContent, /未声明支持|尚不支持/);
+    await submitCandidates(ui); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+test('generation directory unavailable errors have a readable message and never enable manual fallback', async () => {
+  const ui = panel(url => url.endsWith('/generation-accounts') ? [503, {error: 'generation_accounts_unavailable'}] : directoryResponse(url));
+  await openModels(ui); configureCandidateRequest(ui);
+  assert.match(ui.get('generation-directory-status').textContent, /生成账号目录暂不可用/);
+  assert.equal(ui.get('generation-submit').disabled, true); await submitCandidates(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('directory loading, read failure and stale instances block new generation without automatic retry', async () => {
+  let resolveCatalog;
+  const ui = panel(url => url.endsWith('/generation-accounts') ? new Promise(resolve => { resolveCatalog = resolve; }) : directoryResponse(url));
+  await openModels(ui); configureCandidateRequest(ui);
+  assert.equal(ui.get('generation-refresh-accounts').disabled, true); assert.equal(ui.get('generation-submit').disabled, true);
+  await submitCandidates(ui); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  resolveCatalog([200, generationDirectory('stale-instance')]); await flush();
+  assert.match(ui.get('generation-directory-status').textContent, /失败/); assert.equal(ui.get('generation-submit').disabled, true);
+  await ui.tick(5000); assert.equal(ui.calls.filter(call => call.url.endsWith('/generation-accounts')).length, 1);
+  const retry = ui.get('generation-refresh-accounts').onclick(); resolveCatalog([503, {error: 'storage_unavailable'}]); await retry;
+  assert.equal(ui.get('generation-submit').disabled, true); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  const success = ui.get('generation-refresh-accounts').onclick(); resolveCatalog([200, generationDirectory()]); await success;
+  assert.equal(ui.get('generation-submit').disabled, false);
+});
+test('late catalog responses after disconnect cannot expose options or enable generation', async () => {
+  let resolveCatalog;
+  const ui = panel(url => url.endsWith('/generation-accounts') ? new Promise(resolve => { resolveCatalog = resolve; }) : directoryResponse(url));
+  await openModels(ui); ui.get('disconnect').onclick();
+  resolveCatalog([200, generationDirectory()]); await flush();
+  assert.equal(ui.get('generation-account-options').children.length, 0);
+  assert.equal(ui.get('generation-submit').disabled, true); assert.equal(ui.get('generation-refresh-accounts').disabled, true);
+});
+test('invalid directory payloads are not rendered or accepted as an implicit manual-account fallback', async () => {
+  const invalid = [
+    {instance_id: 'a', accounts: null},
+    generationDirectory('a', [{id: 'account', provider: 'other', status: 'available'}]),
+    generationDirectory('a', [{id: 'account', provider: 'codex', status: 'other'}]),
+    generationDirectory('a', [{id: 'account\n', provider: 'codex', status: 'available'}]),
+    generationDirectory('a', [{id: 'same', provider: 'codex', status: 'available'}, {id: 'same', provider: 'antigravity', status: 'available'}])
+  ];
+  for (const directory of invalid) {
+    const ui = panel(url => directoryResponse(url, directory)); await openModels(ui); configureCandidateRequest(ui);
+    assert.equal(ui.get('generation-account-options').children.length, 0); assert.equal(ui.get('generation-submit').disabled, true);
+    assert.match(ui.get('generation-directory-status').textContent, /失败/); await submitCandidates(ui);
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+test('typing through partial account IDs still clears a model when changing the selected provider', async () => {
+  const ui = panel(url => directoryResponse(url)); await openModels(ui);
+  ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-account').oninput();
+  ui.get('generation-model').value = 'antig-model';
+  ui.get('generation-account').value = 'codex-'; ui.get('generation-account').oninput();
+  ui.get('generation-account').value = 'codex-01'; ui.get('generation-account').oninput();
+  assert.equal(ui.get('generation-model').value, ''); assert.match(ui.get('generation-account-help').textContent, /Codex/);
+});
+test('catalog responses from an earlier backend cannot override a newly observed instance', async () => {
+  let instance = 'a', resolveCatalog;
+  const ui = panel(url => url.endsWith('/generation-accounts') ? new Promise(resolve => { resolveCatalog = resolve; }) : directoryResponse(url, generationDirectory(instance), instance));
+  await openModels(ui); instance = 'b'; await ui.tick(5000);
+  resolveCatalog([200, generationDirectory('a')]); await flush();
+  assert.equal(ui.get('generation-account-options').children.length, 0); assert.equal(ui.get('generation-submit').disabled, true);
+  await ui.tick(5000); resolveCatalog([200, generationDirectory('b')]); await flush();
+  assert.equal(ui.get('generation-account-options').children.length, 3);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('catalog refresh never clears unknown generation state, unlocks fields or creates another request key', async () => {
+  const ui = panel((url, options) => url.includes('/prompt-generations') ? [200, {instance_id: 'a', job_id: 'unknown-antig', phase: 'unknown', candidates: []}] : directoryResponse(url));
+  await openModels(ui); configureCandidateRequest(ui);
+  await submitCandidates(ui); assert.equal(ui.get('generation-fields').disabled, true);
+  await ui.get('generation-refresh-accounts').onclick();
+  assert.equal(ui.get('generation-fields').disabled, true); assert.equal(ui.get('generation-submit').disabled, true);
+  assert.match(ui.get('generation-message').textContent, /未知/);
+  ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-account').oninput();
+  assert.equal(ui.get('generation-fields').disabled, true); await submitCandidates(ui); await ui.get('generation-verify').onclick();
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(ui.calls.filter(call => call.url.includes('/prompt-generations?job_id=')).length, 1);
+});
+test('catalog refresh after lost generation acknowledgement preserves the original verification key and body', async () => {
+  let submissions = 0;
+  const ui = panel((url, options) => {
+    if (url.includes('/prompt-generations')) {
+      if (++submissions === 1) throw new Error('lost acknowledgement');
+      return [202, {instance_id: 'a', job_id: 'verified-original', phase: 'queued', candidates: []}];
+    }
+    return directoryResponse(url);
+  });
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  await ui.get('generation-refresh-accounts').onclick();
+  ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-model').value = 'changed';
+  await ui.get('generation-verify').onclick();
+  const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 2);
+  assert.equal(posts[0].body, posts[1].body); assert.equal(posts[0].headers['Idempotency-Key'], posts[1].headers['Idempotency-Key']);
+});
+test('legacy generation keeps manual Codex entry and never fetches an unsupported directory', async () => {
+  const ui = panel(url => modelResponse(url)); await openModels(ui); configureCandidateRequest(ui);
+  assert.match(ui.get('generation-account-help').textContent, /旧版.*Codex/);
+  assert.equal(ui.get('generation-refresh-accounts').disabled, true);
+  await ui.get('generation-refresh-accounts').onclick(); assert.equal(ui.calls.some(call => call.url.endsWith('/generation-accounts')), false);
+});
 test('candidate generation submits exactly once, polls reads and stages only explicitly selected candidates', async () => {
   let phase = 'queued';
   const ui = panel((url, options) => {

@@ -46,13 +46,7 @@ type generationHandle struct {
 }
 
 func (c *CPA) GenerationAvailable() bool {
-	if c.Host == nil {
-		return false
-	}
-	if capability, ok := c.Host.(interface{ SupportsPromptGeneration() bool }); ok {
-		return capability.SupportsPromptGeneration()
-	}
-	return true
+	return len(c.GenerationProviders()) > 0
 }
 
 func (c *CPA) generationAccount(ctx context.Context, account store.Account) error {
@@ -62,38 +56,11 @@ func (c *CPA) generationAccount(ctx context.Context, account store.Account) erro
 	if !store.ValidID(account.ID) || account.AuthIndex == "" || account.Binding == "" || account.Status != "available" {
 		return errors.New("account_identity_unavailable")
 	}
-	accounts, err := c.Accounts(ctx)
+	current, err := c.ResolveGenerationAccount(ctx, account.ID)
 	if err != nil {
-		return errors.New("account_identity_unavailable")
+		return err
 	}
-	found := false
-	for _, current := range accounts {
-		if current.ID != account.ID {
-			continue
-		}
-		found = true
-		if current.Status == "disabled" {
-			return errors.New("account_disabled")
-		}
-		if current.Status != "available" || current.AuthIndex == "" {
-			return errors.New("account_identity_unavailable")
-		}
-		if current.AuthIndex != account.AuthIndex {
-			return errors.New("account_binding_changed")
-		}
-	}
-	if !found {
-		return errors.New("account_not_found")
-	}
-	cred, err := c.readBindingFor(ctx, account, true)
-	if err != nil {
-		switch err.Error() {
-		case "account_binding_changed", "account_disabled", "account_identity_unavailable":
-			return errors.New(err.Error())
-		}
-		return errors.New("account_identity_unavailable")
-	}
-	if account.Binding != bindingID(account, cred.Upstream) {
+	if generationSnapshotProvider(account) != generationSnapshotProvider(current) || account.AuthIndex != current.AuthIndex || account.Binding != current.Binding {
 		return errors.New("account_binding_changed")
 	}
 	return nil
@@ -106,11 +73,21 @@ func (c *CPA) GenerateCandidates(ctx context.Context, account store.Account, mod
 	if c.Host == nil {
 		return nil, errors.New("account_identity_unavailable")
 	}
+	provider, exitProtocol := generationSnapshotProvider(account), "codex"
+	supported := false
+	for _, advertised := range c.GenerationProviders() {
+		if advertised == provider {
+			supported = true
+		}
+	}
+	if !supported {
+		return nil, errors.New("generation_not_supported")
+	}
+	if provider == "antigravity" {
+		exitProtocol = "openai-response"
+	}
 	if err := c.generationAccount(ctx, account); err != nil {
 		return nil, err
-	}
-	if !c.GenerationAvailable() {
-		return nil, errors.New("generation_not_supported")
 	}
 	if ctx.Err() != nil {
 		return nil, errors.New("generation_request_invalid")
@@ -125,8 +102,8 @@ func (c *CPA) GenerateCandidates(ctx context.Context, account store.Account, mod
 	}
 	defer clear(body)
 	request := generationRequest{
-		EntryProtocol: "openai-response", ExitProtocol: "codex", Model: model,
-		Stream: true, Body: body, ForcedProvider: "codex", AuthID: account.ID,
+		EntryProtocol: "openai-response", ExitProtocol: exitProtocol, Model: model,
+		Stream: true, Body: body, ForcedProvider: provider, AuthID: account.ID,
 		Headers: map[string][]string{"Content-Type": {"application/json"}}, Query: map[string][]string{},
 	}
 	unknown := func() ([]string, error) { return nil, errors.New("generation_delivery_unknown") }

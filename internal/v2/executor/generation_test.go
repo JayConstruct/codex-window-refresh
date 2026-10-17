@@ -35,6 +35,9 @@ type generationHost struct {
 	closed         chan struct{}
 	closeOnce      sync.Once
 	closeContextOK bool
+	lists          int
+	runtimes       int
+	credentials    int
 }
 
 func generationFixture() (*CPA, *generationHost, store.Account) {
@@ -70,13 +73,16 @@ func generationRespond(response, value any) error {
 func (host *generationHost) Call(ctx context.Context, method string, request, response any) error {
 	switch method {
 	case "host.auth.list":
+		host.lists++
 		if host.authErr != nil {
 			return host.authErr
 		}
 		return json.Unmarshal([]byte(host.inventory), response)
 	case "host.auth.get_runtime":
+		host.runtimes++
 		return json.Unmarshal([]byte(host.runtime), response)
 	case "host.auth.get":
+		host.credentials++
 		return generationRespond(response, map[string]any{"auth_index": "i", "json": map[string]string{"type": "codex", "account_id": host.upstream, "access_token": "fixture-secret"}})
 	case "host.model.execute_stream":
 		host.executes++

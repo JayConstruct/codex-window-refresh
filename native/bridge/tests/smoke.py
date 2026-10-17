@@ -70,6 +70,7 @@ class NativeBridge(unittest.TestCase):
         self.block_model_read = False
         self.block_model_close = False
         self.model_close_error = False
+        self.antigravity_accounts = False
         self.entered = threading.Event()
         self.release = threading.Event()
         self.release.set()
@@ -114,6 +115,10 @@ class NativeBridge(unittest.TestCase):
             for method in ('GET', 'POST'):
                 self.assertIn({'Method': method, 'Path': '/v0/management/codex-window-refresh/v2/'+endpoint},
                               routes['result']['Routes'])
+        self.assertIn({'Method': 'GET', 'Path': '/v0/management/codex-window-refresh/v2/generation-accounts'},
+                      routes['result']['Routes'])
+        self.assertNotIn({'Method': 'POST', 'Path': '/v0/management/codex-window-refresh/v2/generation-accounts'},
+                         routes['result']['Routes'])
 
     @contextlib.contextmanager
     def cpa_resources(self, registration=None):
@@ -240,13 +245,21 @@ class NativeBridge(unittest.TestCase):
                 return 1
         elif method == 'host.auth.list':
             value = {'files': [{'id': name, 'auth_index': name, 'provider': 'codex'} for name in ('a', 'b')]}
+            if self.antigravity_accounts:
+                value['files'].append({'id': 'antig', 'auth_index': 'antig-index', 'provider': 'antigravity'})
         elif method == 'host.auth.get_runtime':
             if req['auth_index'] == 'slow':
                 self.entered.set()
                 self.release.wait(20)
             value = {'auth': {'id': req['auth_index'], 'auth_index': req['auth_index'], 'provider': 'codex'}}
+            if self.antigravity_accounts and req['auth_index'] == 'antig-index':
+                value = {'auth': {'id': 'antig', 'auth_index': 'antig-index', 'provider': 'antigravity',
+                                  'email': 'fixture@example.invalid', 'project_id': 'fixture-project'}}
         elif method == 'host.auth.get':
             value = {'auth_index': req['auth_index'], 'json': {'type': 'codex', 'account_id': 'fixture-upstream'}}
+            if self.antigravity_accounts and req['auth_index'] == 'antig-index':
+                value = {'auth_index': 'antig-index', 'json': {'type': 'antigravity', 'email': 'fixture@example.invalid',
+                         'project_id': 'fixture-project', 'access_token': 'private-fixture-token', 'refresh_token': 'private-fixture-refresh'}}
         else:
             return 1
         raw = json.dumps({'ok': success, 'result': value}).encode()
@@ -502,13 +515,14 @@ class NativeBridge(unittest.TestCase):
     def test_manual_model_stream_pin_validation_ownership_and_redaction(self):
         hello = self.rpc('bridge.hello')['result']
         self.assertTrue(hello['prompt_generation_supported'])
+        self.assertEqual(hello['prompt_generation_providers'], ['codex', 'antigravity'])
         instance = hello['bridge_instance_id']
         original = self.model_request()
         for field in ('forced_provider', 'auth_id', 'entry_protocol', 'exit_protocol', 'stream', 'model', 'body'):
             request = original.copy()
             del request[field]
             self.assertEqual(self.rpc('host.model.execute_stream', request, instance)['error']['code'], 'invalid_payload')
-        for field, value in [('forced_provider', 'antigravity'), ('auth_id', ''), ('auth_id', 'a'*257),
+        for field, value in [('forced_provider', 'antigravity'), ('forced_provider', 'unknown'), ('auth_id', ''), ('auth_id', 'a'*257),
                              ('entry_protocol', 'chat'), ('exit_protocol', 'openai-response'),
                              ('stream', False), ('stream', 1), ('model', '   '), ('model', 'has space'),
                              ('model', 'has\ttab'), ('model', 'a'*201),
@@ -559,6 +573,35 @@ class NativeBridge(unittest.TestCase):
         self.assertNotEqual(instance, new_instance)
         self.assertEqual(self.rpc('host.model.stream_read', {'stream_id': stream}, new_instance)['error']['code'], 'model_stream_unavailable')
         self.assertEqual(self.models, 1)
+
+    def test_antigravity_stream_exact_provider_protocol_and_no_fallback(self):
+        hello = self.rpc('bridge.hello')['result']
+        instance = hello['bridge_instance_id']
+        original = dict(self.model_request(), forced_provider='antigravity', auth_id='antig',
+                        exit_protocol='openai-response', model='fixture-antigravity-model')
+        for provider, exit_protocol in [('antigravity', 'codex'), ('codex', 'openai-response'),
+                                        ('unknown', 'openai-response'), ('unknown', 'codex'),
+                                        ('Antigravity', 'openai-response')]:
+            request = dict(original, forced_provider=provider, exit_protocol=exit_protocol)
+            self.assertEqual(self.rpc('host.model.execute_stream', request, instance)['error']['code'], 'invalid_payload')
+        for field, value in [('entry_protocol', 'codex'), ('entry_protocol', 'openai-chat'),
+                             ('stream', False), ('auth_id', ''), ('auth_id', 'antig\n'),
+                             ('body', 'not-base64'), ('model', 'has space')]:
+            self.assertEqual(self.rpc('host.model.execute_stream', dict(original, **{field: value}), instance)['error']['code'],
+                             'invalid_payload')
+        self.assertEqual((self.calls, self.models), (0, 0))
+        self.allow_models = True
+        self.expected_models = 1
+        opened = self.rpc('host.model.execute_stream', original, instance)
+        self.assertTrue(opened['ok'], opened)
+        stream = {'stream_id': opened['result']['stream_id']}
+        self.model_error = True
+        failed = self.rpc('host.model.stream_read', stream, instance)
+        self.assertEqual(failed['error']['code'], 'host_callback_failed')
+        self.assertNotIn('secret', json.dumps(failed))
+        self.assertTrue(self.rpc('host.model.stream_close', stream, instance)['ok'])
+        self.assertEqual(self.model_requests, [original])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
 
     def test_model_stream_handles_bounded_and_quiesce_releases_abandoned_results(self):
         instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
@@ -669,6 +712,13 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
 
     def test_inflight_model_generation_crash_recovers_unknown_without_reexecute(self):
+        self.inflight_model_generation_crash('a')
+
+    def test_inflight_antigravity_generation_crash_recovers_unknown_without_reexecute(self):
+        self.antigravity_accounts = True
+        self.inflight_model_generation_crash('antig')
+
+    def inflight_model_generation_crash(self, account_id):
         self.start_daemon()
         deadline = time.monotonic()+5
         while time.monotonic()<deadline:
@@ -681,7 +731,7 @@ class NativeBridge(unittest.TestCase):
         self.expected_models = 1
         self.block_model_read = True
         self.release.clear()
-        request = {'account_id': 'a', 'model': 'fixture-model', 'count': 2}
+        request = {'account_id': account_id, 'model': 'fixture-model', 'count': 2}
         status, accepted = self.management('prompt-generations', 'POST', request, 'interrupted-candidate')
         self.assertEqual(status, 202, accepted)
         self.assertTrue(self.entered.wait(5))
@@ -711,6 +761,106 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(status, 202)
         self.assertEqual(replay['job_id'], job_id)
         self.assertEqual(replay['phase'], 'unknown')
+        time.sleep(.3)
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+
+    def wait_generation(self, job_id):
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, result = self.management('prompt-generations', query={'job_id': [job_id]})
+            self.assertIn(status, (200, 503), result)
+            if status == 200 and result['phase'] not in ('queued', 'running'):
+                return result
+            time.sleep(.025)
+        self.fail(f'generation did not finish: {result}')
+
+    def test_antigravity_generation_directory_pin_idempotence_and_restart_without_codex_pollution(self):
+        self.antigravity_accounts = True
+        self.start_daemon()
+        self.wait_activity(0)
+        status, directory = self.management('generation-accounts')
+        self.assertEqual(status, 200)
+        self.assertEqual(directory['accounts'], [
+            {'id': 'a', 'provider': 'codex', 'status': 'available'},
+            {'id': 'b', 'provider': 'codex', 'status': 'available'},
+            {'id': 'antig', 'provider': 'antigravity', 'status': 'available'},
+        ])
+        self.assertEqual(set(directory), {'instance_id', 'accounts'})
+        for secret in ('fixture@example.invalid', 'fixture-project', 'private-fixture', 'access_token', 'refresh_token', 'auth_index'):
+            self.assertNotIn(secret, json.dumps(directory))
+        self.assertEqual(self.management('generation-accounts', 'POST', {})[0], 404)
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, overview = self.management('overview')
+            if status == 200 and overview.get('inventory', {}).get('status') == 'ready':
+                break
+            time.sleep(.025)
+        self.assertEqual(overview['inventory']['status'], 'ready')
+        self.assertEqual(overview['dashboard']['total'], 2)
+        self.assertEqual(overview['capabilities']['prompt_generation_providers'], ['codex', 'antigravity'])
+        status, accounts = self.management('accounts')
+        self.assertEqual(status, 200)
+        self.assertEqual([account['id'] for account in accounts['accounts']], ['a', 'b'])
+        status, settings = self.management('model-settings')
+        self.assertEqual(status, 200)
+        self.allow_models = True
+        self.expected_models = 1
+        request = {'account_id': 'antig', 'model': 'fixture-antigravity-model', 'count': 2}
+        status, accepted = self.management('prompt-generations', 'POST', request, 'antigravity-exactly-once')
+        self.assertEqual(status, 202, accepted)
+        job_id = accepted['job_id']
+        result = self.wait_generation(job_id)
+        self.assertEqual(result['phase'], 'completed', result)
+        self.assertEqual(result['candidates'], ['清风入怀', '星光相伴'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+        execution = self.model_requests[0]
+        self.assertEqual(execution['auth_id'], 'antig')
+        self.assertEqual(execution['forced_provider'], 'antigravity')
+        self.assertEqual(execution['entry_protocol'], 'openai-response')
+        self.assertEqual(execution['exit_protocol'], 'openai-response')
+        self.assertEqual(execution['model'], 'fixture-antigravity-model')
+        self.assertTrue(execution['stream'])
+        self.assertEqual(json.loads(base64.b64decode(execution['body']))['model'], execution['model'])
+        status, replay = self.management('prompt-generations', 'POST', request, 'antigravity-exactly-once')
+        self.assertEqual((status, replay['job_id']), (202, job_id))
+        self.assertEqual(self.management('prompt-generations', 'POST', dict(request, model='another-model'),
+                                         'antigravity-exactly-once')[0], 409)
+        self.stop_daemon()
+        self.start_daemon()
+        result = self.wait_generation(job_id)
+        self.assertEqual(result['phase'], 'completed')
+        status, replay = self.management('prompt-generations', 'POST', request, 'antigravity-exactly-once')
+        self.assertEqual((status, replay['job_id']), (202, job_id))
+        self.assertEqual(replay['phase'], 'completed')
+        status, after = self.management('model-settings')
+        self.assertEqual(status, 200)
+        self.assertEqual(after['config'], settings['config'])
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+
+    def test_antigravity_model_error_stays_unknown_and_never_falls_back_or_retries(self):
+        self.antigravity_accounts = True
+        self.start_daemon()
+        self.wait_activity(0)
+        self.allow_models = True
+        self.expected_models = 1
+        self.model_error = True
+        request = {'account_id': 'antig', 'model': 'fixture-antigravity-model', 'count': 2}
+        status, accepted = self.management('prompt-generations', 'POST', request, 'antigravity-unknown')
+        self.assertEqual(status, 202, accepted)
+        job_id = accepted['job_id']
+        result = self.wait_generation(job_id)
+        self.assertEqual(result['phase'], 'unknown', result)
+        self.assertEqual(result['error_code'], 'generation_outcome_unknown')
+        self.assertEqual(result['candidates'], [])
+        self.assertNotIn('secret', json.dumps(result))
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+        self.assertEqual(self.model_requests[0]['forced_provider'], 'antigravity')
+        self.model_error = False
+        self.stop_daemon()
+        self.start_daemon()
+        self.assertEqual(self.wait_generation(job_id)['phase'], 'unknown')
+        status, replay = self.management('prompt-generations', 'POST', request, 'antigravity-unknown')
+        self.assertEqual((status, replay['job_id'], replay['phase']), (202, job_id, 'unknown'))
         time.sleep(.3)
         self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
 

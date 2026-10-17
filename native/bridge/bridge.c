@@ -191,7 +191,9 @@ static int equals(J*value,const char*expected) {
 static int model_payload(J*payload) {
     const char*body=string(field(payload,"body"));
     const char*model=string(field(payload,"model"));
-    if(!equals(field(payload,"forced_provider"),"codex")||!equals(field(payload,"entry_protocol"),"openai-response")||!equals(field(payload,"exit_protocol"),"codex")||!bounded_text(field(payload,"auth_id"),256)||!bounded_text(field(payload,"model"),200)||json_object_get_type(field(payload,"stream"))!=1||!json_object_get_int(field(payload,"stream"))||!body)return 0;
+    int codex=equals(field(payload,"forced_provider"),"codex")&&equals(field(payload,"exit_protocol"),"codex");
+    int antigravity=equals(field(payload,"forced_provider"),"antigravity")&&equals(field(payload,"exit_protocol"),"openai-response");
+    if((!codex&&!antigravity)||!equals(field(payload,"entry_protocol"),"openai-response")||!bounded_text(field(payload,"auth_id"),256)||!bounded_text(field(payload,"model"),200)||json_object_get_type(field(payload,"stream"))!=1||!json_object_get_int(field(payload,"stream"))||!body)return 0;
     if(strpbrk(model," \t\n\r\v\f"))return 0;
     size_t length=strlen(body);
     if(!length||length>65536||length%4)return 0;
@@ -278,6 +280,10 @@ static J *rpc(J*req) {
         json_object_object_add(j,"bridge_instance_id",json_object_new_string(instance));
         json_object_object_add(j,"read_only",json_object_new_boolean(1));
         json_object_object_add(j,"prompt_generation_supported",json_object_new_boolean(1));
+        J*providers=json_object_new_array();
+        json_object_array_add(providers,json_object_new_string("codex"));
+        json_object_array_add(providers,json_object_new_string("antigravity"));
+        json_object_object_add(j,"prompt_generation_providers",providers);
         json_object_object_add(j,"version",json_object_new_string(CWR_VERSION));
         json_object_object_add(j,"max_host_calls",json_object_new_int(HOST_CALLS));
         pthread_mutex_lock(&queue_mu);
@@ -666,7 +672,7 @@ static J *proxy(J*req) {
     char endpoint[128];
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
-        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations");
+        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts");
         int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations");
         if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
@@ -782,9 +788,9 @@ static J *registration(void) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts"
     };
-    for(int i=0;i<11;i++) {
+    for(int i=0;i<12;i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);

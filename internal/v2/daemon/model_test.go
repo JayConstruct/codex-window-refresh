@@ -86,9 +86,9 @@ func TestModelSettingsAPIValidationConflictAndNoNetwork(t *testing.T) {
 	}
 	response = request(service, "GET", "/api/v2/overview", "", "")
 	var overview struct {
-		Capabilities map[string]bool `json:"capabilities"`
+		Capabilities map[string]any `json:"capabilities"`
 	}
-	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &overview) != nil || !overview.Capabilities["model_settings"] || overview.Capabilities["model_execution"] {
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &overview) != nil || overview.Capabilities["model_settings"] != true || overview.Capabilities["model_execution"] != false {
 		t.Fatal(response.Code, response.Body.String())
 	}
 	if source.accountCalls.Load() != 0 || source.queryCalls.Load() != 0 {

@@ -271,3 +271,204 @@ func TestGenerationUnsupportedSourceIsNotAdvertisedOrDispatched(t *testing.T) {
 		t.Fatal(response.Body.String())
 	}
 }
+
+type catalogueGenerationSource struct {
+	generationSource
+	directory      func(context.Context) ([]store.Account, error)
+	resolve        func(context.Context, string) (store.Account, error)
+	providers      []string
+	unavailable    atomic.Bool
+	directoryCalls atomic.Int32
+	resolveCalls   atomic.Int32
+}
+
+func (source *catalogueGenerationSource) GenerationAccounts(ctx context.Context) ([]store.Account, error) {
+	source.directoryCalls.Add(1)
+	return source.directory(ctx)
+}
+
+func (source *catalogueGenerationSource) ResolveGenerationAccount(ctx context.Context, id string) (store.Account, error) {
+	source.resolveCalls.Add(1)
+	return source.resolve(ctx, id)
+}
+
+func (source *catalogueGenerationSource) GenerationProviders() []string { return source.providers }
+func (source *catalogueGenerationSource) GenerationAvailable() bool {
+	return !source.unavailable.Load()
+}
+
+func catalogueService(t *testing.T, source *catalogueGenerationSource) (*Service, *store.Store) {
+	t.Helper()
+	_, storage := generationService(t, &source.generationSource)
+	service, err := New(storage, source, Options{QueryConcurrency: 1, QueryTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service, storage
+}
+
+func TestGenerationCatalogueIsBoundedReadOnlyAndRedacted(t *testing.T) {
+	source := &catalogueGenerationSource{providers: []string{"codex", "antigravity", "codex", "not-supported"}}
+	source.directory = func(ctx context.Context) ([]store.Account, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 5*time.Second {
+			t.Error("directory read has no bounded deadline")
+		}
+		return []store.Account{
+			{ID: "codex-account", AuthIndex: "secret-index", Binding: "secret-binding", Status: "available", Quota: json.RawMessage(`{"secret":"quota"}`)},
+			{ID: "antigravity-account", Provider: "antigravity", AuthIndex: "secret-antig-index", Binding: "secret-antig-binding", Status: "disabled"},
+			{ID: "missing-binding", Provider: "antigravity", Status: "binding_unavailable"},
+		}, nil
+	}
+	service, storage := catalogueService(t, source)
+	before, err := storage.Overview(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(service, "GET", "/api/v2/generation-accounts", "", "")
+	var directory struct {
+		InstanceID string              `json:"instance_id"`
+		Accounts   []map[string]string `json:"accounts"`
+	}
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &directory) != nil || directory.InstanceID != service.instance || len(directory.Accounts) != 3 || directory.Accounts[0]["provider"] != "codex" || directory.Accounts[1]["provider"] != "antigravity" || directory.Accounts[2]["status"] != "binding_unavailable" {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	for _, entry := range directory.Accounts {
+		if len(entry) != 3 {
+			t.Fatal("unexpected directory fields", entry)
+		}
+	}
+	if strings.Contains(response.Body.String(), "secret") || strings.Contains(response.Body.String(), "auth_index") || strings.Contains(response.Body.String(), "quota") {
+		t.Fatal(response.Body.String())
+	}
+	after, err := storage.Overview(context.Background())
+	if err != nil || before.Revision != after.Revision || after.Dashboard.Total != 1 || source.calls.Load() != 0 || source.queryCalls.Load() != 0 || source.resolveCalls.Load() != 0 || source.accountCalls.Load() != 0 {
+		t.Fatal(before, after, err)
+	}
+	response = request(service, "GET", "/api/v2/overview", "", "")
+	if !strings.Contains(response.Body.String(), `"generation_accounts":true`) || !strings.Contains(response.Body.String(), `"prompt_generation_providers":["codex","antigravity"]`) {
+		t.Fatal(response.Body.String())
+	}
+	source.directory = func(context.Context) ([]store.Account, error) { return nil, nil }
+	response = request(service, "GET", "/api/v2/generation-accounts", "", "")
+	if response.Code != 200 || !strings.Contains(response.Body.String(), `"accounts":[]`) {
+		t.Fatal(response.Body.String())
+	}
+	for _, directory := range []func(context.Context) ([]store.Account, error){
+		func(context.Context) ([]store.Account, error) { return nil, errors.New("secret raw callback error") },
+		func(context.Context) ([]store.Account, error) { return make([]store.Account, 10001), nil },
+		func(context.Context) ([]store.Account, error) {
+			return []store.Account{{ID: "same"}, {ID: "same"}}, nil
+		},
+		func(context.Context) ([]store.Account, error) { return []store.Account{{ID: "invalid\nid"}}, nil },
+		func(context.Context) ([]store.Account, error) {
+			return []store.Account{{ID: "valid", Provider: "unsupported"}}, nil
+		},
+	} {
+		source.directory = directory
+		response = request(service, "GET", "/api/v2/generation-accounts", "", "")
+		if response.Code != 503 || strings.Contains(response.Body.String(), "secret") {
+			t.Fatal(response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestGenerationResolvedProviderReplaySurvivesUnavailableHost(t *testing.T) {
+	account := store.Account{ID: "antigravity-account", Provider: "antigravity", AuthIndex: "antig-index", Binding: "antig-binding", Status: "available"}
+	source := &catalogueGenerationSource{providers: []string{"codex", "antigravity"}}
+	source.resolve = func(ctx context.Context, id string) (store.Account, error) {
+		if id != account.ID {
+			t.Error(id)
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("resolve has no deadline")
+		}
+		return account, nil
+	}
+	service, storage := catalogueService(t, source)
+	body := strings.Replace(generationBody, "generation-account", account.ID, 1)
+	for _, field := range []string{`"provider":"antigravity"`, `"auth_index":"index"`, `"binding":"binding"`} {
+		response := request(service, "POST", "/api/v2/prompt-generations", strings.TrimSuffix(body, "}")+","+field+"}", "invalid")
+		if response.Code != 400 || source.resolveCalls.Load() != 0 {
+			t.Fatal(response.Code, response.Body.String())
+		}
+	}
+	response := request(service, "POST", "/api/v2/prompt-generations", body, "antig")
+	var first store.Generation
+	if response.Code != 202 || json.Unmarshal(response.Body.Bytes(), &first) != nil || source.resolveCalls.Load() != 1 || source.calls.Load() != 0 {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	persisted, err := storage.Generation(context.Background(), first.ID)
+	if err != nil || persisted.Account.Provider != account.Provider || persisted.Account.Binding != account.Binding {
+		t.Fatal(persisted, err)
+	}
+	source.unavailable.Store(true)
+	source.resolve = func(context.Context, string) (store.Account, error) {
+		return store.Account{}, errors.New("account_not_found")
+	}
+	response = request(service, "POST", "/api/v2/prompt-generations", body, "antig")
+	var duplicate store.Generation
+	if response.Code != 202 || json.Unmarshal(response.Body.Bytes(), &duplicate) != nil || duplicate.ID != first.ID || source.resolveCalls.Load() != 1 {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	response = request(service, "POST", "/api/v2/prompt-generations", strings.Replace(body, `"count":2`, `"count":1`, 1), "antig")
+	if response.Code != 409 || !strings.Contains(response.Body.String(), "idempotency_conflict") || source.resolveCalls.Load() != 1 {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	response = request(service, "POST", "/api/v2/prompt-generations", body, "new")
+	if response.Code != 503 || source.resolveCalls.Load() != 1 {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	source.unavailable.Store(false)
+	for _, code := range []string{"account_not_found", "account_disabled", "account_identity_unavailable", "account_binding_changed", "raw secret callback error", "generation_not_supported"} {
+		source.resolve = func(context.Context, string) (store.Account, error) { return store.Account{}, errors.New(code) }
+		response = request(service, "POST", "/api/v2/prompt-generations", body, "new")
+		want := 409
+		if code == "generation_not_supported" {
+			want = 503
+		}
+		if response.Code != want || strings.Contains(response.Body.String(), "secret") {
+			t.Fatal(code, response.Code, response.Body.String())
+		}
+	}
+	source.resolve = func(context.Context, string) (store.Account, error) {
+		account.ID = "different-id"
+		return account, nil
+	}
+	response = request(service, "POST", "/api/v2/prompt-generations", body, "new")
+	if response.Code != 409 || source.calls.Load() != 0 {
+		t.Fatal(response.Code, response.Body.String())
+	}
+}
+
+func TestGenerationAntigravityReplacementFailsBeforeModelExecute(t *testing.T) {
+	account := store.Account{ID: "antigravity-account", Provider: "antigravity", AuthIndex: "antig-index", Binding: "original-binding", Status: "available"}
+	source := &catalogueGenerationSource{providers: []string{"antigravity"}}
+	source.resolve = func(context.Context, string) (store.Account, error) { return account, nil }
+	var models atomic.Int32
+	source.generate = func(ctx context.Context, snapshot store.Account, _ string, _ int) ([]string, error) {
+		current, err := source.ResolveGenerationAccount(ctx, snapshot.ID)
+		if err != nil || current.Provider != snapshot.Provider || current.AuthIndex != snapshot.AuthIndex || current.Binding != snapshot.Binding {
+			return nil, errors.New("account_binding_changed")
+		}
+		models.Add(1)
+		return []string{"hello"}, nil
+	}
+	service, storage := catalogueService(t, source)
+	body := strings.Replace(generationBody, "generation-account", account.ID, 1)
+	response := request(service, "POST", "/api/v2/prompt-generations", body, "replacement")
+	var first store.Generation
+	if response.Code != 202 || json.Unmarshal(response.Body.Bytes(), &first) != nil {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	account.Binding = "replacement-binding"
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); service.generate(ctx) }()
+	finished := awaitGeneration(t, storage, first.ID, "failed")
+	cancel()
+	<-done
+	if finished.ErrorCode != "generation_account_unavailable" || finished.Account.Provider != "antigravity" || models.Load() != 0 || source.queryCalls.Load() != 0 || source.accountCalls.Load() != 0 {
+		t.Fatal(finished, models.Load())
+	}
+}

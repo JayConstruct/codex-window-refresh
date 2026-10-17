@@ -11,6 +11,76 @@ import (
 	"codex-window-refresh/internal/v2/policy"
 )
 
+func TestVersionFiveMigrationPreservesGenerationSnapshotsAndKeys(t *testing.T) {
+	ctx := context.Background()
+	dir := privateDir(t)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "backend.sqlite")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	database, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := strings.Replace(schema, "SELECT 6 WHERE NOT EXISTS", "SELECT 5 WHERE NOT EXISTS", 1)
+	old = strings.Replace(old, "provider TEXT NOT NULL DEFAULT 'codex', ", "", 1)
+	if _, err = database.Exec(old); err != nil {
+		t.Fatal(err)
+	}
+	var providerColumns int
+	if err = database.QueryRow("SELECT count(*) FROM pragma_table_info('prompt_generations') WHERE name='provider'").Scan(&providerColumns); err != nil || providerColumns != 0 {
+		t.Fatal("fixture is not schema 5", providerColumns, err)
+	}
+	request := GenerationRequest{AccountID: "schema-five-account", Model: "legacy-model", Count: 1}
+	for _, phase := range []string{"queued", "running", "unknown", "completed"} {
+		hash, hashErr := generationRequestHash(phase, request)
+		if hashErr != nil {
+			t.Fatal(hashErr)
+		}
+		if _, err = database.Exec("INSERT INTO prompt_generations(id,idempotency_key,request_hash,account_id,auth_index,binding,model,count,phase,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?,?)", phase, phase, hash, request.AccountID, "legacy-index", "legacy-binding", request.Model, phase, now(), now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	database.Close()
+	storage, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	for _, phase := range []string{"queued", "running", "unknown", "completed"} {
+		generation, existing, err := storage.LookupGeneration(ctx, phase, request)
+		if err != nil || !existing || generation.ID != phase || generation.Phase != phase || generation.Account.Provider != "codex" || generation.Account.AuthIndex != "legacy-index" || generation.Account.Binding != "legacy-binding" {
+			t.Fatal(generation, existing, err)
+		}
+	}
+	if err = storage.RecoverGenerations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recovered, existing, err := storage.CreateGeneration(ctx, "running", request)
+	if err != nil || !existing || recovered.Phase != "unknown" || recovered.ErrorCode != "generation_interrupted" {
+		t.Fatal(recovered, existing, err)
+	}
+	if err = storage.SyncInventory(ctx, []Account{{ID: request.AccountID, AuthIndex: "legacy-index", Binding: "legacy-binding", Status: "available"}}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := storage.ClaimGeneration(ctx)
+	if err != nil || claimed.ID != "queued" || claimed.Account.Provider != "codex" || claimed.Phase != "running" {
+		t.Fatal(claimed, err)
+	}
+	var version, columns int
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 6 {
+		t.Fatal(version, err)
+	}
+	if err = storage.db.QueryRow("SELECT count(*) FROM pragma_table_info('prompt_generations') WHERE name='provider'").Scan(&columns); err != nil || columns != 1 {
+		t.Fatal(columns, err)
+	}
+}
+
 func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
 	dir := privateDir(t)
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -27,7 +97,7 @@ func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := strings.Split(schema, "CREATE INDEX IF NOT EXISTS jobs_retention")[0]
-	old = strings.Replace(old, "SELECT 5 WHERE NOT EXISTS", "SELECT 1 WHERE NOT EXISTS", 1)
+	old = strings.Replace(old, "SELECT 6 WHERE NOT EXISTS", "SELECT 1 WHERE NOT EXISTS", 1)
 	if _, err = db.Exec(old); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +115,7 @@ func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
 		t.Fatal(id, existing, err)
 	}
 	var version int
-	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 5 {
+	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 6 {
 		t.Fatal(version, err)
 	}
 }
@@ -66,7 +136,7 @@ func TestVersionTwoMigrationKeepsQuotaAndAddsBindingState(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := strings.Split(schema, "CREATE TABLE IF NOT EXISTS account_bindings")[0]
-	old = strings.Replace(old, "SELECT 5 WHERE NOT EXISTS", "SELECT 2 WHERE NOT EXISTS", 1)
+	old = strings.Replace(old, "SELECT 6 WHERE NOT EXISTS", "SELECT 2 WHERE NOT EXISTS", 1)
 	if _, err = db.Exec(old); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +263,7 @@ func TestVersionFourMigrationPreservesQueryConfigurationAndSchedule(t *testing.T
 	}
 	defer storage.Close()
 	var version int
-	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 5 {
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 6 {
 		t.Fatal(version, err)
 	}
 	models, err := storage.ModelSettings(ctx)

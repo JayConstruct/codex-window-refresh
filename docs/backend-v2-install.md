@@ -4,6 +4,8 @@
 
 rc.6 新增可折叠侧栏、总览查询开关直接保存、模型与提示词持久配置及手动短句候选生成；生成需要显式选择账号和模型并确认消耗额度，不随安装验收、配置保存或额度查询自动执行。自动唤醒仍未实现。数据库迁移到 schema 5，并依赖新版接入层注册模型配置/生成管理路由和有界模型流接口，部署时须同时替换两部分并显式 `--restart`。
 
+rc.7 支持反重力账号生成、独立生成账号目录及提供方协商，并将数据库迁移到 schema 6。rc.6 仍仅支持 Codex。升级需要后台与接入层同时更新并显式 `--restart`，不导入反重力账号到额度查询池，也不会自动调用模型或切换提供方。
+
 旧后台不能直接打开迁移后的新库，回退必须停服务并恢复升级前一致的数据库备份，不能仅替换旧二进制。安装器激活失败时会使用临时一致备份恢复，但成功后会清理该副本；需要日后手动降级时，升级前须另行保存停机或 SQLite 在线一致备份。
 
 ## 首次切换
@@ -25,7 +27,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.6` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.7` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -53,7 +55,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.6 --package /path/codex-window-refresh-v2_v0.2.0-rc.6_linux_amd64.tar.gz \
+  --version v0.2.0-rc.7 --package /path/codex-window-refresh-v2_v0.2.0-rc.7_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 
