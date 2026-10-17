@@ -14,6 +14,7 @@ const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-pr
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], reads = [], exceptions = [], pageErrors = [];
 const jobs = new Map();
+let accountReadGate;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let queryConfig = {timezone: 'Asia/Shanghai', automatic: false, interval_seconds: 300, on_five_hour_expiry: false,
   on_weekly_expiry: false, random_delay: {min_seconds: 5, max_seconds: 60}, excluded_hours: []};
@@ -102,6 +103,7 @@ try {
       }
       if (resource === 'jobs') { const job = jobs.get(url.searchParams.get('job_id')); json(response, job ? 200 : 404, job ? {...job, ...identity()} : {error: 'not_found'}); return; }
       if (resource === 'accounts') {
+        if (accountReadGate) { accountReadGate.started = true; await accountReadGate.promise; }
         if (url.searchParams.has('after') && Number(url.searchParams.get('revision')) !== accountsRevision) { json(response, 409, {error: 'view_changed'}); return; }
         const search = (url.searchParams.get('search') || '').toLowerCase(), status = url.searchParams.get('status') || 'all';
         const filtered = accounts.filter(account => account.id.toLowerCase().includes(search) && (status === 'all' || status === account.status || status === 'attention' && (account.status === 'unavailable' || account.quota?.permission === 'blocked')));
@@ -146,6 +148,13 @@ try {
   async function evaluate(expression) {
     const result = await cdp('Runtime.evaluate', {expression, returnByValue: true, awaitPromise: true});
     assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails)); return result.result.value;
+  }
+  async function clickWhenEnabled(id) {
+    await waitFor(() => evaluate(`(() => {
+      const button = document.getElementById(${JSON.stringify(id)});
+      if (!button || button.disabled) return false;
+      button.click(); return true;
+    })()`), 'Button did not become enabled: ' + id);
   }
   async function screenshot(name) {
     await mkdir(output, {recursive: true});
@@ -243,13 +252,25 @@ try {
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /处于排除时段/);
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /手动批量/);
   await evaluate('document.querySelector("[data-page=overview]").click()');
+  await waitFor(() => evaluate('!document.getElementById("query").disabled'), 'Batch submission did not finish');
+  accountReadGate = {started: false};
+  accountReadGate.promise = new Promise(resolve => { accountReadGate.release = resolve; });
   await evaluate('document.getElementById("sync").click()');
   await waitFor(() => posts.some(post => post.resource === 'sync'), 'CPA sync not dispatched');
   assert.equal(posts.find(post => post.resource === 'sync').body, '');
+  await waitFor(() => accountReadGate.started, 'Sync did not refresh accounts');
+  assert.equal(await evaluate('document.getElementById("next").disabled'), true, 'Pagination must wait for the pending account read');
   await evaluate('document.getElementById("next").click()');
-  await waitFor(() => evaluate('document.getElementById("accounts").textContent.includes("codex-07")'), 'Next account page not displayed');
-  await evaluate('document.getElementById("previous").click()');
-  await waitFor(() => evaluate('document.getElementById("accounts").textContent.includes("codex-01")'), 'Previous account page not displayed');
+  assert.equal(reads.some(path => path.includes('/accounts?') && path.includes('&after=')), false, 'Disabled pagination dispatched a request');
+  accountReadGate.release(); accountReadGate = undefined;
+  await waitFor(() => evaluate('!document.getElementById("sync").disabled'), 'CPA sync did not finish');
+  await clickWhenEnabled('next');
+  await waitFor(() => evaluate('document.getElementById("accounts-page-info").textContent === "7–12 / 24" && document.getElementById("accounts").rows[0]?.querySelector("strong")?.textContent === "codex-07"'), 'Next account page not displayed');
+  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll("#accounts .account-name strong"), node => node.textContent)'), accounts.slice(6, 12).map(account => account.id));
+  assert.ok(reads.some(path => path === api + 'accounts?limit=6&after=codex-06&revision=1'), 'Next page did not use the account cursor and revision');
+  await clickWhenEnabled('previous');
+  await waitFor(() => evaluate('document.getElementById("accounts-page-info").textContent === "1–6 / 24" && document.getElementById("accounts").rows[0]?.querySelector("strong")?.textContent === "codex-01"'), 'Previous account page not displayed');
+  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll("#accounts .account-name strong"), node => node.textContent)'), accounts.slice(0, 6).map(account => account.id));
   await evaluate('document.getElementById("accounts-search").value="codex-24";document.getElementById("accounts-search").dispatchEvent(new Event("input"))');
   await waitFor(() => evaluate('document.getElementById("accounts").textContent.includes("codex-24") && document.getElementById("accounts").rows.length===1'), 'Full-pool search not applied');
   assert.match(await evaluate('document.getElementById("accounts-page-info").textContent'), /1–1 \/ 1/);
@@ -280,6 +301,7 @@ try {
   console.log('V2 browser checks passed: desktop/mobile layout, settings validation/drafts/save/conflict/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging and authentication.');
   console.log('Local fixture screenshots: ' + output);
 } finally {
+  accountReadGate?.release();
   if (socket) socket.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) {
     browser.kill('SIGTERM');

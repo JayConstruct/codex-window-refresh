@@ -286,6 +286,32 @@ test('sync queues only CPA inventory refresh, with no account/model payload', as
   assert.ok(request.url.endsWith('/sync')); assert.equal(request.body, undefined);
   assert.match(ui.get('notice').textContent, /不查询上游额度/);
 });
+test('paging waits for the sync account read and then advances with the same cursor', async () => {
+  let revision = 1, finishAccountRead;
+  const ui = panel((url, settings) => {
+    if (settings.method === 'POST') { revision = 2; return [202, {status: 'queued'}]; }
+    if (url.endsWith('/overview')) return [200, {...overview(revision), accounts_revision: 1}];
+    if (url.includes('after=')) return [200, {...accountPage(1, [{id: 'codex-07', status: 'available'}]), ...view('a', revision), total: 24}];
+    const response = [200, {...accountPage(1), ...view('a', revision), next_after: 'codex-06', total: 24}];
+    return revision === 2 ? new Promise(resolve => { finishAccountRead = () => resolve(response); }) : response;
+  });
+  await ui.get('connect').onclick();
+  const sync = ui.get('sync').onclick();
+  await flush();
+  assert.equal(typeof finishAccountRead, 'function');
+  assert.equal(ui.get('sync').disabled, true);
+  assert.equal(ui.get('next').disabled, true);
+  const reads = ui.calls.length;
+  await ui.get('next').onclick();
+  assert.equal(ui.calls.length, reads, 'An in-flight account read must prevent paging');
+  assert.match(ui.get('accounts').textContent, /codex-01/);
+  finishAccountRead(); await sync;
+  assert.equal(ui.get('sync').disabled, false);
+  assert.equal(ui.get('next').disabled, false);
+  await ui.get('next').onclick();
+  assert.ok(ui.calls.some(call => call.url.endsWith('/accounts?limit=6&after=codex-06&revision=1')));
+  assert.match(ui.get('accounts').textContent, /codex-07/);
+});
 test('search and filter apply to the backend account pool, not only the current page', async () => {
   const ui = panel(basic); await ui.get('connect').onclick();
   ui.get('accounts-search').value = 'another & account'; ui.get('accounts-filter').value = 'disabled';
