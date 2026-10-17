@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install/update the independent read-only backend for an existing CPA service."""
+"""Install/update the independent V2 backend for an existing CPA service."""
 import argparse
 import copy
 import contextlib
@@ -315,6 +315,8 @@ def wait_ready(plan, locations, version, bridge_version, timeout=30):
 def install(args, plan, arch):
     locations = paths(plan)
     previous = read_record(locations, plan)
+    if previous:
+        print(f"当前后台版本：{previous['version']}；目标后台版本：{args.version}。")
     require(previous is not None or args.restart, "首次切换到 v2 必须显式 --restart，安全卸载 v1 并回收旧 Go 运行时。")
     filename = f"{PREFIX}_{args.version}_linux_{arch}.tar.gz"
     with tempfile.TemporaryDirectory(prefix="cwr-v2-package-") as temporary:
@@ -331,6 +333,7 @@ def install(args, plan, arch):
         metadata = unpack(archive, sums, filename, unpacked, args.version, arch)
         bridge_version = metadata.get("bridge_version")
         require(isinstance(bridge_version, str) and re.fullmatch(r"v0\.2\.\d+-rc\.[1-9]\d*", bridge_version), "包缺少接入层版本。")
+        print(f"目标接入层版本：{bridge_version}（与后台独立版本；CPA 插件列表可能显示此版本）。")
         bridge_bytes = (unpacked / "codex-window-refresh-v2-bridge.so").read_bytes()
         bridge_hash = hashlib.sha256(bridge_bytes).hexdigest()
         changed_bridge = previous is None or previous["bridge_sha256"] != bridge_hash
@@ -446,6 +449,7 @@ def install(args, plan, arch):
         except (OSError, InstallError):
             raise InstallError("新版本已运行，但旧版清理未完成；未回退。请重试 v2 部署以继续清理。") from None
         print(f"v2 更新成功：{args.version}；已核对 CPA 注册资源入口、后台版本、接入实例和 CPA PID。")
+        print(f"实际后台版本：{ready['version']}；实际接入层版本：{bridge_version}。请以后台版本判断 V2 是否更新。")
         print(f"CPA {'已按 --restart 重启' if stopped_cpa else '未重启'}；已清除 v1 数据、旧版本和临时备份，保留当前 v2 数据。")
         if metadata.get("prompt_generation") is True:
             print("额度查询本身不发送模型请求；短句候选与手动唤醒需明确确认。自动唤醒默认关闭，已有开启规则会保留并独立执行。")
@@ -478,7 +482,7 @@ def main():
     cpa_resource_url(plan)
     locations = paths(plan)
     common.verify_elf(plan["binary"], arch)
-    print(f"v2 只读后台；CPA 服务：{plan['service']['name']}；运行用户：{plan['user']}")
+    print(f"V2 独立后台；CPA 服务：{plan['service']['name']}；运行用户：{plan['user']}")
     print(f"数据：{locations['data']}；运行目录：{locations['runtime']}")
     if args.dry_run:
         print("成功后清除 v1 策略、状态、环境文件、旧插件和后台版本、临时备份；保留当前 v2 数据。")
@@ -486,6 +490,7 @@ def main():
         return
     if args.version == "latest":
         args.version = latest(arch)
+    print(f"已选择 V2 后台版本：{args.version}（{arch}）。")
     lock = common.safe_path(plan["directory"] / ".window-refresh-install.lock")
     with os.fdopen(os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), "r+") as stream:
         require(os.fstat(stream.fileno()).st_uid == 0, "安装锁必须由 root 拥有。")

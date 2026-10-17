@@ -170,5 +170,65 @@ bash "$1" "${@:2}"
             self.assertFalse(record.exists() or operations.exists())
 
 
+class V2BootstrapTests(unittest.TestCase):
+    run_script = BootstrapTests.run_script
+
+    def downloaded_script(self, directory):
+        script = pathlib.Path(directory) / "install-v2.sh"
+        script.write_bytes((ROOT / "scripts/install-v2.sh").read_bytes())
+        return script
+
+    def test_downloaded_entry_refreshes_both_helpers_even_if_old_copies_exist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = self.downloaded_script(directory)
+            for filename in ["install.py", "install-v2.py"]:
+                (pathlib.Path(directory) / filename).write_text("old installer")
+            result, record, operations = self.run_script(directory, script=script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installer = pathlib.Path(record.read_text().splitlines()[0])
+            self.assertNotEqual(installer.parent, pathlib.Path(directory))
+            self.assertEqual(installer.name, "install-v2.py")
+            actions = operations.read_text()
+            self.assertEqual(actions.count("curl "), 2)
+            self.assertIn("main/scripts/install.py", actions)
+            self.assertIn("main/scripts/install-v2.py", actions)
+            self.assertFalse(installer.parent.exists())
+            self.assertEqual((pathlib.Path(directory) / "install.py").read_text(), "old installer")
+
+    def test_source_checkout_uses_local_helpers_and_forwards_explicit_options(self):
+        options = ["--version", "v0.2.0-rc.10", "--cpa-dir", "/fixture/cpa with spaces",
+                   "--user-service", "--service", "cpa.service", "--user", "root", "--restart"]
+        with tempfile.TemporaryDirectory() as directory:
+            result, record, operations = self.run_script(directory, options, script=ROOT / "scripts/install-v2.sh")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(record.read_text().splitlines(), [str(ROOT / "scripts/install-v2.py"), *options])
+            self.assertFalse(operations.exists())
+
+    def test_download_failure_never_runs_stale_helpers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = self.downloaded_script(directory)
+            for filename in ["install.py", "install-v2.py"]:
+                (pathlib.Path(directory) / filename).write_text("old installer")
+            result, record, operations = self.run_script(directory, script=script, TEST_CURL_STATUS="22")
+            self.assertEqual(result.returncode, 22)
+            self.assertFalse(record.exists())
+            destination = operations.read_text().splitlines()[0].split()[-1]
+            self.assertFalse(pathlib.Path(destination).parent.exists())
+
+    def test_installer_failure_propagates_and_cleans_downloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, record, _ = self.run_script(directory, script=self.downloaded_script(directory), TEST_INSTALL_STATUS="1")
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(pathlib.Path(record.read_text().splitlines()[0]).parent.exists())
+
+    def test_help_requires_neither_root_nor_downloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, record, operations = self.run_script(directory, ["--help"],
+                script=self.downloaded_script(directory), TEST_UID="1000")
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("--restart", result.stdout)
+            self.assertFalse(record.exists() or operations.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -214,6 +214,7 @@
     <section data-view="diagnostics" aria-label="诊断与设置" hidden><div class="detail-grid"><section class="card detail-card"><div class="card-heading"><h2>连接诊断</h2><svg class="icon muted" aria-hidden="true"><use href="#icon-settings"/></svg></div><div id="diagnostics-content" class="diagnostics-list"><p class="empty-state">连接后显示后台实际状态</p></div></section><section class="card detail-card"><div class="card-heading"><h2>功能边界</h2></div><ul class="feature-list"><li><strong>数据来自真实后台</strong><span>未连接时不展示模拟账号或虚构指标。</span></li><li><strong>额度查询与模型请求分离</strong><span>当前额度查询不执行模型唤醒，不解除账号禁用。</span></li><li><strong>后台独立运行</strong><span>关闭页面不停止后台同步，重开页面后读取最新数据。</span></li><li><strong>查询能力以后台为准</strong><span id="diagnostic-query-note">连接后核实自动查询和随机延迟能力。模型唤醒及提示词配置尚未接入。</span></li></ul></section></div></section>
     <footer class="page-footer"><span>窗口助手 V2 · 真实后台数据</span><span>额度查询与模型请求分离</span></footer>
   </main>
+  <section id="toast-region" class="toast-region" aria-label="操作提示" tabindex="-1"><p id="catalog-feedback" hidden></p></section>
   <script src="panel.js"></script>
 </body>
 </html>

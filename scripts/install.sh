@@ -20,7 +20,7 @@ for argument in "$@"; do
     --help|-h)
       printf '%s\n' \
         '用法：bash install.sh [install.py 参数] [--hot-reload|--restart|--no-restart]' \
-        '自动安装依赖、识别 CPA、默认热重载更新最新版本（含 rc），不重启 CPA。' \
+        '仅更新 V1 最新版本（含 rc），默认热重载，不重启 CPA；V2 请使用 scripts/install-v2.sh。' \
         '首次安装默认仅查询额度；在面板填写模型后可开启模型唤醒。升级保留策略、模型和状态。' \
         '常用参数：--cpa-dir 路径、--model 模型、--service 服务、--user-service --user 用户、--version 版本。' \
         '--hot-reload：默认模式，通过本机版本文件确认，无需管理 key。' \
@@ -56,6 +56,7 @@ if [[ $diagnostic == true || $uninstall == true ]]; then
   fi
 fi
 
+printf '%s\n' '此入口仅安装/更新 V1；V2 请使用 scripts/install-v2.sh，不会自动跨版本切换。'
 if [[ $(id -u) != 0 ]]; then
   printf '请以 root 运行：sudo bash install.sh。\n' >&2
   exit 1

@@ -81,6 +81,7 @@ class ReleaseSelectionTests(unittest.TestCase):
         request = fetch.call_args.args[0]
         self.assertEqual(request.full_url, installer.RELEASE_API + "?per_page=100&page=1")
         self.assertNotIn("Authorization", request.headers)
+        self.assertEqual(request.get_header("Cache-control"), "no-cache")
         result.read.assert_called_once_with((2 << 20) + 1)
         for data, url in [(b"{}", installer.RELEASE_API), (b"[]", "https://example.com"),
                           (b"x" * ((2 << 20) + 1), installer.RELEASE_API)]:

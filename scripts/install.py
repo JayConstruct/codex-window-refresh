@@ -441,7 +441,7 @@ def release_page(page):
     request = urllib.request.Request(
         f"{RELEASE_API}?per_page=100&page={page}",
         headers={"Accept": "application/vnd.github+json", "User-Agent": f"{PLUGIN}-installer",
-                 "X-GitHub-Api-Version": "2022-11-28"})
+                 "X-GitHub-Api-Version": "2022-11-28", "Cache-Control": "no-cache"})
     try:
         with urllib.request.urlopen(request, timeout=30) as result:
             address = urllib.parse.urlsplit(result.url)

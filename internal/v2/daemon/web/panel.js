@@ -297,15 +297,71 @@
     throw new Error('无法生成随机预览，请稍后重试');
   }
   function message(code) { return codes[code] || '请求失败，请查看诊断信息'; }
+  function createToastCenter(document, clock) {
+    const region = document.getElementById('toast-region'), entries = new Map();
+    function dismiss(id, forget = false) {
+      const entry = entries.get(id);
+      if (!entry) return;
+      clock.clearTimeout(entry.timer); entry.timer = null;
+      entry.card.hidden = true; entry.content.hidden = true;
+      entry.hovered = false; entry.focused = false;
+      if (forget) entry.last = '';
+    }
+    function schedule(entry) {
+      clock.clearTimeout(entry.timer); entry.timer = null;
+      if (entry.card.hidden || entry.hovered || entry.focused || ['error', 'warning'].includes(entry.tone)) return;
+      entry.timer = clock.setTimeout(() => dismiss(entry.id), entry.tone === 'success' ? 4500 : 6000);
+    }
+    function show(id, text, tone = 'info') {
+      if (!text) { dismiss(id, true); return; }
+      let entry = entries.get(id);
+      if (!entry) {
+        const content = document.getElementById(id), card = document.createElement('div'), close = document.createElement('button');
+        if (!content || !region) return;
+        card.className = 'toast'; card.dataset.channel = id;
+        content.className = 'toast-text';
+        close.type = 'button'; close.className = 'toast-close'; close.textContent = '×';
+        close.setAttribute('aria-label', '关闭提示');
+        entry = {id, card, content, close, last: '', tone, timer: null, hovered: false, focused: false};
+        close.onclick = () => dismiss(id);
+        card.addEventListener('mouseenter', () => { entry.hovered = true; schedule(entry); });
+        card.addEventListener('mouseleave', () => { entry.hovered = false; schedule(entry); });
+        card.addEventListener('focusin', () => { entry.focused = true; schedule(entry); });
+        card.addEventListener('focusout', event => { entry.focused = card.contains(event.relatedTarget); schedule(entry); });
+        card.append(content, close); region.append(card); entries.set(id, entry);
+      }
+      const signature = tone + ':' + text;
+      if (entry.last === signature) return;
+      entry.last = signature; entry.tone = tone;
+      entry.card.dataset.tone = tone;
+      entry.content.setAttribute('role', tone === 'error' ? 'alert' : 'status');
+      entry.content.setAttribute('aria-atomic', 'true');
+      entry.card.hidden = false; entry.content.hidden = false; entry.content.textContent = text;
+      if (!entry.focused && !entry.hovered) region.append(entry.card);
+      entries.delete(id); entries.set(id, entry);
+      const visible = [...entries.values()].filter(item => !item.card.hidden);
+      while (visible.length > 4) {
+        const index = visible.findIndex(item => item !== entry && !item.focused && !item.hovered);
+        if (index < 0) break;
+        dismiss(visible.splice(index, 1)[0].id);
+      }
+      schedule(entry);
+    }
+    function clear() { for (const id of entries.keys()) dismiss(id, true); }
+    return {show, dismiss, clear};
+  }
   if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText};
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {wakeDefaults, wakeConfigDraft, validateWakeDraft});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
+  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {createToastCenter});
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
+  const toasts = createToastCenter(document, context);
+  for (const id of ['error', 'notice', 'rules-message', 'wake-overview-message', 'settings-message', 'wake-settings-message', 'wake-manual-message', 'wake-history-message', 'model-message', 'generation-message']) $(id).hidden = true;
   let base;
-  try { base = apiBase(context.location); } catch (error) { $('error').hidden = false; $('error').textContent = message(error.code); return; }
+  try { base = apiBase(context.location); } catch (error) { toasts.show('error', message(error.code), 'error'); return; }
   let key = '', generation = 0, views = new ViewTracker(), pollTimer;
   let connected = false, connecting = false, refreshing = false;
   let overviewData = null, accountsData = [], accountsRevision = 0, accountsViewRevision = -1, cursor = '', nextCursor = '', previousCursors = [], pageStart = 0, filteredTotal = null;
@@ -383,12 +439,13 @@
     return item;
   }
   function report(error) {
-    $('error').hidden = false;
-    $('error').textContent = message(error.code || error.message) + '。已显示的数据可能已过期。';
+    feedback('error', message(error.code || error.message) + '。已显示的数据可能已过期。', 'error');
   }
-  function notice(text) { if ($('notice')) { $('notice').hidden = !text; $('notice').textContent = text; } }
-  function clearError() { $('error').hidden = true; $('error').textContent = ''; }
-  function ruleMessage(text) { setText('rules-message', text); $('rules-message').hidden = !text; }
+  function feedback(id, text, tone = 'info') { toasts.show(id, text, tone); }
+  function rememberFeedback(id, text) { toasts.dismiss(id, true); setText(id, text); $(id).hidden = true; }
+  function notice(text, tone = 'success') { feedback('notice', text, tone); }
+  function clearError() { toasts.dismiss('error', true); $('error').hidden = true; $('error').textContent = ''; }
+  function ruleMessage(text, tone = 'info') { feedback('rules-message', text, tone); }
   function settingsSupported() { return overviewData?.capabilities?.query_settings === true; }
   function readDraft() {
     return Object.fromEntries(Object.entries(settingsFields).map(([name, id]) => [name, ['automatic', 'fiveHour', 'weekly'].includes(name) ? $(id).checked === true : $(id).value]));
@@ -456,10 +513,11 @@
       if (current !== generation || !views.accept('settings', sequence, data)) return false;
       if (!applySettings(data, discard)) return false;
       settingsNeedsVerification = false;
-      if (verifying) ruleMessage('已重新读取后台设置，请核对开关状态。未重复提交任何更改。');
-      setText('settings-message', discard ? '已重新加载后台设置并丢弃草稿，尚未写入任何更改。' : '已读取后台设置；修改后请预览差异并保存。');
+      if (verifying) ruleMessage('已重新读取后台设置，请核对开关状态。未重复提交任何更改。', 'success');
+      const text = discard ? '已重新加载后台设置并丢弃草稿，尚未写入任何更改。' : '已读取后台设置；修改后请预览差异并保存。';
+      if (discard && !verifying) feedback('settings-message', text, 'success'); else rememberFeedback('settings-message', text);
       return true;
-    } catch (error) { if (current === generation) { setText('settings-message', message(error.code)); ruleMessage('读取设置失败：' + message(error.code)); } return false; }
+    } catch (error) { if (current === generation) { rememberFeedback('settings-message', message(error.code)); ruleMessage('读取设置失败：' + message(error.code), 'error'); } return false; }
     finally { if (current === generation) { settingsLoading = false; renderSettings(); } }
   }
   async function saveSettings() {
@@ -468,20 +526,20 @@
     const validated = validateQueryDraft(readDraft());
     if (Object.keys(validated.errors).length) { renderSettings(); return; }
     const current = generation, sequence = views.begin('settings');
-    settingsSaving = true; renderSettings(); setText('settings-message', '正在保存设置…');
+    settingsSaving = true; renderSettings(); feedback('settings-message', '正在保存设置…');
     try {
       const data = await api('/settings', {method: 'POST', body: JSON.stringify({revision: settingsBase.revision, config: validated.config})});
       if (current !== generation) return;
       if (!views.accept('settings', sequence, data)) throw Object.assign(new Error('settings_unconfirmed'), {code: 'settings_unconfirmed'});
       if (!applySettings(data, true)) throw Object.assign(new Error('settings_conflict'), {code: 'settings_conflict'});
-      views.barrier(); setText('settings-message', '已保存并应用。后台将按此规则持续执行额度查询，不发送模型请求。');
+      views.barrier(); feedback('settings-message', '已保存并应用。后台将按此规则持续执行额度查询，不发送模型请求。', 'success');
     } catch (error) {
       if (current !== generation) return;
       if (['settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code)) {
         settingsConflict = true; settingsNeedsVerification = true;
-        ruleMessage('查询设置保存失败或结果未确认，请先重新读取后台设置。');
+        rememberFeedback('rules-message', '查询设置保存失败或结果未确认，请先重新读取后台设置。');
       }
-      setText('settings-message', message(['network', 'timeout', 'invalid_response'].includes(error.code) ? 'settings_unconfirmed' : error.code));
+      feedback('settings-message', message(['network', 'timeout', 'invalid_response'].includes(error.code) ? 'settings_unconfirmed' : error.code), 'error');
     } finally { if (current === generation) { settingsSaving = false; renderSettings(); } }
   }
   async function toggleRule(name, checked) {
@@ -506,13 +564,13 @@
           if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else $(id).value = draft[name];
         }
       }
-      views.barrier(); ruleMessage(label + '已' + (checked ? '开启' : '关闭') + '并保存。');
-      setText('settings-message', draftDirty() ? '总览开关已保存；编辑器中的其他修改仍为草稿，尚未应用。' : '总览开关已保存并应用。');
+      views.barrier(); ruleMessage(label + '已' + (checked ? '开启' : '关闭') + '并保存。', 'success');
+      rememberFeedback('settings-message', draftDirty() ? '总览开关已保存；编辑器中的其他修改仍为草稿，尚未应用。' : '总览开关已保存并应用。');
     } catch (error) {
       if (current !== generation) return;
       const uncertain = ['settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code);
       if (uncertain) settingsNeedsVerification = true;
-      ruleMessage(error.code === 'settings_conflict' ? '后台设置已变化，本次开关未保存。请重新读取后再调整。' : uncertain ? '保存结果尚未确认，已恢复最后已知状态。请重新读取核实，不要重复提交。' : '开关未保存：' + message(error.code));
+      ruleMessage(error.code === 'settings_conflict' ? '后台设置已变化，本次开关未保存。请重新读取后再调整。' : uncertain ? '保存结果尚未确认，已恢复最后已知状态。请重新读取核实，不要重复提交。' : '开关未保存：' + message(error.code), 'error');
     } finally { if (current === generation) { settingsSaving = false; savingRule = null; renderSettings(); } }
   }
   function wakeSettingsSupported() { return overviewData?.capabilities?.wake_settings === true; }
@@ -546,7 +604,7 @@
     else if (wakeBase.instance_id !== data.instance_id || wakeBase.revision !== data.revision) wakeConflict = true;
     renderWakeSettings(); return true;
   }
-  function wakeOverviewMessage(text) { setText('wake-overview-message', text); $('wake-overview-message').hidden = !text; }
+  function wakeOverviewMessage(text, tone = 'info') { feedback('wake-overview-message', text, tone); }
   function renderWakeSettings() {
     const supported = wakeSettingsSupported(), dirty = wakeDirty(), draft = readWakeDraft(), errors = wakeBase ? validateWakeDraft(draft).errors : {};
     const locked = !connected || !supported || !wakeBase || wakeLoading || wakeSaving;
@@ -587,11 +645,14 @@
     try {
       const data = await api('/wake-settings');
       if (current !== generation || !views.accept('wake-settings', sequence, data) || !applyWakeSettings(data, discard)) return false;
-      if (explicit) { wakeNeedsVerification = false; wakeOverviewMessage('已读取真实后台唤醒设置；未重发保存或模型请求。'); }
-      if (discard || !wakeDirty()) setText('wake-settings-message', discard ? '已重新读取并丢弃唤醒草稿，没有重发模型请求。' : '已读取后台规则；修改后请检查差异并明确保存。');
+      if (explicit) {
+        wakeNeedsVerification = false;
+        if (discard) { toasts.dismiss('wake-overview-message', true); feedback('wake-settings-message', '已重新读取并丢弃唤醒草稿，没有重发模型请求。', 'success'); }
+        else wakeOverviewMessage('已读取真实后台唤醒设置；未重发保存或模型请求。', 'success');
+      }
       return true;
     } catch (error) {
-      if (current === generation) { setText('wake-settings-message', '读取唤醒设置失败：' + message(error.code)); wakeOverviewMessage('读取唤醒设置失败：' + message(error.code)); }
+      if (current === generation) { rememberFeedback('wake-settings-message', '读取唤醒设置失败：' + message(error.code)); wakeOverviewMessage('读取唤醒设置失败：' + message(error.code), 'error'); }
       return false;
     } finally { if (current === generation) { wakeLoading = false; wakePolling = false; renderWakeSettings(); } }
   }
@@ -602,20 +663,21 @@
     if (!basis || !direct && (wakeConflict || !wakeDirty())) { renderWakeSettings(); return; }
     const validated = validateWakeDraft(direct ? wakeConfigDraft({...basis.config, enabled: checked}) : readWakeDraft());
     if (Object.keys(validated.errors).length) {
-      if (direct) wakeOverviewMessage(Object.values(validated.errors).join('；') + '。请先编辑唤醒规则并明确保存。');
+      if (direct) wakeOverviewMessage(Object.values(validated.errors).join('；') + '。请先编辑唤醒规则并明确保存。', 'error');
       renderWakeSettings(); return;
     }
     if (validated.config.enabled && (!automaticWakeSupported() || !$(direct ? 'wake-overview-consent' : 'wake-settings-consent').checked)) {
-      if (direct) wakeOverviewMessage('开启自动唤醒前，请先明确确认后台持续消耗模型额度。');
-      else setText('wake-settings-message', '请明确确认开启后后台可能持续消耗模型额度，再保存。');
+      if (direct) wakeOverviewMessage('开启自动唤醒前，请先明确确认后台持续消耗模型额度。', 'warning');
+      else feedback('wake-settings-message', '请明确确认开启后后台可能持续消耗模型额度，再保存。', 'warning');
       renderWakeSettings(); return;
     }
-    if (basis.instance_id !== views.instance) { wakeNeedsVerification = true; wakeOverviewMessage('后台实例已变化，请重新读取唤醒设置后再保存。'); renderWakeSettings(); return; }
+    if (basis.instance_id !== views.instance) { wakeNeedsVerification = true; wakeOverviewMessage('后台实例已变化，请重新读取唤醒设置后再保存。', 'warning'); renderWakeSettings(); return; }
     if (direct && basis.config.enabled === checked) { renderWakeSettings(); return; }
     const current = generation, sequence = views.begin('wake-settings'), draft = readWakeDraft(), original = wakeBase ? wakeConfigDraft(wakeBase.config) : null;
     const rebase = direct && !wakeConflict && wakeBase?.instance_id === basis.instance_id && wakeBase.revision === basis.revision;
     wakeSaving = true; wakeSavingEnabled = direct ? checked : null; renderWakeSettings();
-    const saving = direct ? '正在保存自动唤醒开关…' : '正在保存后台唤醒规则…'; setText('wake-settings-message', saving); if (direct) wakeOverviewMessage(saving);
+    const saving = direct ? '正在保存自动唤醒开关…' : '正在保存后台唤醒规则…';
+    if (direct) wakeOverviewMessage(saving); else feedback('wake-settings-message', saving);
     try {
       const data = await api('/wake-settings', {method: 'POST', body: JSON.stringify({revision: basis.revision, config: validated.config})});
       if (current !== generation) return;
@@ -626,13 +688,15 @@
         if (typeof draft[name] === 'boolean') $(id).checked = draft[name]; else $(id).value = draft[name];
       }
       views.barrier(); $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false;
-      setText('wake-settings-message', wakeDirty() ? '总览开关已保存；编辑器中的其他修改仍是未保存草稿。' : '唤醒规则已保存；后台按已保存模型、提示词和规则执行。');
-      if (direct) wakeOverviewMessage('自动唤醒已' + (checked ? '开启' : '关闭') + '并保存；其他页面草稿未提交。');
+      const text = wakeDirty() ? '总览开关已保存；编辑器中的其他修改仍是未保存草稿。' : '唤醒规则已保存；后台按已保存模型、提示词和规则执行。';
+      if (direct) { rememberFeedback('wake-settings-message', text); wakeOverviewMessage('自动唤醒已' + (checked ? '开启' : '关闭') + '并保存；其他页面草稿未提交。', 'success'); }
+      else feedback('wake-settings-message', text, 'success');
     } catch (error) {
       if (current !== generation) return;
       if (['wake_settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code) || error.status >= 500) { wakeNeedsVerification = true; wakeConflict = true; }
       const text = wakeNeedsVerification ? '唤醒设置已冲突或保存结果尚未确认。保留草稿与最后已知开关，请显式重新读取核实，不会自动重试。' : '唤醒设置未保存：' + message(error.code);
-      setText('wake-settings-message', text); if (direct) wakeOverviewMessage(text);
+      if (direct) { rememberFeedback('wake-settings-message', text); wakeOverviewMessage(text, 'error'); }
+      else feedback('wake-settings-message', text, 'error');
     } finally { if (current === generation) { wakeSaving = false; wakeSavingEnabled = null; renderWakeSettings(); } }
   }
   function wakeActive() { return wakeTask && !['completed', 'skipped', 'failed', 'unknown', 'cancelled'].includes(wakeTask.phase); }
@@ -677,7 +741,7 @@
     if (wakeTask?.job_id === data.job_id && wakeTask.instance_id === data.instance_id && Number.isSafeInteger(wakeTask.view_revision) && Number.isSafeInteger(data.view_revision) && data.view_revision < wakeTask.view_revision) return;
     wakeTask = data; wakeUnconfirmed = false; wakeUnknown = data.phase === 'unknown';
     if (['completed', 'skipped', 'failed', 'cancelled'].includes(data.phase)) $('wake-manual-consent').checked = false;
-    setText('wake-manual-message', wakeUnknown ? '唤醒结果未知，可能已消耗额度。不会重发；只能核实已有任务。' : data.phase === 'completed' ? '唤醒任务已完成；请以后台核实的额度和窗口状态为准。' : data.phase === 'skipped' ? '后台已跳过此次唤醒：' + (wakeHoldText(data.hold_reason) || '不满足安全执行条件') : data.phase === 'failed' ? '唤醒失败：' + message(data.error_code) : data.phase === 'cancelled' ? '唤醒任务已取消，未开始的工作不会继续发送。' : '任务已接受：' + wakePhases[data.phase] + '。页面只读取进度，不会再次提交模型请求。');
+    feedback('wake-manual-message', wakeUnknown ? '唤醒结果未知，可能已消耗额度。不会重发；只能核实已有任务。' : data.phase === 'completed' ? '唤醒任务已完成；请以后台核实的额度和窗口状态为准。' : data.phase === 'skipped' ? '后台已跳过此次唤醒：' + (wakeHoldText(data.hold_reason) || '不满足安全执行条件') : data.phase === 'failed' ? '唤醒失败：' + message(data.error_code) : data.phase === 'cancelled' ? '唤醒任务已取消，未开始的工作不会继续发送。' : '任务已接受：' + wakePhases[data.phase] + '。页面只读取进度，不会再次提交模型请求。', wakeUnknown ? 'warning' : data.phase === 'failed' ? 'error' : data.phase === 'completed' ? 'success' : 'info');
   }
   async function readWakeJob(id = wakeTask?.job_id) {
     if (!connected || !wakeExecutionSupported() || !id || wakeReading || wakeSubmitting) return;
@@ -688,14 +752,14 @@
       validateWakeJob(data, id);
       wakeJobs = [data, ...wakeJobs.filter(job => job.job_id !== id)].slice(0, 20);
       if (wakeTask?.job_id === id) acceptWakeTask(data);
-      else if (data.phase === 'unknown') setText('wake-history-message', '该任务结果未知，可能已消耗额度。读取不会重发模型请求。');
+      else if (data.phase === 'unknown') feedback('wake-history-message', '该任务结果未知，可能已消耗额度。读取不会重发模型请求。', 'warning');
     } catch (error) {
       if (current !== generation) return;
-      if (wakeTask?.job_id === id && [404, 410].includes(error.status)) { wakeUnknown = true; wakeTask = {...wakeTask, phase: 'unknown'}; setText('wake-manual-message', '无法核实原唤醒任务，可能已消耗额度。禁止重发或新建替代请求。'); }
-      else setText('wake-history-message', '读取唤醒任务失败：' + message(error.code) + '；只重试读取，不重发模型请求。');
+      if (wakeTask?.job_id === id && [404, 410].includes(error.status)) { wakeUnknown = true; wakeTask = {...wakeTask, phase: 'unknown'}; feedback('wake-manual-message', '无法核实原唤醒任务，可能已消耗额度。禁止重发或新建替代请求。', 'warning'); }
+      else feedback('wake-history-message', '读取唤醒任务失败：' + message(error.code) + '；只重试读取，不重发模型请求。', 'error');
     } finally { if (current === generation) { wakeReading = false; renderManualWake(); } }
   }
-  async function loadWakeJobs() {
+  async function loadWakeJobs(explicit = false) {
     if (!connected || !wakeExecutionSupported() || wakeJobsLoading) return;
     const current = generation, sequence = views.begin('wake-jobs'); wakeJobsLoading = true; renderManualWake();
     try {
@@ -705,8 +769,8 @@
       const ids = new Set(); for (const job of data.jobs) { validateWakeJob(job); if (ids.has(job.job_id)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'}); ids.add(job.job_id); }
       wakeJobs = data.jobs;
       const own = wakeJobs.find(job => job.job_id === wakeTask?.job_id); if (own) acceptWakeTask({...own, instance_id: data.instance_id, view_revision: data.view_revision});
-      setText('wake-history-message', '显示最近 ' + data.jobs.length + ' 条持久任务。刷新只读取状态，不发送模型请求。');
-    } catch (error) { if (current === generation) setText('wake-history-message', '读取唤醒历史失败：' + message(error.code)); }
+      if (explicit) feedback('wake-history-message', '显示最近 ' + data.jobs.length + ' 条持久任务。刷新只读取状态，不发送模型请求。', 'success');
+    } catch (error) { if (current === generation) feedback('wake-history-message', '读取唤醒历史失败：' + message(error.code), 'error'); }
     finally { if (current === generation) { wakeJobsLoading = false; renderManualWake(); } }
   }
   async function submitManualWake(verify = false) {
@@ -715,14 +779,14 @@
     if (wakeUnknown || (verify ? !wakeUnconfirmed || !wakeIntent : wakeUnconfirmed || wakeActive() || !$('wake-manual-consent').checked)) return;
     if (!verify) {
       const account = $('wake-account').value.trim();
-      if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account)) { setText('wake-manual-message', '请输入完整有效的 Codex 账号 ID，并确认可能消耗模型额度。'); return; }
+      if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account)) { feedback('wake-manual-message', '请输入完整有效的 Codex 账号 ID，并确认可能消耗模型额度。', 'error'); return; }
       try { wakeIntent = {key: requestID(context.crypto), instance: views.instance, body: JSON.stringify({account_id: account})}; }
-      catch (error) { setText('wake-manual-message', message(error.code)); return; }
+      catch (error) { feedback('wake-manual-message', message(error.code), 'error'); return; }
       wakeTask = null;
     }
-    if (wakeIntent.instance !== views.instance) { wakeUnknown = true; setText('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。'); renderManualWake(); return; }
+    if (wakeIntent.instance !== views.instance) { wakeUnknown = true; feedback('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。', 'warning'); renderManualWake(); return; }
     const current = generation; wakeSubmitting = true; renderManualWake();
-    setText('wake-manual-message', verify ? '使用原标识与原账号核实同一唤醒任务，不创建替代请求…' : '提交一次明确确认的手动唤醒，后台将先查询额度并检查安全条件…');
+    feedback('wake-manual-message', verify ? '使用原标识与原账号核实同一唤醒任务，不创建替代请求…' : '提交一次明确确认的手动唤醒，后台将先查询额度并检查安全条件…');
     try {
       const data = await api('/wake-jobs', {method: 'POST', headers: {'Idempotency-Key': wakeIntent.key}, body: wakeIntent.body});
       if (current !== generation) return;
@@ -730,8 +794,8 @@
       views.barrier();
     } catch (error) {
       if (current !== generation) return;
-      if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed', 'idempotency_conflict'].includes(error.code) || error.status >= 500 && error.code !== 'wake_unavailable') { wakeUnconfirmed = true; setText('wake-manual-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请显式核实同一任务，保留原标识与原账号。'); }
-      else { wakeUnconfirmed = false; $('wake-manual-consent').checked = false; setText('wake-manual-message', '唤醒请求未接受：' + message(error.code)); }
+      if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed', 'idempotency_conflict'].includes(error.code) || error.status >= 500 && error.code !== 'wake_unavailable') { wakeUnconfirmed = true; feedback('wake-manual-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请显式核实同一任务，保留原标识与原账号。', 'warning'); }
+      else { wakeUnconfirmed = false; $('wake-manual-consent').checked = false; feedback('wake-manual-message', '唤醒请求未接受：' + message(error.code), 'error'); }
     } finally { if (current === generation) { wakeSubmitting = false; renderManualWake(); } }
   }
   function modelSupported() { return overviewData?.capabilities?.model_settings === true; }
@@ -801,9 +865,9 @@
       if (current !== generation || !views.accept('model-settings', sequence, data)) return false;
       if (!applyModelSettings(data, discard)) return false;
       if (explicit) modelNeedsVerification = false;
-      if (explicit || !modelDirty()) setText('model-message', discard ? '已重新读取后台配置并丢弃草稿，未重复提交任何更改。' : '已读取配置；修改后请检查差异并明确保存。');
+      if (explicit) feedback('model-message', discard ? '已重新读取后台配置并丢弃草稿，未重复提交任何更改。' : '已读取配置；修改后请检查差异并明确保存。', 'success');
       return true;
-    } catch (error) { if (current === generation) setText('model-message', '读取配置失败：' + message(error.code)); return false; }
+    } catch (error) { if (current === generation) feedback('model-message', '读取配置失败：' + message(error.code), 'error'); return false; }
     finally { if (current === generation) { modelLoading = false; modelPolling = false; renderModelSettings(); } }
   }
   async function saveModelSettings() {
@@ -811,23 +875,23 @@
     const basis = modelBase, validated = validateModelDraft(readModelDraft());
     if (!editableGenerationPrompt()) delete validated.config.generation_prompt;
     if (Object.keys(validated.errors).length) { renderModelSettings(); return; }
-    if (basis.instance_id !== views.instance) { modelConflict = true; setText('model-message', '后台已重启，请重新读取配置后再保存。'); renderModelSettings(); return; }
-    const current = generation, sequence = views.begin('model-settings'); modelSaving = true; renderModelSettings(); setText('model-message', '正在保存模型与提示词配置…');
+    if (basis.instance_id !== views.instance) { modelConflict = true; feedback('model-message', '后台已重启，请重新读取配置后再保存。', 'warning'); renderModelSettings(); return; }
+    const current = generation, sequence = views.begin('model-settings'); modelSaving = true; renderModelSettings(); feedback('model-message', '正在保存模型与提示词配置…');
     try {
       const data = await api('/model-settings', {method: 'POST', body: JSON.stringify({revision: basis.revision, config: validated.config})});
       if (current !== generation) return;
       if (data.instance_id !== basis.instance_id || views.instance !== basis.instance_id || data.revision < basis.revision ||
         !views.accept('model-settings', sequence, data) || currentModelFields().some(name => JSON.stringify(name === 'generation_prompt' ? data.config?.[name] ?? '' : data.config?.[name]) !== JSON.stringify(validated.config[name]))) throw Object.assign(new Error('settings_unconfirmed'), {code: 'settings_unconfirmed'});
       if (!applyModelSettings(data, true)) throw Object.assign(new Error('settings_conflict'), {code: 'settings_conflict'});
-      views.barrier(); setText('model-message', '配置已保存，本次未发送模型请求。候选生成需单独确认，自动唤醒仍未接入。');
+      views.barrier(); feedback('model-message', '配置已保存，本次未发送模型请求。候选生成与唤醒按已保存规则独立执行。', 'success');
     } catch (error) {
       if (current !== generation) return;
       if (['model_settings_conflict', 'settings_conflict', 'settings_unconfirmed', 'network', 'timeout', 'invalid_response'].includes(error.code)) { modelConflict = true; modelNeedsVerification = true; }
-      setText('model-message', message(['network', 'timeout', 'invalid_response'].includes(error.code) ? 'settings_unconfirmed' : error.code));
+      feedback('model-message', message(['network', 'timeout', 'invalid_response'].includes(error.code) ? 'settings_unconfirmed' : error.code), 'error');
     } finally { if (current === generation) { modelSaving = false; renderModelSettings(); } }
   }
   function modelDraftChanged() {
-    modelConfirmation = ''; renderModelSettings(); setText('model-message', '草稿尚未保存。请检查差异后保存，本地预览不调用模型。');
+    modelConfirmation = ''; renderModelSettings(); rememberFeedback('model-message', '草稿尚未保存。请检查差异后保存，本地预览不调用模型。');
     setText('model-preview-result', '草稿已修改，请重新生成本地预览。');
   }
   function previewModel() {
@@ -837,7 +901,7 @@
     try {
       const preview = modelPromptPreview(validated.config, $('model-preview-rule').value, context.crypto);
       setText('model-preview-result', '实际模型：' + (preview.model || '未指定（执行前须独立保存可用模型）') + (preview.modelInherited ? ' · 继承默认模型' : '') + '\n提示词来源：' + (preview.mode === 'random' ? '本地随机短句' : preview.promptInherited ? '继承默认提示词' : '固定提示词') + '\n实际提示词：\n' + preview.prompt + '\n\n仅为当前草稿的本地预览，未发送模型请求。');
-    } catch (error) { setText('model-preview-result', error.message || '本地预览失败'); }
+    } catch (error) { feedback('model-message', error.message || '本地预览失败', 'error'); }
   }
   function generationSupported() { return overviewData?.capabilities?.prompt_generation === true; }
   function validGenerationPrompt(prompt) { return new TextEncoder().encode(prompt).length <= 8192 && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/u.test(prompt); }
@@ -861,7 +925,7 @@
     const statuses = {disabled: '已禁用', unavailable: '暂不可用', binding_unavailable: '无法核实凭据绑定'};
     return {allowed: account.status === 'available', provider, text: label + ' · ' + (statuses[account.status] || '可用，请填写该提供方实际可用的模型') + '；不会自动回退到其他账号。'};
   }
-  async function reloadGenerationAccounts() {
+  async function reloadGenerationAccounts(explicit = false) {
     if (!connected || !generationCatalogSupported() || generationCatalogLoading) return;
     clearModelCatalog('generation');
     const current = generation, instance = views.instance, sequence = ++generationCatalogSequence;
@@ -882,9 +946,11 @@
       }));
       const selected = generationCatalog.accounts.find(account => account.id === $('generation-account').value.trim());
       if (selected && !generationAccountIdentity) generationAccountIdentity = {id: selected.id, provider: selected.provider};
+      if (explicit) feedback('catalog-feedback', '已读取 ' + generationCatalog.accounts.length + ' 个生成账号，未调用模型。', 'success');
     } catch (error) {
       if (current !== generation || sequence !== generationCatalogSequence || instance !== views.instance) return;
       generationCatalogError = message(error.code);
+      feedback('catalog-feedback', '读取生成账号失败：' + generationCatalogError, 'error');
     } finally {
       if (current === generation && sequence === generationCatalogSequence) { generationCatalogLoading = false; renderGeneration(); }
     }
@@ -950,8 +1016,12 @@
       if (before.index !== after.index) throw Object.assign(new Error('model_catalog_changed'), {code: 'model_catalog_changed'});
       $(kind === 'wake' ? 'wake-model-options' : 'generation-model-options').replaceChildren(...models.map(id => { const option = element('option'); option.value = id; return option; }));
       setText(status, models.length ? '已读取 ' + models.length + ' 个 CPA 注册模型；请选择或手动填写，不自动保存，也不保证实时权限。' : '该账号暂无 CPA 注册模型，可手动填写已确认可用的模型；未试发请求。');
+      feedback('catalog-feedback', $(status).textContent, 'success');
     } catch (error) {
-      if (currentRequest()) setText(status, '读取模型失败：' + message(error.status === 404 ? 'model_catalog_unavailable' : error.code));
+      if (currentRequest()) {
+        setText(status, '读取模型失败：' + message(error.status === 404 ? 'model_catalog_unavailable' : error.code));
+        feedback('catalog-feedback', $(status).textContent, 'error');
+      }
     } finally {
       if (current === generation && sequence === state.sequence) { state.loading = false; renderModelCatalogs(); }
     }
@@ -997,10 +1067,10 @@
       data.phase === 'completed' && !data.candidates?.length) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
     if (generationTask?.job_id !== data.job_id || generationTask.phase !== data.phase) generationSelected.clear();
     generationTask = data; generationUnconfirmed = false; generationUnknown = data.phase === 'unknown';
-    if (data.phase === 'completed') { $('generation-consent').checked = false; setText('generation-message', '候选已生成。请勾选后加入短句池草稿；尚未保存配置。'); }
-    else if (data.phase === 'failed') { $('generation-consent').checked = false; setText('generation-message', '生成任务失败：' + (codes[data.error_code] || '请查看后台诊断信息') + '。重新生成需要再次明确确认消耗额度。'); }
-    else if (data.phase === 'unknown') setText('generation-message', '生成结果未知，可能已消耗额度。禁止重复发送；可核实已有任务，不会创建新的模型请求。');
-    else setText('generation-message', '任务已接受，正在后台' + (data.phase === 'queued' ? '排队' : '生成') + '。关闭或切换页面不会重发模型请求。');
+    if (data.phase === 'completed') { $('generation-consent').checked = false; feedback('generation-message', '候选已生成。请勾选后加入短句池草稿；尚未保存配置。', 'success'); }
+    else if (data.phase === 'failed') { $('generation-consent').checked = false; feedback('generation-message', '生成任务失败：' + (codes[data.error_code] || '请查看后台诊断信息') + '。重新生成需要再次明确确认消耗额度。', 'error'); }
+    else if (data.phase === 'unknown') feedback('generation-message', '生成结果未知，可能已消耗额度。禁止重复发送；可核实已有任务，不会创建新的模型请求。', 'warning');
+    else feedback('generation-message', '任务已接受，正在后台' + (data.phase === 'queued' ? '排队' : '生成') + '。关闭或切换页面不会重发模型请求。');
   }
   async function submitGeneration(verify = false) {
     if (!connected || !generationSupported() || generationSubmitting || generationReading) return;
@@ -1008,18 +1078,18 @@
     if (generationUnknown) return;
     if (verify ? !generationUnconfirmed || !generationIntent : generationUnconfirmed || generationActive() || !$('generation-consent').checked) return;
     if (!verify) {
-      if (!generationAccountState().allowed) { setText('generation-message', '请先核实可用的生成账号与提供方；' + generationAccountState().text); return; }
+      if (!generationAccountState().allowed) { feedback('generation-message', '请先核实可用的生成账号与提供方；' + generationAccountState().text, 'error'); return; }
       const account = $('generation-account').value.trim(), model = $('generation-model').value, rawCount = $('generation-count').value;
       const count = /^\d+$/.test(rawCount) ? Number(rawCount) : NaN;
-      if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account) || !model || new TextEncoder().encode(model).length > 200 || /[\s\p{Cc}]/u.test(model) || !Number.isSafeInteger(count) || count < 1 || count > 20) { setText('generation-message', '请输入有效账号 ID、无空白的实际模型标识及 1–20 的整数数量，并确认消耗额度。'); return; }
+      if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account) || !model || new TextEncoder().encode(model).length > 200 || /[\s\p{Cc}]/u.test(model) || !Number.isSafeInteger(count) || count < 1 || count > 20) { feedback('generation-message', '请输入有效账号 ID、无空白的实际模型标识及 1–20 的整数数量，并确认消耗额度。', 'error'); return; }
       const prompt = editableGenerationPrompt() ? $('generation-prompt').value : '';
-      if (!validGenerationPrompt(prompt)) { setText('generation-message', '生成提示词最多 8192 字节，仅允许换行、回车和制表控制字符。'); return; }
+      if (!validGenerationPrompt(prompt)) { feedback('generation-message', '生成提示词最多 8192 字节，仅允许换行、回车和制表控制字符。', 'error'); return; }
       try { generationIntent = {key: requestID(context.crypto), body: JSON.stringify({account_id: account, model, count, ...(prompt ? {prompt} : {})}), instance: views.instance}; }
-      catch (error) { setText('generation-message', message(error.code)); return; }
+      catch (error) { feedback('generation-message', message(error.code), 'error'); return; }
       generationTask = null; generationSelected.clear();
     }
-    if (generationIntent.instance !== views.instance) { generationUnknown = true; setText('generation-message', '后台实例已更换，原任务可能已消耗额度。为避免重复调用，不再重发生成请求。'); renderGeneration(); return; }
-    const current = generation; generationSubmitting = true; renderGeneration(); setText('generation-message', verify ? '正在使用原请求标识核实同一任务，不更换账号、模型或数量…' : '正在提交一次明确确认的模型请求…');
+    if (generationIntent.instance !== views.instance) { generationUnknown = true; feedback('generation-message', '后台实例已更换，原任务可能已消耗额度。为避免重复调用，不再重发生成请求。', 'warning'); renderGeneration(); return; }
+    const current = generation; generationSubmitting = true; renderGeneration(); feedback('generation-message', verify ? '正在使用原请求标识核实同一任务，不更换账号、模型或数量…' : '正在提交一次明确确认的模型请求…');
     try {
       const data = await api('/prompt-generations', {method: 'POST', headers: {'Idempotency-Key': generationIntent.key}, body: generationIntent.body});
       if (current !== generation) return;
@@ -1027,8 +1097,8 @@
     } catch (error) {
       if (current !== generation) return;
       if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed'].includes(error.code) || error.status >= 500 && error.code !== 'prompt_generation_unavailable') {
-        generationUnconfirmed = true; setText('generation-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请点击“核实同一任务”显式使用原标识和原参数核实。');
-      } else { generationUnconfirmed = false; $('generation-consent').checked = false; setText('generation-message', '生成请求未接受：' + message(error.code)); }
+        generationUnconfirmed = true; feedback('generation-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请点击“核实同一任务”显式使用原标识和原参数核实。', 'warning');
+      } else { generationUnconfirmed = false; $('generation-consent').checked = false; feedback('generation-message', '生成请求未接受：' + message(error.code), 'error'); }
     } finally { if (current === generation) { generationSubmitting = false; renderGeneration(); } }
   }
   async function pollGeneration(explicit = false) {
@@ -1040,8 +1110,8 @@
       acceptGeneration(data, expectedID);
     } catch (error) {
       if (current !== generation) return;
-      if ([404, 410].includes(error.status)) { generationUnknown = true; generationTask = {...generationTask, phase: 'unknown'}; setText('generation-message', '无法核实原生成任务，可能已消耗额度。不会重发或创建新请求。'); }
-      else setText('generation-message', '读取生成任务失败：' + message(error.code) + '。仅重试读取，不会重发模型请求。');
+      if ([404, 410].includes(error.status)) { generationUnknown = true; generationTask = {...generationTask, phase: 'unknown'}; feedback('generation-message', '无法核实原生成任务，可能已消耗额度。不会重发或创建新请求。', 'warning'); }
+      else feedback('generation-message', '读取生成任务失败：' + message(error.code) + '。仅重试读取，不会重发模型请求。', 'error');
     } finally { if (current === generation) { generationReading = false; renderGeneration(); } }
   }
   function applyGenerationCandidates() {
@@ -1050,7 +1120,7 @@
     if (!chosen.length) return;
     const current = parseModelPhrases($('model-phrases').value);
     $('model-phrases').value = [...current, ...chosen].join('\n'); generationSelected.clear();
-    modelDraftChanged(); renderGeneration(); setText('generation-message', '已将所选候选加入短句池草稿，尚未保存。请检查重复项与差异后保存配置。');
+    modelDraftChanged(); renderGeneration(); feedback('generation-message', '已将所选候选加入短句池草稿，尚未保存。请检查重复项与差异后保存配置。', 'success');
   }
   function setConnection(text) {
     setText('connection', text);
@@ -1072,6 +1142,7 @@
     renderModelCatalogs();
   }
   function stop() {
+    toasts.clear();
     generation++; connected = false; connecting = false; key = '';
     clearTimeout(pollTimer); clearTimeout(filterTimer);
     for (const controller of controllers) controller.abort();
@@ -1338,7 +1409,7 @@
       renderModelSettings();
     }
     if (generationIntent && generationIntent.instance !== data.instance_id && !generationTask?.job_id && generationUnconfirmed) {
-      generationUnknown = true; setText('generation-message', '后台实例已更换，原生成任务可能已消耗额度；不会向新实例重发请求。');
+      generationUnknown = true; feedback('generation-message', '后台实例已更换，原生成任务可能已消耗额度；不会向新实例重发请求。', 'warning');
     }
     if (savedWakeSettings && savedWakeSettings.instance_id !== data.instance_id) {
       if (wakeDirty()) wakeConflict = true;
@@ -1346,7 +1417,7 @@
       $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false;
     }
     if (wakeIntent && wakeIntent.instance !== data.instance_id && !wakeTask?.job_id && wakeUnconfirmed) {
-      wakeUnknown = true; setText('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。');
+      wakeUnknown = true; feedback('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。', 'warning');
     }
     if (data.query_settings && settingsSupported()) applySettings({...data.query_settings, instance_id: data.instance_id, view_revision: data.view_revision});
     renderOverview(); return data;
@@ -1359,7 +1430,7 @@
         const job = await api('/jobs?job_id=' + encodeURIComponent(id));
         if (current !== generation || !views.accept(resource, sequence, job)) continue;
         pending.set(id, job);
-        if (job.phase === 'failed') notice('查询任务已结束：' + message(job.error_code || job.items?.find(item => item.error_code)?.error_code || 'quota_query_failed'));
+        if (job.phase === 'failed') notice('查询任务已结束：' + message(job.error_code || job.items?.find(item => item.error_code)?.error_code || 'quota_query_failed'), 'error');
       } catch (error) {
         if (current !== generation || error.code === 'stale') return;
         if (error.status === 404 || error.status === 410) pending.delete(id); else throw error;
@@ -1523,7 +1594,7 @@
   $('model-codex-preset').onclick = () => {
     if ($('model-fields').disabled) return;
     $('model-default-prompt').value = codexPromptPreset; modelDraftChanged();
-    setText('model-message', '已填入 Codex 风格编程短问句，仅修改草稿；保存后才用于唤醒，不读取文件或运行命令。');
+    feedback('model-message', '已填入 Codex 风格编程短问句，仅修改草稿；保存后才用于唤醒，不读取文件或运行命令。', 'success');
   };
   for (const id of Object.values(modelFields)) $(id).addEventListener('input', () => {
     if (id === 'generation-prompt') {
@@ -1535,22 +1606,23 @@
   $('generation-reset-prompt').onclick = () => {
     if ($('generation-prompt').disabled) return;
     $('generation-prompt').value = modelDefaults.generation_prompt; $('generation-consent').checked = false; modelDraftChanged();
+    feedback('model-message', '已填入默认生成提示词，仅修改草稿，尚未保存或调用模型。', 'success');
   };
   $('model-preview').onclick = previewModel;
   $('model-preview-rule').addEventListener('change', () => setText('model-preview-result', '规则已修改，请重新生成本地预览。'));
   $('model-import').onclick = () => {
     if ($('model-import').disabled) return;
     const text = $('model-transfer').value;
-    if (new TextEncoder().encode(text).length > 65536) { setText('model-message', '导入文本超过 65536 字节，请拆分后再导入。'); return; }
+    if (new TextEncoder().encode(text).length > 65536) { feedback('model-message', '导入文本超过 65536 字节，请拆分后再导入。', 'error'); return; }
     const phrases = parseModelPhrases(text);
-    if (!phrases.length) { setText('model-message', '请先粘贴非空的纯文本短句。'); return; }
+    if (!phrases.length) { feedback('model-message', '请先粘贴非空的纯文本短句。', 'error'); return; }
     $('model-phrases').value = [...parseModelPhrases($('model-phrases').value), ...phrases].join('\n');
-    modelDraftChanged(); setText('model-message', '已追加导入草稿；尚未去重，也未保存后台。');
+    modelDraftChanged(); feedback('model-message', '已追加导入草稿；尚未去重，也未保存后台。', 'success');
   };
   $('model-export').onclick = () => {
     if ($('model-export').disabled) return;
     $('model-transfer').value = exportModelPhrases(parseModelPhrases($('model-phrases').value));
-    setText('model-message', '纯文本已显示在导入 / 导出区，可选择复制；未修改后台。');
+    feedback('model-message', '纯文本已显示在导入 / 导出区，可选择复制；未修改后台。', 'success');
   };
   for (const [id, action] of [['model-deduplicate', 'deduplicate'], ['model-clear', 'clear']]) $(id).onclick = () => {
     if ($(id).disabled) return;
@@ -1559,8 +1631,10 @@
   $('model-cancel-action').onclick = () => { modelConfirmation = ''; renderModelSettings(); };
   $('model-confirm-action').onclick = () => {
     if ($('model-confirm-action').disabled || !modelConfirmation) return;
+    const action = modelConfirmation;
     $('model-phrases').value = modelConfirmation === 'clear' ? '' : deduplicateModelPhrases(parseModelPhrases($('model-phrases').value)).join('\n');
     modelDraftChanged();
+    feedback('model-message', action === 'clear' ? '已清空短句池草稿，尚未保存。' : '已对短句池草稿去重，尚未保存。', 'success');
   };
   $('generation-form').onsubmit = event => { event.preventDefault(); return submitGeneration(); };
   $('generation-verify').onclick = () => submitGeneration(true);
@@ -1569,7 +1643,7 @@
     if ($('generation-fields').disabled) return;
     $('generation-consent').checked = false; renderGeneration();
   };
-  $('generation-refresh-accounts').onclick = reloadGenerationAccounts;
+  $('generation-refresh-accounts').onclick = () => reloadGenerationAccounts(true);
   $('generation-account').oninput = () => {
     if ($('generation-fields').disabled) return;
     clearModelCatalog('generation');
@@ -1581,14 +1655,14 @@
   $('generation-use-default').onclick = () => {
     if ($('generation-fields').disabled) return;
     $('generation-model').value = $('model-default').value; $('generation-consent').checked = false;
-    setText('generation-message', '已按你的操作填入草稿默认模型，请确认它属于所选账号提供方且实际可用；尚未调用模型。'); renderGeneration();
+    feedback('generation-message', '已按你的操作填入草稿默认模型，请确认它属于所选账号提供方且实际可用；尚未调用模型。'); renderGeneration();
   };
   $('generation-select-all').onclick = () => {
     if ($('generation-select-all').disabled) return;
     generationTask.candidates.forEach((phrase, index) => generationSelected.add(index)); renderGeneration();
   };
   $('generation-apply').onclick = applyGenerationCandidates;
-  for (const id of Object.values(settingsFields)) $(id).addEventListener('input', () => { renderSettings(); setText('settings-message', '草稿尚未保存，请核对差异后保存。'); });
+  for (const id of Object.values(settingsFields)) $(id).addEventListener('input', () => { renderSettings(); rememberFeedback('settings-message', '草稿尚未保存，请核对差异后保存。'); });
   $('five-hour-query').onchange = () => toggleRule('fiveHour', $('five-hour-query').checked);
   $('weekly-query').onchange = () => toggleRule('weekly', $('weekly-query').checked);
   $('wake-settings-form').onsubmit = event => { event.preventDefault(); return saveWakeSettings(); };
@@ -1599,13 +1673,13 @@
   $('auto-wake').onchange = () => saveWakeSettings(true, $('auto-wake').checked);
   for (const id of Object.values(wakeFields)) $(id).addEventListener('input', () => {
     if ($('wake-settings-fields').disabled) return;
-    $('wake-settings-consent').checked = false; renderWakeSettings(); setText('wake-settings-message', '唤醒草稿尚未保存；启用后可能持续消耗额度，请核对差异并明确确认。');
+    $('wake-settings-consent').checked = false; renderWakeSettings(); rememberFeedback('wake-settings-message', '唤醒草稿尚未保存；启用后可能持续消耗额度，请核对差异并明确确认。');
   });
   $('wake-manual-form').onsubmit = event => { event.preventDefault(); return submitManualWake(); };
   $('wake-manual-verify').onclick = () => submitManualWake(true);
   $('wake-manual-consent').onchange = renderManualWake;
   $('wake-account').oninput = () => { if (!$('wake-manual-fields').disabled) { $('wake-manual-consent').checked = false; renderManualWake(); } };
-  $('wake-history-refresh').onclick = loadWakeJobs;
+  $('wake-history-refresh').onclick = () => loadWakeJobs(true);
   $('accounts-search').addEventListener('input', changeFilter); $('accounts-filter').addEventListener('change', changeFilter);
   $('next').onclick = async () => {
     if (!connected || updatingAccounts || !nextCursor) return;

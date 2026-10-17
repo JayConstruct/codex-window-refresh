@@ -88,6 +88,25 @@ class V2PackageTests(unittest.TestCase):
             self.assertEqual(v2.latest("amd64"), self.version)
             with self.assertRaises(v2.InstallError): v2.latest("arm64")
 
+    def test_latest_compares_rc_numbers_instead_of_release_list_order(self):
+        records = [dict(tag_name=tag, draft=False, published_at="now", prerelease=True, assets=[
+            dict(name=f"{v2.PREFIX}_{tag}_linux_{architecture}.tar.gz", state="uploaded", size=100)
+            for architecture in ["amd64", "arm64"]] + [dict(name="SHA256SUMS", state="uploaded", size=100)])
+            for tag in ["v0.2.0-rc.9", "v0.2.0-rc.8", "v0.2.0-rc.10"]]
+        with mock.patch.object(v2.common, "release_page", return_value=records):
+            for architecture in ["amd64", "arm64"]:
+                self.assertEqual(v2.latest(architecture), "v0.2.0-rc.10")
+
+    def test_latest_incomplete_release_fails_instead_of_installing_older_one(self):
+        records = [dict(tag_name=tag, draft=False, published_at="now", assets=[
+            dict(name=f"{v2.PREFIX}_{tag}_linux_amd64.tar.gz", state="uploaded", size=100),
+            dict(name="SHA256SUMS", state="uploaded", size=100)])
+            for tag in ["v0.2.0-rc.9", "v0.2.0-rc.10"]]
+        records[1]["assets"][0]["state"] = "new"
+        with mock.patch.object(v2.common, "release_page", return_value=records):
+            with self.assertRaisesRegex(v2.InstallError, "v0.2.0-rc.10"):
+                v2.latest("amd64")
+
 
 class V2CPAResourceTests(unittest.TestCase):
     def test_listener_address_and_tls_are_inferred(self):

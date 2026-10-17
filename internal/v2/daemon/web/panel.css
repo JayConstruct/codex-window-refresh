@@ -93,10 +93,15 @@ select { cursor: pointer; }
 .login-controls input { width: 100%; min-width: 0; }
 .connection-message { width: 100%; color: var(--muted); font-size: 12px; }
 .disconnect-button { margin: 7px 0 0 28px; font-size: 11px; color: #71849a; }
-.feedback { margin: 0 0 14px; padding: 11px 15px; border: 1px solid; border-radius: 8px; overflow-wrap: anywhere; }
-.feedback:empty { display: none; }
-.feedback-error { color: #b84035; background: #fff3f0; border-color: #f5d6d0; }
-.feedback-notice { color: #00796f; background: #eaf9f4; border-color: #c9ebe2; }
+.toast-region { position: fixed; top: max(20px, env(safe-area-inset-top)); right: max(20px, env(safe-area-inset-right)); z-index: 1000; display: grid; gap: 10px; width: min(420px, calc(100vw - 32px)); max-height: calc(100dvh - 40px); overflow-y: auto; pointer-events: none; }
+.toast { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; border: 1px solid #cddded; border-left: 4px solid #5079ae; border-radius: 10px; background: #fff; color: #244372; box-shadow: 0 8px 30px #17233e1c; pointer-events: auto; }
+.toast[data-tone="success"] { color: #00796f; border-color: #bde5da; background: #f2fcf8; }
+.toast[data-tone="error"] { color: #b84035; border-color: #f0c6bf; background: #fff5f2; }
+.toast[data-tone="warning"] { color: #936113; border-color: #e9d4a9; background: #fffbef; }
+.toast-text { flex: 1; min-width: 0; font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }
+.toast-close { flex-shrink: 0; display: grid; place-items: center; width: 28px; height: 28px; margin: -3px -5px -3px 0; padding: 0; border: 0; background: transparent; color: inherit; font-size: 22px; }
+.toast-close:hover { background: #17233e0a; }
+@media (max-width: 600px) { .toast-region { top: max(12px, env(safe-area-inset-top)); right: max(16px, env(safe-area-inset-right)); } }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
 .metric-card { display: flex; align-items: flex-start; gap: 22px; min-height: 128px; padding: 18px 20px; }
 .metric-icon { display: grid; place-items: center; width: 57px; height: 57px; flex-shrink: 0; border-radius: 21px; }

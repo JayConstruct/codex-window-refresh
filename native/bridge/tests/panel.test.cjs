@@ -171,6 +171,7 @@ function panel(respond, options = {}) {
       this._text = ''; child.parentNode = this; this.children.splice(index, 0, child);
     }
     removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; return child; }
+    contains(child) { return child === this || this.children.some(node => node.contains(child)); }
   }
   const elements = new Map(), timers = new Map(), calls = [], events = new Map(), storage = options.storage || {};
   let nextTimer = 0;
@@ -205,9 +206,97 @@ function panel(respond, options = {}) {
     const entry = [...timers.entries()].find(([, timer]) => timer.delay === delay);
     assert.ok(entry, 'missing timer ' + delay); timers.delete(entry[0]); await entry[1].fn();
   }
-  return {get, timers, calls, nav, panels, events, tick, storage};
+  return {get, timers, calls, nav, panels, events, tick, storage, document: context.document, clock: context};
 }
 function basic(url) { return url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
+
+function toastPanel() {
+  const ui = panel(basic);
+  const {createToastCenter} = require('../../../internal/v2/daemon/web/panel.js');
+  return {...ui, toasts: createToastCenter(ui.document, ui.clock)};
+}
+test('toasts reuse a channel, render plain text and expose accessible severity', () => {
+  const ui = toastPanel(), region = ui.get('toast-region');
+  ui.toasts.show('notice', '<img src=x onerror=alert(1)>', 'success');
+  assert.equal(region.children.length, 1);
+  assert.equal(ui.get('notice').textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(ui.get('notice').children.length, 0);
+  assert.equal(ui.get('notice').getAttribute('role'), 'status');
+  assert.equal(region.children[0].dataset.tone, 'success');
+  ui.toasts.show('notice', '保存失败', 'error');
+  assert.equal(region.children.length, 1);
+  assert.equal(ui.get('notice').getAttribute('role'), 'alert');
+  assert.equal(ui.get('notice').getAttribute('aria-atomic'), 'true');
+  assert.equal(ui.timers.size, 0);
+});
+test('success toasts expire, while repeated polling never resets or reopens them', async () => {
+  const ui = toastPanel();
+  ui.toasts.show('notice', '已保存', 'success');
+  const timer = [...ui.timers.keys()][0];
+  ui.toasts.show('notice', '已保存', 'success');
+  assert.deepEqual([...ui.timers.keys()], [timer]);
+  await ui.tick(4500);
+  assert.equal(ui.get('notice').hidden, true);
+  ui.toasts.show('notice', '已保存', 'success');
+  assert.equal(ui.get('notice').hidden, true);
+  assert.equal(ui.timers.size, 0);
+  ui.toasts.show('notice', '新结果', 'success');
+  assert.equal(ui.get('notice').hidden, false);
+});
+test('error and unknown-outcome toasts remain until explicitly dismissed', () => {
+  const ui = toastPanel();
+  ui.toasts.show('error', '网络失败', 'error');
+  ui.toasts.show('generation-message', '结果未知，禁止重发', 'warning');
+  assert.equal(ui.timers.size, 0);
+  const card = ui.get('generation-message').parentNode;
+  assert.equal(card.children[1].getAttribute('aria-label'), '关闭提示');
+  card.children[1].onclick();
+  assert.equal(ui.get('generation-message').hidden, true);
+  assert.equal(ui.get('error').hidden, false);
+  ui.toasts.show('generation-message', '结果未知，禁止重发', 'warning');
+  assert.equal(ui.get('generation-message').hidden, true);
+});
+test('hover and keyboard focus pause automatic toast dismissal without taking focus', async () => {
+  const ui = toastPanel();
+  ui.toasts.show('notice', '操作完成', 'success');
+  const card = ui.get('notice').parentNode;
+  card.listeners.get('mouseenter')(); assert.equal(ui.timers.size, 0);
+  card.listeners.get('mouseleave')(); assert.equal(ui.timers.size, 1);
+  card.listeners.get('focusin')(); assert.equal(ui.timers.size, 0);
+  card.listeners.get('focusout')({relatedTarget: card.children[1]}); assert.equal(ui.timers.size, 0);
+  card.listeners.get('focusout')({relatedTarget: ui.get('model-default')}); assert.equal(ui.timers.size, 1);
+  await ui.tick(4500); assert.equal(card.hidden, true);
+});
+test('toast stack is bounded and does not evict a focused notification', () => {
+  const ui = toastPanel();
+  ui.toasts.show('first', 'first');
+  const first = ui.get('first').parentNode;
+  first.listeners.get('focusin')();
+  for (const id of ['second', 'third', 'fourth', 'fifth']) ui.toasts.show(id, id);
+  const visible = ui.get('toast-region').children.filter(card => !card.hidden);
+  assert.equal(visible.length, 4);
+  assert.equal(first.hidden, false); assert.equal(ui.get('second').hidden, true);
+});
+test('clearing notifications cancels timers and permits a later identical error', () => {
+  const ui = toastPanel();
+  ui.toasts.show('notice', '已读取'); ui.toasts.show('error', '网络失败', 'error');
+  ui.toasts.clear();
+  assert.equal(ui.timers.size, 0);
+  assert.equal(ui.get('notice').hidden, true); assert.equal(ui.get('error').hidden, true);
+  ui.toasts.show('error', '网络失败', 'error'); assert.equal(ui.get('error').hidden, false);
+});
+test('query feedback uses the global toast region and disconnect cleans its timers', async () => {
+  const ui = panel((url, options) => url.endsWith('/jobs') && options.method === 'POST'
+    ? [202, {...view(), job_id: 'toast-query', phase: 'queued'}]
+    : url.includes('/jobs?') ? [200, {...view(), job_id: 'toast-query', phase: 'queued'}] : basic(url));
+  await ui.get('connect').onclick();
+  await ui.get('query').onclick();
+  assert.equal(ui.get('notice').parentNode.parentNode, ui.get('toast-region'));
+  assert.match(ui.get('notice').textContent, /批量查询/);
+  assert.equal(ui.get('notice').parentNode.dataset.tone, 'success');
+  ui.get('disconnect').onclick(); assert.equal(ui.timers.size, 0);
+  assert.equal(ui.get('notice').hidden, true);
+});
 
 test('account rendering and refresh keep full placeholders out of the countdown timer', async () => {
   const observed = Date.now(), stamp = new Date(observed).toISOString();
@@ -1229,7 +1318,7 @@ test('model form validation blocks direct invalid submission and unsupported ran
   assert.equal(ui.get('model-default').attributes.get('aria-invalid'), 'true'); assert.equal(ui.get('model-save').disabled, true);
   edit(ui, 'model-default', 'good'); edit(ui, 'model-default-prompt', '<script>alert(1)</script>');
   edit(ui, 'model-prompt-mode', 'random'); edit(ui, 'model-phrases', '<img src=x onerror=alert(1)>'); ui.get('model-preview').onclick();
-  assert.match(ui.get('model-preview-result').textContent, /随机/);
+  assert.match(ui.get('model-message').textContent, /随机/);
   assert.equal(ui.get('model-preview-result').children.length, 0); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
 test('model conflict and lost acknowledgement preserve drafts until explicit verification without automatic retry', async () => {
@@ -1687,6 +1776,35 @@ test('unchanged wake polling preserves consent but changed rules and explicit re
   await ui.get('wake-settings-reload').onclick();
   assert.equal(ui.get('wake-settings-consent').checked, false);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('background wake reads stay quiet and do not reopen dismissed history toasts', async () => {
+  const ui = panel(url => wakeResponse(url)); await openWake(ui);
+  assert.equal(ui.get('toast-region').children.length, 0);
+  await ui.tick(5000); assert.equal(ui.get('toast-region').children.length, 0);
+  await ui.get('wake-history-refresh').onclick();
+  assert.equal(ui.get('wake-history-message').parentNode.parentNode, ui.get('toast-region'));
+  await ui.tick(4500); assert.equal(ui.get('wake-history-message').hidden, true);
+  await ui.tick(5000); assert.equal(ui.get('wake-history-message').hidden, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('model typing and background reads stay quiet and preserve the last save acknowledgement', async () => {
+  let settings = modelSettings();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings') && options.method === 'POST') {
+      settings = modelSettings(2, JSON.parse(options.body).config); return [200, settings];
+    }
+    return modelResponse(url, settings);
+  });
+  await openModels(ui);
+  assert.equal(ui.get('toast-region').children.length, 0);
+  edit(ui, 'model-default', 'registered-test-model');
+  await ui.tick(5000); assert.equal(ui.get('toast-region').children.length, 0);
+  await submitModels(ui);
+  assert.equal(ui.get('model-message').parentNode.dataset.tone, 'success');
+  const acknowledged = ui.get('model-message').textContent;
+  await ui.tick(5000); assert.equal(ui.get('model-message').textContent, acknowledged);
+  await ui.tick(4500); assert.equal(ui.get('model-message').hidden, true);
+  await ui.tick(5000); assert.equal(ui.get('model-message').hidden, true);
 });
 test('reading historical wake results does not disable an unrelated manual account draft', async () => {
   let release;

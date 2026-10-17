@@ -3,6 +3,7 @@ set -euo pipefail
 directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
   printf '%s\n' '用法：sudo bash install-v2.sh [--cpa-dir 路径] [--restart] [--version v0.2.X-rc.N]' \
+    '默认更新最新已发布的 V2 测试版（--version latest），不使用 GitHub Latest 标记。' \
     'v2 独立后台：首次切换或接入层变化须显式 --restart；仅后台变化时不重启 CPA。' \
     '成功后清除 v1 数据、旧版本及临时备份；保留现有 v2 数据库。清理旧服务环境须 --restart。' \
     '支持 --service、--user-service --user、--dry-run、--package、--checksums 与 --cpa-url。'
@@ -21,12 +22,12 @@ if ! command -v python3 >/dev/null || ! python3 -c "import yaml,ctypes; ctypes.C
   [[ $VERSION_ID != 13 ]] || curl_package=libcurl4t64
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml "$curl_package" libjson-c5
 fi
-if [[ ! -f $directory/install-v2.py || ! -f $directory/install.py ]]; then
+if [[ ! -f $directory/install-v2.py || ! -f $directory/install.py || ! -f $directory/../go.mod ]]; then
   temporary=$(mktemp -d /tmp/cwr-v2-installer.XXXXXX)
   trap 'rm -rf -- "$temporary"' EXIT
   directory=$temporary
   for file in install.py install-v2.py; do
-    curl -fSL --retry 3 --connect-timeout 15 --max-time 180 \
+    curl -fSL --retry 3 --connect-timeout 15 --max-time 180 -H 'Cache-Control: no-cache' \
       "https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/$file" -o "$directory/$file"
   done
 fi

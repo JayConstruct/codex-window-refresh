@@ -262,9 +262,13 @@ try {
     assert.equal(await evaluate('document.querySelector("[data-view=overview]").hidden'), false, 'Home switch navigated away from the overview');
     assert.equal(await evaluate('document.querySelector("[data-view=query]").hidden'), true, 'Home switch opened the settings editor');
     assert.equal(await evaluate('document.getElementById("auto-wake").disabled && !document.getElementById("auto-wake").checked'), true, 'Automatic wake must remain unavailable');
-    assert.equal(await evaluate('document.getElementById("rules-message").getAttribute("role")'), 'status');
-    assert.equal(await evaluate('document.getElementById("rules-message").hidden'), false, 'Overview rule feedback is hidden');
-    assert.notEqual(await evaluate('document.getElementById("rules-message").textContent.trim()'), '', 'Overview rule feedback is empty');
+    const feedback = await evaluate(`(() => {
+      const node = ['rules-message', 'settings-message'].map(id => document.getElementById(id)).find(node => !node.hidden);
+      return node && {role: node.getAttribute('role'), toast: !!node.closest('#toast-region'), text: node.textContent.trim()};
+    })()`);
+    assert.ok(feedback?.toast, 'Rule feedback must use the shared toast region');
+    assert.ok(['status', 'alert'].includes(feedback.role));
+    assert.notEqual(feedback.text, '', 'Overview rule feedback is empty');
   }
   async function assertRulesLocked() {
     assert.equal(await evaluate('document.getElementById("five-hour-query").disabled && document.getElementById("weekly-query").disabled'), true, 'Both home switches must be locked');
@@ -385,6 +389,8 @@ try {
   await screenshot('query-settings-desktop.png');
   await evaluate('document.getElementById("settings-save").click()');
   await waitFor(() => evaluate('document.getElementById("settings-message").textContent.startsWith("已保存并应用")'), 'Settings save not acknowledged');
+  assert.equal(await evaluate('document.getElementById("settings-message").closest("#toast-region") !== null'), true, 'Editor save must use a global toast');
+  assert.equal(await evaluate('document.getElementById("settings-message").parentElement.dataset.tone'), 'success');
   const settingsPost = posts.filter(post => post.resource === 'settings')[1];
   assert.deepEqual(JSON.parse(settingsPost.body), {revision: 2, config: {...queryConfig}});
   assert.equal(await evaluate('document.getElementById("five-hour-query").checked'), true);
@@ -746,6 +752,29 @@ try {
       assert.notEqual(await evaluate('getComputedStyle(document.getElementById("primary-navigation")).display'), 'none', 'Mobile navigation did not expand');
     }
     await evaluate('document.querySelector("[data-page=overview]").click()');
+  }
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
+  for (const width of [1586, 390]) {
+    await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
+    const writesBeforeToast = posts.length;
+    await evaluate(`(() => {
+      document.querySelector('[data-page=query]').click();
+      const input = document.getElementById('account'); input.value = ''; input.focus();
+      document.getElementById('query-single').onclick();
+    })()`);
+    const toast = await evaluate(`(() => {
+      const content = document.getElementById('error'), card = content.closest('.toast'), box = card.getBoundingClientRect();
+      return {visible: !content.hidden && !card.hidden, tone: card.dataset.tone, role: content.getAttribute('role'),
+        inRegion: !!card.closest('#toast-region'), focus: document.activeElement.id,
+        fits: box.left >= 0 && box.right <= innerWidth && box.top >= 0 && box.bottom <= innerHeight};
+    })()`);
+    assert.deepEqual(toast, {visible: true, tone: 'error', role: 'alert', inRegion: true, focus: 'account', fits: true});
+    assert.equal(posts.length, writesBeforeToast, 'Displaying a validation toast wrote to the API');
+    await screenshot('toast-error-' + width + '.png');
+    await evaluate('document.getElementById("error").parentElement.querySelector(".toast-close").click()');
+    assert.equal(await evaluate('document.getElementById("error").hidden'), true, 'Toast close did not dismiss');
+    await evaluate('document.getElementById("refresh").click()');
+    await waitFor(() => evaluate('document.getElementById("error").textContent === ""'), 'Successful refresh did not clear the toast error state');
   }
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   unauthorized = true;
