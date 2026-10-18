@@ -6,7 +6,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查�
 
 ## 一键安装或更新
 
-重建后的 **v0.2.0-rc.11 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+重建后的 **v0.2.0-rc.12 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --restart
@@ -20,7 +20,7 @@ v2 提供额度查询、活动观测、模型配置、显式手动短句候选�
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest
 ```
 
-若提示接入层改变，确认可重启 CPA 后在末尾添加 `--restart`。可用 `--version v0.2.0-rc.11` 固定本次版本。**后台 rc.11 仍使用 rc.8 接入层**，CPA 插件列表显示 rc.8 不代表更新失败；以安装器核实的实际后台版本或 V2 网页诊断中的后台版本为准。
+若提示接入层改变，确认可重启 CPA 后在末尾添加 `--restart`。可用 `--version v0.2.0-rc.12` 固定本次版本。**后台 rc.12 仍使用 rc.8 接入层**，CPA 插件列表显示 rc.8 不代表更新失败；以安装器核实的实际后台版本或 V2 网页诊断中的后台版本为准。
 
 rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总览与侧栏布局，默认自动更新。已接入持久化批量随机延迟、定期及五小时/周到期额度查询、网页设置与差异预览；手动单账号立即查询，查询均不发送模型请求。自动查询默认关闭，模型唤醒仍明确禁用。升级 rc.5 须添加 `--restart` 更新接入层；数据库迁移与降级限制见[发布说明](docs/releases/v0.2.0-rc.5.md)。
 
@@ -37,6 +37,8 @@ rc.9 修复轮询导致输入框失焦，支持按账号读取 CPA 注册模型�
 rc.10 进一步修复跨页面轮询干扰：候选复选框、账号按钮和历史控件保持节点及焦点，查询详情保留展开状态；未变化的读取不取消确认，历史任务读取不打断无关账号草稿。后台分页读取与显式操作隔离，旧请求不能覆盖新页面。数据库和接入层保持不变，详见 [rc.10 发布说明](docs/releases/v0.2.0-rc.10.md)。
 
 rc.11 将操作反馈统一到右上角 toast，不抢焦点，相同轮询结果不重复弹出；错误和结果未知警告可手动收起，任务安全保护不变。独立下载入口不再复用残留旧安装器，并明确区分 V1/V2 入口、后台与接入层版本；详见 [rc.11 发布说明](docs/releases/v0.2.0-rc.11.md)。
+
+rc.12 在额度查询时同步已核实的 CPA 账号状态，不必等待下一轮定时同步；查询失败不误判额度耗尽，不清空有效额度。查询、唤醒及候选生成任务可展开脱敏错误详情，查看不重发任务，轮询保留详情展开和焦点。数据库及接入层不变，详见 [rc.12 发布说明](docs/releases/v0.2.0-rc.12.md)。
 
 ## 旧版 V1 安装与更新（不更新 V2）
 

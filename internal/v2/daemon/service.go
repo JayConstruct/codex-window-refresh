@@ -221,7 +221,15 @@ func (s *Service) worker(ctx context.Context, index int) {
 		}
 		s.workerErrors[index].Store(false)
 		readCtx, cancel := context.WithTimeout(ctx, s.options.QueryTimeout)
-		quota, err := s.source.Query(readCtx, run.Account)
+		var quota json.RawMessage
+		var observed *store.Account
+		if source, ok := s.source.(interface {
+			QueryWithStatus(context.Context, store.Account) (json.RawMessage, *store.Account, error)
+		}); ok {
+			quota, observed, err = source.QueryWithStatus(readCtx, run.Account)
+		} else {
+			quota, err = s.source.Query(readCtx, run.Account)
+		}
 		if readCtx.Err() != nil {
 			err = readCtx.Err()
 		}
@@ -233,7 +241,7 @@ func (s *Service) worker(ctx context.Context, index int) {
 		// Cancellation must not erase an outcome already obtained. Query failure is
 		// safe to retry after a restart; committed job identity is always retained.
 		saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		saveErr := s.Store.Finish(saveCtx, run, quota, code)
+		saveErr := s.Store.FinishWithStatus(saveCtx, run, quota, code, observed)
 		saveCancel()
 		if saveErr != nil {
 			s.workerErrors[index].Store(true)
@@ -244,7 +252,7 @@ func (s *Service) worker(ctx context.Context, index int) {
 					return
 				}
 				saveCtx, saveCancel = context.WithTimeout(ctx, 5*time.Second)
-				saveErr = s.Store.Finish(saveCtx, run, quota, code)
+				saveErr = s.Store.FinishWithStatus(saveCtx, run, quota, code, observed)
 				saveCancel()
 			}
 		}

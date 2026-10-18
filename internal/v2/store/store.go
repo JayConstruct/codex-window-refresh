@@ -374,6 +374,10 @@ func (s *Store) Claim(ctx context.Context) (Run, error) {
 	return s.ClaimAt(ctx, time.Now().UTC())
 }
 func (s *Store) Finish(ctx context.Context, r Run, quota json.RawMessage, code string) error {
+	return s.FinishWithStatus(ctx, r, quota, code, nil)
+}
+
+func (s *Store) FinishWithStatus(ctx context.Context, r Run, quota json.RawMessage, code string, observed *Account) error {
 	if code == "" && !json.Valid(quota) {
 		return errors.New("invalid_quota_snapshot")
 	}
@@ -450,6 +454,9 @@ func (s *Store) Finish(ctx context.Context, r Run, quota json.RawMessage, code s
 		phase := "completed"
 		if code != "" {
 			phase = "failed"
+		}
+		if err = applyQueryStatus(ctx, tx, r, observed); err != nil {
+			return err
 		}
 		if _, err = tx.ExecContext(ctx, "UPDATE job_items SET phase=?,error_code=? WHERE run_id=?", phase, code, r.ID); err != nil {
 			return err

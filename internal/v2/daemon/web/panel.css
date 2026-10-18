@@ -101,6 +101,12 @@ select { cursor: pointer; }
 .toast-text { flex: 1; min-width: 0; font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }
 .toast-close { flex-shrink: 0; display: grid; place-items: center; width: 28px; height: 28px; margin: -3px -5px -3px 0; padding: 0; border: 0; background: transparent; color: inherit; font-size: 22px; }
 .toast-close:hover { background: #17233e0a; }
+.task-error-details { margin-top: 10px; padding: 10px 12px; border: 1px solid #efdbd2; border-radius: 8px; background: #fffbf7; font-size: 12px; overflow-wrap: anywhere; }
+.task-error-details summary { cursor: pointer; color: #a14831; font-weight: 600; }
+.task-error-metadata { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 6px 12px; margin: 12px 0; }
+.task-error-metadata dt { color: var(--muted); }
+.task-error-metadata dd { margin: 0; white-space: pre-wrap; }
+.task-error-advice { margin-bottom: 8px; line-height: 1.65; }
 @media (max-width: 600px) { .toast-region { top: max(12px, env(safe-area-inset-top)); right: max(16px, env(safe-area-inset-right)); } }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
 .metric-card { display: flex; align-items: flex-start; gap: 22px; min-height: 128px; padding: 18px 20px; }

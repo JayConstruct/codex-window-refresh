@@ -296,7 +296,31 @@
     }
     throw new Error('无法生成随机预览，请稍后重试');
   }
-  function message(code) { return codes[code] || '请求失败，请查看诊断信息'; }
+  Object.assign(codes, {invalid_wake_request: '手动唤醒参数无效，请检查 Codex 账号 ID', wake_model_missing: '请先独立保存实际可用的唤醒模型，再确认执行'});
+  Object.assign(codes, {wake_settings_unavailable: '后台未提供唤醒设置能力', wake_unavailable: '后台未提供模型唤醒能力', invalid_wake_settings: '唤醒设置无效，请检查字段', wake_settings_conflict: '唤醒设置已在后台变化，请重新读取核实', invalid_wake_job: '手动唤醒参数无效', wake_account_unavailable: '唤醒账号不可用或绑定已变化', wake_model_unavailable: '请先保存实际可用的唤醒模型', wake_outcome_unknown: '唤醒结果未知，可能已消耗额度，禁止重发', wake_interrupted: '唤醒被中断，请核实原任务，禁止重发', wake_request_rejected: '模型请求未被接受', wake_quota_unknown: '额度证据未知，跳过模型请求', wake_active_window: '账号已有活动窗口，无需重复唤醒'});
+  Object.assign(codes, {model_catalog_account_invalid: '账号身份、提供方或文件别名无法唯一核实，请刷新账号目录后重试', model_catalog_unavailable: 'CPA 未提供账号模型目录，可继续手动填写模型', model_catalog_changed: '账号目录或绑定已变化，请重新读取模型'});
+  codes.invalid_model_settings = '模型与提示词设置无效，请检查字段';
+  codes.generation_accounts_unavailable = '生成账号目录暂不可用，请稍后刷新核实';
+  codes.generation_prompt_unavailable = '当前后台不支持自定义生成提示词，请升级后台后再试';
+  codes.model_settings_conflict = '后台模型配置已变化，请重新读取并丢弃草稿后再编辑';
+  Object.assign(codes, {prompt_generation_unavailable: '后台未提供候选生成功能', invalid_prompt_generation: '生成参数无效，请检查账号、模型和数量', generation_account_unavailable: '生成账号不可用或凭据绑定已变化，请检查账号状态', generation_response_invalid: '模型返回的候选短句无效', generation_request_rejected: '模型请求被拒绝', generation_interrupted: '生成被中断，可能已消耗额度', generation_outcome_unknown: '生成结果未知，可能已消耗额度', idempotency_key_required: '缺少有效的请求标识', job_id_required: '缺少有效的生成任务标识'});
+  function message(code) { return typeof code === 'string' && Object.hasOwn(codes, code) ? codes[code] : '请求失败，请查看诊断信息'; }
+  function taskDiagnostic(code) {
+    const known = typeof code === 'string' && Object.hasOwn(codes, code);
+    const safe = known ? code : 'task_error_unknown';
+    let stage = '后台任务', advice = '查看 CPA 和插件后台同一时间的本地日志；核实原因后再手动操作。页面未保存上游原始响应。';
+    if (/^bridge_|^host_callback_|^backend_/.test(safe)) { stage = 'CPA 本地连接'; advice = '检查 CPA 与独立后台服务、私有 socket 和接入层版本，不必通过模型请求测试连接。'; }
+    else if (/^account_|^generation_account|^wake_account/.test(safe)) { stage = '账号身份与状态核实'; advice = '刷新 CPA 账号目录，核对账号是否删除、禁用、暂不可用或凭据绑定已变化；不会自动更换账号。'; }
+    else if (safe === 'quota_authentication_failed' || safe === 'quota_credential_missing') { stage = '额度凭据认证'; advice = '在 CPA 中核实并更新该账号凭据。认证失败不等同于额度耗尽，也不会解除禁用。'; }
+    else if (safe === 'quota_upstream_rate_limited') { stage = '额度接口 · HTTP 429'; advice = '等待上游限流解除，降低查询频率或增加随机延迟；不要连续提交相同批量任务。'; }
+    else if (safe === 'quota_upstream_forbidden') { stage = '额度接口 · HTTP 403'; advice = '核对账号访问权限、区域及该账号代理配置；不能仅凭拒绝访问推断额度耗尽。'; }
+    else if (/^quota_(transport|proxy|query_timeout)/.test(safe)) { stage = '额度请求连接'; advice = '检查该账号代理、网络、DNS 与 TLS 以及查询超时；不会回退其他账号或发送模型请求。'; }
+    else if (/^quota_/.test(safe)) { stage = '额度接口与响应处理'; advice = '检查上游额度服务及本地日志。异常或无法识别的响应不会覆盖最后一次有效额度。'; }
+    else if (known && /unknown|unconfirmed|interrupted/.test(safe)) { stage = '执行结果核实'; advice = '结果可能已产生或消耗额度；仅核实原任务，保留原请求标识，不要重发或创建替代模型任务。'; }
+    else if (/^generation_|^wake_|^model_/.test(safe)) { stage = '模型任务与安全准入'; advice = '核对实际账号、已保存模型和提示词及任务状态。结果未知时仅核实原任务，不自动重发。'; }
+    else if (safe === 'storage_unavailable') { stage = '后台持久化'; advice = '检查磁盘空间、目录权限和后台日志；不要删除数据库或发送防重记录来恢复执行。'; }
+    return {code: safe, title: known ? message(code) : '未识别的任务错误', stage, advice};
+  }
   function createToastCenter(document, clock) {
     const region = document.getElementById('toast-region'), entries = new Map();
     function dismiss(id, forget = false) {
@@ -355,6 +379,7 @@
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {wakeDefaults, wakeConfigDraft, validateWakeDraft});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {createToastCenter});
+  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {taskDiagnostic});
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
@@ -377,19 +402,12 @@
   let wakeIntent = null, wakeTask = null, wakeSubmitting = false, wakeReading = false, wakeUnconfirmed = false, wakeUnknown = false, wakeJobsLoading = false, wakeJobs = [];
   const wakeFields = {enabled: 'wake-enabled', fiveHour: 'wake-five-hour', weekly: 'wake-weekly', timezone: 'wake-timezone', delayMin: 'wake-delay-min', delayMax: 'wake-delay-max', allowed: 'wake-allowed', perUser: 'wake-per-user', maximum: 'wake-max-accounts', daily: 'wake-daily', dailyWindow: 'wake-daily-window', dailyTarget: 'wake-daily-target'};
   const wakePhases = {queued: '等待执行', checking: '查询并核实额度', prepared: '已准备', sending: '正在发送模型请求', verifying: '核实执行结果', completed: '已完成', skipped: '已跳过', failed: '执行失败', unknown: '结果未知', cancelled: '已取消'};
-  Object.assign(codes, {invalid_wake_request: '手动唤醒参数无效，请检查 Codex 账号 ID', wake_model_missing: '请先独立保存实际可用的唤醒模型，再确认执行'});
   const wakeReasons = {manual: '手动唤醒', manual_single: '手动唤醒', five_hour_reset: '五小时重置', weekly_reset: '周额度重置', startup: '启动分散唤醒', daily: '每日容量准备', daily_capacity: '每日容量准备'};
-  Object.assign(codes, {wake_settings_unavailable: '后台未提供唤醒设置能力', wake_unavailable: '后台未提供模型唤醒能力', invalid_wake_settings: '唤醒设置无效，请检查字段', wake_settings_conflict: '唤醒设置已在后台变化，请重新读取核实', invalid_wake_job: '手动唤醒参数无效', wake_account_unavailable: '唤醒账号不可用或绑定已变化', wake_model_unavailable: '请先保存实际可用的唤醒模型', wake_outcome_unknown: '唤醒结果未知，可能已消耗额度，禁止重发', wake_interrupted: '唤醒被中断，请核实原任务，禁止重发', wake_request_rejected: '模型请求未被接受', wake_quota_unknown: '额度证据未知，跳过模型请求', wake_active_window: '账号已有活动窗口，无需重复唤醒'});
-  Object.assign(codes, {model_catalog_account_invalid: '账号身份、提供方或文件别名无法唯一核实，请刷新账号目录后重试', model_catalog_unavailable: 'CPA 未提供账号模型目录，可继续手动填写模型', model_catalog_changed: '账号目录或绑定已变化，请重新读取模型'});
   const generationSelected = new Set();
   const modelFields = {default_model: 'model-default', default_prompt: 'model-default-prompt', five_hour_model: 'model-five-hour', five_hour_prompt: 'model-five-hour-prompt', weekly_model: 'model-weekly', weekly_prompt: 'model-weekly-prompt', generation_prompt: 'generation-prompt', prompt_mode: 'model-prompt-mode', phrases: 'model-phrases'};
-  codes.invalid_model_settings = '模型与提示词设置无效，请检查字段';
-  codes.generation_accounts_unavailable = '生成账号目录暂不可用，请稍后刷新核实';
-  codes.generation_prompt_unavailable = '当前后台不支持自定义生成提示词，请升级后台后再试';
-  codes.model_settings_conflict = '后台模型配置已变化，请重新读取并丢弃草稿后再编辑';
-  Object.assign(codes, {prompt_generation_unavailable: '后台未提供候选生成功能', invalid_prompt_generation: '生成参数无效，请检查账号、模型和数量', generation_account_unavailable: '生成账号不可用或凭据绑定已变化，请检查账号状态', generation_response_invalid: '模型返回的候选短句无效', generation_request_rejected: '模型请求被拒绝', generation_interrupted: '生成被中断，可能已消耗额度', generation_outcome_unknown: '生成结果未知，可能已消耗额度', idempotency_key_required: '缺少有效的请求标识', job_id_required: '缺少有效的生成任务标识'});
   const settingsFields = {automatic: 'settings-automatic', fiveHour: 'settings-five-hour', weekly: 'settings-weekly', interval: 'settings-interval', timezone: 'settings-timezone', delayMin: 'settings-delay-min', delayMax: 'settings-delay-max', excluded: 'settings-excluded'};
   const pending = new Map(), controllers = new Set(), queryBusy = new Set(), unresolved = new Map();
+  const errorLimits = new Map();
   const setText = (id, text) => { if ($(id) && $(id).textContent !== String(text)) $(id).textContent = text; };
   function updateChildren(parent, children) {
     const previous = Array.from(parent.childNodes);
@@ -437,6 +455,18 @@
     if (className) item.className = className;
     if (text !== undefined) item.textContent = text;
     return item;
+  }
+  function taskErrorDetails(code, job, account = '', kind = 'query') {
+    const diagnostic = taskDiagnostic(code), details = element('details', 'task-error-details');
+    details.dataset.renderKey = 'error:' + account + ':' + diagnostic.code;
+    details.append(element('summary', '', '错误详情 · ' + diagnostic.title));
+    const metadata = element('dl', 'task-error-metadata');
+    const phases = kind === 'wake' ? wakePhases : kind === 'generation' ? {queued: '等待生成', running: '正在生成', completed: '生成完成', failed: '生成失败', unknown: '结果未知'} : phaseNames;
+    for (const [label, value] of [['任务 ID', job.job_id || job.id || '未知'], ['账号', account || job.account_id || job.target || '批量任务'], ['任务阶段', phases[job.phase] || '未知'], ['错误代码', diagnostic.code], ['失败环节', diagnostic.stage], ['记录时间', job.updated_at || job.created_at || '未提供']]) {
+      metadata.append(element('dt', '', label), element('dd', '', value));
+    }
+    details.append(metadata, element('p', 'task-error-advice', diagnostic.advice), element('p', 'muted', '仅展示脱敏分类与排查建议，不包含凭据、代理密钥、请求提示词或上游原始响应。'));
+    return details;
   }
   function report(error) {
     feedback('error', message(error.code || error.message) + '。已显示的数据可能已过期。', 'error');
@@ -713,7 +743,7 @@
       item.append(heading, element('p', 'task-description', wakeReasons[job.reason] || '后台唤醒任务'));
       if (job.scheduled_at) item.append(element('small', 'task-description', '后台计划：' + (Number.isFinite(timestamp(job.scheduled_at)) ? new Date(job.scheduled_at).toLocaleString('zh-CN', {hour12: false}) : '待核实')));
       if (job.hold_reason) item.append(element('p', 'task-description', wakeHoldText(job.hold_reason)));
-      if (job.error_code) item.append(element('small', 'error-text', message(job.error_code)));
+      if (['failed', 'unknown'].includes(job.phase) || job.error_code && ['skipped', 'cancelled'].includes(job.phase)) item.append(taskErrorDetails(job.error_code || (job.phase === 'unknown' ? 'wake_outcome_unknown' : 'wake_request_rejected'), job, '', 'wake'));
       if (job.phase === 'unknown') item.append(element('p', 'error-text', '可能已消耗额度；禁止重发，仅可读取原任务。'));
       const time = element('small', 'task-time', age(job.updated_at || job.created_at)); time.dataset.observedAt = job.updated_at || job.created_at || ''; item.append(time);
       const button = element('button', 'text-button', '读取任务结果'); button.dataset.renderKey = 'read'; button.type = 'button'; button.disabled = !connected || !wakeExecutionSupported(); button.onclick = () => readWakeJob(job.job_id); item.append(button); return item;
@@ -1059,6 +1089,8 @@
     $('generation-select-all').disabled = !connected || !supported || !candidates.length;
     $('generation-apply').disabled = !connected || !supported || !modelSupported() || !modelBase || modelSaving || modelLoading || !generationSelected.size;
     renderModelCatalogs();
+    updateChildren($('generation-task-details'), generationTask && ['failed', 'unknown'].includes(generationTask.phase)
+      ? [taskErrorDetails(generationTask.error_code || (generationTask.phase === 'unknown' ? 'generation_outcome_unknown' : 'generation_response_invalid'), generationTask, '', 'generation')] : []);
   }
   function acceptGeneration(data, expectedID = '') {
     const phases = ['queued', 'running', 'completed', 'failed', 'unknown'];
@@ -1143,6 +1175,7 @@
   }
   function stop() {
     toasts.clear();
+    errorLimits.clear();
     generation++; connected = false; connecting = false; key = '';
     clearTimeout(pollTimer); clearTimeout(filterTimer);
     for (const controller of controllers) controller.abort();
@@ -1271,7 +1304,20 @@
     const time = element('small', 'task-time', age(job.updated_at || job.created_at)); time.dataset.observedAt = job.updated_at || job.created_at || '';
     item.append(heading, element('p', 'task-description', description), time);
     if (['queued', 'blocked', 'running'].includes(job.phase) && (job.scheduled_at || job.hold_reason)) item.append(queueAnnotation({...job, phase: waiting > 0 ? 'queued' : phase}));
-    if (job.error_code) item.append(element('small', 'task-description error-text', message(job.error_code)));
+    if (job.error_code) item.append(taskErrorDetails(job.error_code, job));
+    const failed = Array.isArray(job.items) ? job.items.filter(result => result.phase === 'failed' || result.error_code) : [];
+    if (failed.length) {
+      const errors = element('details', 'task-results task-errors'); errors.dataset.renderKey = 'errors';
+      errors.append(element('summary', '', '逐账号错误详情 · ' + failed.length + ' 个账号'));
+      const id = job.job_id || job.id, limit = errorLimits.get(id) || 20;
+      for (const result of failed.slice(0, limit)) errors.append(taskErrorDetails(result.error_code || 'quota_query_failed', {...job, phase: result.phase}, result.account_id));
+      if (failed.length > limit) {
+        const more = element('button', 'text-button', '显示更多错误（剩余 ' + (failed.length - limit) + ' 个）'); more.type = 'button'; more.dataset.renderKey = 'more-errors';
+        more.onclick = () => { errorLimits.delete(id); errorLimits.set(id, limit + 20); if (errorLimits.size > 64) errorLimits.delete(errorLimits.keys().next().value); renderTasks(); };
+        errors.append(more);
+      }
+      item.append(errors);
+    }
     if (detailed && Array.isArray(job.items)) {
       const details = element('details', 'task-results');
       details.dataset.renderKey = 'results';
@@ -1285,9 +1331,13 @@
       if (job.items.length > 20) details.append(element('small', 'muted', '仅展示前 20 个账号结果'));
       item.append(details);
     } else if (detailed && (job.job_id || job.id)) {
-      const button = element('button', 'task-open', '查看逐账号结果'); button.type = 'button'; button.disabled = !connected;
+      const button = element('button', 'task-open', job.error_code || job.failed ? '查看逐账号结果与错误详情' : '查看逐账号结果'); button.type = 'button'; button.disabled = !connected;
       button.dataset.renderKey = 'open';
       button.onclick = () => openJob(job.job_id || job.id); item.append(button);
+    }
+    if (!detailed && (job.error_code || job.failed || failed.length) && (job.job_id || job.id)) {
+      const button = element('button', 'text-button', '查看错误详情'); button.type = 'button'; button.disabled = !connected;
+      button.dataset.renderKey = 'open-errors'; button.onclick = () => openJob(job.job_id || job.id); item.append(button);
     }
     return item;
   }

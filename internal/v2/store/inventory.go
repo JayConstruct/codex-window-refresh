@@ -13,6 +13,24 @@ import (
 
 const InventoryRefreshInterval = 30 * time.Second
 
+func applyQueryStatus(ctx context.Context, tx *sql.Tx, run Run, observed *Account) error {
+	if observed == nil || observed.ID != run.Account.ID || observed.AuthIndex != run.Account.AuthIndex || observed.Binding == "" || run.Account.Binding != "" && run.Account.Binding != observed.Binding {
+		return nil
+	}
+	switch observed.Status {
+	case "available", "disabled", "unavailable":
+	default:
+		return nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, observed.StatusObservedAt)
+	if err != nil || at.IsZero() || at.After(time.Now().UTC()) {
+		return nil
+	}
+	stamp := at.UTC().Format("2006-01-02T15:04:05.000000000Z")
+	_, err = tx.ExecContext(ctx, `UPDATE accounts SET status=?,updated_at=? WHERE id=? AND auth_index=? AND status NOT IN ('removed','binding_unavailable') AND updated_at<=? AND (COALESCE((SELECT binding FROM account_bindings WHERE account_id=accounts.id),'')=? OR (?='' AND COALESCE((SELECT binding FROM account_bindings WHERE account_id=accounts.id),'')=''))`, observed.Status, stamp, observed.ID, observed.AuthIndex, stamp, observed.Binding, run.Account.Binding)
+	return err
+}
+
 func (s *Store) SyncInventory(ctx context.Context, accounts []Account) error {
 	if len(accounts) > 10000 {
 		return errors.New("inventory_too_large")

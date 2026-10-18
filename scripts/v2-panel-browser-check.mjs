@@ -777,6 +777,29 @@ try {
     await waitFor(() => evaluate('document.getElementById("error").textContent === ""'), 'Successful refresh did not clear the toast error state');
   }
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
+  const failureID = 'fixture-error-details';
+  const failureJob = {...identity(), job_id: failureID, id: failureID, phase: 'failed', trigger: 'manual_batch', completed: 24, failed: 1, total: 25, created_at: observed(), updated_at: observed(),
+    items: Array.from({length: 25}, (_, index) => ({account_id: 'error-fixture-account-' + index, phase: index === 24 ? 'failed' : 'completed', error_code: index === 24 ? 'quota_upstream_forbidden' : ''}))};
+  jobs.set(failureID, failureJob); fixtureJobs.unshift({...failureJob, items: undefined}); revision++;
+  const writesBeforeDetails = posts.length;
+  await evaluate('document.getElementById("refresh").onclick()');
+  await waitFor(() => evaluate('document.getElementById("history-list").textContent.includes("查看逐账号结果与错误详情")'), 'Error summary did not expose details');
+  await evaluate(`document.querySelector('[data-page=history]').click();Array.from(document.querySelectorAll('#history-list .task-item')).find(node => node.dataset.renderKey === 'query:${failureID}').querySelector('.task-open').click()`);
+  await waitFor(() => evaluate('!!document.querySelector("#history-list .task-errors")'), 'Per-account errors were not loaded');
+  await evaluate('globalThis.errorDetails=document.querySelector("#history-list .task-errors");errorDetails.open=true;globalThis.errorItem=errorDetails.querySelector(".task-error-details");errorItem.open=true;globalThis.errorSummary=errorItem.querySelector("summary");errorSummary.focus()');
+  assert.match(await evaluate('errorItem.textContent'), /quota_upstream_forbidden/);
+  assert.match(await evaluate('errorItem.textContent'), /HTTP 403/);
+  assert.match(await evaluate('errorItem.textContent'), /error-fixture-account-24/);
+  assert.match(await evaluate('errorItem.textContent'), /fixture-error-details/);
+  await evaluate('document.getElementById("refresh").onclick()');
+  await waitFor(() => evaluate('errorItem.isConnected && errorItem.open && errorDetails.open && document.activeElement === errorSummary'), 'Polling reset error expansion or keyboard focus');
+  for (const width of [1586, 390]) {
+    await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Task error details overflow at ' + width);
+    await screenshot('task-error-details-' + width + '.png');
+  }
+  assert.equal(posts.length, writesBeforeDetails, 'Reading error details created work');
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   unauthorized = true;
   await waitFor(() => evaluate('!document.getElementById("login-section").hidden && document.getElementById("query").disabled'), 'Expired authentication did not stop polling');
   const readCount = reads.length;

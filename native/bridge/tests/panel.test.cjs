@@ -210,6 +210,72 @@ function panel(respond, options = {}) {
 }
 function basic(url) { return url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
 
+test('task diagnostics classify safe error codes without echoing arbitrary upstream failures', () => {
+  const {taskDiagnostic} = require('../../../internal/v2/daemon/web/panel.js');
+  assert.match(taskDiagnostic('quota_upstream_rate_limited').stage, /429/);
+  assert.match(taskDiagnostic('quota_upstream_forbidden').stage, /403/);
+  assert.match(taskDiagnostic('quota_authentication_failed').advice, /凭据/);
+  assert.match(taskDiagnostic('quota_transport_failed').advice, /DNS/);
+  assert.match(taskDiagnostic('wake_outcome_unknown').advice, /不要重发/);
+  assert.equal(taskDiagnostic('wake_outcome_unknown').code, 'wake_outcome_unknown');
+  for (const code of ['token=private-secret', '__proto__', null]) {
+    const diagnostic = taskDiagnostic(code);
+    assert.equal(diagnostic.code, 'task_error_unknown');
+    assert.equal(diagnostic.stage, '后台任务');
+    assert.equal(JSON.stringify(diagnostic).includes('private-secret'), false);
+  }
+});
+test('failed task summaries open read-only error details for every failed account beyond the result preview', async () => {
+  const job = {...view(), job_id: 'detail-job', phase: 'failed', created_at: '2026-10-18T00:00:00Z', updated_at: '2026-10-18T00:01:00Z',
+    items: Array.from({length: 45}, (_, index) => ({account_id: 'detail-account-' + index, phase: index < 20 ? 'completed' : 'failed', error_code: index < 20 ? '' : 'quota_upstream_rate_limited'}))};
+  const summary = {id: job.job_id, phase: 'failed', failed: 25, completed: 20, total: 45, created_at: job.created_at};
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) { const data = overview(); data.dashboard.recent_jobs = [summary]; return [200, data]; }
+    return url.includes('/jobs?job_id=') ? [200, job] : basic(url);
+  });
+  const descendants = node => [node, ...node.children.flatMap(descendants)];
+  await ui.get('connect').onclick();
+  const button = descendants(ui.get('history-list')).find(node => node.tagName === 'button' && node.textContent.includes('错误详情'));
+  assert.ok(button); await button.onclick();
+  assert.equal(ui.get('page-title').textContent, '计划与历史');
+  let errors = descendants(ui.get('history-list')).find(node => node.dataset.renderKey === 'errors');
+  assert.match(errors.textContent, /detail-account-20/); assert.match(errors.textContent, /quota_upstream_rate_limited/);
+  assert.match(errors.textContent, /detail-job/); assert.match(errors.textContent, /HTTP 429/);
+  assert.equal(errors.textContent.includes('detail-account-44'), false);
+  errors.open = true;
+  const first = errors.children[1]; first.open = true;
+  const more = errors.children.find(node => node.dataset.renderKey === 'more-errors'); more.onclick();
+  errors = descendants(ui.get('history-list')).find(node => node.dataset.renderKey === 'errors');
+  assert.match(errors.textContent, /detail-account-44/);
+  assert.equal(errors.children.some(node => node.dataset.renderKey === 'more-errors'), false);
+  await ui.tick(5000);
+  assert.equal(descendants(ui.get('history-list')).find(node => node.dataset.renderKey === 'errors'), errors);
+  assert.equal(errors.open, true); assert.equal(first.open, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('wake unknown outcomes expose durable error details without permitting another model send', async () => {
+  const job = {...view('a', 20), job_id: 'unknown-detail', account_id: 'wake-detail-account', phase: 'unknown', error_code: 'wake_outcome_unknown'};
+  const ui = panel(url => url.includes('/wake-jobs?limit=') ? [200, {...view('a', 20), jobs: [job]}] : wakeResponse(url));
+  await openWake(ui);
+  assert.match(ui.get('wake-history').textContent, /错误详情/);
+  assert.match(ui.get('wake-history').textContent, /unknown-detail/);
+  assert.match(ui.get('wake-history').textContent, /不要重发/);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('candidate generation failures keep inspectable details after closing their toast', async () => {
+  const ui = panel((url, options) => url.endsWith('/prompt-generations') && options.method === 'POST'
+    ? [202, {...view(), job_id: 'generation-detail', phase: 'failed', error_code: 'generation_request_rejected', account_id: 'codex-01'}]
+    : modelResponse(url));
+  await openModels(ui); configureCandidateRequest(ui); await submitCandidates(ui);
+  assert.match(ui.get('generation-task-details').textContent, /错误详情/);
+  assert.match(ui.get('generation-task-details').textContent, /generation_request_rejected/);
+  assert.match(ui.get('generation-task-details').textContent, /generation-detail/);
+  const count = ui.calls.filter(call => call.method === 'POST').length;
+  ui.get('generation-message').parentNode.children[1].onclick();
+  assert.match(ui.get('generation-task-details').textContent, /generation-detail/);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, count);
+});
+
 function toastPanel() {
   const ui = panel(basic);
   const {createToastCenter} = require('../../../internal/v2/daemon/web/panel.js');

@@ -114,6 +114,7 @@ type credential struct {
 	ProxyDash  string `json:"proxy-url"`
 	ProxyUpper string `json:"proxyURL"`
 	status     string
+	statusAt   string
 }
 
 func (c *CPA) binding(ctx context.Context, a store.Account) (credential, error) {
@@ -121,10 +122,14 @@ func (c *CPA) binding(ctx context.Context, a store.Account) (credential, error) 
 	if err != nil {
 		return credential{}, err
 	}
-	if cred.Token == "" || len(cred.Token) > 65536 || strings.IndexFunc(cred.Token, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {
+	if !validQuotaToken(cred.Token) {
 		return credential{}, errors.New("quota_credential_missing")
 	}
 	return cred, nil
+}
+
+func validQuotaToken(token string) bool {
+	return token != "" && len(token) <= 65536 && strings.IndexFunc(token, func(character rune) bool { return character < 33 || character > 126 }) < 0
 }
 func (c *CPA) readBinding(ctx context.Context, a store.Account) (credential, error) {
 	return c.readBindingFor(ctx, a, false)
@@ -138,6 +143,7 @@ func (c *CPA) readBindingFor(ctx context.Context, a store.Account, requireAvaila
 		return credential{}, err
 	}
 	r := runtime.Auth
+	statusAt := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
 	status := accountStatus(r)
 	if requireAvailable && status == "disabled" {
 		return credential{}, errors.New("account_disabled")
@@ -166,6 +172,7 @@ func (c *CPA) readBindingFor(ctx context.Context, a store.Account, requireAvaila
 	cred.Fallback = ""
 	if r.Status != "" || r.Disabled || r.Unavailable {
 		cred.status = status
+		cred.statusAt = statusAt
 	}
 	return cred, nil
 }
@@ -248,15 +255,35 @@ func (c *CPA) client(cred credential) (*http.Client, error) {
 	return &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
 }
 func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, error) {
+	raw, _, err := c.QueryWithStatus(ctx, a)
+	return raw, err
+}
+
+func (c *CPA) QueryWithStatus(ctx context.Context, a store.Account) (json.RawMessage, *store.Account, error) {
+	var observed *store.Account
+	raw, err := c.query(ctx, a, &observed)
+	return raw, observed, err
+}
+
+func (c *CPA) query(ctx context.Context, a store.Account, observed **store.Account) (json.RawMessage, error) {
 	if a.Status == "binding_unavailable" || a.AuthIndex == "" {
 		return nil, errors.New("account_identity_unavailable")
 	}
-	cred, err := c.binding(ctx, a)
+	cred, err := c.readBinding(ctx, a)
 	if err != nil {
 		return nil, err
 	}
 	if a.Binding != "" && a.Binding != bindingID(a, cred.Upstream) {
 		return nil, errors.New("account_binding_changed")
+	}
+	observe := func(credential credential) {
+		if credential.status != "" {
+			*observed = &store.Account{ID: a.ID, AuthIndex: a.AuthIndex, Binding: bindingID(a, credential.Upstream), Status: credential.status, StatusObservedAt: credential.statusAt}
+		}
+	}
+	observe(cred)
+	if !validQuotaToken(cred.Token) {
+		return nil, errors.New("quota_credential_missing")
 	}
 	endpoint := c.endpoint
 	if endpoint == "" {
@@ -281,6 +308,12 @@ func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, erro
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		after, bindingErr := c.readBinding(ctx, a)
+		if bindingErr != nil || after.Upstream != cred.Upstream {
+			*observed = nil
+			return nil, errors.New("account_binding_changed")
+		}
+		observe(after)
 		switch resp.StatusCode {
 		case 401:
 			return nil, errors.New("quota_authentication_failed")
@@ -302,8 +335,10 @@ func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, erro
 	// Revalidate after network work, including the actual upstream account ID.
 	after, err := c.binding(ctx, a)
 	if err != nil || after.Upstream != cred.Upstream {
+		*observed = nil
 		return nil, errors.New("account_binding_changed")
 	}
+	observe(after)
 	at := time.Now().UTC()
 	if at.Before(started) {
 		return nil, errors.New("quota_clock_changed")

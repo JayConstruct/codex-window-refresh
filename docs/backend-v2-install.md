@@ -14,11 +14,13 @@ rc.10 保留候选、账号及历史控件的焦点和详情展开状态，修�
 
 首次升级 rc.8 时先保持自动唤醒及五小时、周、每日规则关闭，核对实际模型、时区与允许时段，再显式手动唤醒一个测试账号。手动操作会先只读查额度和活动保护，可能跳过或阻塞，不保证一定发送；若发送则可能消耗模型额度。模型完成与窗口核实分开显示，结果未知不得换新键重复发送。确认行为后再按需保存开启自动规则。自动规则默认关闭并不覆盖旧版中用户已经明确保存的设置。
 
-升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.11 发布说明](releases/v0.2.0-rc.11.md)。
+升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.12 发布说明](releases/v0.2.0-rc.12.md)。
 
 旧后台不能直接打开迁移后的新库，回退必须停服务并恢复升级前一致的数据库备份，不能仅替换旧二进制。安装器激活失败时会使用临时一致备份恢复，但成功后会清理该副本；需要日后手动降级时，升级前须另行保存停机或 SQLite 在线一致备份。
 
 rc.11 将操作反馈统一到全局 toast，正常轮询和草稿输入不刷屏，错误及未知结果警告可手动收起，发送保护不变。独立下载入口重新获取安装器，不复用旧副本，并显示实际后台及接入层版本。数据库与接入层版本仍不变，更新及验证说明见 [rc.11 发布说明](releases/v0.2.0-rc.11.md)。
+
+rc.12 在额度查询完成时同步已核实的宿主账号状态，并提供查询、唤醒及候选生成任务的脱敏错误详情。保留 30 秒定时状态同步和原任务安全保护，数据库及接入层仍不变；详见 [rc.12 发布说明](releases/v0.2.0-rc.12.md)。
 
 ## 首次切换
 
@@ -39,7 +41,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.11` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.12` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -49,11 +51,11 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest
 ```
 
-若只改变后台与网页，省略 `--restart`，安装器只停止并启动独立后台；接入层改变则在写入前提示需要显式 `--restart`，确认可重启 CPA 后再添加此参数。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.11`。
+若只改变后台与网页，省略 `--restart`，安装器只停止并启动独立后台；接入层改变则在写入前提示需要显式 `--restart`，确认可重启 CPA 后再添加此参数。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.12`。
 
 `latest` 会按数值比较全部已发布 V2 rc 版本，不取发布列表第一条，也不使用排除预发布的 GitHub `/releases/latest`。下载的独立入口会重新获取两份 Python 安装器，不复用下载目录中的旧副本；只有完整源码目录（含上级 `go.mod`）使用本地安装器，运行前须自行更新源码。离线安装继续使用下文的包内 Python 入口。
 
-**后台和接入层独立记录版本**。例如后台 rc.11 使用 rc.8 接入层，CPA 插件列表可能仍显示 rc.8，这是正常复用，并非更新停在 rc.8。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
+**后台和接入层独立记录版本**。例如后台 rc.12 使用 rc.8 接入层，CPA 插件列表可能仍显示 rc.8，这是正常复用，并非更新停在 rc.8。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
 
 普通 v1 的 `install.sh` 不自动选择 v2 包；检测到已有 v2 安装记录时拒绝覆盖。不能通过旧脚本把正在运行的 v2 改回 v1。
 
@@ -77,7 +79,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.11 --package /path/codex-window-refresh-v2_v0.2.0-rc.11_linux_amd64.tar.gz \
+  --version v0.2.0-rc.12 --package /path/codex-window-refresh-v2_v0.2.0-rc.12_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 
