@@ -9,7 +9,7 @@
     query: ['额度查询', '管理查询规则与随机延迟，不发送模型请求'],
     wake: ['模型唤醒', '配置后台唤醒规则、手动执行并核实任务结果'],
     models: ['模型与提示词', '管理唤醒模型、提示词与短句池'],
-    history: ['计划与历史', '查看后台持久保存的查询任务与执行结果'],
+    history: ['任务记录', '统一查看手动与自动任务，追踪执行进度与响应结果'],
     diagnostics: ['诊断与设置', '检查 CPA 连接、查询能力与后台异常']
   };
   const codes = {
@@ -374,7 +374,76 @@
     function clear() { for (const id of entries.keys()) dismiss(id, true); }
     return {show, dismiss, clear};
   }
-  if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText};
+  function historyTimeRange(range = 'all', now = Date.now()) {
+    const today = new Date(now); today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
+    const start = new Date(today);
+    if (range === 'week') start.setDate(start.getDate() - 6);
+    if (range === 'month') start.setDate(start.getDate() - 29);
+    const bounded = ['today', 'week', 'month'].includes(range);
+    return {from: bounded ? start.toISOString() : '', to: bounded ? tomorrow.toISOString() : '', today_from: today.toISOString(), today_to: tomorrow.toISOString()};
+  }
+  function historyQuery(filters = {}, now = Date.now()) {
+    const params = new URLSearchParams();
+    for (const [name, value] of Object.entries({...historyTimeRange(filters.date, now), search: filters.search?.trim(), type: filters.type, source: filters.source, trigger: filters.trigger, status: filters.status, page: filters.page || 1, limit: filters.limit || 10})) {
+      if (value !== undefined && value !== '') params.set(name, String(value));
+    }
+    return '/task-history?' + params.toString();
+  }
+  function historyStatus(record) {
+    const status = record.status || record.phase;
+    if (['running', 'checking', 'prepared', 'sending', 'verifying'].includes(status)) return {label: '执行中', kind: 'querying'};
+    if (['queued', 'blocked'].includes(status)) return {label: '排队中', kind: 'unavailable'};
+    return {completed: {label: '已完成', kind: 'available'}, failed: {label: '失败', kind: 'attention'}, unknown: {label: '结果未知', kind: 'attention'}, skipped: {label: '已跳过', kind: 'disabled'}, cancelled: {label: '已取消', kind: 'disabled'}}[status] || {label: '状态未知', kind: 'unavailable'};
+  }
+  function historyDuration(record) {
+    const started = timestamp(record.started_at), finished = timestamp(record.finished_at);
+    if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) return '—';
+    const seconds = (finished - started) / 1000;
+    return seconds < 60 ? Number(seconds.toFixed(1)) + ' 秒' : Math.floor(seconds / 60) + ' 分 ' + Math.floor(seconds % 60) + ' 秒';
+  }
+  function historyString(value, maximum = 256, required = false) {
+    return value === undefined ? !required : typeof value === 'string' && value.length <= maximum && (!required || value.length > 0) && !/[\x00-\x1f\x7f]/.test(value);
+  }
+  function validateQueryJob(data, expectedID = '') {
+    const invalid = () => { throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'}); };
+    if (!data || typeof data !== 'object' || Array.isArray(data) || !historyString(data.job_id, 256, true) || expectedID && data.job_id !== expectedID || !Object.hasOwn(phaseNames, data.phase) || !Array.isArray(data.items) || data.items.length > 10000) invalid();
+    for (const name of ['account_id', 'error_code', 'hold_reason', 'trigger']) if (!historyString(data[name])) invalid();
+    for (const name of ['scheduled_at', 'created_at', 'updated_at', 'started_at', 'finished_at']) if (!historyString(data[name], 64)) invalid();
+    for (const item of data.items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || !historyString(item.account_id, 256, true) || !Object.hasOwn(phaseNames, item.phase)) invalid();
+      for (const name of ['error_code', 'hold_reason', 'trigger']) if (!historyString(item[name])) invalid();
+      if (!historyString(item.scheduled_at, 64)) invalid();
+    }
+    return data;
+  }
+  function validateTaskHistoryPage(data) {
+    const invalid = () => { throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'}); };
+    const object = value => value && typeof value === 'object' && !Array.isArray(value);
+    const integer = value => Number.isSafeInteger(value) && value >= 0;
+    const statuses = ['running', 'queued', 'completed', 'failed', 'unknown', 'skipped', 'cancelled'];
+    if (!object(data) || !historyString(data.instance_id, 256, true) || !integer(data.view_revision) || !Array.isArray(data.records) || ![data.page, data.limit, data.total].every(integer) || data.limit < 1 || data.limit > 100 || data.page < 1 || data.page > Math.max(1, Math.ceil(data.total / data.limit)) || data.records.length > data.limit || data.records.length > Math.max(0, data.total - (data.page - 1) * data.limit) || !object(data.summary) || !object(data.status_counts)) invalid();
+    for (const name of ['all', ...statuses]) if (!integer(data.status_counts[name])) invalid();
+    for (const name of ['today', 'today_automatic', 'today_manual', 'running', 'queued', 'completed', 'failed', 'unknown']) if (!integer(data.summary[name])) invalid();
+    const ids = new Set();
+    for (const record of data.records) {
+      if (!object(record) || !historyString(record.job_id, 256, true) || !['query', 'wake'].includes(record.type) || !['manual', 'automatic'].includes(record.source) || !statuses.includes(record.status)) invalid();
+      const phases = record.type === 'query' ? Object.keys(phaseNames) : ['queued', 'checking', 'prepared', 'sending', 'verifying', 'completed', 'skipped', 'failed', 'unknown', 'cancelled'];
+      const recognizedPhase = phases.includes(record.phase);
+      if (!recognizedPhase && (!historyString(record.phase, 80, true) || record.status !== 'unknown')) invalid();
+      const waitingQuery = record.type === 'query' && record.phase === 'running' && record.waiting > 0 && record.querying === 0;
+      const grouped = waitingQuery || ['queued', 'blocked'].includes(record.phase) ? 'queued' : ['running', 'checking', 'prepared', 'sending', 'verifying'].includes(record.phase) ? 'running' : record.phase;
+      if (recognizedPhase && grouped !== record.status) invalid();
+      for (const name of ['account_id', 'trigger', 'model', 'error_code', 'hold_reason']) if (!historyString(record[name])) invalid();
+      for (const name of ['created_at', 'updated_at', 'scheduled_at', 'started_at', 'finished_at']) if (!historyString(record[name], 64)) invalid();
+      for (const name of ['total', 'completed', 'failed', 'waiting', 'querying']) if (!integer(record[name])) invalid();
+      if (['completed', 'failed', 'waiting', 'querying'].some(name => record[name] > record.total)) invalid();
+      const key = record.type + ':' + record.job_id;
+      if (ids.has(key)) invalid(); ids.add(key);
+    }
+    return data;
+  }
+  if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText, historyTimeRange, historyQuery, historyStatus, historyDuration, validateQueryJob, validateTaskHistoryPage};
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {wakeDefaults, wakeConfigDraft, validateWakeDraft});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
@@ -401,6 +470,10 @@
   let savedWakeSettings = null, wakeBase = null, wakeLoading = false, wakePolling = false, wakeSaving = false, wakeConflict = false, wakeNeedsVerification = false, wakeSettingsAttempt = '', wakeSavingEnabled = null;
   let wakeIntent = null, wakeTask = null, wakeSubmitting = false, wakeReading = false, wakeUnconfirmed = false, wakeUnknown = false, wakeJobsLoading = false, wakeJobs = [];
   let quickWakeAccount = '', quickWakeLoading = false, quickWakeSequence = 0;
+  let historyData = null, historyLoading = false, historyError = '', historyTimer, historySequence = 0, historyDetailSequence = 0;
+  let historySelected = null, historyJob = null, historyDetailLoading = false, historyDetailError = '';
+  let historyDetailOpener = null, historyCopySequence = 0;
+  const historyFilters = {search: '', type: '', source: '', trigger: '', date: 'all', status: '', page: 1, limit: 10};
   const wakeFields = {enabled: 'wake-enabled', fiveHour: 'wake-five-hour', weekly: 'wake-weekly', timezone: 'wake-timezone', delayMin: 'wake-delay-min', delayMax: 'wake-delay-max', allowed: 'wake-allowed', perUser: 'wake-per-user', maximum: 'wake-max-accounts', daily: 'wake-daily', dailyWindow: 'wake-daily-window', dailyTarget: 'wake-daily-target'};
   const wakePhases = {queued: '等待执行', checking: '查询并核实额度', prepared: '已准备', sending: '正在发送模型请求', verifying: '核实执行结果', completed: '已完成', skipped: '已跳过', failed: '执行失败', unknown: '结果未知', cancelled: '已取消'};
   const wakeReasons = {manual: '手动唤醒', manual_single: '手动唤醒', five_hour_reset: '五小时重置', weekly_reset: '周额度重置', startup: '启动分散唤醒', daily: '每日容量准备', daily_capacity: '每日容量准备'};
@@ -427,6 +500,7 @@
       for (const name of current.getAttributeNames()) if (!next.hasAttribute(name) && !(name === 'open' && current.tagName === 'DETAILS')) current.removeAttribute(name);
       for (const name of next.getAttributeNames()) if (current.getAttribute(name) !== next.getAttribute(name)) current.setAttribute(name, next.getAttribute(name));
       for (const name of ['className', 'title', 'disabled', 'checked', 'value', 'max', 'type', 'colSpan']) {
+        if (name === 'className' && typeof next.className !== 'string') continue;
         if (name in next && current[name] !== next[name]) current[name] = next[name];
       }
       for (const name of Object.keys(current.dataset)) if (!Object.hasOwn(next.dataset, name)) delete current.dataset[name];
@@ -436,10 +510,10 @@
       else if (current.textContent !== next.textContent) current.textContent = next.textContent;
       return current;
     });
+    for (const node of Array.from(parent.childNodes)) if (!desired.includes(node)) parent.removeChild(node);
     for (let index = 0; index < desired.length; index++) {
       if (parent.childNodes[index] !== desired[index]) parent.insertBefore(desired[index], parent.childNodes[index] || null);
     }
-    for (const node of Array.from(parent.childNodes)) if (!desired.includes(node)) parent.removeChild(node);
   }
   const sidebarPreference = 'cwr-v2-sidebar:' + base;
   function renderSidebar(collapsed, persist = false) {
@@ -782,6 +856,7 @@
       ['account_id', 'reason', 'error_code', 'hold_reason', 'scheduled_at', 'created_at', 'updated_at'].some(name => data[name] !== undefined && typeof data[name] !== 'string')) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
     if (data.response !== undefined && (!data.response || typeof data.response !== 'object' || Array.isArray(data.response) || ['recorded_at', 'stage', 'event', 'status', 'upstream_error_code', 'upstream_error_type', 'error_message', 'response_text', 'error_code'].some(name => data.response[name] !== undefined && (typeof data.response[name] !== 'string' || data.response[name].length > 4096)))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
     if (data.response && (['completed', 'truncated', 'close_failed'].some(name => data.response[name] !== undefined && typeof data.response[name] !== 'boolean') || ['http_status', 'bytes'].some(name => data.response[name] !== undefined && (!Number.isSafeInteger(data.response[name]) || data.response[name] < 0 || data.response[name] > (name === 'bytes' ? 1048576 : 599))))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+    if (!historyString(data.job_id, 256, true) || ['account_id', 'reason', 'error_code', 'hold_reason'].some(name => !historyString(data[name])) || ['scheduled_at', 'created_at', 'updated_at', 'started_at', 'finished_at'].some(name => !historyString(data[name], 64))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
   }
   function acceptWakeTask(data) {
     validateWakeJob(data);
@@ -1216,13 +1291,17 @@
     renderModelSettings();
     renderGeneration();
     renderModelCatalogs();
+    if ($('history-refresh')) $('history-refresh').disabled = !connected;
   }
   function stop() {
     toasts.clear();
     closeQuickWake();
     errorLimits.clear();
     generation++; connected = false; connecting = false; key = '';
-    clearTimeout(pollTimer); clearTimeout(filterTimer);
+    clearTimeout(pollTimer); clearTimeout(filterTimer); clearTimeout(historyTimer);
+    historySequence++; historyDetailSequence++;
+    historyData = null; historySelected = null; historyJob = null; historyLoading = false; historyDetailLoading = false; historyError = ''; historyDetailError = '';
+    historyDetailOpener = null; clearHistoryCopy();
     for (const controller of controllers) controller.abort();
     controllers.clear(); queryBusy.clear(); pending.clear();
     refreshing = false; updatingAccounts = false; syncing = false; settingsLoading = false; settingsSaving = false; settingsNeedsVerification = false; savingRule = null;
@@ -1244,6 +1323,7 @@
     setText('metric-status', '未连接'); setText('metric-status-detail', '网页已断开 · 后台不受影响'); controls();
     for (const button of document.querySelectorAll('.account-query')) button.disabled = true;
     for (const button of document.querySelectorAll('.task-open')) button.disabled = true;
+    renderHistory();
   }
   async function api(path, options = {}, management = false) {
     if (!key) throw Object.assign(new Error('unauthorized'), {code: 'unauthorized'});
@@ -1344,10 +1424,9 @@
     if (Number.isFinite(at)) node.title = '后台计划时间：' + new Date(at).toLocaleString('zh-CN', {hour12: false});
     return node;
   }
-  function taskElement(job, detailed = false) {
+  function taskElement(job, detailed = false, phase = displayedJobPhase(job)) {
     const item = element('article', 'task-item'), heading = element('div', 'task-heading');
     item.dataset.renderKey = 'query:' + (job.job_id || job.id);
-    const phase = displayedJobPhase(job);
     heading.append(element('strong', '', job.account_id || job.target || '全部账号'), badge(phaseNames[phase] || '状态未知', phase === 'failed' ? 'attention' : ['queued', 'blocked'].includes(phase) ? 'unavailable' : 'available'));
     const counts = jobCounts(job);
     const waiting = jobWaiting(job);
@@ -1364,7 +1443,7 @@
       for (const result of failed.slice(0, limit)) errors.append(taskErrorDetails(result.error_code || 'quota_query_failed', {...job, phase: result.phase}, result.account_id));
       if (failed.length > limit) {
         const more = element('button', 'text-button', '显示更多错误（剩余 ' + (failed.length - limit) + ' 个）'); more.type = 'button'; more.dataset.renderKey = 'more-errors';
-        more.onclick = () => { errorLimits.delete(id); errorLimits.set(id, limit + 20); if (errorLimits.size > 64) errorLimits.delete(errorLimits.keys().next().value); renderTasks(); };
+        more.onclick = () => { errorLimits.delete(id); errorLimits.set(id, limit + 20); if (errorLimits.size > 64) errorLimits.delete(errorLimits.keys().next().value); if (activePage === 'history') renderHistoryDetail(); else renderTasks(); };
         errors.append(more);
       }
       item.append(errors);
@@ -1392,13 +1471,202 @@
     }
     return item;
   }
+  function historyDate(raw, full = false) {
+    return Number.isFinite(timestamp(raw)) ? new Date(raw).toLocaleString('zh-CN', full ? {hour12: false} : {month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}) : '—';
+  }
+  function resetHistory() {
+    clearTimeout(historyTimer); historySequence++; historyDetailSequence++;
+    historyData = null; historySelected = null; historyJob = null; historyLoading = false; historyDetailLoading = false; historyError = ''; historyDetailError = '';
+    historyDetailOpener = null; clearHistoryCopy();
+    renderHistory();
+  }
+  function historyTrigger(record) { return triggerNames[record.trigger] || wakeReasons[record.trigger] || record.trigger || '未记录'; }
+  function historySource(record) { return {manual: '手动', automatic: '自动'}[record.source] || '未记录'; }
+  function historyKind(record) { return record.type === 'wake' ? '模型唤醒' : record.trigger === 'manual_batch' ? '批量查询' : '额度查询'; }
+  function historyTarget(record) { return record.account_id || (record.type === 'query' && Number.isSafeInteger(record.total) && record.total > 0 ? '目标 ' + record.total + ' 个账号' : '批量账号'); }
+  function historyMetadata(record, job) {
+    if (!job || job.job_id !== record.job_id || job.instance_id !== record.instance_id || !Number.isSafeInteger(job.view_revision) || job.view_revision < record.view_revision) return record;
+    return {...record, ...job, status: record.type === 'query' ? displayedJobPhase(job) : job.phase};
+  }
+  function historyResult(record) {
+    const status = record.status || record.phase;
+    if (record.type === 'query' && ['queued', 'blocked', 'running'].includes(status)) {
+      const querying = Array.isArray(record.items) ? record.items.filter(item => item.phase === 'running').length : record.querying;
+      const waiting = jobWaiting(record), parts = [];
+      if (Number.isSafeInteger(querying) && querying >= 0) parts.push('执行中 ' + querying);
+      if (Number.isSafeInteger(waiting) && waiting >= 0) parts.push('排队中 ' + waiting);
+      parts.push(queueText({...record, phase: status === 'queued' || waiting > 0 ? 'queued' : record.phase || status}));
+      return parts.join(' · ');
+    }
+    const outcomes = {window_verified: '窗口启动已核实', window_already_active: '已有活动窗口，未发送', wake_rule_disabled: '自动唤醒规则已关闭'};
+    if (record.type === 'wake' && Object.hasOwn(outcomes, record.error_code)) return outcomes[record.error_code];
+    if (record.error_code) return message(record.error_code);
+    if (record.hold_reason) return holdNames[record.hold_reason] || wakeHoldText(record.hold_reason);
+    if (status === 'unknown') return '执行结果待核实，禁止重发';
+    if (record.type === 'query' && Number.isSafeInteger(record.total) && record.total > 0 && Number.isSafeInteger(record.completed) && Number.isSafeInteger(record.failed)) return record.completed + ' 成功 / ' + record.failed + ' 失败';
+    if (status === 'completed') return record.type === 'wake' ? '后台记录执行完成' : '额度查询已完成';
+    if (status === 'skipped') return '后台已跳过，查看详情';
+    if (status === 'cancelled') return '后台已取消';
+    return historyStatus(record).label;
+  }
+  function renderHistoryDetail() {
+    const record = historySelected, body = $('history-detail-body');
+    $('history-detail-close').disabled = !record;
+    $('history-verify').disabled = !connected || !record;
+    $('history-verify').setAttribute('aria-busy', String(historyDetailLoading));
+    $('history-copy').disabled = !record;
+    const job = historyJob, metadataRecord = record ? historyMetadata(record, job) : null, status = metadataRecord?.status || metadataRecord?.phase;
+    $('history-detail-safety').hidden = status !== 'unknown';
+    setText('history-detail-message', historyDetailLoading ? '正在只读核实原任务，不发送模型请求…' : historyDetailError ? '详情读取失败：' + historyDetailError + '。已保存的详情仍可查看。' : record ? '只读展示原任务；核实仅重新读取记录，不查询上游额度，也不发送模型请求。' : '');
+    if (!record) { updateChildren(body, [element('p', 'empty-state', '选择一条任务，查看只读执行元数据与真实记录。')]); return; }
+    const content = element('div', 'history-detail-content'); content.dataset.renderKey = record.id;
+    const identity = element('div', 'history-detail-identity'), symbol = element('span', 'metric-icon blue');
+    const graphic = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); graphic.setAttribute('class', 'icon'); graphic.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use'); use.setAttribute('href', record.type === 'wake' ? '#icon-wake' : '#icon-database'); graphic.append(use); symbol.append(graphic);
+    const description = element('div'), heading = element('h3', '', historyKind(metadataRecord)), state = historyStatus({status});
+    heading.append(badge(state.label, state.kind)); description.append(heading, element('p', '', historyTarget(metadataRecord)), element('p', 'muted', record.job_id)); identity.append(symbol, description);
+    const metadata = element('dl', 'history-metadata');
+    const fields = [['来源', historySource(metadataRecord)], ['触发规则', historyTrigger(metadataRecord)], ['模型', metadataRecord.model || '未记录'], ['计划时间', historyDate(metadataRecord.scheduled_at, true)], ['创建时间', historyDate(metadataRecord.created_at, true)], ['开始时间', historyDate(metadataRecord.started_at, true)], ['结束时间', historyDate(metadataRecord.finished_at, true)], ['最近更新', historyDate(metadataRecord.updated_at, true)], ['执行耗时', historyDuration(metadataRecord)], ['当前阶段', (record.type === 'wake' ? wakePhases[status] : phaseNames[status]) || status || '未知'], ['执行结果', historyResult(metadataRecord)]];
+    for (const [label, value] of fields) metadata.append(element('dt', '', label), element('dd', '', value));
+    content.append(identity, metadata);
+    const trail = element('section', 'history-detail-section'), timeline = element('ol', 'history-timeline');
+    trail.append(element('h3', '', '执行轨迹'));
+    const events = [[metadataRecord.created_at, '任务创建记录'], [metadataRecord.scheduled_at, '后台计划时间（不代表实际执行）'], [metadataRecord.started_at, '已记录开始执行'], [job?.response?.recorded_at, '已保存响应记录'], [metadataRecord.updated_at, '最近更新 · ' + ((record.type === 'wake' ? wakePhases[status] : phaseNames[status]) || '未知阶段')]].filter(([at]) => Number.isFinite(timestamp(at))).sort((first, second) => timestamp(first[0]) - timestamp(second[0]));
+    for (const [at, label] of events) { const entry = element('li'), time = element('time', '', new Date(at).toLocaleTimeString('zh-CN', {hour12: false})); time.setAttribute('datetime', at); time.title = historyDate(at, true); entry.append(time, element('span', '', label)); timeline.append(entry); }
+    trail.append(timeline, element('p', 'history-timeline-note', '仅展示后台真实时间字段，不补造中间步骤。未记录起止时间时，不计算执行耗时；发送或响应完成不代表窗口已启动。')); content.append(trail);
+    if (job && record.type === 'query') {
+      const results = element('section', 'history-detail-section'); results.dataset.renderKey = 'query-results'; results.append(element('h3', '', '逐账号执行结果'), taskElement({...job, ...metadataRecord}, true, status)); content.append(results);
+    } else if (job && record.type === 'wake') {
+      const response = element('section', 'history-detail-section'); response.dataset.renderKey = 'wake-results'; response.append(element('h3', '', '响应与错误'));
+      if (metadataRecord.error_code && !['window_verified', 'window_already_active', 'wake_rule_disabled'].includes(metadataRecord.error_code) || ['failed', 'unknown'].includes(status)) response.append(taskErrorDetails(metadataRecord.error_code || (status === 'unknown' ? 'wake_outcome_unknown' : 'wake_request_rejected'), {...job, ...metadataRecord}, '', 'wake'));
+      if (job.response) response.append(wakeResponseDetails(job.response));
+      else response.append(element('p', 'muted', '后台未保存模型响应记录；不推断是否发送或返回了什么内容。'));
+      content.append(response);
+    }
+    updateChildren(body, [content]);
+  }
+  function renderHistory() {
+    const data = historyData, stats = data?.stats, pagination = data?.pagination;
+    const count = name => Number.isSafeInteger(stats?.[name]) && stats[name] >= 0 ? stats[name] : null;
+    const metric = (name, value) => setText('history-' + name, value === null ? '—' : String(value));
+    metric('today', count('today')); metric('completed', count('completed'));
+    metric('active', count('running') !== null && count('queued') !== null ? count('running') + count('queued') : null);
+    metric('attention', count('failed') !== null && count('unknown') !== null ? count('failed') + count('unknown') : null);
+    setText('history-today-detail', stats ? '自动 ' + (count('today_automatic') ?? '—') + ' · 手动 ' + (count('today_manual') ?? '—') : '等待后台统计');
+    setText('history-active-detail', '执行中 ' + (count('running') ?? '—') + ' · 排队中 ' + (count('queued') ?? '—'));
+    setText('history-attention-detail', '失败 ' + (count('failed') ?? '—') + ' · 结果未知 ' + (count('unknown') ?? '—'));
+    for (const button of document.querySelectorAll('[data-history-status]')) button.setAttribute('aria-pressed', String(button.dataset.historyStatus === historyFilters.status));
+    for (const node of document.querySelectorAll('[data-history-count]')) { const name = node.dataset.historyCount; const value = count(name === 'all' ? 'total' : name) ?? stats?.by_status?.[name]; if (node.textContent !== String(value ?? '—')) node.textContent = String(value ?? '—'); }
+    setText('history-count', pagination ? pagination.total + ' 条' : '— 条');
+    setText('history-message', !connected ? '连接后读取后台持久任务记录。' : historyError ? '任务记录暂不可用：' + historyError + '。' + (data ? '以下为上次成功读取的记录，非最新数据。' : '未以总览中的局部任务代替全部历史。') : historyLoading ? '正在读取后台持久任务记录…' : '仅展示后台持久记录；自动刷新不执行查询或唤醒。');
+    $('history-message').dataset.error = String(!!historyError);
+    const rows = (data?.items || []).map(record => {
+      const row = element('tr'); row.dataset.renderKey = record.id; row.dataset.selected = String(historySelected?.id === record.id);
+      const task = element('td'); task.append(element('strong', '', historyKind(record)), element('small', '', historyTarget(record)));
+      const source = element('td'), sourceTag = element('span', 'history-source', historySource(record)); sourceTag.dataset.source = record.source; source.append(sourceTag, element('span', 'history-rule', historyTrigger(record)));
+      const scheduled = element('td', 'history-time', historyDate(record.scheduled_at)); scheduled.title = historyDate(record.scheduled_at, true);
+      const status = element('td'), state = historyStatus(record); status.append(badge(state.label, state.kind));
+      const action = element('td'), button = element('button', 'text-button', '详情'); button.type = 'button'; button.dataset.renderKey = 'open'; button.disabled = !connected; button.setAttribute('aria-label', '查看任务 ' + record.job_id + ' 详情'); button.setAttribute('aria-pressed', String(historySelected?.id === record.id)); button.onclick = function () { selectHistory(record, null, this); }; action.append(button);
+      row.append(task, source, scheduled, status, element('td', '', historyResult(record)), element('td', '', historyDuration(record)), action); return row;
+    });
+    if (!rows.length) { const row = element('tr'), cell = element('td', 'empty-state', historyError ? '任务记录不可用，请刷新重试' : historyLoading ? '正在读取任务记录…' : connected ? '没有符合筛选条件的持久任务' : '连接后查看后台持久记录'); cell.colSpan = 7; row.append(cell); rows.push(row); }
+    updateChildren($('history-list'), rows);
+    const page = pagination?.page || historyFilters.page, totalPages = pagination?.pages || 0;
+    setText('history-page-info', pagination ? pagination.total ? '显示 ' + ((page - 1) * pagination.limit + 1) + '–' + ((page - 1) * pagination.limit + data.items.length) + ' 条，共 ' + pagination.total + ' 条' : '共 0 条记录' : '尚无任务数据');
+    $('history-previous').disabled = !connected || !pagination || page <= 1;
+    $('history-next').disabled = !connected || !pagination || page >= totalPages;
+    $('history-refresh').disabled = !connected;
+    $('history-refresh').setAttribute('aria-busy', String(historyLoading));
+    const pages = [...new Set([1, page - 1, page, page + 1, totalPages].filter(value => value > 0 && value <= totalPages))].sort((first, second) => first - second), buttons = [];
+    for (const [index, value] of pages.entries()) {
+      if (index && value > pages[index - 1] + 1) buttons.push(element('span', 'muted', '…'));
+      const button = element('button', 'button button-small', String(value)); button.type = 'button'; button.dataset.renderKey = 'page:' + value; button.disabled = !connected; button.setAttribute('aria-label', '任务第 ' + value + ' 页'); if (value === page) button.setAttribute('aria-current', 'page'); button.onclick = () => changeHistoryPage(value); buttons.push(button);
+    }
+    updateChildren($('history-pages'), buttons); renderHistoryDetail();
+  }
+  async function loadHistory() {
+    if (!connected) return;
+    const current = generation, sequence = ++historySequence, query = historyQuery(historyFilters), view = views.begin('task-history');
+    historyLoading = true; renderHistory();
+    try {
+      const data = await api(query);
+      if (current !== generation || sequence !== historySequence) return;
+      validateTaskHistoryPage(data);
+      if (data.instance_id !== views.instance) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      data.items = data.records.map(record => ({...record, instance_id: data.instance_id, view_revision: data.view_revision, id: record.type + ':' + record.job_id}));
+      data.pagination = {page: data.page, limit: data.limit, total: data.total, pages: data.limit > 0 ? Math.ceil(data.total / data.limit) : 0};
+      data.stats = {...data.summary, total: data.status_counts.all, by_status: data.status_counts};
+      if (!Array.isArray(data.items) || !data.pagination || ![data.pagination.page, data.pagination.limit, data.pagination.total, data.pagination.pages].every(Number.isSafeInteger) || data.pagination.page < 1 || data.pagination.limit < 1 || data.pagination.total < 0 || data.pagination.pages < 0 || !data.stats || data.items.some(record => !record || typeof record.id !== 'string' || typeof record.job_id !== 'string' || !['query', 'wake'].includes(record.type))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      if (!views.accept('task-history', view, data)) return;
+      historyData = data; historyError = ''; historyFilters.page = data.pagination.page;
+      if (historySelected) { const record = data.items.find(item => item.id === historySelected.id); if (record && record.view_revision >= historySelected.view_revision) historySelected = record; }
+    } catch (error) {
+      if (current !== generation || sequence !== historySequence || error.code === 'stale') return;
+      historyError = error.status === 404 ? '当前接入层尚未提供任务记录接口，请升级并重启 CPA 接入层' : message(error.code);
+    } finally { if (current === generation && sequence === historySequence) { historyLoading = false; renderHistory(); } }
+  }
+  async function readHistoryDetail() {
+    const record = historySelected;
+    if (!connected || !record) return;
+    const current = generation, sequence = ++historyDetailSequence, resource = 'history-detail:' + record.id, view = views.begin(resource);
+    historyDetailLoading = true; renderHistoryDetail();
+    try {
+      const data = await api((record.type === 'wake' ? '/wake-jobs' : '/jobs') + '?job_id=' + encodeURIComponent(record.job_id));
+      if (current !== generation || sequence !== historyDetailSequence || historySelected?.id !== record.id) return;
+      if (record.type === 'wake') validateWakeJob(data, record.job_id); else validateQueryJob(data, record.job_id);
+      if (data.instance_id !== views.instance || historySelected.instance_id && historySelected.instance_id !== data.instance_id) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      if (!views.accept(resource, view, data)) return;
+      historyJob = data; historyDetailError = '';
+    } catch (error) { if (current === generation && sequence === historyDetailSequence && error.code !== 'stale') historyDetailError = message(error.code); }
+    finally { if (current === generation && sequence === historyDetailSequence) { historyDetailLoading = false; renderHistoryDetail(); } }
+  }
+  function selectHistory(record, job = null, opener = document.activeElement) {
+    if (historySelected?.id !== record.id) { historyDetailSequence++; historyJob = null; historyDetailError = ''; clearHistoryCopy(); }
+    if (historySelected?.id !== record.id || record.view_revision >= historySelected.view_revision) historySelected = record;
+    if (job) historyJob = job;
+    historyDetailOpener = opener;
+    renderHistory(); if (!job) void readHistoryDetail();
+    if (context.matchMedia?.('(max-width: 1100px)').matches) {
+      $('history-detail-title').scrollIntoView({block: 'start'});
+      $('history-detail-title').focus({preventScroll: true});
+    }
+  }
+  function changeHistoryPage(page) { if (!connected || historyLoading) return; historyFilters.page = page; void loadHistory(); }
+  function changeHistoryFilter(immediate = false) {
+    clearTimeout(historyTimer); historySequence++; historyLoading = false;
+    Object.assign(historyFilters, {search: $('history-search').value, type: $('history-kind').value, source: $('history-source').value, trigger: $('history-trigger').value, date: $('history-date').value, limit: Number($('history-page-size').value), page: 1});
+    if (immediate) void loadHistory(); else historyTimer = setTimeout(() => { if (connected) void loadHistory(); }, 250);
+  }
+  function clearHistoryCopy() {
+    historyCopySequence++;
+    $('history-copy-fallback').hidden = true; $('history-copy-value').value = '';
+  }
+  async function copyHistoryID() {
+    if (!historySelected) return;
+    const record = historySelected, current = generation, sequence = ++historyCopySequence;
+    const stillSelected = () => current === generation && sequence === historyCopySequence && historySelected?.id === record.id;
+    if (context.isSecureContext && typeof context.navigator?.clipboard?.writeText === 'function') {
+      try {
+        await context.navigator.clipboard.writeText(record.job_id);
+        if (stillSelected()) { clearHistoryCopy(); notice('已复制任务 ID。'); }
+        return;
+      } catch {}
+    }
+    if (!stillSelected()) return;
+    $('history-copy-fallback').hidden = false; $('history-copy-value').value = record.job_id;
+    $('history-copy-value').focus(); $('history-copy-value').select();
+  }
   async function openJob(id) {
     if (!connected) return;
-    const current = generation, resource = 'job:' + id, sequence = views.begin(resource);
+    const current = generation, resource = 'job:' + id, sequence = views.begin(resource), opener = document.activeElement;
     try {
       const job = await api('/jobs?job_id=' + encodeURIComponent(id));
-      if (current !== generation || !views.accept(resource, sequence, job)) return;
-      pending.set(id, job); navigate('history');
+      if (current !== generation) return;
+      validateQueryJob(job, id);
+      if (job.instance_id !== views.instance || !views.accept(resource, sequence, job)) return;
+      pending.set(id, job);
+      navigate('history');
+      selectHistory({...job, id: 'query:' + id, type: 'query', source: ['manual_single', 'manual_batch'].includes(job.trigger) ? 'manual' : job.trigger ? 'automatic' : '', status: displayedJobPhase(job)}, job, opener);
     } catch (error) { if (current === generation || error.code === 'unauthorized') report(error); }
   }
   function recentJobs() {
@@ -1410,7 +1678,6 @@
     const jobs = recentJobs(), active = jobs.filter(job => !['completed', 'failed', 'cancelled'].includes(job.phase));
     updateChildren($('tasks'), active.length ? active.slice(0, 3).map(job => taskElement(job)) : [element('div', 'empty-state', connected ? '暂无执行中的任务' : '连接后查看后台任务')]);
     setText('tasks-count', Math.max(active.length, overviewData?.dashboard?.tasks?.active || 0) + ' 项');
-    updateChildren($('history-list'), jobs.length ? jobs.map(job => taskElement(job, true)) : [element('div', 'empty-state', connected ? '暂无查询历史，任务将在后台持久保存' : '连接后查看已保存任务')]);
     const latest = active[0];
     setText('job', latest ? (phaseNames[displayedJobPhase(latest)] || '查询任务') + ' · ' + (latest.account_id || latest.target || '全部账号') : '查询额度不发送模型请求');
   }
@@ -1498,7 +1765,7 @@
     const data = await api('/overview');
     if (current !== generation || !views.accept('overview', sequence, data)) return null;
     if (!data.capabilities?.quota_query && !data.read_only) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
-    if (previous && previous !== data.instance_id) { cursor = ''; nextCursor = ''; previousCursors = []; pageStart = 0; accountsRevision = -1; accountsViewRevision = -1; pending.clear(); }
+    if (previous && previous !== data.instance_id) { cursor = ''; nextCursor = ''; previousCursors = []; pageStart = 0; accountsRevision = -1; accountsViewRevision = -1; pending.clear(); resetHistory(); }
     overviewData = data;
     if (savedSettings && savedSettings.instance_id !== data.instance_id) {
       if (draftDirty()) settingsConflict = true;
@@ -1549,6 +1816,7 @@
         await accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing);
       }
       await pollJobs();
+      if (activePage === 'history') { if (!historyLoading) await loadHistory(); if (historySelected && !historyDetailLoading) await readHistoryDetail(); }
       if (wakeSettingsSupported() && wakeSettingsAttempt !== views.instance) await reloadWakeSettings();
       if (activePage === 'wake') { await reloadWakeSettings(); await loadWakeJobs(); }
       if (wakeActive()) await readWakeJob();
@@ -1589,6 +1857,7 @@
       if (current !== generation) return;
       if (wakeSettingsSupported()) await reloadWakeSettings();
       if (activePage === 'wake') await loadWakeJobs();
+      if (activePage === 'history') await loadHistory();
       if (activePage === 'query' && settingsSupported() && !savedSettings) await reloadSettings();
       if (activePage === 'models') { ensureGenerationAccounts(); await reloadModelSettings(); await pollGeneration(); }
       clearError(); monitor(current);
@@ -1659,6 +1928,7 @@
     if (name === 'query' && loadSettings && connected && settingsSupported() && (!savedSettings || savedSettings.instance_id !== views.instance)) void reloadSettings();
     if (name === 'models' && loadSettings && connected) { ensureGenerationAccounts(); void reloadModelSettings(); void pollGeneration(); }
     if (name === 'wake' && loadSettings && connected) { ensureWakeSettings(); void loadWakeJobs(); }
+    if (name === 'history') { renderHistory(); if (loadSettings && connected) void loadHistory(); }
   }
   function changeFilter() {
     clearTimeout(filterTimer); filterSequence++;
@@ -1783,10 +2053,26 @@
   $('quick-wake-consent').onchange = renderQuickWake;
   $('quick-wake-cancel').onclick = closeQuickWake;
   $('quick-wake-dialog').addEventListener('cancel', event => { event.preventDefault(); closeQuickWake(); });
-  $('quick-wake-dialog').addEventListener('close', () => { if (quickWakeAccount) closeQuickWake(); });
+  $('quick-wake-dialog').addEventListener('close', () => { if (!$('quick-wake-dialog').open && quickWakeAccount) closeQuickWake(); });
   $('quick-wake-history').onclick = () => { closeQuickWake(); navigate('wake'); };
   $('wake-account').oninput = () => { if (!$('wake-manual-fields').disabled) { $('wake-manual-consent').checked = false; renderManualWake(); } };
   $('wake-history-refresh').onclick = () => loadWakeJobs(true);
+  $('history-refresh').onclick = () => { void loadHistory(); if (historySelected && !historyDetailLoading) void readHistoryDetail(); };
+  $('history-search').oninput = () => changeHistoryFilter();
+  for (const id of ['history-kind', 'history-source', 'history-trigger', 'history-date', 'history-page-size']) $(id).onchange = () => changeHistoryFilter(true);
+  for (const button of document.querySelectorAll('[data-history-status]')) button.onclick = () => { clearTimeout(historyTimer); historyFilters.status = button.dataset.historyStatus; historyFilters.page = 1; void loadHistory(); };
+  $('history-reset').onclick = () => {
+    $('history-search').value = ''; $('history-kind').value = ''; $('history-source').value = ''; $('history-trigger').value = ''; $('history-date').value = 'all'; historyFilters.status = ''; changeHistoryFilter(true);
+  };
+  $('history-previous').onclick = () => changeHistoryPage(Math.max(1, historyFilters.page - 1));
+  $('history-next').onclick = () => changeHistoryPage(historyFilters.page + 1);
+  $('history-verify').onclick = () => readHistoryDetail();
+  $('history-copy').onclick = copyHistoryID;
+  $('history-detail-close').onclick = () => {
+    const opener = historyDetailOpener;
+    historyDetailSequence++; historySelected = null; historyJob = null; historyDetailLoading = false; historyDetailError = ''; historyDetailOpener = null; clearHistoryCopy(); renderHistory();
+    if (opener && document.documentElement.contains(opener)) opener.focus();
+  };
   $('accounts-search').addEventListener('input', changeFilter); $('accounts-filter').addEventListener('change', changeFilter);
   $('next').onclick = async () => {
     if (!connected || updatingAccounts || !nextCursor) return;

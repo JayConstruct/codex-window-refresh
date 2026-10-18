@@ -170,35 +170,62 @@ function panel(respond, options = {}) {
       const index = before ? this.children.indexOf(before) : this.children.length;
       this._text = ''; child.parentNode = this; this.children.splice(index, 0, child);
     }
-    removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; return child; }
+    removeChild(child) {
+      if (child.contains(context.document.activeElement)) context.document.activeElement = null;
+      this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; return child;
+    }
     contains(child) { return child === this || this.children.some(node => node.contains(child)); }
+    focus() { context.document.activeElement = this; }
+    scrollIntoView(options) { this.scrollCalls = (this.scrollCalls || 0) + 1; this.scrollOptions = options; }
+    select() { this.selectionStart = 0; this.selectionEnd = this.value.length; }
+    blur() { if (context.document.activeElement === this) context.document.activeElement = null; }
     showModal() { this.open = true; }
     close() { this.open = false; }
   }
   const elements = new Map(), timers = new Map(), calls = [], events = new Map(), storage = options.storage || {};
   let nextTimer = 0;
-  const get = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
+  const get = id => {
+    if (!elements.has(id)) {
+      const node = new Element(); elements.set(id, node);
+      if (id !== 'document-root') elements.get('document-root')?.append(node);
+    }
+    return elements.get(id);
+  };
+  const root = get('document-root');
   get('accounts-filter').value = 'all'; get('key').value = 'fixture-key';
+  get('history-date').value = 'all'; get('history-page-size').value = '10';
+  for (const status of ['', 'running', 'queued', 'completed', 'failed', 'unknown', 'skipped', 'cancelled']) {
+    const button = new Element('button'), count = new Element('span');
+    button.dataset.historyStatus = status; count.dataset.historyCount = status || 'all';
+    button.append(count); get('history-tabs').append(button);
+  }
   const nav = ['overview', 'accounts', 'query', 'wake', 'models', 'history', 'diagnostics'].map(name => { const node = new Element('button'); node.dataset.page = name; return node; });
   const panels = nav.map(node => { const panel = new Element(); panel.dataset.view = node.dataset.page; return panel; });
+  root.append(...nav, ...panels);
   const walk = node => [node, ...node.children.flatMap(walk)];
   const context = vm.createContext({
-    document: {documentElement: get('document-root'), getElementById: get, createElement: tag => new Element(tag), createTextNode: text => { const node = new Element('#text'); node.textContent = text; return node; },
+    document: {documentElement: get('document-root'), activeElement: null, getElementById: get, createElement: tag => new Element(tag),
+      createElementNS: (namespace, tag) => {
+        const node = new Element(tag), className = {baseVal: ''};
+        Object.defineProperty(node, 'className', {get: () => className});
+        return node;
+      }, createTextNode: text => { const node = new Element('#text'); node.textContent = text; return node; },
       querySelectorAll: selector => {
         if (selector === '[data-page]') return nav;
         if (selector === '[data-view]') return panels;
         const nodes = [...new Set([...elements.values()].flatMap(walk))];
         if (selector.startsWith('.')) return nodes.filter(node => node.className === selector.slice(1));
-        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase', '[data-wake-account]': 'wakeAccount'}[selector];
+        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase', '[data-wake-account]': 'wakeAccount', '[data-history-status]': 'historyStatus', '[data-history-count]': 'historyCount'}[selector];
         return attribute ? nodes.filter(node => Object.hasOwn(node.dataset, attribute)) : [];
       }},
-    location: options.location || location, navigator: {userAgent: 'fixture'},
+    location: options.location || location, navigator: {userAgent: 'fixture', ...options.navigator}, isSecureContext: options.secure || false,
+    matchMedia: query => ({matches: !!options.mobile && query === '(max-width: 1100px)'}),
     localStorage: {getItem: name => storage[name] ?? null, setItem: (name, value) => { if (options.storageBlocked) throw new Error('storage unavailable'); storage[name] = value; }},
     fetch: async (url, settings) => {
       calls.push({url, ...settings}); const response = await respond(url, settings, calls);
       return {ok: response[0] < 400, status: response[0], json: async () => response[1]};
     },
-    AbortController, URL, TextEncoder, TextDecoder, Uint8Array, atob,
+    AbortController, URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, atob,
     crypto: options.crypto || {randomUUID: () => 'fixture-idempotency-key'},
     addEventListener: (name, callback) => events.set(name, callback),
     setTimeout: (fn, delay) => { timers.set(++nextTimer, {fn, delay}); return nextTimer; }, clearTimeout: id => timers.delete(id),
@@ -210,7 +237,242 @@ function panel(respond, options = {}) {
   }
   return {get, timers, calls, nav, panels, events, tick, storage, document: context.document, clock: context};
 }
-function basic(url) { return url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
+function basic(url) { return url.includes('/task-history?') ? [200, historyPage()] : url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
+function historyRecord(overrides = {}) {
+  const record = {job_id: 'recorded-query', type: 'query', source: 'automatic', trigger: 'periodic', status: 'completed', account_id: 'recorded-account', model: '',
+    created_at: '2026-10-19T01:00:00Z', updated_at: '2026-10-19T01:02:00Z', scheduled_at: '', started_at: '', error_code: '', hold_reason: '', ...overrides};
+  return {...record, phase: record.phase || record.status, total: 1, completed: record.status === 'completed' ? 1 : 0, failed: record.status === 'failed' ? 1 : 0, waiting: record.status === 'queued' ? 1 : 0, querying: record.status === 'running' ? 1 : 0};
+}
+function historyPage(records = [], overrides = {}) {
+  return {...view('a', 30), records, page: 1, limit: 10, total: records.length,
+    status_counts: {all: records.length, running: 0, queued: 0, completed: records.length, failed: 0, cancelled: 0, skipped: 0, unknown: 0},
+    summary: {today: records.length, running: 0, queued: 0, completed: records.length, failed: 0, unknown: 0, today_manual: 0, today_automatic: records.length}, ...overrides};
+}
+const descendants = node => [node, ...node.children.flatMap(descendants)];
+const historyButtons = ui => descendants(ui.get('history-list')).filter(node => node.tagName === 'button');
+async function openHistory(ui) {
+  await ui.get('connect').onclick();
+  ui.nav.find(node => node.dataset.page === 'history').listeners.get('click')();
+  await flush();
+}
+
+test('history markup exposes only supported triggers and keeps safety outside the scrollable audit body', () => {
+  const html = fs.readFileSync(path.resolve(__dirname, '../../../internal/v2/daemon/web/index.html'), 'utf8');
+  const triggers = [...html.match(/<select id="history-trigger">([\s\S]*?)<\/select>/)[1].matchAll(/value="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(triggers, ['manual_single', 'manual_batch', 'periodic', 'five_hour_expiry', 'weekly_expiry', 'initial_sync', 'wake_preflight', 'wake_verification', 'manual', 'five_hour_reset', 'weekly_reset', 'daily']);
+  const detail = html.match(/<aside id="history-detail"[\s\S]*?<\/aside>/)[0];
+  assert.match(detail, /id="history-detail-title" tabindex="-1"/);
+  assert.match(detail, /<\/div><p id="history-detail-safety" class="field-help history-unknown" role="status" hidden>/);
+  assert.equal((detail.match(/history-unknown/g) || []).length, 1);
+  assert.ok(detail.indexOf('history-detail-safety') > detail.indexOf('history-detail-body'));
+  assert.ok(detail.indexOf('history-detail-safety') < detail.indexOf('history-detail-actions'));
+  assert.match(detail, /<input id="history-copy-value"[^>]*readonly/);
+  assert.doesNotMatch(detail, /history-detail-warning/);
+});
+
+test('skipped and cancelled tabs send read-only filters with backend counts', async () => {
+  const counts = {all: 9, running: 0, queued: 0, completed: 0, failed: 0, unknown: 0, skipped: 4, cancelled: 5};
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([], {status_counts: counts})] : basic(url));
+  await openHistory(ui);
+  for (const status of ['skipped', 'cancelled']) {
+    const button = ui.document.querySelectorAll('[data-history-status]').find(node => node.dataset.historyStatus === status);
+    assert.equal(button.children[0].textContent, String(counts[status]));
+    button.onclick(); await flush();
+    const request = ui.calls.filter(call => call.url.includes('/task-history?')).at(-1);
+    assert.equal(new URL(request.url, origin).searchParams.get('status'), status);
+    assert.equal(button.getAttribute('aria-pressed'), 'true');
+  }
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+
+test('explicit mobile details focus and scroll once while polling preserves focus and close returns to its live opener', async () => {
+  for (const mobile of [true, false]) {
+    const record = historyRecord();
+    const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([record])] : url.includes('/jobs?') ? [200, {...view('a', 30), job_id: record.job_id, phase: 'completed', items: []}] : basic(url), {mobile});
+    await openHistory(ui);
+    const opener = historyButtons(ui)[0], title = ui.get('history-detail-title'); opener.focus(); opener.onclick(); await flush();
+    assert.equal(title.scrollCalls || 0, mobile ? 1 : 0);
+    assert.equal(ui.document.activeElement, mobile ? title : opener);
+    const reading = ui.get('history-detail-message'); reading.focus();
+    ui.get('history-refresh').onclick(); await flush(); await ui.tick(5000); await flush();
+    assert.equal(ui.document.activeElement, reading);
+    assert.equal(title.scrollCalls || 0, mobile ? 1 : 0);
+    ui.get('history-detail-close').onclick();
+    assert.equal(ui.document.activeElement, opener);
+    assert.equal(ui.get('history-detail-safety').hidden, true);
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+
+test('closing details never focuses an opener removed by a new history filter', async () => {
+  let records = [historyRecord()];
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage(records)] : url.includes('/jobs?') ? [200, {...view('a', 30), job_id: 'recorded-query', phase: 'completed', items: []}] : basic(url), {mobile: true});
+  await openHistory(ui); const opener = historyButtons(ui)[0]; opener.onclick(); await flush();
+  records = []; ui.get('history-source').onchange(); await flush();
+  assert.equal(ui.document.documentElement.contains(opener), false);
+  const focus = ui.get('history-detail-close'); focus.focus(); focus.onclick();
+  assert.equal(ui.document.activeElement, focus);
+});
+
+test('overview job navigation reveals mobile history details after navigation', async () => {
+  const job = {...view('a', 30), job_id: 'overview-failed', phase: 'running', error_code: 'quota_query_failed', items: [{account_id: 'codex-01', phase: 'failed'}]};
+  const data = overview(30); data.dashboard.recent_jobs = [job];
+  const ui = panel(url => url.endsWith('/overview') ? [200, data] : url.includes('/jobs?') ? [200, job] : url.includes('/task-history?') ? [200, historyPage([historyRecord({job_id: job.job_id, status: 'failed'})])] : basic(url), {mobile: true});
+  await ui.get('connect').onclick();
+  const opener = descendants(ui.get('tasks')).find(node => node.dataset.renderKey === 'open-errors');
+  assert.ok(opener); opener.focus(); await opener.onclick(); await flush();
+  assert.equal(ui.get('page-title').textContent, '任务记录');
+  assert.equal(ui.document.activeElement, ui.get('history-detail-title'));
+  assert.equal(ui.get('history-detail-title').scrollCalls, 1);
+  assert.match(ui.get('history-detail-body').textContent, /overview-failed/);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+
+test('HTTP, absent clipboard and denied clipboard expose a selected manual-copy input without posting', async () => {
+  for (const capability of ['http', 'absent', 'denied', 'success']) {
+    const copied = [], records = [historyRecord(), historyRecord({job_id: 'other-account-task', account_id: 'other-account'})];
+    const options = {secure: capability !== 'http', navigator: capability === 'absent' ? {} : {clipboard: {writeText: async value => { copied.push(value); if (capability === 'denied') throw new Error('denied'); }}}};
+    const ui = panel(url => url.includes('/task-history?') ? [200, historyPage(records)] : url.includes('/jobs?') ? [200, {...view('a', 30), job_id: new URL(url, origin).searchParams.get('job_id'), phase: 'completed', items: []}] : basic(url), options);
+    await openHistory(ui); historyButtons(ui)[0].onclick(); await flush();
+    assert.equal(ui.get('history-copy').disabled, false);
+    await ui.get('history-copy').onclick();
+    const input = ui.get('history-copy-value');
+    if (capability === 'success') {
+      assert.deepEqual(copied, [records[0].job_id]);
+      assert.equal(ui.get('history-copy-fallback').hidden, true); assert.match(ui.get('notice').textContent, /已复制任务 ID/);
+    } else {
+      assert.equal(ui.get('history-copy-fallback').hidden, false); assert.equal(input.value, records[0].job_id);
+      assert.equal(input.selectionStart, 0); assert.equal(input.selectionEnd, records[0].job_id.length); assert.equal(ui.document.activeElement, input);
+      if (capability === 'http') assert.deepEqual(copied, []);
+    }
+    historyButtons(ui)[1].onclick(); await flush();
+    assert.equal(input.value, ''); assert.equal(ui.get('history-copy-fallback').hidden, true);
+    ui.get('history-detail-close').onclick(); assert.equal(input.value, ''); assert.equal(ui.get('history-copy').disabled, true);
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+
+test('a delayed clipboard rejection cannot reveal an ID belonging to the previous selection', async () => {
+  let reject;
+  const records = [historyRecord(), historyRecord({job_id: 'new-account-job'})];
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage(records)] : url.includes('/jobs?') ? [200, {...view('a', 30), job_id: new URL(url, origin).searchParams.get('job_id'), phase: 'completed', items: []}] : basic(url), {secure: true, navigator: {clipboard: {writeText: () => new Promise((resolve, failure) => { reject = failure; })}}});
+  await openHistory(ui); historyButtons(ui)[0].onclick(); await flush();
+  const copying = ui.get('history-copy').onclick(); historyButtons(ui)[1].onclick(); await flush(); reject(new Error('denied')); await copying;
+  assert.equal(ui.get('history-copy-value').value, ''); assert.equal(ui.get('history-copy-fallback').hidden, true);
+});
+
+test('newer history metadata wins over earlier and late stale detail snapshots without losing audit text', async () => {
+  for (const status of ['unknown', 'completed']) for (const delayed of [false, true]) {
+    let revision = 98, release;
+    const record = historyRecord({type: 'wake', job_id: 'revision-wake', status: 'running', phase: 'sending', model: 'old-model'});
+    const response = {response_text: 'Saved audit response', bytes: 20, completed: true, truncated: false};
+    const detail = {...view('a', 99), job_id: record.job_id, phase: 'verifying', model: 'stale-model', updated_at: '2099-01-01T00:00:00Z', response};
+    const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([revision === 98 ? record : historyRecord({...record, phase: status, status, model: 'authoritative-model', updated_at: '2020-01-01T00:00:00Z'})], view('a', revision))]
+      : url.includes('/wake-jobs?job_id=') ? delayed ? new Promise(resolve => { release = () => resolve([200, detail]); }) : [200, detail] : basic(url));
+    await openHistory(ui); historyButtons(ui)[0].onclick(); await flush();
+    revision = 100; ui.get('history-source').onchange(); await flush();
+    if (delayed) { release(); await flush(); }
+    const body = ui.get('history-detail-body'), metadata = descendants(body).find(node => node.className === 'history-metadata');
+    assert.match(metadata.textContent, /authoritative-model/); assert.doesNotMatch(metadata.textContent, /stale-model|verifying|2099/);
+    assert.equal(metadata.children[metadata.children.findIndex(node => node.textContent === '当前阶段') + 1].textContent, status === 'unknown' ? '结果未知' : '已完成');
+    assert.equal(ui.get('history-detail-safety').hidden, status !== 'unknown');
+    assert.match(body.textContent, /Saved audit response/);
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+
+test('changing terminal safety metadata does not detach a focused retained response when error siblings change', async () => {
+  for (const initial of ['unknown', 'completed']) {
+    let phase = initial, revision = 98;
+    const outcome = value => value === 'unknown' ? 'wake_outcome_unknown' : 'window_verified';
+    const detail = {...view('a', 99), job_id: 'focus-safe-response', phase: initial, error_code: outcome(initial), response: {response_text: 'Retained audit text', bytes: 19, completed: false, truncated: false}};
+    const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([historyRecord({type: 'wake', job_id: detail.job_id, phase, status: phase, error_code: outcome(phase)})], view('a', revision))]
+      : url.includes('/wake-jobs?job_id=') ? [200, detail] : basic(url));
+    await openHistory(ui); historyButtons(ui)[0].onclick(); await flush();
+    const response = descendants(ui.get('history-detail-body')).find(node => node.dataset.renderKey === 'wake-response');
+    response.open = true; const summary = response.children[0]; summary.focus();
+    phase = initial === 'unknown' ? 'completed' : 'unknown'; revision = 100;
+    ui.get('history-refresh').onclick(); await flush();
+    assert.equal(ui.document.documentElement.contains(response), true);
+    assert.equal(response.open, true);
+    assert.equal(ui.document.activeElement, summary);
+    assert.equal(ui.get('history-detail-safety').hidden, phase !== 'unknown');
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+
+test('newer details remain authoritative when a lower-revision history list arrives later', async () => {
+  for (const status of ['unknown', 'completed']) {
+    let revision = 98;
+    const record = historyRecord({type: 'wake', job_id: 'newer-detail', status: 'running', phase: 'sending'});
+    const detail = {...view('a', 100), job_id: record.job_id, phase: status, model: 'detail-authority', updated_at: '2020-01-01T00:00:00Z'};
+    const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([revision === 98 ? record : historyRecord({...record, phase: status === 'unknown' ? 'completed' : 'unknown', status: status === 'unknown' ? 'completed' : 'unknown', model: 'stale-list', updated_at: '2099-01-01T00:00:00Z'})], view('a', revision))]
+      : url.includes('/wake-jobs?job_id=') ? [200, detail] : basic(url));
+    await openHistory(ui); historyButtons(ui)[0].onclick(); await flush(); revision = 99; ui.get('history-source').onchange(); await flush();
+    const metadata = descendants(ui.get('history-detail-body')).find(node => node.className === 'history-metadata');
+    assert.match(metadata.textContent, /detail-authority/); assert.doesNotMatch(metadata.textContent, /stale-list|2099/);
+    assert.equal(ui.get('history-detail-safety').hidden, status !== 'unknown');
+  }
+});
+
+test('query metadata preserves verified list start and finish times without stale detail phase rollback', async () => {
+  const started = '2026-10-19T01:00:00Z', finished = '2026-10-19T01:00:01.500Z';
+  for (const [status, detailRevision, detailPhase] of [['completed', 99, 'running'], ['queued', 99, 'running'], ['completed', 100, 'completed'], ['completed', 101, 'completed']]) {
+    const record = historyRecord({status, started_at: started, finished_at: status === 'completed' ? finished : ''});
+    const detail = {...view('a', detailRevision), job_id: record.job_id, phase: detailPhase, items: [{account_id: record.account_id, phase: detailPhase}]};
+    const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([record], view('a', 100))] : url.includes('/jobs?') ? [200, detail] : basic(url));
+    await openHistory(ui); historyButtons(ui)[0].onclick(); await flush();
+    const body = ui.get('history-detail-body');
+    const heading = descendants(body).find(node => node.className === 'task-heading');
+    assert.match(heading.textContent, status === 'completed' ? /查询完成/ : /等待查询/);
+    if (status === 'completed') assert.match(body.textContent, /1\.5 秒/);
+    else assert.equal(ui.get('history-list').children[0].children[5].textContent, '—');
+  }
+});
+
+test('history finish-time validation accepts absent and empty legacy values without inventing elapsed time', () => {
+  const {validateTaskHistoryPage, validateQueryJob, historyDuration} = require('../../../internal/v2/daemon/web/panel.js');
+  for (const finished of [undefined, '', '2026-10-19T01:00:02Z']) {
+    const record = historyRecord({finished_at: finished, started_at: '2026-10-19T01:00:00Z'});
+    assert.doesNotThrow(() => validateTaskHistoryPage(historyPage([record])));
+    assert.doesNotThrow(() => validateQueryJob({...view(), job_id: record.job_id, phase: 'completed', finished_at: finished, items: []}));
+    assert.equal(historyDuration(record), finished ? '2 秒' : '—');
+  }
+});
+
+test('active query rows show real waiting and querying counts and only persisted schedule hints', async () => {
+  let queued = true;
+  const future = new Date(Date.now() + 600000).toISOString();
+  const waiting = historyRecord({job_id: 'batch-waiting', trigger: 'manual_batch', status: 'queued', account_id: '', scheduled_at: future}); waiting.total = 7; waiting.waiting = 7;
+  const running = historyRecord({job_id: 'batch-running', trigger: 'manual_batch', status: 'running', account_id: '', scheduled_at: '2000-01-01T00:00:00Z'}); running.total = 5; running.waiting = 2; running.querying = 3;
+  const unplanned = historyRecord({job_id: 'no-future', status: 'queued', account_id: '', scheduled_at: ''}); unplanned.total = 0; unplanned.waiting = 0;
+  const finished = historyRecord({...waiting, status: 'completed', phase: 'completed'}); finished.total = 7; finished.completed = 7;
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage(queued ? [waiting, running, unplanned] : [finished])] : basic(url));
+  await openHistory(ui);
+  const rows = ui.get('history-list').children;
+  assert.match(rows[0].children[0].textContent, /批量查询目标 7 个账号/);
+  assert.match(rows[0].children[4].textContent, /执行中 0 · 排队中 7.*后计划查询/);
+  assert.doesNotMatch(rows[0].children[4].textContent, /成功|失败/);
+  assert.match(rows[1].children[4].textContent, /执行中 3 · 排队中 2.*已到计划时间，等待后台执行/);
+  assert.doesNotMatch(rows[2].textContent, /目标 \d|后计划查询|重试/);
+  queued = false; ui.get('history-refresh').onclick(); await flush();
+  assert.equal(ui.get('history-list').children[0].children[4].textContent, '7 成功 / 0 失败');
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+
+test('a delayed native close event cannot close a reopened quick-wake dialog or inherit its consent', async () => {
+  const ui = panel(url => url.endsWith('/model-settings') ? [200, modelSettings(1, modelConfig({default_model: 'saved-model'}))] : wakeResponse(url));
+  await ui.get('connect').onclick();
+  const wake = ui.get('accounts').children[0].children[5].children[0].children[1];
+  await wake.onclick(); ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
+  ui.get('quick-wake-cancel').onclick(); await wake.onclick();
+  ui.get('quick-wake-dialog').listeners.get('close')();
+  assert.equal(ui.get('quick-wake-dialog').open, true); assert.equal(ui.get('quick-wake-dialog').hidden, false);
+  assert.equal(ui.get('quick-wake-consent').checked, false); assert.equal(ui.get('quick-wake-submit').disabled, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  ui.get('quick-wake-dialog').open = false; ui.get('quick-wake-dialog').listeners.get('close')();
+  assert.equal(ui.get('quick-wake-dialog').hidden, true);
+});
 
 test('overview immediate wake opens consent for the exact account without navigating or saving drafts', async () => {
   let posted;
@@ -306,31 +568,243 @@ test('task diagnostics classify safe error codes without echoing arbitrary upstr
     assert.equal(JSON.stringify(diagnostic).includes('private-secret'), false);
   }
 });
+test('task history calendar shortcuts and query parameters preserve local-day boundaries and server filters', () => {
+  const {historyTimeRange, historyQuery} = require('../../../internal/v2/daemon/web/panel.js');
+  const current = new Date(2026, 0, 3, 15, 42, 18), now = current.getTime();
+  for (const [range, start] of [['all', ''], ['today', new Date(2026, 0, 3).toISOString()], ['week', new Date(2025, 11, 28).toISOString()], ['month', new Date(2025, 11, 5).toISOString()]]) {
+    assert.deepEqual(historyTimeRange(range, now), {from: start, to: range === 'all' ? '' : new Date(2026, 0, 4).toISOString(), today_from: new Date(2026, 0, 3).toISOString(), today_to: new Date(2026, 0, 4).toISOString()});
+  }
+  assert.equal(current.getHours(), 15);
+  const request = new URL(historyQuery({search: '  account/a & b  ', type: 'wake', source: 'automatic', trigger: 'weekly_reset', status: 'unknown', date: 'today', page: 3, limit: 20}, now), origin);
+  assert.equal(request.pathname, '/task-history');
+  assert.deepEqual(Object.fromEntries(request.searchParams), {from: new Date(2026, 0, 3).toISOString(), to: new Date(2026, 0, 4).toISOString(), today_from: new Date(2026, 0, 3).toISOString(), today_to: new Date(2026, 0, 4).toISOString(),
+    search: 'account/a & b', type: 'wake', source: 'automatic', trigger: 'weekly_reset', status: 'unknown', page: '3', limit: '20'});
+  const cleared = new URL(historyQuery({}, now), origin);
+  for (const name of ['from', 'to', 'search', 'type', 'source', 'trigger', 'status']) assert.equal(cleared.searchParams.has(name), false);
+});
+test('task history status groups include wake phases and never infer execution duration from updates', () => {
+  const {historyStatus, historyDuration} = require('../../../internal/v2/daemon/web/panel.js');
+  for (const status of ['running', 'checking', 'prepared', 'sending', 'verifying']) assert.equal(historyStatus({status}).label, '执行中');
+  for (const status of ['queued', 'blocked']) assert.equal(historyStatus({status}).label, '排队中');
+  assert.equal(historyStatus({status: 'unknown'}).label, '结果未知');
+  assert.equal(historyStatus({phase: 'failed'}).label, '失败');
+  assert.equal(historyStatus({status: 'unsupported'}).label, '状态未知');
+  const record = historyRecord({started_at: '2026-10-19T01:01:00Z'});
+  assert.equal(historyDuration(record), '—');
+  assert.equal(historyDuration({...record, finished_at: '2026-10-19T01:00:00Z'}), '—');
+  assert.equal(historyDuration({...record, started_at: '', finished_at: record.updated_at}), '—');
+  assert.equal(historyDuration({...record, finished_at: '2026-10-19T01:01:01.500Z'}), '1.5 秒');
+  assert.equal(historyDuration({...record, finished_at: record.updated_at}), '1 分 0 秒');
+});
+test('task history reads persisted automatic and manual query and wake records with server totals', async () => {
+  const records = [historyRecord(), historyRecord({job_id: 'manual-query', source: 'manual', trigger: 'manual_single'}),
+    historyRecord({job_id: 'automatic-wake', type: 'wake', trigger: 'weekly_reset', status: 'unknown', model: 'saved-model'}),
+    historyRecord({job_id: 'manual-wake', type: 'wake', source: 'manual', trigger: 'manual', status: 'queued'})];
+  const data = historyPage(records, {total: 47,
+    summary: {today: 31, today_manual: 7, today_automatic: 24, running: 4, queued: 5, completed: 29, failed: 3, unknown: 3}});
+  const ui = panel(url => url.includes('/task-history?') ? [200, data] : basic(url));
+  await openHistory(ui);
+  assert.equal(ui.get('page-title').textContent, '任务记录');
+  assert.deepEqual(ui.get('history-list').children.map(row => row.dataset.renderKey), records.map(record => record.type + ':' + record.job_id));
+  assert.equal(ui.get('history-list').children.length, records.length);
+  assert.equal(ui.get('history-today').textContent, '31');
+  assert.equal(ui.get('history-active').textContent, '9');
+  assert.equal(ui.get('history-completed').textContent, '29');
+  assert.equal(ui.get('history-attention').textContent, '6');
+  assert.match(ui.get('history-page-info').textContent, /47/);
+  assert.equal(ui.get('history-next').disabled, false);
+  assert.equal(ui.get('history-previous').disabled, true);
+  const request = new URL(ui.calls.find(call => call.url.includes('/task-history?')).url, origin);
+  assert.equal(request.pathname, '/v0/management/codex-window-refresh/v2/task-history');
+  assert.equal(request.searchParams.get('page'), '1');
+  assert.equal(request.searchParams.get('limit'), '10');
+  assert.ok(request.searchParams.has('today_from')); assert.ok(request.searchParams.has('today_to'));
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('successful wake history outcomes show verified completion rather than an unknown error', async () => {
+  const record = historyRecord({job_id: 'verified-wake', type: 'wake', status: 'completed', trigger: 'five_hour_reset', error_code: 'window_verified'});
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([record])] : basic(url));
+  await openHistory(ui);
+  assert.match(ui.get('history-list').textContent, /窗口启动已核实/);
+  assert.doesNotMatch(ui.get('history-list').textContent, /请求失败/);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('task history pagination uses requested server pages and page-size changes reset to page one', async () => {
+  const ui = panel(url => {
+    if (!url.includes('/task-history?')) return basic(url);
+    const params = new URL(url, origin).searchParams, page = Number(params.get('page')), limit = Number(params.get('limit'));
+    return [200, historyPage([historyRecord({job_id: 'page-' + page, account_id: 'page-' + page + '-account'})], {page, limit, total: 43})];
+  });
+  await openHistory(ui); ui.get('history-next').onclick(); await flush();
+  assert.match(ui.get('history-list').textContent, /page-2-account/);
+  assert.doesNotMatch(ui.get('history-list').textContent, /page-1-account/);
+  assert.equal(ui.get('history-previous').disabled, false);
+  ui.get('history-previous').onclick(); await flush();
+  assert.match(ui.get('history-list').textContent, /page-1-account/);
+  ui.get('history-next').onclick(); await flush();
+  ui.get('history-page-size').value = '20'; ui.get('history-page-size').onchange(); await flush();
+  assert.match(ui.get('history-list').textContent, /page-1-account/);
+  const request = new URL(ui.calls.filter(call => call.url.includes('/task-history?')).at(-1).url, origin);
+  assert.equal(request.searchParams.get('page'), '1'); assert.equal(request.searchParams.get('limit'), '20');
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('task history unavailable endpoint is explicit and never substitutes overview summaries', async () => {
+  const ui = panel(url => {
+    if (url.includes('/task-history?')) return [503, {error: 'task_history_unavailable'}];
+    if (url.endsWith('/overview')) { const data = overview(); data.dashboard.recent_jobs = [{id: 'overview-only', phase: 'completed'}]; return [200, data]; }
+    return basic(url);
+  });
+  await openHistory(ui);
+  assert.match(ui.get('history-message').textContent, /失败|不可用|无法/);
+  assert.doesNotMatch(ui.get('history-list').textContent, /overview-only/);
+  assert.equal(ui.get('history-today').textContent, '—');
+  assert.equal(ui.get('history-next').disabled, true);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('task history filters and tabs are sent to the server while status-independent totals stay intact', async () => {
+  const data = historyPage([historyRecord({type: 'wake', status: 'unknown'})], {total: 1, status_counts: {all: 18, running: 2, queued: 3, completed: 10, failed: 1, unknown: 1, skipped: 1, cancelled: 0}});
+  const ui = panel(url => url.includes('/task-history?') ? [200, data] : basic(url));
+  await openHistory(ui);
+  for (const [id, value] of [['history-kind', 'wake'], ['history-source', 'automatic'], ['history-trigger', 'weekly_reset'], ['history-date', 'week']]) {
+    ui.get(id).value = value; ui.get(id).onchange(); await flush();
+  }
+  ui.get('history-search').value = ' durable account '; ui.get('history-search').oninput(); await ui.tick(250); await flush();
+  const tab = ui.document.querySelectorAll('[data-history-status]').find(node => node.dataset.historyStatus === 'unknown');
+  tab.onclick(); await flush();
+  const params = new URL(ui.calls.filter(call => call.url.includes('/task-history?')).at(-1).url, origin).searchParams;
+  for (const [name, value] of Object.entries({search: 'durable account', type: 'wake', source: 'automatic', trigger: 'weekly_reset', status: 'unknown', page: '1', limit: '10'})) assert.equal(params.get(name), value);
+  assert.ok(params.has('from')); assert.ok(params.has('today_from')); assert.ok(params.has('today_to'));
+  assert.equal(tab.getAttribute('aria-pressed'), 'true');
+  assert.equal(ui.document.querySelectorAll('[data-history-count]').find(node => node.dataset.historyCount === 'all').textContent, '18');
+  ui.get('history-reset').onclick(); await flush();
+  const reset = new URL(ui.calls.filter(call => call.url.includes('/task-history?')).at(-1).url, origin).searchParams;
+  for (const name of ['search', 'type', 'source', 'trigger', 'status', 'from', 'to']) assert.equal(reset.has(name), false);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('task history uses the actual clamped page returned by the backend', async () => {
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([historyRecord()], {page: 1, limit: 10, total: 1})] : basic(url));
+  await openHistory(ui);
+  ui.get('history-next').onclick(); await flush();
+  assert.equal(ui.get('history-next').disabled, true); assert.equal(ui.get('history-previous').disabled, true);
+  ui.get('history-refresh').onclick(); await flush();
+  assert.equal(new URL(ui.calls.filter(call => call.url.includes('/task-history?')).at(-1).url, origin).searchParams.get('page'), '1');
+});
+test('obsolete task history responses and failures cannot replace newer filters or their totals', async () => {
+  for (const status of [200, 503]) {
+    let release, hold = false;
+    const ui = panel(url => {
+      if (!url.includes('/task-history?')) return basic(url);
+      if (hold) { hold = false; return new Promise(resolve => { release = () => resolve(status === 200 ? [200, historyPage([historyRecord({account_id: 'obsolete-account'})])] : [status, {error: 'task_history_unavailable'}]); }); }
+      const source = new URL(url, origin).searchParams.get('source');
+      return [200, historyPage([historyRecord({account_id: source === 'automatic' ? 'newest-account' : 'initial-account'})])];
+    });
+    await openHistory(ui); hold = true; ui.get('history-refresh').onclick(); await flush();
+    ui.get('history-source').value = 'automatic'; ui.get('history-source').onchange(); await flush();
+    assert.match(ui.get('history-list').textContent, /newest-account/);
+    release(); await flush();
+    assert.match(ui.get('history-list').textContent, /newest-account/); assert.doesNotMatch(ui.get('history-list').textContent, /obsolete-account/);
+    assert.equal(ui.get('history-message').dataset.error, 'false');
+  }
+});
+test('unknown wake task history keeps safe response text, focus and expansion while verifying only the original record', async () => {
+  const response = {recorded_at: '2026-10-19T01:02:00Z', stage: 'read', http_status: 429, event: 'response.failed', status: 'failed', upstream_error_code: 'rate_limit_exceeded',
+    error_message: '[已隐藏] <img src=x onerror=alert(1)>', response_text: 'Safe response [已隐藏]', bytes: 512, completed: false, truncated: true};
+  const record = historyRecord({job_id: 'durable-unknown', type: 'wake', status: 'unknown', trigger: 'weekly_reset'});
+  const job = {...view('a', 30), job_id: record.job_id, account_id: record.account_id, phase: 'unknown', reason: 'weekly_reset', error_code: 'wake_outcome_unknown', response};
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([record])] : url.includes('/wake-jobs?job_id=') ? [200, job] : basic(url));
+  await openHistory(ui); historyButtons(ui)[0].onclick(); await flush();
+  const body = ui.get('history-detail-body'), details = descendants(body).find(node => node.dataset.renderKey === 'wake-response');
+  assert.ok(details); details.open = true; const summary = details.children[0]; summary.focus();
+  assert.match(body.textContent, /不要重发|禁止重复发送/); assert.match(body.textContent, /429/); assert.match(body.textContent, /rate_limit_exceeded/);
+  const error = descendants(details).find(node => node.textContent === response.error_message);
+  assert.ok(error); assert.equal(error.children.length, 0);
+  await ui.get('history-verify').onclick();
+  ui.get('history-refresh').onclick(); await flush();
+  assert.equal(descendants(body).find(node => node.dataset.renderKey === 'wake-response'), details);
+  assert.equal(details.open, true); assert.equal(ui.document.activeElement, summary);
+  assert.ok(ui.calls.filter(call => call.url.includes('/wake-jobs?job_id=durable-unknown')).length >= 3);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('switching selected task ignores late details and does not reuse another task expansion', async () => {
+  let release;
+  const records = [historyRecord({job_id: 'slow-task'}), historyRecord({job_id: 'new-task'})];
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage(records)] : url.includes('/jobs?job_id=slow-task') ? new Promise(resolve => { release = () => resolve([200, {...view('a', 30), job_id: 'slow-task', phase: 'completed', items: [{account_id: 'obsolete-detail', phase: 'completed'}]}]); })
+    : url.includes('/jobs?job_id=new-task') ? [200, {...view('a', 30), job_id: 'new-task', phase: 'completed', items: [{account_id: 'current-detail', phase: 'completed'}]}] : basic(url));
+  await openHistory(ui); historyButtons(ui)[0].onclick(); await flush(); historyButtons(ui)[1].onclick(); await flush();
+  assert.match(ui.get('history-detail-body').textContent, /current-detail/);
+  release(); await flush();
+  assert.match(ui.get('history-detail-body').textContent, /current-detail/); assert.doesNotMatch(ui.get('history-detail-body').textContent, /obsolete-detail/);
+  ui.get('history-detail-close').onclick(); assert.doesNotMatch(ui.get('history-detail-body').textContent, /current-detail/);
+  assert.equal(ui.get('history-verify').disabled, true);
+});
+test('task history backend restart clears retired details without clearing active filters', async () => {
+  let instance = 'a';
+  const identity = () => view(instance, instance === 'a' ? 30 : 1);
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([historyRecord({job_id: instance + '-query', account_id: instance + '-account'})], identity())]
+    : url.includes('/jobs?job_id=') ? [200, {...identity(), job_id: instance + '-query', phase: 'completed', items: [{account_id: instance + '-detail', phase: 'completed'}]}]
+    : url.endsWith('/overview') ? [200, {...overview(), ...identity()}] : [200, {...accountPage(), ...identity()}]);
+  await openHistory(ui);
+  ui.get('history-source').value = 'automatic'; ui.get('history-source').onchange(); await flush();
+  historyButtons(ui)[0].onclick(); await flush(); assert.match(ui.get('history-detail-body').textContent, /a-detail/);
+  instance = 'b'; await ui.tick(5000); await flush();
+  assert.equal(ui.get('history-source').value, 'automatic');
+  assert.match(ui.get('history-list').textContent, /b-account/); assert.doesNotMatch(ui.get('history-list').textContent, /a-account/);
+  assert.doesNotMatch(ui.get('history-detail-body').textContent, /a-detail/); assert.equal(ui.get('history-verify').disabled, true);
+  assert.equal(new URL(ui.calls.filter(call => call.url.includes('/task-history?')).at(-1).url, origin).searchParams.get('source'), 'automatic');
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('malformed task history pages and query details fail closed without replacing readable records', async () => {
+  const {validateTaskHistoryPage, validateQueryJob} = require('../../../internal/v2/daemon/web/panel.js');
+  const valid = historyPage([historyRecord()]); assert.equal(validateTaskHistoryPage(valid), valid);
+  assert.doesNotThrow(() => validateTaskHistoryPage(historyPage([historyRecord({phase: 'running', status: 'queued'})])));
+  assert.doesNotThrow(() => validateTaskHistoryPage(historyPage([historyRecord({type: 'wake', phase: 'sending', status: 'running'})])));
+  for (const type of ['query', 'wake']) {
+    const unknown = historyRecord({type, phase: 'future-safe-phase', status: 'unknown'});
+    assert.doesNotThrow(() => validateTaskHistoryPage(historyPage([unknown])));
+    assert.throws(() => validateTaskHistoryPage(historyPage([{...unknown, status: 'completed'}])), {code: 'invalid_response'});
+    assert.throws(() => validateTaskHistoryPage(historyPage([{...unknown, phase: 'unsafe\nphase'}])), {code: 'invalid_response'});
+  }
+  const malformed = [null, {...valid, records: {}}, {...valid, page: 0}, {...valid, limit: 101}, {...valid, total: -1}, {...valid, summary: {...valid.summary, today: '1'}},
+    {...valid, status_counts: {...valid.status_counts, running: -1}}, {...valid, records: [valid.records[0], valid.records[0]], total: 2},
+    {...valid, records: [{...valid.records[0], source: 'unexpected'}]}, {...valid, records: [{...valid.records[0], status: 'unknown'}]},
+    {...valid, records: [{...valid.records[0], querying: 2}]}, {...valid, records: [{...valid.records[0], job_id: 'x'.repeat(257)}]}];
+  for (const value of malformed) assert.throws(() => validateTaskHistoryPage(value), {code: 'invalid_response'});
+  const job = {...view('a', 30), job_id: 'recorded-query', phase: 'completed', items: [{account_id: 'safe-account', phase: 'completed'}]};
+  assert.equal(validateQueryJob(job, job.job_id), job);
+  for (const value of [null, {...job, job_id: 'wrong-task'}, {...job, phase: 'unexpected'}, {...job, items: [{}]}, {...job, items: 'invalid'}]) assert.throws(() => validateQueryJob(value, job.job_id), {code: 'invalid_response'});
+  let corrupt = false;
+  const ui = panel(url => url.includes('/task-history?') ? [200, corrupt ? {...valid, records: null} : valid] : url.includes('/jobs?') ? [200, corrupt ? {...job, job_id: 'wrong-task'} : job] : basic(url));
+  await openHistory(ui); historyButtons(ui)[0].onclick(); await flush(); corrupt = true;
+  ui.get('history-refresh').onclick(); await flush();
+  assert.match(ui.get('history-detail-body').textContent, /safe-account/); assert.equal(ui.get('history-message').dataset.error, 'true');
+  assert.match(ui.get('history-detail-message').textContent, /失败/);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
 test('failed task summaries open read-only error details for every failed account beyond the result preview', async () => {
   const job = {...view(), job_id: 'detail-job', phase: 'failed', created_at: '2026-10-18T00:00:00Z', updated_at: '2026-10-18T00:01:00Z',
     items: Array.from({length: 45}, (_, index) => ({account_id: 'detail-account-' + index, phase: index < 20 ? 'completed' : 'failed', error_code: index < 20 ? '' : 'quota_upstream_rate_limited'}))};
   const summary = {id: job.job_id, phase: 'failed', failed: 25, completed: 20, total: 45, created_at: job.created_at};
   const ui = panel(url => {
     if (url.endsWith('/overview')) { const data = overview(); data.dashboard.recent_jobs = [summary]; return [200, data]; }
+    if (url.includes('/task-history?')) return [200, historyPage([historyRecord({job_id: job.job_id, status: 'failed'})])];
     return url.includes('/jobs?job_id=') ? [200, job] : basic(url);
   });
-  const descendants = node => [node, ...node.children.flatMap(descendants)];
-  await ui.get('connect').onclick();
-  const button = descendants(ui.get('history-list')).find(node => node.tagName === 'button' && node.textContent.includes('错误详情'));
-  assert.ok(button); await button.onclick();
-  assert.equal(ui.get('page-title').textContent, '计划与历史');
-  let errors = descendants(ui.get('history-list')).find(node => node.dataset.renderKey === 'errors');
+  await openHistory(ui);
+  const button = historyButtons(ui)[0];
+  assert.ok(button); button.onclick(); await flush();
+  assert.equal(ui.get('page-title').textContent, '任务记录');
+  let errors = descendants(ui.get('history-detail-body')).find(node => node.dataset.renderKey === 'errors');
   assert.match(errors.textContent, /detail-account-20/); assert.match(errors.textContent, /quota_upstream_rate_limited/);
   assert.match(errors.textContent, /detail-job/); assert.match(errors.textContent, /HTTP 429/);
   assert.equal(errors.textContent.includes('detail-account-44'), false);
   errors.open = true;
   const first = errors.children[1]; first.open = true;
   const more = errors.children.find(node => node.dataset.renderKey === 'more-errors'); more.onclick();
-  errors = descendants(ui.get('history-list')).find(node => node.dataset.renderKey === 'errors');
+  errors = descendants(ui.get('history-detail-body')).find(node => node.dataset.renderKey === 'errors');
   assert.match(errors.textContent, /detail-account-44/);
   assert.equal(errors.children.some(node => node.dataset.renderKey === 'more-errors'), false);
   await ui.tick(5000);
-  assert.equal(descendants(ui.get('history-list')).find(node => node.dataset.renderKey === 'errors'), errors);
+  assert.equal(descendants(ui.get('history-detail-body')).find(node => node.dataset.renderKey === 'errors'), errors);
   assert.equal(errors.open, true); assert.equal(first.open, true);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
@@ -556,15 +1030,18 @@ test('account updates reuse rows and buttons while refreshing quota, labels and 
 test('query history keeps expanded results and the same summary while task progress changes', async () => {
   let revision = 1;
   const summary = () => ({id: 'stable-history', phase: 'running', total: 1, completed: revision > 1 ? 1 : 0, failed: 0});
-  const ui = panel(url => url.includes('/jobs?job_id=') ? [200, {...view('a', revision), job_id: 'stable-history', phase: 'running', items: [{account_id: 'one', phase: 'running'}]}] : url.endsWith('/overview') ? [200, {...overview(revision), dashboard: {...overview().dashboard, recent_jobs: [summary()]}}] : [200, accountPage()]);
-  await ui.get('connect').onclick();
-  const button = ui.get('history-list').children[0].children.at(-1); await button.onclick();
-  const card = ui.get('history-list').children[0], details = card.children.find(node => node.tagName === 'details');
-  const heading = details.children[0]; details.open = true;
+  const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([historyRecord({job_id: 'stable-history', status: 'running'})], view('a', revision))]
+    : url.includes('/jobs?job_id=') ? [200, {...view('a', revision), job_id: 'stable-history', phase: 'running', items: [{account_id: 'one', phase: 'running'}]}]
+    : url.endsWith('/overview') ? [200, {...overview(revision), dashboard: {...overview().dashboard, recent_jobs: [summary()]}}] : [200, accountPage()]);
+  await openHistory(ui);
+  const button = historyButtons(ui)[0]; button.onclick(); await flush();
+  const card = ui.get('history-list').children[0], details = descendants(ui.get('history-detail-body')).find(node => node.dataset.renderKey === 'results');
+  const heading = details.children[0]; details.open = true; heading.focus();
   revision++; await ui.tick(1500);
   assert.equal(ui.get('history-list').children[0], card);
-  assert.equal(card.children.find(node => node.tagName === 'details'), details);
+  assert.equal(descendants(ui.get('history-detail-body')).find(node => node.dataset.renderKey === 'results'), details);
   assert.equal(details.children[0], heading); assert.equal(details.open, true);
+  assert.equal(ui.document.activeElement, heading);
 });
 test('background account reads do not disable pagination and obsolete errors cannot reset a newer page', async () => {
   let reads = 0, revision = 0, releaseBackground, releasePage;
@@ -1074,11 +1551,14 @@ test('queue countdown, trigger and hold reasons appear in task summaries and ite
   const job = {...view(), id: 'queued-job', phase: 'queued', trigger: 'five_hour_expiry', scheduled_at: due, waiting: 1, total: 1,
     items: [{account_id: 'codex-01', phase: 'queued', trigger: 'five_hour_expiry', scheduled_at: due, hold_reason: 'automatic_query_disabled'}]};
   const data = configuredOverview(); data.dashboard.recent_jobs = [job];
-  const ui = panel(url => url.endsWith('/overview') ? [200, data] : [200, accountPage()]);
+  const ui = panel(url => url.endsWith('/overview') ? [200, data] : url.includes('/task-history?') ? [200, historyPage([historyRecord({job_id: job.id, status: job.phase, trigger: job.trigger, scheduled_at: due})])]
+    : url.includes('/jobs?job_id=') ? [200, {...job, job_id: job.id}] : [200, accountPage()]);
   await ui.get('connect').onclick();
   assert.match(ui.get('tasks').textContent, /5 小时到期.*等待 1/);
-  assert.match(ui.get('history-list').textContent, /自动查询规则已关闭/);
-  assert.match(ui.get('history-list').textContent, /后计划查询/);
+  ui.nav.find(node => node.dataset.page === 'history').listeners.get('click')(); await flush();
+  historyButtons(ui)[0].onclick(); await flush();
+  assert.match(ui.get('history-detail-body').textContent, /自动查询规则已关闭/);
+  assert.match(ui.get('history-detail-body').textContent, /后计划查询/);
   assert.match(queueText({...job, scheduled_at: '2000-01-01T00:00:00Z'}), /等待后台执行/);
   assert.equal(queueText({phase: 'running', trigger: 'manual_single'}), '查询中 · 手动单账号');
 });
@@ -1097,14 +1577,19 @@ test('mixed batches remain querying while other items wait for random delay or e
   for (const scheduling of [{querying: 1, waiting: 2}, {items: [{phase: 'running', account_id: 'codex-01'}, {phase: 'queued', account_id: 'codex-02', scheduled_at: due, hold_reason: 'excluded_hours'}]}]) {
     const data = configuredOverview();
     data.dashboard.recent_jobs = [{id: 'mixed', phase: 'running', trigger: 'manual_batch', scheduled_at: due, total: 3, ...scheduling}];
-    const ui = panel(url => url.endsWith('/overview') ? [200, data] : [200, accountPage()]);
+    const job = {...view(), ...data.dashboard.recent_jobs[0], job_id: 'mixed'};
+    const ui = panel(url => url.endsWith('/overview') ? [200, data] : url.includes('/task-history?') ? [200, historyPage([historyRecord({job_id: job.id, status: 'running'})])]
+      : url.includes('/jobs?job_id=') ? [200, job] : [200, accountPage()]);
     await ui.get('connect').onclick();
     const heading = ui.get('tasks').children[0].children[0];
     assert.match(heading.textContent, /查询中/); assert.doesNotMatch(heading.textContent, /等待查询/);
     assert.match(ui.get('job').textContent, /查询中/);
     assert.match(ui.get('tasks').textContent, /等待 [12]/);
     assert.match(ui.get('tasks').textContent, /后计划查询/);
-    if (scheduling.items) assert.match(ui.get('history-list').textContent, /处于排除时段/);
+    if (scheduling.items) {
+      ui.nav.find(node => node.dataset.page === 'history').listeners.get('click')(); await flush(); historyButtons(ui)[0].onclick(); await flush();
+      assert.match(ui.get('history-detail-body').textContent, /处于排除时段/);
+    }
   }
 });
 test('overdue automatic jobs held by excluded hours show waiting with the hold reason', async () => {

@@ -301,6 +301,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]any{"quota_query": true, "model_execution": s.wakeSupported(), "wake_settings": true, "automatic_wake": s.wakeSupported(), "prompt_generation": s.generationSupported(), "editable_generation_prompt": s.editableGenerationPrompt(), "generation_accounts": s.generationAccountsSupported(), "prompt_generation_providers": s.generationProviders(), "model_settings": true, "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+	case "GET /api/v2/task-history":
+		s.taskHistory(w, r)
 	case "GET /api/v2/wake-settings", "POST /api/v2/wake-settings":
 		s.wakeSettings(w, r)
 	case "GET /api/v2/wake-jobs", "POST /api/v2/wake-jobs":

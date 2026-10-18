@@ -119,6 +119,10 @@ class NativeBridge(unittest.TestCase):
                       routes['result']['Routes'])
         self.assertNotIn({'Method': 'POST', 'Path': '/v0/management/codex-window-refresh/v2/generation-accounts'},
                          routes['result']['Routes'])
+        self.assertIn({'Method': 'GET', 'Path': '/v0/management/codex-window-refresh/v2/task-history'},
+                      routes['result']['Routes'])
+        self.assertNotIn({'Method': 'POST', 'Path': '/v0/management/codex-window-refresh/v2/task-history'},
+                         routes['result']['Routes'])
 
     @contextlib.contextmanager
     def cpa_resources(self, registration=None):
@@ -985,6 +989,66 @@ class NativeBridge(unittest.TestCase):
         self.wait_wake_fixture_ready()
         status, restored = self.management('wake-settings')
         self.assertEqual((status, restored['revision'], restored['config']), (200, 1, config))
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
+
+    def test_task_history_proxies_persistent_automatic_records_and_readonly_filters(self):
+        import datetime
+        import sqlite3
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        self.stop_daemon()
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        with sqlite3.connect(self.root/'data'/'backend.sqlite') as database:
+            for job_id, trigger, automatic in [('history-fixture-auto', 'periodic', 1),
+                                                ('history-fixture-manual', 'manual_single', 0)]:
+                database.execute('INSERT INTO jobs(id,idempotency_key,request_hash,target,phase,expanded,created_at,updated_at) '
+                                 "VALUES(?,?,?,'a','completed',1,?,?)", (job_id, job_id, 'fixture-hash', stamp, stamp))
+                database.execute("INSERT INTO job_items(job_id,account_id,phase) VALUES(?,'a','completed')", (job_id,))
+                database.execute('INSERT INTO query_plans VALUES(?,?,?,?,?)', (job_id, trigger, automatic, 0, 0))
+            account = database.execute('SELECT a.id,a.auth_index,b.binding FROM accounts a '
+                                       'JOIN account_bindings b ON a.id=b.account_id WHERE a.id=?', ('a',)).fetchone()
+            self.assertIsNotNone(account)
+            database.execute('INSERT INTO wake_jobs(id,account_id,auth_index,binding,reason,cycle,phase,'
+                             'scheduled_at,created_at,updated_at,model,prompt) '
+                             "VALUES(?,?,?,?,'five_hour_reset','history-cycle','unknown',?,?,?,?,?)",
+                             ('history-fixture-wake', *account, stamp, stamp, stamp,
+                              'fixture-history-model', 'history-secret-prompt-must-not-leak'))
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, page = self.management('task-history', query={'search': ['history-fixture'], 'limit': ['1'], 'page': ['1']})
+        self.assertEqual(status, 200, page)
+        self.assertEqual((page['total'], page['limit'], page['page'], len(page['records'])), (3, 1, 1, 1))
+        self.assertEqual(page['status_counts']['unknown'], 1)
+        self.assertIsInstance(page['view_revision'], int)
+        self.assertTrue(page['instance_id'])
+        first_id = page['records'][0]['job_id']
+        status, second = self.management('task-history', query={'search': ['history-fixture'], 'limit': ['1'], 'page': ['2']})
+        self.assertEqual((status, second['page'], second['total']), (200, 2, 3))
+        self.assertNotEqual(first_id, second['records'][0]['job_id'])
+        today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        query = {'search': ['history-fixture'], 'type': ['wake'], 'source': ['automatic'],
+                 'trigger': ['five_hour_reset'], 'status': ['unknown'],
+                 'from': ['2000-01-01T00:00:00Z'], 'to': ['2100-01-01T00:00:00Z'],
+                 'today_from': [today.isoformat()], 'today_to': [(today + datetime.timedelta(days=1)).isoformat()]}
+        status, automatic = self.management('task-history', query=query)
+        self.assertEqual((status, automatic['total']), (200, 1), automatic)
+        record = automatic['records'][0]
+        self.assertEqual((record['job_id'], record['source'], record['phase']),
+                         ('history-fixture-wake', 'automatic', 'unknown'))
+        self.assertEqual(record.get('finished_at', ''), '')
+        raw = json.dumps(automatic)
+        self.assertNotIn('history-secret-prompt-must-not-leak', raw)
+        self.assertNotIn('auth_index', raw)
+        self.assertNotIn('binding', raw)
+        status, completed = self.management('task-history', query={
+            'search': ['history-fixture-auto'], 'type': ['query'], 'source': ['automatic'], 'status': ['completed']})
+        self.assertEqual((status, completed['total']), (200, 1), completed)
+        self.assertEqual(completed['records'][0]['finished_at'], stamp)
+        self.assertEqual(completed['records'][0]['started_at'], '')
+        self.assertEqual(self.management('task-history', 'POST', {})[0], 404)
+        for invalid in ({'source': ['invalid']}, {'page': ['2', '3']}, {'limit': ['101']},
+                        {'from': ['invalid']}, {'type': ['invalid']}, {'today_from': ['invalid']}):
+            self.assertEqual(self.management('task-history', query=invalid)[0], 400, invalid)
         self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
 
     def test_manual_wake_readonly_preflight_failure_is_durable_and_never_sends_models(self):

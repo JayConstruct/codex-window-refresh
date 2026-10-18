@@ -14,7 +14,8 @@ const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-pr
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], reads = [], exceptions = [], pageErrors = [];
 const jobs = new Map();
-let accountReadGate, settingsPostGate, settingsReadGate, modelReadGate, wakeReadGate;
+let accountReadGate, settingsPostGate, settingsReadGate, modelReadGate, wakeReadGate, historyDetailGate;
+let historyUnavailable = false;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
@@ -45,7 +46,60 @@ const fixtureJobs = [
 ];
 accounts[0].pending_query = {phase: 'queued', scheduled_at: later(90), trigger: 'manual_batch', job_id: 'fixture-bulk', hold_reason: ''};
 for (const job of fixtureJobs) jobs.set(job.id, {...job, job_id: job.id, items: (job.target ? accounts.filter(account => account.id === job.target) : accounts).map((account, index) => ({account_id: account.id, phase: index < job.querying ? 'running' : 'queued', scheduled_at: job.scheduled_at, trigger: job.trigger, hold_reason: job.hold_reason || ''}))});
+for (let index = 0; index < 36; index++) {
+  const jobID = 'persisted-query-' + String(index).padStart(2, '0');
+  const phase = ['completed', 'failed', 'queued', 'running', 'cancelled'][index % 5];
+  const trigger = ['periodic', 'five_hour_expiry', 'weekly_expiry', 'wake_verification', 'manual_single', 'manual_batch', 'initial_sync', 'wake_preflight'][index % 8];
+  const stamp = later(-3600 - index * 3600);
+  const error = phase === 'failed' ? 'quota_upstream_forbidden' : '';
+  jobs.set(jobID, {job_id: jobID, account_id: 'persisted-account-' + String(index).padStart(2, '0'), phase, trigger, created_at: stamp, updated_at: stamp,
+    started_at: ['running', 'completed', 'failed'].includes(phase) ? new Date(Date.parse(stamp) - 2500).toISOString() : '', error_code: error,
+    items: [{account_id: 'persisted-account-' + String(index).padStart(2, '0'), phase, trigger, error_code: error}]});
+}
+const responseRecord = {recorded_at: observed(), stage: 'read', http_status: 429, event: 'response.failed', status: 'failed', upstream_error_code: 'rate_limit_exceeded',
+  error_message: 'Please try later [已隐藏] <img src=x onerror=alert(1)>', response_text: 'Partial safe response [已隐藏]\n' + 'Long persisted response line for scroll verification.\n'.repeat(60), error_code: 'wake_delivery_unknown', bytes: 4096, completed: false, truncated: true};
+for (const [index, phase, reason] of [[0, 'unknown', 'weekly_reset'], [1, 'completed', 'five_hour_reset'], [2, 'skipped', 'five_hour_reset'], [3, 'queued', 'daily'], [4, 'cancelled', 'daily']]) {
+  const jobID = 'persisted-wake-' + index, stamp = later(-1800 - index * 3600);
+  wakeJobs.set(jobID, {job_id: jobID, account_id: 'persisted-wake-account-' + index, phase, reason, model: ['unknown', 'completed'].includes(phase) ? 'fixture-recorded-model' : '', created_at: stamp, updated_at: stamp,
+    error_code: phase === 'unknown' ? 'wake_outcome_unknown' : phase === 'completed' ? 'window_verified' : '', hold_reason: phase === 'unknown' ? 'verification_pending' : '', response: phase === 'unknown' ? responseRecord : undefined});
+}
 const identity = () => ({instance_id: 'local-browser-fixture', view_revision: revision});
+function taskHistory(parameters) {
+  const running = ['running', 'checking', 'prepared', 'sending', 'verifying'], queued = ['queued', 'blocked'];
+  const records = [...[...jobs.values()].map(job => ({...job, type: 'query', trigger: job.trigger || 'manual_single'})),
+    ...[...wakeJobs.values()].map(job => ({...job, type: 'wake', trigger: job.reason || 'manual'}))].map(job => ({
+    job_id: job.job_id, type: job.type,
+    source: (job.type === 'query' ? ['manual_single', 'manual_batch'].includes(job.trigger) : job.trigger === 'manual') ? 'manual' : 'automatic',
+    trigger: job.trigger, phase: job.phase,
+    status: job.type === 'query' && job.phase === 'running' && job.items?.some(item => item.phase === 'queued') && !job.items.some(item => item.phase === 'running') ? 'queued' : running.includes(job.phase) ? 'running' : queued.includes(job.phase) ? 'queued' : job.phase,
+    account_id: job.account_id || job.target || '', model: job.model || '', created_at: job.created_at, updated_at: job.updated_at,
+    scheduled_at: job.scheduled_at || '', started_at: job.type === 'wake' ? '' : job.started_at || '',
+    finished_at: job.type === 'query' && ['completed', 'failed', 'cancelled'].includes(job.phase) ? job.updated_at : '', error_code: job.error_code || '', hold_reason: job.hold_reason || '',
+    total: job.total ?? job.items?.length ?? 1, completed: job.completed ?? (job.phase === 'completed' ? 1 : 0), failed: job.failed ?? (job.phase === 'failed' ? 1 : 0),
+    waiting: job.waiting ?? (queued.includes(job.phase) ? 1 : 0), querying: job.querying ?? (running.includes(job.phase) ? 1 : 0)
+  }));
+  const value = name => parameters.get(name) || '';
+  const matches = (record, name, field = name) => !value(name) || value(name) === 'all' || record[field] === value(name);
+  const filtered = records.filter(record => matches(record, 'type') && matches(record, 'source') && matches(record, 'trigger') &&
+    (!value('search') || [record.job_id, record.account_id, record.model, record.error_code].join(' ').toLowerCase().includes(value('search').toLowerCase())) &&
+    (!value('from') || Date.parse(record.created_at) >= Date.parse(value('from'))) && (!value('to') || Date.parse(record.created_at) < Date.parse(value('to'))));
+  const stats = {total: filtered.length, today: 0, active: 0, running: 0, queued: 0, completed: 0, failed: 0, cancelled: 0, skipped: 0, unknown: 0, today_manual: 0, today_automatic: 0, by_status: {}};
+  const todayFrom = Date.parse(value('today_from') || new Date().toISOString().slice(0, 10)), todayTo = value('today_to') ? Date.parse(value('today_to')) : todayFrom + 86400000;
+  for (const record of filtered) {
+    stats.by_status[record.status] = (stats.by_status[record.status] || 0) + 1;
+    if (['completed', 'failed', 'cancelled', 'skipped', 'unknown'].includes(record.status)) stats[record.status]++;
+    if (running.includes(record.status)) stats.running++;
+    if (queued.includes(record.status)) stats.queued++;
+    if (Date.parse(record.created_at) >= todayFrom && Date.parse(record.created_at) < todayTo) { stats.today++; stats['today_' + record.source]++; }
+  }
+  stats.active = stats.running + stats.queued + stats.unknown;
+  const status = value('status'), selected = filtered.filter(record => !status || status === 'all' || record.status === status);
+  selected.sort((first, second) => Date.parse(second.created_at) - Date.parse(first.created_at) || first.type.localeCompare(second.type) || second.job_id.localeCompare(first.job_id));
+  const limit = Math.min(100, Math.max(1, Number(value('limit') || 10))), pages = Math.max(1, Math.ceil(selected.length / limit)), page = Math.min(pages, Math.max(1, Number(value('page') || 1)));
+  return {...identity(), records: selected.slice((page - 1) * limit, page * limit), page, limit, total: selected.length,
+    status_counts: {all: stats.total, running: stats.running, queued: stats.queued, completed: stats.completed, failed: stats.failed, unknown: stats.unknown, skipped: stats.skipped, cancelled: stats.cancelled},
+    summary: {today: stats.today, today_manual: stats.today_manual, today_automatic: stats.today_automatic, running: stats.running, queued: stats.queued, completed: stats.completed, failed: stats.failed, unknown: stats.unknown}};
+}
 function accountDisplayStatus(account) {
   if (account.status !== 'available') return account.status;
   if (['five_hour', 'weekly'].some(name => account.quota?.[name]?.Remaining?.Value === 0)) return 'quota_exhausted';
@@ -59,7 +113,7 @@ function json(response, status, body) {
 async function waitFor(check, message, timeout = 12000) {
   const until = Date.now() + timeout;
   while (Date.now() < until) { if (await check()) return; await new Promise(resolve => setTimeout(resolve, 50)); }
-  throw new Error(message);
+  throw new Error(typeof message === 'function' ? await message() : message);
 }
 function gate(outcome = 'success') {
   const pending = {started: false, outcome};
@@ -166,6 +220,11 @@ try {
         json(response, 202, {job_id: id, instance_id: 'local-browser-fixture'}); return;
       }
       reads.push(request.url);
+      if (resource === 'task-history') {
+        assert.equal(request.method, 'GET');
+        if (historyUnavailable) { json(response, 503, {error: 'task_history_unavailable'}); return; }
+        json(response, 200, taskHistory(url.searchParams)); return;
+      }
       if (resource === 'wake-settings') {
         if (wakeReadGate) { wakeReadGate.started = true; await wakeReadGate.promise; }
         json(response, 200, {...identity(), revision: wakeRevision, config: wakeConfig}); return;
@@ -173,9 +232,10 @@ try {
       if (resource === 'wake-jobs') {
         const id = url.searchParams.get('job_id');
         if (!id) { assert.equal(url.searchParams.get('limit'), '20'); json(response, 200, {...identity(), jobs: [...wakeJobs.values()]}); return; }
+        const held = historyDetailGate;
+        if (held?.jobID === id) { held.started = true; await held.promise; json(response, 200, held.response); return; }
         const job = wakeJobs.get(id); if (!job) { json(response, 404, {error: 'not_found'}); return; }
-        job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++;
-        job.response = {recorded_at: observed(), stage: 'read', http_status: 429, event: 'response.failed', status: 'failed', upstream_error_code: 'rate_limit_exceeded', error_message: 'Please try later [已隐藏]', response_text: 'Partial safe response', error_code: 'wake_delivery_unknown', bytes: 512, completed: false, truncated: false};
+        if (job.reason === 'manual') { job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++; job.response = responseRecord; }
         json(response, 200, {...identity(), ...job}); return;
       }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
@@ -200,7 +260,11 @@ try {
             tasks: {active: 3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
             recent_events: [{kind: 'quota_query', at: observed(), account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: observed(), account_id: '', phase: 'queued'}, {kind: 'inventory', at: observed(), phase: 'ready'}]}}); return;
       }
-      if (resource === 'jobs') { const job = jobs.get(url.searchParams.get('job_id')); json(response, job ? 200 : 404, job ? {...job, ...identity()} : {error: 'not_found'}); return; }
+      if (resource === 'jobs') {
+        const job = jobs.get(url.searchParams.get('job_id')), detail = job ? {...job, ...identity()} : {error: 'not_found'};
+        delete detail.started_at; delete detail.finished_at;
+        json(response, job ? 200 : 404, detail); return;
+      }
       if (resource === 'accounts') {
         if (accountReadGate) { accountReadGate.started = true; await accountReadGate.promise; }
         if (url.searchParams.has('after') && Number(url.searchParams.get('revision')) !== accountsRevision) { json(response, 409, {error: 'view_changed'}); return; }
@@ -215,7 +279,8 @@ try {
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   const origin = 'http://127.0.0.1:' + server.address().port;
-  browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=0', '--user-data-dir=' + temporary, 'about:blank'], {stdio: ['ignore', 'ignore', 'pipe']});
+  const httpOrigin = 'http://cpa-fixture.test:' + server.address().port, fixtureOrigins = new Set([origin, httpOrigin]);
+  browser = spawn(executable, ['--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--no-proxy-server', '--host-resolver-rules=MAP cpa-fixture.test 127.0.0.1', '--remote-debugging-port=0', '--user-data-dir=' + temporary, 'about:blank'], {stdio: ['ignore', 'ignore', 'pipe']});
   let log = '';
   browser.stderr.on('data', chunk => { log = (log + chunk.toString()).slice(-8000); });
   browser.on('error', error => exceptions.push(String(error)));
@@ -247,6 +312,7 @@ try {
     }
     if (data.method === 'Runtime.exceptionThrown') pageErrors.push(data.params.exceptionDetails);
     if (data.method === 'Log.entryAdded' && data.params.entry.source === 'security') pageErrors.push(data.params.entry.text);
+    if (data.method === 'Network.requestWillBeSent' && /^https?:/.test(data.params.request.url) && !fixtureOrigins.has(new URL(data.params.request.url).origin)) pageErrors.push('Non-fixture network request: ' + data.params.request.url);
   });
   async function evaluate(expression) {
     const result = await cdp('Runtime.evaluate', {expression, returnByValue: true, awaitPromise: true});
@@ -305,8 +371,8 @@ try {
     const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
     await writeFile(join(output, name), Buffer.from(capture.data, 'base64'));
   }
-  await cdp('Page.enable'); await cdp('Runtime.enable'); await cdp('Log.enable');
-  await cdp('Page.addScriptToEvaluateOnNewDocument', {source: `localStorage.setItem('cli-proxy-auth', JSON.stringify({state:{managementKey:${JSON.stringify(fixtureKey)},apiBase:${JSON.stringify(origin + '/cpa')}}}));`});
+  await cdp('Page.enable'); await cdp('Runtime.enable'); await cdp('Log.enable'); await cdp('Network.enable');
+  await cdp('Page.addScriptToEvaluateOnNewDocument', {source: `localStorage.setItem('cli-proxy-auth', JSON.stringify({state:{managementKey:${JSON.stringify(fixtureKey)},apiBase:location.origin+'/cpa'}}));`});
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   await cdp('Page.navigate', {url: origin + base + 'status'});
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
@@ -529,11 +595,16 @@ try {
   await waitFor(() => evaluate('document.getElementById("accounts").rows[0].textContent.includes("处于排除时段")'), 'Queue-only revision did not reload account pending state');
   assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector("button").textContent'), '立即查询');
   await evaluate('document.querySelector("[data-page=history]").click()');
+  await waitFor(() => evaluate(`!!document.querySelector('#history-list [data-render-key="query:fixture-bulk"] button')`), 'Persisted query history did not load');
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /处于排除时段/);
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /手动批量/);
-  await evaluate('document.querySelector("#history-list .task-open").click()');
-  await waitFor(() => evaluate('!!document.querySelector("#history-list details")'), 'Query history details did not load');
-  await evaluate('globalThis.historyDetails=document.querySelector("#history-list details");historyDetails.open=true;globalThis.historySummary=historyDetails.querySelector("summary");historySummary.focus();document.getElementById("refresh").onclick()');
+  await evaluate(`document.querySelector('#history-list [data-render-key="query:fixture-bulk"] button').click()`);
+  await waitFor(async () => {
+    const detail = await evaluate('({loaded:!!document.querySelector("#history-detail-body .task-results"),message:document.getElementById("history-detail-message").textContent})');
+    assert.doesNotMatch(detail.message, /详情读取失败/, detail.message + ': ' + JSON.stringify(jobs.get('fixture-bulk')));
+    return detail.loaded;
+  }, async () => 'Query history details did not load: ' + JSON.stringify({page: await evaluate('({message:document.getElementById("history-detail-message").textContent,body:document.getElementById("history-detail-body").textContent,selected:document.querySelector("#history-list [data-selected=true]")?.dataset.renderKey})'), jobs: reads.filter(path => path.includes('/jobs?')), pageErrors}));
+  await evaluate('globalThis.historyDetails=document.querySelector("#history-detail-body .task-results");historyDetails.open=true;globalThis.historySummary=historyDetails.querySelector("summary");historySummary.focus();document.getElementById("refresh").onclick()');
   await waitFor(() => evaluate('!document.getElementById("sync").disabled'), 'History refresh did not finish');
   assert.equal(await evaluate('historyDetails.isConnected && historyDetails.open && document.activeElement===historySummary'), true, 'Query history polling reset expansion or focus');
   await evaluate('document.querySelector("[data-page=overview]").click()');
@@ -726,13 +797,29 @@ try {
   await cdp('Emulation.setDeviceMetricsOverride', {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
   assert.equal(await evaluate('(() => {const box=document.getElementById("quick-wake-dialog").getBoundingClientRect();return box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight})()'), true, 'Quick wake modal overflowed mobile viewport');
   await screenshot('quick-wake-mobile.png');
-  await evaluate('document.getElementById("quick-wake-cancel").click()');
+  modelReadGate = gate();
+  await evaluate(`(() => {
+    const dialog = document.getElementById('quick-wake-dialog');
+    globalThis.quickWakeOldClose = new Promise(resolve => dialog.addEventListener('close', () => setTimeout(resolve, 0), {once: true}));
+    document.getElementById('quick-wake-cancel').click();
+    document.querySelector('#accounts .account-wake').click();
+  })()`);
+  await evaluate('quickWakeOldClose');
+  assert.equal(await evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-dialog").hidden'), true, 'Old native close event dismissed the reopened same-account dialog');
+  await waitFor(() => modelReadGate.started, 'Reopened quick wake did not verify the saved model');
+  assert.equal(await evaluate('document.getElementById("quick-wake-consent").disabled && document.getElementById("quick-wake-submit").disabled'), true, 'Quick wake allowed consent before saved model verification');
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Cancelling quick wake submitted a task');
+  modelReadGate.release(); modelReadGate = undefined;
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
-  await evaluate('document.querySelector("#accounts .account-wake").click()');
-  await waitFor(() => evaluate('!document.getElementById("quick-wake-consent").disabled'), 'Quick wake did not reopen');
+  await waitFor(() => evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-consent").disabled'), 'Quick wake did not reopen after the original close event');
+  assert.equal(await evaluate('document.getElementById("quick-wake-consent").checked'), false, 'Reopening inherited spend consent');
+  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Reopening or saved-model verification submitted a task');
+  console.log('Quick wake native close race passed: reopened same-account dialog survives the original close event; saved model verified, consent reset, zero wake POSTs before explicit confirmation.');
   await evaluate('document.getElementById("quick-wake-consent").click();document.getElementById("quick-wake-submit").click()');
-  await waitFor(() => evaluate('document.getElementById("wake-manual-status").textContent==="结果未知"'), 'Manual wake unknown outcome was not read');
+  await waitFor(() => evaluate('document.getElementById("wake-manual-status").textContent==="结果未知"'), async () => 'Manual wake unknown outcome was not read: ' + JSON.stringify({
+    state: await evaluate('({status:document.getElementById("wake-manual-status").textContent,message:document.getElementById("wake-manual-message").textContent,history:document.getElementById("wake-history-message").textContent,toasts:document.getElementById("toast-region").textContent,dialog:document.getElementById("quick-wake-dialog").open,consent:document.getElementById("quick-wake-consent").checked,submitDisabled:document.getElementById("quick-wake-submit").disabled,verifyDisabled:document.getElementById("wake-manual-verify").disabled})'),
+    jobs: [...wakeJobs.values()].map(job => ({job_id: job.job_id, reason: job.reason, phase: job.phase})), writes: posts.filter(post => post.resource === 'wake-jobs').length,
+    reads: reads.filter(path => path.includes('/wake-jobs?')).slice(-12), pageErrors, exceptions}));
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Manual wake submitted more than once');
   assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'wake-jobs').body), {account_id: 'codex-01'});
   assert.equal(await evaluate('document.getElementById("quick-wake-dialog").hidden && !document.querySelector("[data-view=overview]").hidden'), true, 'Quick wake changed the overview page');
@@ -799,28 +886,251 @@ try {
     await waitFor(() => evaluate('document.getElementById("error").textContent === ""'), 'Successful refresh did not clear the toast error state');
   }
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
+  const historyReads = () => reads.filter(path => path.includes('/task-history?'));
+  const latestHistory = () => new URL(historyReads().at(-1), origin);
+  async function historyFilter(id, value, event = 'change') {
+    const before = historyReads().length;
+    await evaluate(`(() => {const input=document.getElementById(${JSON.stringify(id)});input.value=${JSON.stringify(value)};input.dispatchEvent(new Event(${JSON.stringify(event)}))})()`);
+    await waitFor(async () => historyReads().length > before && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'Task history filter did not finish: ' + id);
+  }
+  async function assertHistoryData() {
+    const expected = taskHistory(latestHistory().searchParams);
+    assert.deepEqual(await evaluate('Array.from(document.querySelectorAll("#history-list tr[data-render-key]")).map(row=>row.dataset.renderKey)'), expected.records.map(record => record.type + ':' + record.job_id));
+    assert.deepEqual(await evaluate('["today","active","completed","attention"].map(name=>document.getElementById("history-"+name).textContent)'),
+      [expected.summary.today, expected.summary.running + expected.summary.queued, expected.summary.completed, expected.summary.failed + expected.summary.unknown].map(String));
+    assert.equal(await evaluate('document.querySelector("[data-history-count=all]").textContent'), String(expected.status_counts.all));
+    for (const status of ['running', 'queued', 'completed', 'failed', 'unknown', 'skipped', 'cancelled']) {
+      assert.equal(await evaluate(`document.querySelector('[data-history-count="${status}"]').textContent`), String(expected.status_counts[status]), 'Incorrect status tab count: ' + status);
+    }
+    assert.equal(await evaluate('document.getElementById("history-count").textContent'), expected.total + ' 条');
+    return expected;
+  }
+  async function historyStatus(status) {
+    const before = historyReads().length;
+    await evaluate(`document.querySelector('[data-history-status="${status}"]').click()`);
+    await waitFor(async () => historyReads().length > before && (latestHistory().searchParams.get('status') || '') === status && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'Status tab did not finish: ' + status);
+    return assertHistoryData();
+  }
+  async function assertUnknownSafety(inViewport = false) {
+    const state = await evaluate(`(() => {
+      const warning=document.getElementById('history-detail-safety'), body=document.getElementById('history-detail-body'), box=warning.getBoundingClientRect();
+      return {visible:!warning.hidden && box.width>0 && box.height>0, outside:!body.contains(warning), text:warning.textContent, fits:box.top>=0 && box.bottom<=innerHeight};
+    })()`);
+    assert.equal(state.visible && state.outside, true, 'Unknown warning must remain outside the scrollable detail body');
+    assert.match(state.text, /禁止.*(?:重复|重发)|不会.*重发/);
+    if (inViewport) assert.equal(state.fits, true, 'Unknown warning left the viewport while reading a long response');
+  }
+  const writesBeforeHistory = posts.length;
+  await evaluate('document.querySelector("[data-page=history]").click()');
+  await waitFor(() => evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'Persisted history did not finish loading');
+  assert.ok((await assertHistoryData()).total > 20, 'History fixture does not exercise real pagination');
+  assert.deepEqual(await evaluate('Array.from(document.getElementById("history-trigger").options).map(option=>option.value).sort()'),
+    ['', 'manual_single', 'manual_batch', 'periodic', 'five_hour_expiry', 'weekly_expiry', 'initial_sync', 'wake_preflight', 'wake_verification', 'manual', 'five_hour_reset', 'weekly_reset', 'daily'].sort(), 'Trigger menu differs from the real backend contract');
+  for (const status of ['skipped', 'cancelled']) {
+    const result = await historyStatus(status);
+    assert.ok(result.records.length > 0, 'Missing fixture for ' + status);
+    assert.equal(result.records.every(record => record.status === status), true);
+  }
+  await historyStatus('');
+  await historyFilter('history-kind', 'query');
+  await historyFilter('history-search', 'persisted-query-00', 'input');
+  assert.equal((await assertHistoryData()).records[0].finished_at, jobs.get('persisted-query-00').updated_at, 'Terminal query fixture omitted its actual finish time');
+  assert.equal(await evaluate('document.querySelector("#history-list tr[data-render-key]").cells[5].textContent'), '2.5 秒', 'Completed query duration did not use finished_at');
+  await evaluate('document.querySelector("#history-list tr[data-render-key] button").click()');
+  await waitFor(() => evaluate('document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'Completed query detail did not load');
+  assert.match(await evaluate('document.getElementById("history-detail-body").textContent'), /2\.5 秒/, 'Query detail without timestamp fields discarded the list finish time');
+  assert.equal(await evaluate('document.getElementById("history-detail-safety").hidden'), true, 'Completed query incorrectly showed unknown spend warning');
+  await clickWhenEnabled('history-detail-close');
+  await historyFilter('history-search', '', 'input');
+  await historyFilter('history-kind', '');
+  await historyFilter('history-page-size', '20');
+  assert.equal((await assertHistoryData()).records.length, 20);
+  const firstHistoryPage = await evaluate('Array.from(document.querySelectorAll("#history-list tr")).map(row=>row.dataset.renderKey)');
+  await clickWhenEnabled('history-next');
+  await waitFor(async () => latestHistory().searchParams.get('page') === '2' && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'History next page did not request page two');
+  const secondHistoryPage = (await assertHistoryData()).records.map(record => record.type + ':' + record.job_id);
+  assert.equal(secondHistoryPage.some(key => firstHistoryPage.includes(key)), false, 'History pages repeat the same records');
+  assert.ok(secondHistoryPage.some(key => key.startsWith('query:persisted-query-')), 'History omitted automatic tasks from before this browser session');
+  await clickWhenEnabled('history-previous');
+  await waitFor(async () => latestHistory().searchParams.get('page') === '1' && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'History previous page did not return to page one');
+  assert.deepEqual((await assertHistoryData()).records.map(record => record.type + ':' + record.job_id), firstHistoryPage);
+  await historyFilter('history-page-size', '10');
+  await historyFilter('history-source', 'manual');
+  assert.equal((await assertHistoryData()).records.every(record => record.source === 'manual'), true);
+  await historyFilter('history-kind', 'query');
+  await historyFilter('history-trigger', 'manual_batch');
+  assert.equal((await assertHistoryData()).records.every(record => record.type === 'query' && record.trigger === 'manual_batch'), true);
+  await historyFilter('history-trigger', '');
+  await historyFilter('history-kind', '');
+  await historyFilter('history-source', 'automatic');
+  assert.equal((await assertHistoryData()).records.every(record => record.source === 'automatic'), true);
+  assert.equal(latestHistory().searchParams.get('page'), '1');
+  await historyFilter('history-kind', 'wake');
+  assert.equal((await assertHistoryData()).records.every(record => record.type === 'wake'), true);
+  await historyFilter('history-trigger', 'daily');
+  assert.ok((await assertHistoryData()).total > 0, 'Actual daily wake fixture was not filterable');
+  assert.equal((await assertHistoryData()).records.every(record => record.trigger === 'daily'), true);
+  await historyFilter('history-trigger', '');
+  assert.match(await evaluate('document.getElementById("history-list").textContent'), /窗口启动已核实/);
+  assert.doesNotMatch(await evaluate(`document.querySelector('#history-list [data-render-key="wake:persisted-wake-1"]').textContent`), /请求失败/);
+  const automaticWakeTotal = (await assertHistoryData()).status_counts.all;
+  await evaluate('document.querySelector("[data-history-status=unknown]").click()');
+  await waitFor(async () => latestHistory().searchParams.get('status') === 'unknown' && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'Unknown status filter was not sent to the server');
+  assert.equal((await assertHistoryData()).records.every(record => record.status === 'unknown'), true);
+  assert.equal((await assertHistoryData()).status_counts.all, automaticWakeTotal, 'Status tab incorrectly narrowed server summary counts');
+  await historyFilter('history-trigger', 'weekly_reset');
+  await historyFilter('history-date', 'week');
+  await historyFilter('history-search', 'persisted-wake-account-0', 'input');
+  assert.equal((await assertHistoryData()).total, 1);
+  assert.equal(latestHistory().searchParams.get('trigger'), 'weekly_reset');
+  assert.equal(latestHistory().searchParams.get('search'), 'persisted-wake-account-0');
+  assert.ok(latestHistory().searchParams.has('from'));
+  assert.ok(latestHistory().searchParams.has('today_from')); assert.ok(latestHistory().searchParams.has('today_to'));
+  await evaluate(`document.querySelector('#history-list [data-render-key="wake:persisted-wake-0"] button').click()`);
+  await waitFor(() => evaluate('!!document.querySelector("#history-detail-body [data-render-key=wake-response]")'), 'Persisted unknown wake response did not load');
+  await assertUnknownSafety();
+  assert.match(await evaluate('document.getElementById("history-detail-body").textContent'), /rate_limit_exceeded/);
+  assert.match(await evaluate('document.getElementById("history-detail-body").textContent'), /\[已隐藏\]/);
+  assert.match(await evaluate('document.getElementById("history-detail-body").textContent'), /<img src=x onerror=alert\(1\)>/);
+  assert.equal(await evaluate('document.querySelectorAll("#history-detail-body img,#history-detail-body script").length'), 0, 'Response text became executable HTML');
+  await evaluate('globalThis.taskResponse=document.querySelector("#history-detail-body [data-render-key=wake-response]");taskResponse.open=true;globalThis.taskResponseSummary=taskResponse.querySelector("summary");taskResponseSummary.focus()');
+  const detailReads = reads.filter(path => path.includes('/wake-jobs?job_id=persisted-wake-0')).length;
+  const writesBeforeVerify = posts.length;
+  await clickWhenEnabled('history-verify');
+  await waitFor(async () => reads.filter(path => path.includes('/wake-jobs?job_id=persisted-wake-0')).length > detailReads && await evaluate('document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'Unknown wake verification did not read the original task');
+  assert.equal(await evaluate('taskResponse.isConnected && taskResponse.open && document.activeElement===taskResponseSummary'), true, 'Read-only verification replaced response expansion or focus');
+  assert.equal(posts.length, writesBeforeVerify, 'Unknown verification submitted work');
+  await assertUnknownSafety();
+  await evaluate(`Object.defineProperty(navigator, 'clipboard', {configurable:true, value:{writeText:async()=>{throw new DOMException('Fixture clipboard denied','NotAllowedError')}}})`);
+  await clickWhenEnabled('history-copy');
+  await waitFor(() => evaluate('!document.getElementById("history-copy-fallback").hidden'), 'HTTP clipboard rejection did not expose manual copy');
+  assert.deepEqual(await evaluate('(() => {const input=document.getElementById("history-copy-value");return [input.readOnly,input.value,document.activeElement===input,input.selectionStart,input.selectionEnd]})()'),
+    [true, 'persisted-wake-0', true, 0, 'persisted-wake-0'.length], 'Manual copy did not select the readonly original task ID');
+  assert.equal(posts.length, writesBeforeVerify, 'Copy fallback submitted work');
+  await evaluate(`Object.defineProperty(navigator, 'clipboard', {configurable:true, value:undefined})`);
+  await clickWhenEnabled('history-copy');
+  assert.equal(await evaluate('!document.getElementById("history-copy-fallback").hidden && document.activeElement.id==="history-copy-value"'), true, 'Missing clipboard API did not preserve the manual copy fallback');
+  await historyStatus('');
+  await evaluate('taskResponseSummary.focus()');
+  const persistedWake = wakeJobs.get('persisted-wake-0');
+  for (const [older, newer] of [['completed', 'unknown'], ['unknown', 'completed']]) {
+    historyDetailGate = gate();
+    historyDetailGate.jobID = persistedWake.job_id;
+    historyDetailGate.response = {...structuredClone(persistedWake), ...identity(), phase: older, error_code: older === 'completed' ? 'window_verified' : 'wake_outcome_unknown'};
+    await clickWhenEnabled('history-verify');
+    await waitFor(() => historyDetailGate.started, 'Controlled older detail request did not start');
+    Object.assign(persistedWake, {phase: newer, error_code: newer === 'completed' ? 'window_verified' : 'wake_outcome_unknown', updated_at: observed()}); revision++;
+    const beforeSummary = historyReads().length;
+    await clickWhenEnabled('history-refresh');
+    await waitFor(async () => historyReads().length > beforeSummary && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'Newer task summary did not finish while old detail was held');
+    const selectedSummary = (await assertHistoryData()).records.find(record => record.type === 'wake' && record.job_id === persistedWake.job_id);
+    assert.equal(selectedSummary?.phase, newer, 'Newer summary must actually contain the selected record before testing state ordering');
+    assert.equal(await evaluate('document.getElementById("history-detail-safety").hidden'), newer !== 'unknown', 'Newer summary did not control unknown safety state');
+    historyDetailGate.release(); historyDetailGate = undefined;
+    await waitFor(() => evaluate('document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'Older detail did not finish');
+    assert.equal(await evaluate('document.getElementById("history-detail-safety").hidden'), newer !== 'unknown', 'Older detail rolled back the newer unknown safety state');
+    const responseState = await evaluate('({connected:taskResponse.isConnected,open:taskResponse.open,focused:document.activeElement===taskResponseSummary,active:document.activeElement.outerHTML.slice(0,200),sameResponse:taskResponse===document.querySelector("#history-detail-body [data-render-key=wake-response]")})');
+    assert.equal(responseState.connected && responseState.open && responseState.focused, true, 'Out-of-order responses disturbed focus or response expansion: ' + JSON.stringify({older, newer, ...responseState}));
+  }
+  Object.assign(persistedWake, {phase: 'unknown', error_code: 'wake_outcome_unknown', updated_at: observed()}); revision++;
+  await clickWhenEnabled('history-reset');
+  await waitFor(async () => !latestHistory().searchParams.has('status') && !latestHistory().searchParams.has('search') && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'History reset did not clear server filters');
+  await assertHistoryData();
+  await assertUnknownSafety();
+  await evaluate('const search=document.getElementById("history-search");search.focus();search.setSelectionRange(0,0)');
+  await evaluate('document.getElementById("refresh").onclick()');
+  assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("history-search").value,document.getElementById("history-search").selectionStart,document.getElementById("history-search").selectionEnd]'), ['history-search', '', 0, 0], 'Polling stole filter focus or selection');
+  assert.equal(await evaluate('taskResponse.isConnected && taskResponse.open'), true, 'Filter focus polling collapsed the response');
+  await evaluate('taskResponseSummary.focus()');
+  const beforeHistoryRefresh = historyReads().length;
+  await clickWhenEnabled('history-refresh');
+  await waitFor(async () => historyReads().length > beforeHistoryRefresh && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false" && document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'Task refresh did not finish');
+  assert.equal(await evaluate('taskResponse.isConnected && taskResponse.open && document.activeElement===taskResponseSummary'), true, 'Task polling reset response expansion or focus');
+  for (const [width, height] of [[2560, 1600], [1280, 900], [390, 844]]) {
+    await cdp('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: width < 600});
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Task history overflow at ' + width);
+    assert.equal(await evaluate('document.querySelector(".history-table-scroll").clientWidth > 0 && document.getElementById("history-detail").getBoundingClientRect().width > 0'), true, 'Task table or details hidden at ' + width);
+    if (width === 2560) assert.equal(await evaluate('document.getElementById("history-detail").getBoundingClientRect().left >= document.querySelector(".history-card").getBoundingClientRect().right'), true, 'Desktop task details are not right aligned');
+    await evaluate('(async () => {document.activeElement?.blur?.();document.querySelectorAll("#toast-region button").forEach(button=>button.click());window.scrollTo(0,0);await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))})()');
+    assert.equal(await evaluate('window.scrollY'), 0, 'Task history screenshot did not return to the page top');
+    if (width > 1100) {
+      await evaluate('document.getElementById("history-detail-body").scrollTop=document.getElementById("history-detail-body").scrollHeight');
+      assert.equal(await evaluate('document.getElementById("history-detail-body").scrollTop>0'), true, 'Long response did not exercise detail scrolling');
+      await assertUnknownSafety(true);
+      assert.equal(await evaluate('document.querySelector(".history-detail-actions").getBoundingClientRect().bottom<=innerHeight'), true, 'Detail actions left the desktop viewport');
+    }
+    await screenshot('task-history-' + width + 'x' + height + '.png');
+    if (width === 390) {
+      await evaluate('document.getElementById("history-detail-close").click()');
+      assert.equal(await evaluate('document.getElementById("history-detail-safety").hidden && document.getElementById("history-copy-fallback").hidden'), true, 'Closing detail retained stale safety or copy text');
+      assert.equal(await evaluate(`document.activeElement===document.querySelector('#history-list [data-render-key="wake:persisted-wake-0"] button')`), true, 'Closing mobile detail did not restore the original details button focus');
+      await evaluate(`document.querySelector('#history-list [data-render-key="wake:persisted-wake-0"] button').click()`);
+      await waitFor(() => evaluate('document.activeElement.id==="history-detail-title" && document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'Explicit mobile detail did not focus its title');
+      await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+      assert.equal(await evaluate('document.getElementById("history-detail-title").getAttribute("tabindex")==="-1" && document.getElementById("history-detail-title").getBoundingClientRect().top>=0 && document.getElementById("history-detail-title").getBoundingClientRect().bottom<=innerHeight && scrollY>0'), true, 'Mobile explicit detail did not scroll the title into view');
+      await assertUnknownSafety(true);
+      const detailScroll = await evaluate('scrollY');
+      await evaluate('document.getElementById("refresh").onclick()');
+      assert.deepEqual(await evaluate('[document.activeElement.id,scrollY]'), ['history-detail-title', detailScroll], 'Mobile polling moved explicit detail focus or scroll');
+      await screenshot('task-history-details-' + width + 'x' + height + '.png');
+      await evaluate('globalThis.taskResponse=document.querySelector("#history-detail-body [data-render-key=wake-response]");taskResponse.open=true;document.getElementById("history-detail-body").scrollTop=document.getElementById("history-detail-body").scrollHeight');
+      await assertUnknownSafety(true);
+      assert.equal(await evaluate('document.querySelector(".history-detail-actions").getBoundingClientRect().bottom<=innerHeight'), true, 'Mobile long response hid read-only detail actions');
+      await screenshot('task-history-details-response-' + width + 'x' + height + '.png');
+      await evaluate('globalThis.taskResponseSummary=taskResponse.querySelector("summary");taskResponseSummary.focus()');
+    }
+  }
+  historyUnavailable = true;
+  await clickWhenEnabled('history-refresh');
+  await waitFor(() => evaluate('document.getElementById("history-message").dataset.error==="true"'), 'Unavailable task history was not reported');
+  assert.match(await evaluate('document.getElementById("history-message").textContent'), /上次成功|非最新/);
+  assert.equal(await evaluate('taskResponse.isConnected && taskResponse.open'), true, 'History outage discarded an already readable response');
+  historyUnavailable = false;
+  await clickWhenEnabled('history-refresh');
+  await waitFor(() => evaluate('document.getElementById("history-message").dataset.error==="false"'), 'Task history did not recover after read-only retry');
+  assert.equal(posts.length, writesBeforeHistory, 'History pagination, filtering, details or unknown verification created work');
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 2560, height: 1600, deviceScaleFactor: 1, mobile: false});
   const failureID = 'fixture-error-details';
   const failureJob = {...identity(), job_id: failureID, id: failureID, phase: 'failed', trigger: 'manual_batch', completed: 24, failed: 1, total: 25, created_at: observed(), updated_at: observed(),
     items: Array.from({length: 25}, (_, index) => ({account_id: 'error-fixture-account-' + index, phase: index === 24 ? 'failed' : 'completed', error_code: index === 24 ? 'quota_upstream_forbidden' : ''}))};
   jobs.set(failureID, failureJob); fixtureJobs.unshift({...failureJob, items: undefined}); revision++;
   const writesBeforeDetails = posts.length;
   await evaluate('document.getElementById("refresh").onclick()');
-  await waitFor(() => evaluate('document.getElementById("history-list").textContent.includes("查看逐账号结果与错误详情")'), 'Error summary did not expose details');
-  await evaluate(`document.querySelector('[data-page=history]').click();Array.from(document.querySelectorAll('#history-list .task-item')).find(node => node.dataset.renderKey === 'query:${failureID}').querySelector('.task-open').click()`);
-  await waitFor(() => evaluate('!!document.querySelector("#history-list .task-errors")'), 'Per-account errors were not loaded');
-  await evaluate('globalThis.errorDetails=document.querySelector("#history-list .task-errors");errorDetails.open=true;globalThis.errorItem=errorDetails.querySelector(".task-error-details");errorItem.open=true;globalThis.errorSummary=errorItem.querySelector("summary");errorSummary.focus()');
+  await evaluate('document.querySelector("[data-page=history]").click()');
+  await waitFor(() => evaluate(`!!document.querySelector('#history-list [data-render-key="query:${failureID}"] button')`), 'Error summary did not expose details');
+  await evaluate(`document.querySelector('#history-list [data-render-key="query:${failureID}"] button').click()`);
+  await waitFor(() => evaluate('!!document.querySelector("#history-detail-body .task-errors")'), 'Per-account errors were not loaded');
+  await evaluate('globalThis.errorDetails=document.querySelector("#history-detail-body .task-errors");errorDetails.open=true;globalThis.errorItem=errorDetails.querySelector(".task-error-details");errorItem.open=true;globalThis.errorSummary=errorItem.querySelector("summary");errorSummary.focus()');
   assert.match(await evaluate('errorItem.textContent'), /quota_upstream_forbidden/);
   assert.match(await evaluate('errorItem.textContent'), /HTTP 403/);
   assert.match(await evaluate('errorItem.textContent'), /error-fixture-account-24/);
   assert.match(await evaluate('errorItem.textContent'), /fixture-error-details/);
   await evaluate('document.getElementById("refresh").onclick()');
   await waitFor(() => evaluate('errorItem.isConnected && errorItem.open && errorDetails.open && document.activeElement === errorSummary'), 'Polling reset error expansion or keyboard focus');
-  for (const width of [1586, 390]) {
-    await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
+  for (const [width, height] of [[2560, 1600], [1280, 900], [390, 844]]) {
+    await cdp('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: width < 600});
     assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Task error details overflow at ' + width);
     await screenshot('task-error-details-' + width + '.png');
   }
   assert.equal(posts.length, writesBeforeDetails, 'Reading error details created work');
+  const writesBeforeHTTP = posts.length;
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
+  await cdp('Page.navigate', {url: httpOrigin + base + 'status'});
+  await waitFor(() => evaluate(`location.origin===${JSON.stringify(httpOrigin)} && document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length===6`), 'Non-secure local HTTP fixture did not connect');
+  assert.equal(await evaluate('location.protocol==="http:" && !isSecureContext && typeof navigator.clipboard==="undefined"'), true, 'HTTP copy fallback was not tested in a genuinely insecure context');
+  await evaluate('document.querySelector("[data-page=history]").click()');
+  await waitFor(() => evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false" && document.getElementById("history-count").textContent!=="— 条"'), 'HTTP task history did not load');
+  await historyFilter('history-search', 'persisted-wake-0', 'input');
+  await evaluate(`document.querySelector('#history-list [data-render-key="wake:persisted-wake-0"] button').click()`);
+  await waitFor(() => evaluate('document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'HTTP original wake detail did not load');
+  await assertUnknownSafety();
+  await clickWhenEnabled('history-copy');
+  assert.deepEqual(await evaluate('(() => {const input=document.getElementById("history-copy-value");return [!document.getElementById("history-copy-fallback").hidden,input.readOnly,input.value,document.activeElement===input,input.selectionStart,input.selectionEnd]})()'),
+    [true, true, 'persisted-wake-0', true, 0, 'persisted-wake-0'.length], 'Real HTTP manual copy did not expose and select the readonly original ID');
+  await screenshot('task-history-http-copy-fallback-390x844.png');
+  await clickWhenEnabled('history-detail-close');
+  assert.equal(await evaluate('document.getElementById("history-copy-fallback").hidden && document.getElementById("history-copy-value").value==="" && document.getElementById("history-detail-safety").hidden'), true, 'Closing HTTP detail did not clear copy or warning state');
+  assert.equal(posts.length, writesBeforeHTTP, 'HTTP navigation, detail or copy fallback submitted work');
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   unauthorized = true;
   await waitFor(() => evaluate('!document.getElementById("login-section").hidden && document.getElementById("query").disabled'), 'Expired authentication did not stop polling');
@@ -837,7 +1147,7 @@ try {
   assert.equal(posts.length, 19, 'Unexpected total API write count');
   assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations', 'wake-settings', 'wake-jobs'].includes(post.resource)), true, 'Unexpected API write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
-  console.log('V2 browser checks passed: desktop/mobile layout, direct overview settings saves/locking/draft isolation/rejections/conflicts/unknown-result GET verification, explicit editor saves, settings validation/drafts/polling/timezone aliases, mixed batches, overdue exclusion holds, queued countdowns, immediate single/randomized bulk query contracts, sync, filtering, paging, authentication, local generation directory, disabled Antigravity selection, explicit catalog refresh, editable generation prompt reset/save/draft/consent isolation, exact Antigravity generation prompt snapshot, wake rules and spend consent, direct auto-wake saves with draft isolation, wake settings conflicts and unknown manual-wake read-only verification.');
+  console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, same-account quick-wake native close race, exactly one confirmed wake POST, persisted task history and real trigger menus, skipped/cancelled tabs, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard rejection/unavailable API fallback, filter/expansion focus preservation, explicit mobile detail focus/scroll/close return, unavailable-history recovery, fixture-only page traffic, and top-page screenshots at 2560x1600, 1280x900 and 390x844 plus mobile detail.');
   console.log('Local fixture screenshots: ' + output);
 } finally {
   accountReadGate?.release();
@@ -845,6 +1155,7 @@ try {
   settingsReadGate?.release();
   modelReadGate?.release();
   wakeReadGate?.release();
+  historyDetailGate?.release();
   if (socket) socket.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) {
     browser.kill('SIGTERM');

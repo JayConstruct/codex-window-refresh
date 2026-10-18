@@ -684,7 +684,7 @@ static J *proxy(J*req) {
     char endpoint[128];
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
-        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs");
+        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"task-history");
         int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs");
         if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
@@ -701,14 +701,14 @@ static J *proxy(J*req) {
     else return http_error(404,"not_found");
     CURL*curl=curl_easy_init();
     if(!curl)return http_error(503,"backend_unavailable");
-    char target[8192];
+    char target[16384];
     snprintf(target,sizeof(target),"http://localhost%s",endpoint);
     J*query=field(req,"Query");
     const char*allowed[]= {
-        "job_id","after","limit","revision","search","status"
+        "job_id","after","limit","revision","search","status","type","source","trigger","from","to","page","today_from","today_to"
     };
-    for(int i=0;i<6;i++) {
-        J*v=field(query,allowed[i]);
+    for(size_t index=0;index<sizeof(allowed)/sizeof(allowed[0]);index++) {
+        J*v=field(query,allowed[index]);
         if(!v)continue;
         if(json_object_get_type(v)!=5||json_object_array_length(v)!=1)goto invalid;
         const char*text=string(json_object_array_get_idx(v,0));
@@ -716,7 +716,7 @@ static J *proxy(J*req) {
         char*escaped=curl_easy_escape(curl,text,0);
         if(!escaped)goto invalid;
         size_t used=strlen(target);
-        snprintf(target+used,sizeof(target)-used,"%c%s=%s",strchr(target,'?')?'&':'?',allowed[i],escaped);
+        snprintf(target+used,sizeof(target)-used,"%c%s=%s",strchr(target,'?')?'&':'?',allowed[index],escaped);
         curl_free(escaped);
     }
     size_t body_size=0;
@@ -800,9 +800,9 @@ static J *registration(void) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history"
     };
-    for(int i=0;i<16;i++) {
+    for(int i=0;i<17;i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);
