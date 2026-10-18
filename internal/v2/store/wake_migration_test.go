@@ -39,7 +39,7 @@ func TestWakeVersionSevenMigrationPreservesGenerationAndSettingsWithWakeOff(t *t
 		VALUES('legacy-generation','legacy-generation-key',?,?,'legacy-index','legacy-binding','antigravity',?,1,?,'completed','["旧版候选。"]',?,?)`, hash, request.AccountID, request.Model, request.Prompt, now(), now()); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"wake_cursor", "wake_baselines", "wake_cycles", "wake_jobs", "wake_settings"} {
+	for _, table := range []string{"wake_responses", "wake_cursor", "wake_baselines", "wake_cycles", "wake_jobs", "wake_settings"} {
 		if _, err = storage.db.Exec("DROP TABLE " + table); err != nil {
 			t.Fatal(err)
 		}
@@ -59,7 +59,7 @@ func TestWakeVersionSevenMigrationPreservesGenerationAndSettingsWithWakeOff(t *t
 		t.Fatal(err)
 	}
 	var version int
-	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 8 {
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 9 {
 		t.Fatalf("migrated schema=%d err=%v", version, err)
 	}
 	wakes, err := storage.WakeSettings(ctx)

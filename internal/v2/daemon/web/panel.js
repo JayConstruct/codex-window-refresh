@@ -400,6 +400,7 @@
   let generationCatalog = null, generationCatalogLoading = false, generationCatalogError = '', generationCatalogAttempt = '', generationCatalogSequence = 0, generationAccountIdentity = null;
   let savedWakeSettings = null, wakeBase = null, wakeLoading = false, wakePolling = false, wakeSaving = false, wakeConflict = false, wakeNeedsVerification = false, wakeSettingsAttempt = '', wakeSavingEnabled = null;
   let wakeIntent = null, wakeTask = null, wakeSubmitting = false, wakeReading = false, wakeUnconfirmed = false, wakeUnknown = false, wakeJobsLoading = false, wakeJobs = [];
+  let quickWakeAccount = '', quickWakeLoading = false, quickWakeSequence = 0;
   const wakeFields = {enabled: 'wake-enabled', fiveHour: 'wake-five-hour', weekly: 'wake-weekly', timezone: 'wake-timezone', delayMin: 'wake-delay-min', delayMax: 'wake-delay-max', allowed: 'wake-allowed', perUser: 'wake-per-user', maximum: 'wake-max-accounts', daily: 'wake-daily', dailyWindow: 'wake-daily-window', dailyTarget: 'wake-daily-target'};
   const wakePhases = {queued: '等待执行', checking: '查询并核实额度', prepared: '已准备', sending: '正在发送模型请求', verifying: '核实执行结果', completed: '已完成', skipped: '已跳过', failed: '执行失败', unknown: '结果未知', cancelled: '已取消'};
   const wakeReasons = {manual: '手动唤醒', manual_single: '手动唤醒', five_hour_reset: '五小时重置', weekly_reset: '周额度重置', startup: '启动分散唤醒', daily: '每日容量准备', daily_capacity: '每日容量准备'};
@@ -466,6 +467,18 @@
       metadata.append(element('dt', '', label), element('dd', '', value));
     }
     details.append(metadata, element('p', 'task-error-advice', diagnostic.advice), element('p', 'muted', '仅展示脱敏分类与排查建议，不包含凭据、代理密钥、请求提示词或上游原始响应。'));
+    return details;
+  }
+  function wakeResponseDetails(response) {
+    const details = element('details', 'task-error-details'); details.dataset.renderKey = 'wake-response';
+    details.append(element('summary', '', '响应与执行记录'));
+    const metadata = element('dl', 'task-error-metadata');
+    const stages = {preflight: '发送前核实', open: '打开模型流', read: '读取模型响应', completed: '模型响应完成', close: '关闭模型流', interrupted: '执行中断'};
+    for (const [label, value] of [['记录时间', response.recorded_at || '未提供'], ['执行阶段', stages[response.stage] || '未知'], ['HTTP 状态', response.http_status || '未获得'], ['响应事件', response.event || '未获得'], ['响应状态', response.status || '未获得'], ['上游代码', response.upstream_error_code || '无'], ['上游类型', response.upstream_error_type || '无'], ['执行错误', response.error_code || '无'], ['响应字节', response.bytes ?? 0], ['模型完成', response.completed ? '是（窗口仍需额度核实）' : '否或未确认'], ['关闭异常', response.close_failed ? '是，保留未知结果保护' : '未报告']]) metadata.append(element('dt', '', label), element('dd', '', value));
+    details.append(metadata);
+    if (response.error_message) details.append(element('strong', '', '错误信息（脱敏）'), element('pre', 'wake-response-text', response.error_message));
+    if (response.response_text) details.append(element('strong', '', '响应摘要（脱敏）'), element('pre', 'wake-response-text', response.response_text));
+    details.append(element('p', 'muted', response.truncated ? '摘要已截断；未保存原始响应、请求头或凭据。' : '仅保存有限脱敏摘要，不保存原始响应、请求头或凭据。'));
     return details;
   }
   function report(error) {
@@ -744,6 +757,8 @@
       if (job.scheduled_at) item.append(element('small', 'task-description', '后台计划：' + (Number.isFinite(timestamp(job.scheduled_at)) ? new Date(job.scheduled_at).toLocaleString('zh-CN', {hour12: false}) : '待核实')));
       if (job.hold_reason) item.append(element('p', 'task-description', wakeHoldText(job.hold_reason)));
       if (['failed', 'unknown'].includes(job.phase) || job.error_code && ['skipped', 'cancelled'].includes(job.phase)) item.append(taskErrorDetails(job.error_code || (job.phase === 'unknown' ? 'wake_outcome_unknown' : 'wake_request_rejected'), job, '', 'wake'));
+      if (job.response) item.append(wakeResponseDetails(job.response));
+      else if (['failed', 'unknown'].includes(job.phase)) item.append(element('p', 'muted', '未保存模型响应记录：可能是旧任务或尚未进入模型发送阶段，已有错误分类仍可查看。'));
       if (job.phase === 'unknown') item.append(element('p', 'error-text', '可能已消耗额度；禁止重发，仅可读取原任务。'));
       const time = element('small', 'task-time', age(job.updated_at || job.created_at)); time.dataset.observedAt = job.updated_at || job.created_at || ''; item.append(time);
       const button = element('button', 'text-button', '读取任务结果'); button.dataset.renderKey = 'read'; button.type = 'button'; button.disabled = !connected || !wakeExecutionSupported(); button.onclick = () => readWakeJob(job.job_id); item.append(button); return item;
@@ -760,10 +775,13 @@
     setText('wake-manual-status', !connected ? '等待连接' : !supported ? '尚未接入' : wakeSubmitting ? '提交中' : wakeUnconfirmed ? '需要核实' : wakeUnknown ? '结果未知' : wakePhases[wakeTask?.phase] || '按需唤醒');
     if (!supported) setText('wake-manual-message', '当前后台未提供真实模型唤醒能力，不会提交模型请求。');
     renderWakeHistory();
+    renderQuickWake();
   }
   function validateWakeJob(data, expectedID = '') {
     if (!data || typeof data.job_id !== 'string' || !data.job_id || expectedID && data.job_id !== expectedID || !Object.hasOwn(wakePhases, data.phase) ||
       ['account_id', 'reason', 'error_code', 'hold_reason', 'scheduled_at', 'created_at', 'updated_at'].some(name => data[name] !== undefined && typeof data[name] !== 'string')) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+    if (data.response !== undefined && (!data.response || typeof data.response !== 'object' || Array.isArray(data.response) || ['recorded_at', 'stage', 'event', 'status', 'upstream_error_code', 'upstream_error_type', 'error_message', 'response_text', 'error_code'].some(name => data.response[name] !== undefined && (typeof data.response[name] !== 'string' || data.response[name].length > 4096)))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+    if (data.response && (['completed', 'truncated', 'close_failed'].some(name => data.response[name] !== undefined && typeof data.response[name] !== 'boolean') || ['http_status', 'bytes'].some(name => data.response[name] !== undefined && (!Number.isSafeInteger(data.response[name]) || data.response[name] < 0 || data.response[name] > (name === 'bytes' ? 1048576 : 599))))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
   }
   function acceptWakeTask(data) {
     validateWakeJob(data);
@@ -803,12 +821,13 @@
     } catch (error) { if (current === generation) feedback('wake-history-message', '读取唤醒历史失败：' + message(error.code), 'error'); }
     finally { if (current === generation) { wakeJobsLoading = false; renderManualWake(); } }
   }
-  async function submitManualWake(verify = false) {
+  async function submitManualWake(verify = false, quickAccount = '') {
     if (!connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading) return;
     if (verify && wakeTask?.job_id) return readWakeJob();
-    if (wakeUnknown || (verify ? !wakeUnconfirmed || !wakeIntent : wakeUnconfirmed || wakeActive() || !$('wake-manual-consent').checked)) return;
+    const consent = quickAccount ? quickAccount === quickWakeAccount && !quickWakeLoading && $('quick-wake-consent').checked && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount && account.status === 'available') : $('wake-manual-consent').checked;
+    if (wakeUnknown || (verify ? !wakeUnconfirmed || !wakeIntent : wakeUnconfirmed || wakeActive() || !consent)) return;
     if (!verify) {
-      const account = $('wake-account').value.trim();
+      const account = quickAccount || $('wake-account').value.trim();
       if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account)) { feedback('wake-manual-message', '请输入完整有效的 Codex 账号 ID，并确认可能消耗模型额度。', 'error'); return; }
       try { wakeIntent = {key: requestID(context.crypto), instance: views.instance, body: JSON.stringify({account_id: account})}; }
       catch (error) { feedback('wake-manual-message', message(error.code), 'error'); return; }
@@ -826,7 +845,32 @@
       if (current !== generation) return;
       if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed', 'idempotency_conflict'].includes(error.code) || error.status >= 500 && error.code !== 'wake_unavailable') { wakeUnconfirmed = true; feedback('wake-manual-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请显式核实同一任务，保留原标识与原账号。', 'warning'); }
       else { wakeUnconfirmed = false; $('wake-manual-consent').checked = false; feedback('wake-manual-message', '唤醒请求未接受：' + message(error.code), 'error'); }
-    } finally { if (current === generation) { wakeSubmitting = false; renderManualWake(); } }
+    } finally { if (current === generation) { wakeSubmitting = false; if (quickAccount) closeQuickWake(); renderManualWake(); } }
+  }
+  function quickWakeBlocked() { return !connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading || wakeActive() || wakeUnconfirmed || wakeUnknown; }
+  function renderQuickWake() {
+    const blocked = quickWakeBlocked();
+    $('quick-wake-consent').disabled = blocked || quickWakeLoading;
+    for (const button of document.querySelectorAll('[data-wake-account]')) button.disabled = blocked || !!quickWakeAccount || button.dataset.accountStatus !== 'available';
+    $('quick-wake-submit').disabled = blocked || quickWakeLoading || !$('quick-wake-consent').checked || !accountsData.some(account => account.id === quickWakeAccount && account.status === 'available') || !savedModelSettings?.config?.default_model || savedModelSettings.instance_id !== views.instance || modelNeedsVerification;
+  }
+  function closeQuickWake() {
+    quickWakeSequence++; quickWakeAccount = ''; quickWakeLoading = false; $('quick-wake-consent').checked = false;
+    if ($('quick-wake-dialog').open) $('quick-wake-dialog').close();
+    $('quick-wake-dialog').hidden = true; renderQuickWake();
+  }
+  async function openQuickWake(id) {
+    if (quickWakeBlocked() || quickWakeAccount || !accountsData.some(account => account.id === id && account.status === 'available')) return;
+    const current = generation, sequence = ++quickWakeSequence;
+    quickWakeAccount = id; quickWakeLoading = true; $('quick-wake-consent').checked = false;
+    setText('quick-wake-account', id); setText('quick-wake-model', '正在读取已保存模型…');
+    $('quick-wake-dialog').hidden = false; $('quick-wake-dialog').showModal(); renderQuickWake();
+    const loaded = await reloadModelSettings();
+    if (current !== generation || sequence !== quickWakeSequence || quickWakeAccount !== id) return;
+    quickWakeLoading = false;
+    setText('quick-wake-model', loaded && savedModelSettings?.config?.default_model ? '已保存模型：' + savedModelSettings.config.default_model + '；执行使用后台已保存配置，不提交任何草稿。' : '未能核实已保存模型，请先在“模型与提示词”保存实际可用的默认模型后重试。');
+    if (!loaded) quickWakeLoading = true;
+    renderQuickWake();
   }
   function modelSupported() { return overviewData?.capabilities?.model_settings === true; }
   function editableGenerationPrompt() { return overviewData?.capabilities?.editable_generation_prompt === true; }
@@ -1175,6 +1219,7 @@
   }
   function stop() {
     toasts.clear();
+    closeQuickWake();
     errorLimits.clear();
     generation++; connected = false; connecting = false; key = '';
     clearTimeout(pollTimer); clearTimeout(filterTimer);
@@ -1266,7 +1311,13 @@
       const button = element('button', 'account-query', queryBusy.has(accountKey) ? '提交中…' : unresolved.has(accountKey) ? '重试查询' : '立即查询');
       button.type = 'button'; button.disabled = !connected || queryBusy.has(accountKey);
       button.setAttribute('aria-label', '立即查询账号 ' + account.id); button.onclick = () => submitQuery(account.id);
-      action.append(button);
+      const buttons = element('div', 'account-buttons');
+      const wakeButton = element('button', 'account-query account-wake', '立即唤醒'); wakeButton.type = 'button';
+      wakeButton.dataset.wakeAccount = account.id; wakeButton.dataset.accountStatus = account.status;
+      wakeButton.dataset.renderKey = 'wake'; button.dataset.renderKey = 'query';
+      wakeButton.disabled = quickWakeBlocked() || !!quickWakeAccount || account.status !== 'available';
+      wakeButton.setAttribute('aria-label', '立即唤醒账号 ' + account.id); wakeButton.onclick = () => openQuickWake(account.id);
+      buttons.append(button, wakeButton); action.append(buttons);
       if (['queued', 'running'].includes(account.pending_query?.phase)) action.append(queueAnnotation(account.pending_query, 'query-pending'));
       row.append(name, status, five, weekly, observed, action); rows.push(row);
     }
@@ -1728,6 +1779,12 @@
   $('wake-manual-form').onsubmit = event => { event.preventDefault(); return submitManualWake(); };
   $('wake-manual-verify').onclick = () => submitManualWake(true);
   $('wake-manual-consent').onchange = renderManualWake;
+  $('quick-wake-form').onsubmit = event => { event.preventDefault(); return submitManualWake(false, quickWakeAccount); };
+  $('quick-wake-consent').onchange = renderQuickWake;
+  $('quick-wake-cancel').onclick = closeQuickWake;
+  $('quick-wake-dialog').addEventListener('cancel', event => { event.preventDefault(); closeQuickWake(); });
+  $('quick-wake-dialog').addEventListener('close', () => { if (quickWakeAccount) closeQuickWake(); });
+  $('quick-wake-history').onclick = () => { closeQuickWake(); navigate('wake'); };
   $('wake-account').oninput = () => { if (!$('wake-manual-fields').disabled) { $('wake-manual-consent').checked = false; renderManualWake(); } };
   $('wake-history-refresh').onclick = () => loadWakeJobs(true);
   $('accounts-search').addEventListener('input', changeFilter); $('accounts-filter').addEventListener('change', changeFilter);

@@ -147,7 +147,7 @@ func Open(dir string) (*Store, error) {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
-		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 8 {
+		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 9 {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
@@ -171,7 +171,7 @@ func Open(dir string) (*Store, error) {
 			}
 		}
 		if err == nil {
-			_, err = migration.Exec("UPDATE schema_version SET version=8")
+			_, err = migration.Exec("UPDATE schema_version SET version=9")
 		}
 	}
 	if err == nil {
@@ -184,7 +184,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	var version int
-	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 8 {
+	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 9 {
 		s.Close()
 		return nil, errors.New("unsupported_database_schema")
 	}

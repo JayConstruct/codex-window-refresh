@@ -158,6 +158,11 @@ func (s *Service) wakeJobs(w http.ResponseWriter, r *http.Request) {
 		wakeAPIError(w, err)
 		return
 	}
+	job, err = s.Store.Wake(r.Context(), job.ID)
+	if err != nil {
+		wakeAPIError(w, err)
+		return
+	}
 	job.InstanceID = s.instance
 	s.notifyWake()
 	writeJSON(w, 202, job)
@@ -233,7 +238,17 @@ func (s *Service) executeWakes(ctx context.Context) {
 			continue
 		}
 		requestCtx, requestCancel := context.WithTimeout(ctx, 90*time.Second)
-		err = source.ExecuteWake(requestCtx, job.Account, job.Model, job.Prompt)
+		response := store.WakeResponse{Stage: "preflight"}
+		if recorder, ok := source.(interface {
+			ExecuteWakeWithResponse(context.Context, store.Account, string, string) (store.WakeResponse, error)
+		}); ok {
+			response, err = recorder.ExecuteWakeWithResponse(requestCtx, job.Account, job.Model, job.Prompt)
+		} else {
+			err = source.ExecuteWake(requestCtx, job.Account, job.Model, job.Prompt)
+			if err != nil {
+				response.ErrorCode = err.Error()
+			}
+		}
 		if requestCtx.Err() != nil {
 			err = requestCtx.Err()
 		}
@@ -242,7 +257,7 @@ func (s *Service) executeWakes(ctx context.Context) {
 		finishedAt := time.Now().UTC()
 		for {
 			saveCtx, saveCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			saveErr := s.Store.FinishWake(saveCtx, job.ID, phase, code, finishedAt)
+			saveErr := s.Store.FinishWakeWithResponse(saveCtx, job.ID, phase, code, finishedAt, &response)
 			saveCancel()
 			s.wakeWorkerError.Store(saveErr != nil)
 			if saveErr == nil || ctx.Err() != nil {

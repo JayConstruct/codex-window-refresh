@@ -175,6 +175,7 @@ try {
         if (!id) { assert.equal(url.searchParams.get('limit'), '20'); json(response, 200, {...identity(), jobs: [...wakeJobs.values()]}); return; }
         const job = wakeJobs.get(id); if (!job) { json(response, 404, {error: 'not_found'}); return; }
         job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++;
+        job.response = {recorded_at: observed(), stage: 'read', http_status: 429, event: 'response.failed', status: 'failed', upstream_error_code: 'rate_limit_exceeded', error_message: 'Please try later [已隐藏]', response_text: 'Partial safe response', error_code: 'wake_delivery_unknown', bytes: 512, completed: false, truncated: false};
         json(response, 200, {...identity(), ...job}); return;
       }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
@@ -716,14 +717,35 @@ try {
   await clickWhenEnabled('wake-settings-reload');
   await waitFor(() => evaluate('document.getElementById("wake-per-user").value==="0.5" && document.getElementById("wake-settings-conflict").hidden'), 'Explicit wake settings GET did not resolve conflict');
   await evaluate('document.getElementById("wake-account").value="codex-01";document.getElementById("wake-account").dispatchEvent(new Event("input"));document.getElementById("wake-manual-consent").click()');
-  await clickWhenEnabled('wake-manual-submit');
+  await evaluate('document.querySelector("[data-page=overview]").click();document.querySelector("#accounts .account-wake").click()');
+  await waitFor(() => evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-consent").disabled'), 'Quick wake did not load saved model');
+  assert.equal(await evaluate('document.getElementById("quick-wake-account").textContent'), 'codex-01');
+  assert.equal(await evaluate('document.getElementById("quick-wake-submit").disabled'), true, 'Quick wake bypassed spend consent');
+  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Opening quick wake submitted a task');
+  await screenshot('quick-wake-desktop.png');
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
+  assert.equal(await evaluate('(() => {const box=document.getElementById("quick-wake-dialog").getBoundingClientRect();return box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight})()'), true, 'Quick wake modal overflowed mobile viewport');
+  await screenshot('quick-wake-mobile.png');
+  await evaluate('document.getElementById("quick-wake-cancel").click()');
+  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Cancelling quick wake submitted a task');
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
+  await evaluate('document.querySelector("#accounts .account-wake").click()');
+  await waitFor(() => evaluate('!document.getElementById("quick-wake-consent").disabled'), 'Quick wake did not reopen');
+  await evaluate('document.getElementById("quick-wake-consent").click();document.getElementById("quick-wake-submit").click()');
   await waitFor(() => evaluate('document.getElementById("wake-manual-status").textContent==="结果未知"'), 'Manual wake unknown outcome was not read');
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Manual wake submitted more than once');
   assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'wake-jobs').body), {account_id: 'codex-01'});
+  assert.equal(await evaluate('document.getElementById("quick-wake-dialog").hidden && !document.querySelector("[data-view=overview]").hidden'), true, 'Quick wake changed the overview page');
+  await evaluate('document.querySelector("[data-page=wake]").click()');
   assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
   await clickWhenEnabled('wake-history-refresh'); await clickWhenEnabled('wake-manual-verify');
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Unknown wake verification resent the model action');
   assert.match(await evaluate('document.getElementById("wake-history").textContent'), /禁止重发/);
+  assert.match(await evaluate('document.getElementById("wake-history").textContent'), /响应与执行记录/);
+  assert.match(await evaluate('document.getElementById("wake-history").textContent'), /rate_limit_exceeded/);
+  await evaluate('globalThis.wakeResponse=document.querySelector("#wake-history [data-render-key=wake-response]");wakeResponse.open=true;globalThis.wakeResponseSummary=wakeResponse.querySelector("summary");wakeResponseSummary.focus()');
+  await clickWhenEnabled('wake-history-refresh');
+  assert.equal(await evaluate('wakeResponse.isConnected && wakeResponse.open && document.activeElement===wakeResponseSummary'), true, 'Wake response polling reset the expanded record');
   assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24', 'Wake changed the quota account pool');
   await screenshot('wake-desktop.png');
   await evaluate('document.querySelector("[data-page=overview]").click()');

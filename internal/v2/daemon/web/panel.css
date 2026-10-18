@@ -178,6 +178,15 @@ select { cursor: pointer; }
 .account-query { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 5px 12px; border: 1px solid #59b6aa; color: #008377; background: #fff; font-size: 12px; font-weight: 600; white-space: nowrap; }
 .account-query:hover:not(:disabled) { background: #e8f9f4; }
 .account-query:disabled { opacity: .45; }
+.account-buttons { display: flex; gap: 6px; min-width: 158px; }
+.account-wake { border-color: #d6ad72; color: #a36a18; }
+.account-wake:hover:not(:disabled) { background: #fff7e9; }
+.quick-wake-dialog { width: min(480px, calc(100vw - 32px)); max-height: calc(100dvh - 40px); overflow: auto; border: 1px solid var(--border); border-radius: 14px; padding: 24px; color: inherit; box-shadow: 0 20px 70px #17233e40; }
+.quick-wake-dialog::backdrop { background: #17233e66; }
+.quick-wake-dialog h2 { font-size: 19px; margin-bottom: 10px; }
+.quick-wake-account { margin-bottom: 8px; font-weight: 600; overflow-wrap: anywhere; }
+.quick-wake-dialog .section-description { margin-top: 14px; }
+.wake-response-text { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
 .account-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; min-height: 49px; padding: 7px 4px; color: var(--muted); font-size: 12px; }
 .account-footer > p { display: flex; align-items: center; gap: 9px; }
 .account-footer .icon { width: 18px; height: 18px; }

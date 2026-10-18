@@ -172,6 +172,8 @@ function panel(respond, options = {}) {
     }
     removeChild(child) { this.children.splice(this.children.indexOf(child), 1); child.parentNode = null; return child; }
     contains(child) { return child === this || this.children.some(node => node.contains(child)); }
+    showModal() { this.open = true; }
+    close() { this.open = false; }
   }
   const elements = new Map(), timers = new Map(), calls = [], events = new Map(), storage = options.storage || {};
   let nextTimer = 0;
@@ -187,7 +189,7 @@ function panel(respond, options = {}) {
         if (selector === '[data-view]') return panels;
         const nodes = [...new Set([...elements.values()].flatMap(walk))];
         if (selector.startsWith('.')) return nodes.filter(node => node.className === selector.slice(1));
-        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase'}[selector];
+        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase', '[data-wake-account]': 'wakeAccount'}[selector];
         return attribute ? nodes.filter(node => Object.hasOwn(node.dataset, attribute)) : [];
       }},
     location: options.location || location, navigator: {userAgent: 'fixture'},
@@ -209,6 +211,85 @@ function panel(respond, options = {}) {
   return {get, timers, calls, nav, panels, events, tick, storage, document: context.document, clock: context};
 }
 function basic(url) { return url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
+
+test('overview immediate wake opens consent for the exact account without navigating or saving drafts', async () => {
+  let posted;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-jobs') && options.method === 'POST') { posted = options; return [202, {...view('a', 20), job_id: 'quick-wake-job', account_id: JSON.parse(options.body).account_id, phase: 'queued'}]; }
+    if (url.endsWith('/model-settings')) return [200, modelSettings(1, modelConfig({default_model: 'saved-model'}))];
+    return wakeResponse(url, undefined);
+  });
+  await ui.get('connect').onclick();
+  ui.get('wake-account').value = 'unrelated manual draft';
+  const row = ui.get('accounts').children[0], buttons = row.children[5].children[0], wake = buttons.children[1];
+  assert.equal(buttons.children[0].textContent, '立即查询'); assert.equal(wake.textContent, '立即唤醒');
+  await wake.onclick();
+  assert.equal(ui.get('quick-wake-dialog').open, true); assert.equal(ui.get('page-title').textContent, '运行总览');
+  assert.equal(ui.get('quick-wake-account').textContent, 'codex-01');
+  assert.equal(ui.get('quick-wake-submit').disabled, true);
+  await ui.get('quick-wake-form').onsubmit({preventDefault() {}}); assert.equal(posted, undefined);
+  ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
+  assert.equal(ui.get('quick-wake-submit').disabled, false);
+  await ui.get('quick-wake-form').onsubmit({preventDefault() {}});
+  assert.ok(posted); assert.equal(posted.body, JSON.stringify({account_id: 'codex-01'}));
+  assert.ok(posted.headers['Idempotency-Key']);
+  assert.equal(ui.get('page-title').textContent, '运行总览'); assert.equal(ui.get('quick-wake-dialog').hidden, true);
+  assert.equal(ui.get('wake-account').value, 'unrelated manual draft');
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+  assert.equal(ui.calls.some(call => call.method === 'POST' && call.url.includes('settings')), false);
+});
+test('quick wake cancellation, missing model and disabled accounts cannot submit model tasks', async () => {
+  for (const missing of [false, true]) {
+    const ui = panel(url => url.endsWith('/model-settings') ? [200, modelSettings(1, modelConfig({default_model: missing ? '' : 'saved-model'}))] : wakeResponse(url));
+    await ui.get('connect').onclick();
+    await ui.get('accounts').children[0].children[5].children[0].children[1].onclick();
+    if (missing) {
+      ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
+      assert.equal(ui.get('quick-wake-submit').disabled, true);
+      await ui.get('quick-wake-form').onsubmit({preventDefault() {}});
+    }
+    ui.get('quick-wake-cancel').onclick();
+    assert.equal(ui.get('quick-wake-dialog').hidden, true);
+    assert.equal(ui.get('quick-wake-consent').checked, false);
+    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+  const ui = panel(url => url.includes('/accounts?') ? [200, accountPage(20, [{id: 'disabled', status: 'disabled'}])] : wakeResponse(url));
+  await ui.get('connect').onclick(); const wake = ui.get('accounts').children[0].children[5].children[0].children[1];
+  assert.equal(wake.disabled, true); await wake.onclick(); assert.equal(ui.get('quick-wake-dialog').open, undefined);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('wake response records remain readable and expanded after polling without exposing HTML or resending', async () => {
+  const response = {recorded_at: '2026-10-18T12:00:00Z', stage: 'read', http_status: 429, event: 'response.failed', status: 'failed', upstream_error_code: 'rate_limit_exceeded', error_message: '<img src=x onerror=alert(1)>', response_text: 'Partial safe reply', bytes: 100, completed: false, truncated: true};
+  const job = {...view('a', 20), job_id: 'response-job', account_id: 'codex-01', phase: 'unknown', error_code: 'wake_outcome_unknown', response};
+  const ui = panel(url => url.includes('/wake-jobs?') ? [200, {...view('a', 20), jobs: [job]}] : wakeResponse(url));
+  await openWake(ui);
+  const card = ui.get('wake-history').children[0], details = card.children.find(node => node.dataset.renderKey === 'wake-response');
+  assert.ok(details); details.open = true;
+  assert.match(details.textContent, /429/); assert.match(details.textContent, /rate_limit_exceeded/); assert.match(details.textContent, /Partial safe reply/);
+  const text = details.children.find(node => node.textContent === response.error_message);
+  assert.equal(text.children.length, 0);
+  await ui.tick(5000);
+  assert.equal(ui.get('wake-history').children[0].children.find(node => node.dataset.renderKey === 'wake-response'), details);
+  assert.equal(details.open, true); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('quick wake lost acknowledgement locks every account button and never submits a replacement', async () => {
+  let writes = 0;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-jobs') && options.method === 'POST') { writes++; throw new Error('fixture disconnected'); }
+    if (url.endsWith('/model-settings')) return [200, modelSettings(1, modelConfig({default_model: 'saved-model'}))];
+    return wakeResponse(url);
+  });
+  await ui.get('connect').onclick();
+  const wakeButton = () => ui.get('accounts').children[0].children[5].children[0].children[1];
+  await wakeButton().onclick();
+  ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
+  await ui.get('quick-wake-form').onsubmit({preventDefault() {}});
+  assert.equal(writes, 1); assert.equal(wakeButton().disabled, true);
+  assert.match(ui.get('wake-manual-message').textContent, /尚未确认/);
+  await wakeButton().onclick();
+  assert.equal(ui.get('quick-wake-dialog').hidden, true);
+  await ui.tick(5000); assert.equal(writes, 1); assert.equal(wakeButton().disabled, true);
+});
 
 test('task diagnostics classify safe error codes without echoing arbitrary upstream failures', () => {
   const {taskDiagnostic} = require('../../../internal/v2/daemon/web/panel.js');
@@ -464,10 +545,10 @@ test('account updates reuse rows and buttons while refreshing quota, labels and 
   let revision = 0;
   const ui = panel(url => url.endsWith('/overview') ? [200, overview(++revision)] : [200, accountPage(revision, [{id: 'stable-account', status: revision === 1 ? 'available' : 'disabled', pending_query: revision === 1 ? {phase: 'queued', trigger: 'manual_batch'} : undefined}])]);
   await ui.get('connect').onclick();
-  const row = ui.get('accounts').children[0], action = row.children[5], button = action.children[0];
+  const row = ui.get('accounts').children[0], action = row.children[5], button = action.children[0].children[0];
   await ui.tick(5000);
   assert.equal(ui.get('accounts').children[0], row);
-  assert.equal(row.children[5].children[0], button);
+  assert.equal(row.children[5].children[0].children[0], button);
   assert.match(row.textContent, /已禁用/);
   assert.equal(action.children.length, 1);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
@@ -565,7 +646,7 @@ test('manual single query is immediate, carries no model inputs and retries the 
     return [200, accountPage()];
   });
   await ui.get('connect').onclick();
-  const row = ui.get('accounts').children[0], button = row.children[5].children[0];
+  const row = ui.get('accounts').children[0], button = row.children[5].children[0].children[0];
   await button.onclick();
   const requests = ui.calls.filter(call => call.method === 'POST');
   assert.equal(requests.length, 2); assert.equal(requests[0].body, requests[1].body);
@@ -660,7 +741,7 @@ test('same-origin saved authentication connects automatically on opening', async
 test('disconnect clears timers and disables stale per-account actions', async () => {
   const ui = panel(basic); await ui.get('connect').onclick(); ui.get('disconnect').onclick();
   assert.equal(ui.timers.size, 0); assert.equal(ui.get('query').disabled, true);
-  const rowButton = ui.get('accounts').children[0].children[5].children[0];
+  const rowButton = ui.get('accounts').children[0].children[5].children[0].children[0];
   assert.equal(rowButton.disabled, true); const reads = ui.calls.length; await rowButton.onclick(); assert.equal(ui.calls.length, reads);
 });
 test('navigation moves the same table without losing current account data', async () => {
@@ -985,8 +1066,8 @@ test('queue-only view changes reload accounts and failed reads do not commit the
   assert.equal(ui.get('error').hidden, false); await ui.tick(5000); assert.equal(reads, 3);
   assert.match(ui.get('accounts').textContent, /等待查询 · 手动批量 · 处于排除时段/);
   assert.match(ui.get('accounts').textContent, /后计划查询/);
-  assert.equal(ui.get('accounts').children[0].children[5].children[0].textContent, '立即查询');
-  assert.equal(ui.get('accounts').children[0].children[5].children[0].disabled, false);
+  assert.equal(ui.get('accounts').children[0].children[5].children[0].children[0].textContent, '立即查询');
+  assert.equal(ui.get('accounts').children[0].children[5].children[0].children[0].disabled, false);
 });
 test('queue countdown, trigger and hold reasons appear in task summaries and item detail', async () => {
   const due = new Date(Date.now() + 90000).toISOString();

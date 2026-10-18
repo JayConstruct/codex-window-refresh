@@ -1,6 +1,6 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 8 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 9 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
 CREATE TABLE IF NOT EXISTS accounts(
  id TEXT PRIMARY KEY, auth_index TEXT NOT NULL, status TEXT NOT NULL,
  quota TEXT, observed_at TEXT, updated_at TEXT NOT NULL
@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS wake_jobs(
  hold_until TEXT NOT NULL DEFAULT '', next_check_at TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS wake_account_live ON wake_jobs(account_id,binding) WHERE phase IN ('queued','checking','prepared','sending','verifying','unknown');
+CREATE TABLE IF NOT EXISTS wake_responses(
+ job_id TEXT PRIMARY KEY REFERENCES wake_jobs(id) ON DELETE CASCADE,
+ detail TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS wake_jobs_queue ON wake_jobs(phase,scheduled_at);
 CREATE TABLE IF NOT EXISTS wake_cycles(
  account_id TEXT NOT NULL, binding TEXT NOT NULL, reason TEXT NOT NULL, cycle TEXT NOT NULL,

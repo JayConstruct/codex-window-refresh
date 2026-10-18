@@ -18,27 +18,29 @@ type WakeRequest struct {
 }
 
 type WakeJob struct {
-	ID                   string  `json:"job_id"`
-	AccountID            string  `json:"account_id"`
-	Reason               string  `json:"reason"`
-	Phase                string  `json:"phase"`
-	ErrorCode            string  `json:"error_code,omitempty"`
-	HoldReason           string  `json:"hold_reason,omitempty"`
-	ScheduledAt          string  `json:"scheduled_at"`
-	CreatedAt            string  `json:"created_at"`
-	UpdatedAt            string  `json:"updated_at"`
-	InstanceID           string  `json:"instance_id,omitempty"`
-	Account              Account `json:"-"`
-	Cycle                string  `json:"-"`
-	QueryJobID           string  `json:"-"`
-	QueryGate            string  `json:"-"`
-	Model                string  `json:"-"`
-	Prompt               string  `json:"-"`
-	PolicyRevision       uint64  `json:"-"`
-	ModelRevision        uint64  `json:"-"`
-	VerificationAttempts int     `json:"-"`
-	HoldUntil            string  `json:"-"`
-	NextCheckAt          string  `json:"-"`
+	Revision             uint64        `json:"view_revision"`
+	ID                   string        `json:"job_id"`
+	AccountID            string        `json:"account_id"`
+	Reason               string        `json:"reason"`
+	Phase                string        `json:"phase"`
+	ErrorCode            string        `json:"error_code,omitempty"`
+	HoldReason           string        `json:"hold_reason,omitempty"`
+	ScheduledAt          string        `json:"scheduled_at"`
+	CreatedAt            string        `json:"created_at"`
+	UpdatedAt            string        `json:"updated_at"`
+	InstanceID           string        `json:"instance_id,omitempty"`
+	Response             *WakeResponse `json:"response,omitempty"`
+	Account              Account       `json:"-"`
+	Cycle                string        `json:"-"`
+	QueryJobID           string        `json:"-"`
+	QueryGate            string        `json:"-"`
+	Model                string        `json:"-"`
+	Prompt               string        `json:"-"`
+	PolicyRevision       uint64        `json:"-"`
+	ModelRevision        uint64        `json:"-"`
+	VerificationAttempts int           `json:"-"`
+	HoldUntil            string        `json:"-"`
+	NextCheckAt          string        `json:"-"`
 }
 
 type WakeJobPage struct {
@@ -57,9 +59,25 @@ func scanWake(row interface{ Scan(...any) error }) (WakeJob, error) {
 }
 
 func (st *Store) Wake(ctx context.Context, id string) (WakeJob, error) {
-	job, err := scanWake(st.db.QueryRowContext(ctx, "SELECT "+wakeColumns+" FROM wake_jobs WHERE id=?", id))
+	tx, err := st.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return WakeJob{}, err
+	}
+	defer tx.Rollback()
+	var revision uint64
+	if err = tx.QueryRowContext(ctx, "SELECT revision FROM view_state WHERE singleton=1").Scan(&revision); err != nil {
+		return WakeJob{}, err
+	}
+	job, err := scanWake(tx.QueryRowContext(ctx, "SELECT "+wakeColumns+" FROM wake_jobs WHERE id=?", id))
+	job.Revision = revision
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
+	}
+	if err == nil {
+		job.Response, err = loadWakeResponse(ctx, tx, id)
+	}
+	if err == nil {
+		err = tx.Commit()
 	}
 	return job, err
 }
@@ -93,6 +111,13 @@ func (st *Store) WakeJobs(ctx context.Context, limit int) (WakeJobPage, error) {
 	rows.Close()
 	if err != nil {
 		return page, err
+	}
+	for index := range page.Jobs {
+		page.Jobs[index].Revision = page.Revision
+		page.Jobs[index].Response, err = loadWakeResponse(ctx, tx, page.Jobs[index].ID)
+		if err != nil {
+			return page, err
+		}
 	}
 	return page, tx.Commit()
 }
@@ -187,15 +212,27 @@ func updateWake(ctx context.Context, tx *sql.Tx, job WakeJob, phase, code, hold 
 
 func (st *Store) RecoverWakes(ctx context.Context) error {
 	return st.write(ctx, func(tx *sql.Tx) error {
+		interrupted := NormalizeWakeResponse(WakeResponse{RecordedAt: now(), Stage: "interrupted", ErrorCode: "wake_interrupted"})
+		raw, err := json.Marshal(interrupted)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT INTO wake_responses(job_id,detail) SELECT id,? FROM wake_jobs WHERE phase='sending' ON CONFLICT(job_id) DO UPDATE SET detail=excluded.detail", string(raw)); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, "UPDATE wake_jobs SET phase='queued',model='',prompt='',hold_reason='',updated_at=? WHERE phase='prepared'", now()); err != nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, "UPDATE wake_jobs SET phase='unknown',error_code='wake_interrupted',hold_reason='verification_pending',query_job_id='',query_gate=?,updated_at=? WHERE phase='sending'", now(), now())
+		_, err = tx.ExecContext(ctx, "UPDATE wake_jobs SET phase='unknown',error_code='wake_interrupted',hold_reason='verification_pending',query_job_id='',query_gate=?,updated_at=? WHERE phase='sending'", now(), now())
 		return err
 	})
 }
 
 func (st *Store) FinishWake(ctx context.Context, id, phase, code string, at time.Time) error {
+	return st.FinishWakeWithResponse(ctx, id, phase, code, at, nil)
+}
+
+func (st *Store) FinishWakeWithResponse(ctx context.Context, id, phase, code string, at time.Time, response *WakeResponse) error {
 	if phase != "verifying" && phase != "unknown" && phase != "failed" && !(phase == "queued" && code == "model_busy") {
 		return ErrInvalidWakeRequest
 	}
@@ -205,11 +242,27 @@ func (st *Store) FinishWake(ctx context.Context, id, phase, code string, at time
 		code = "wake_outcome_unknown"
 	}
 	return st.write(ctx, func(tx *sql.Tx) error {
+		var result sql.Result
+		var err error
 		if phase == "queued" {
-			_, err := tx.ExecContext(ctx, "UPDATE wake_jobs SET phase='queued',error_code='',hold_reason='model_busy',next_check_at=?,query_gate='',model='',prompt='',hold_until='',updated_at=? WHERE id=? AND phase='sending'", queryStamp(at.Add(time.Second)), queryStamp(at), id)
+			result, err = tx.ExecContext(ctx, "UPDATE wake_jobs SET phase='queued',error_code='',hold_reason='model_busy',next_check_at=?,query_gate='',model='',prompt='',hold_until='',updated_at=? WHERE id=? AND phase='sending'", queryStamp(at.Add(time.Second)), queryStamp(at), id)
+		} else {
+			result, err = tx.ExecContext(ctx, "UPDATE wake_jobs SET phase=?,error_code=?,hold_reason=?,query_job_id='',query_gate=?,scheduled_at=?,updated_at=? WHERE id=? AND phase='sending'", phase, code, "verification_pending", queryStamp(at), queryStamp(at), queryStamp(at), id)
+		}
+		if err != nil || response == nil {
 			return err
 		}
-		_, err := tx.ExecContext(ctx, "UPDATE wake_jobs SET phase=?,error_code=?,hold_reason=?,query_job_id='',query_gate=?,scheduled_at=?,updated_at=? WHERE id=? AND phase='sending'", phase, code, "verification_pending", queryStamp(at), queryStamp(at), queryStamp(at), id)
+		changed, err := result.RowsAffected()
+		if err != nil || changed == 0 {
+			return err
+		}
+		copy := NormalizeWakeResponse(*response)
+		copy.RecordedAt = queryStamp(at)
+		raw, err := json.Marshal(copy)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, "INSERT INTO wake_responses(job_id,detail) VALUES(?,?) ON CONFLICT(job_id) DO UPDATE SET detail=excluded.detail", id, string(raw))
 		return err
 	})
 }

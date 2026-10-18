@@ -214,6 +214,17 @@
     <section data-view="diagnostics" aria-label="诊断与设置" hidden><div class="detail-grid"><section class="card detail-card"><div class="card-heading"><h2>连接诊断</h2><svg class="icon muted" aria-hidden="true"><use href="#icon-settings"/></svg></div><div id="diagnostics-content" class="diagnostics-list"><p class="empty-state">连接后显示后台实际状态</p></div></section><section class="card detail-card"><div class="card-heading"><h2>功能边界</h2></div><ul class="feature-list"><li><strong>数据来自真实后台</strong><span>未连接时不展示模拟账号或虚构指标。</span></li><li><strong>额度查询与模型请求分离</strong><span>当前额度查询不执行模型唤醒，不解除账号禁用。</span></li><li><strong>后台独立运行</strong><span>关闭页面不停止后台同步，重开页面后读取最新数据。</span></li><li><strong>查询能力以后台为准</strong><span id="diagnostic-query-note">连接后核实自动查询和随机延迟能力。模型唤醒及提示词配置尚未接入。</span></li></ul></section></div></section>
     <footer class="page-footer"><span>窗口助手 V2 · 真实后台数据</span><span>额度查询与模型请求分离</span></footer>
   </main>
+  <dialog id="quick-wake-dialog" class="quick-wake-dialog" aria-labelledby="quick-wake-title" hidden>
+    <form id="quick-wake-form" novalidate>
+      <h2 id="quick-wake-title">立即唤醒此账号</h2>
+      <p id="quick-wake-account" class="quick-wake-account"></p>
+      <p id="quick-wake-model" class="field-help">正在读取已保存模型…</p>
+      <p class="section-description">后台先查询额度并检查活动及账号绑定；符合条件才发送。不会绕过禁用、已有窗口或未知结果保护，也不会保存其他页面草稿。</p>
+      <label class="wake-consent" for="quick-wake-consent"><input id="quick-wake-consent" type="checkbox"><span>我确认唤醒此账号，符合条件时可能消耗一次模型请求额度。</span></label>
+      <div class="settings-actions"><button id="quick-wake-submit" class="button button-primary" type="submit" disabled>确认并唤醒</button><button id="quick-wake-cancel" class="button button-outline" type="button">取消</button></div>
+      <button id="quick-wake-history" class="text-button" type="button">查看唤醒记录</button>
+    </form>
+  </dialog>
   <section id="toast-region" class="toast-region" aria-label="操作提示" tabindex="-1"><p id="catalog-feedback" hidden></p></section>
   <script src="panel.js"></script>
 </body>

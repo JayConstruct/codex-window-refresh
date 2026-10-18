@@ -26,6 +26,32 @@ func (c *CPA) WakeAvailable() bool {
 }
 
 func (c *CPA) ExecuteWake(ctx context.Context, account store.Account, model, prompt string) (resultErr error) {
+	_, err := c.ExecuteWakeWithResponse(ctx, account, model, prompt)
+	return err
+}
+
+func (c *CPA) ExecuteWakeWithResponse(ctx context.Context, account store.Account, model, prompt string) (response store.WakeResponse, resultErr error) {
+	response.Stage = "preflight"
+	resultErr = c.executeWake(ctx, account, model, prompt, &response)
+	if resultErr != nil {
+		response.ErrorCode = resultErr.Error()
+	}
+	if errors.Is(resultErr, context.DeadlineExceeded) {
+		response.ErrorCode = "context_deadline_exceeded"
+	}
+	if errors.Is(resultErr, context.Canceled) {
+		response.ErrorCode = "context_canceled"
+	}
+	if ctx.Err() != nil {
+		response.ErrorCode = "context_canceled"
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			response.ErrorCode = "context_deadline_exceeded"
+		}
+	}
+	return store.NormalizeWakeResponse(response), resultErr
+}
+
+func (c *CPA) executeWake(ctx context.Context, account store.Account, model, prompt string, response *store.WakeResponse) (resultErr error) {
 	if model == "" || len(model) > 200 || !utf8.ValidString(model) || strings.IndexFunc(model, func(value rune) bool { return unicode.IsSpace(value) || unicode.IsControl(value) }) >= 0 || strings.TrimSpace(prompt) == "" || !policy.ValidGenerationPrompt(prompt) {
 		return errors.New("wake_request_invalid")
 	}
@@ -80,7 +106,9 @@ func (c *CPA) ExecuteWake(ctx context.Context, account store.Account, model, pro
 		return errors.New("account_binding_changed")
 	}
 	var opened generationOpened
+	response.Stage = "open"
 	err := c.Host.Call(ctx, "host.model.execute_stream", request, &opened)
+	response.HTTPStatus = opened.StatusCode
 	if opened.StreamID == "" && err != nil && err.Error() == "model_budget_busy" {
 		return errors.New("wake_model_busy")
 	}
@@ -110,25 +138,44 @@ func (c *CPA) ExecuteWake(ctx context.Context, account store.Account, model, pro
 		<-closeJoined
 		closeModel()
 		if closeErr != nil || ctx.Err() != nil {
+			response.CloseFailed = closeErr != nil
+			if closeErr != nil {
+				response.Stage = "close"
+			} else {
+				response.Stage = "interrupted"
+			}
 			resultErr = unknown()
 		}
 	}()
-	if err != nil || opened.StatusCode < 200 || opened.StatusCode >= 300 {
+	recorder := wakeRecorder{response: response, prompt: prompt}
+	defer recorder.finish()
+	if err != nil {
 		return unknown()
 	}
-	stream := candidateStream{discardText: true}
+	response.Stage = "read"
+	stream := candidateStream{discardText: true, observe: recorder.capture}
 	for reads := 0; reads < 1024; reads++ {
 		var chunk generationRead
 		if c.Host.Call(ctx, "host.model.stream_read", generationHandle{opened.StreamID}, &chunk) != nil {
+			response.ErrorMessage = "CPA 模型响应流读取失败，未保存原始错误。"
 			return unknown()
 		}
+		response.Bytes += len(chunk.Payload)
 		if !stream.accept(chunk.Payload) || chunk.Error != "" || ctx.Err() != nil {
+			if chunk.Error != "" && response.ErrorMessage == "" {
+				response.ErrorMessage = "CPA 上报模型响应流异常，未保存原始错误。"
+			}
 			return unknown()
 		}
 		if chunk.Done {
 			if !stream.finish() {
 				return unknown()
 			}
+			if opened.StatusCode < 200 || opened.StatusCode >= 300 {
+				return unknown()
+			}
+			response.Stage = "completed"
+			response.Completed = true
 			return nil
 		}
 	}

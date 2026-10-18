@@ -179,6 +179,7 @@ func (c *CPA) GenerateCandidatesWithPrompt(ctx context.Context, account store.Ac
 }
 
 type candidateStream struct {
+	observe     func(json.RawMessage)
 	discardText bool
 	pending     []byte
 	total       int
@@ -244,6 +245,9 @@ func generationHasError(raw json.RawMessage) bool {
 func (stream *candidateStream) process(raw []byte) {
 	if string(raw) == "[DONE]" {
 		return
+	}
+	if stream.observe != nil {
+		stream.observe(raw)
 	}
 	var event struct {
 		Type     string          `json:"type"`
