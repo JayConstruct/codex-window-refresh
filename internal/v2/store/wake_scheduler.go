@@ -24,14 +24,18 @@ func wakePriority(reason string) int {
 	}
 }
 
-func enqueueWake(ctx context.Context, tx *sql.Tx, account Account, reason, cycle string, at, due time.Time, gate string) (bool, error) {
-	var previousCycle, previousPhase string
-	err := tx.QueryRowContext(ctx, "SELECT c.cycle,COALESCE(w.phase,'') FROM wake_cycles c LEFT JOIN wake_jobs w ON w.id=c.job_id WHERE c.account_id=? AND c.binding=? AND c.reason=?", account.ID, account.Binding, reason).Scan(&previousCycle, &previousPhase)
+func enqueueWake(ctx context.Context, tx *sql.Tx, account Account, reason, cycle string, at, due time.Time, gate string, capacityMissing bool) (bool, error) {
+	var previousCycle, previousPhase, previousHold string
+	err := tx.QueryRowContext(ctx, "SELECT c.cycle,COALESCE(w.phase,''),COALESCE(w.hold_reason,'') FROM wake_cycles c LEFT JOIN wake_jobs w ON w.id=c.job_id WHERE c.account_id=? AND c.binding=? AND c.reason=?", account.ID, account.Binding, reason).Scan(&previousCycle, &previousPhase, &previousHold)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
 	if err == nil && previousCycle == cycle && previousPhase != "cancelled" {
-		return false, nil
+		// Capacity can fall later in the same reset cycle. Only a known-unsent
+		// capacity skip may be reconsidered, and only when demand has returned.
+		if previousPhase != "skipped" || previousHold != "capacity_satisfied" || !capacityMissing {
+			return false, nil
+		}
 	}
 	var id, existingReason, phase string
 	err = tx.QueryRowContext(ctx, "SELECT id,reason,phase FROM wake_jobs WHERE account_id=? AND binding=? AND phase IN ('queued','checking','prepared','sending','verifying','unknown')", account.ID, account.Binding).Scan(&id, &existingReason, &phase)
@@ -79,6 +83,16 @@ func (st *Store) ScheduleWakes(ctx context.Context, at time.Time, boot string) (
 		ready, err := wakeInventoryReady(ctx, tx, at)
 		if err != nil || !ready {
 			return err
+		}
+		// Enqueuing does not reserve capacity. All same-cycle reconsiderations
+		// in this transaction can share one capacity read; dispatch rechecks it.
+		capacityMissing := false
+		if settings.Config.Enabled && (settings.Config.FiveHour || settings.Config.DailyEnabled) {
+			missing, _, err := wakeCapacity(ctx, tx, settings.Config, at, "")
+			if err != nil {
+				return err
+			}
+			capacityMissing = missing > 0
 		}
 		var cursor string
 		if err = tx.QueryRowContext(ctx, "SELECT account_id FROM wake_cursor WHERE singleton=1").Scan(&cursor); err != nil {
@@ -195,7 +209,7 @@ func (st *Store) ScheduleWakes(ctx context.Context, at time.Time, boot string) (
 					}
 					due = at.Add(delay)
 				}
-				made, err := enqueueWake(ctx, tx, account, entry.reason, entry.cycle, at, due, gate)
+				made, err := enqueueWake(ctx, tx, account, entry.reason, entry.cycle, at, due, gate, capacityMissing)
 				if err != nil {
 					return err
 				}

@@ -506,3 +506,174 @@ func TestWakeKnownUnsentBudgetCanRequeueButUnknownNeverCan(t *testing.T) {
 		t.Fatal("unknown was requeued", current)
 	}
 }
+
+func TestWakeCapacitySatisfiedEndsUnsentJobsAndRearmsOnDemand(t *testing.T) {
+	for _, reason := range []string{"five_hour_reset", "daily"} {
+		for _, phase := range []string{"queued", "checking", "prepared"} {
+			t.Run(reason+"/"+phase, func(t *testing.T) {
+				ctx := context.Background()
+				storage, accounts, at := wakeStoreFixture(t, 2)
+				// The other account has an active window but no usable permission yet.
+				other := wakeStoreQuota(t, storage, accounts[1], at, core.WindowActive, at.Add(5*time.Hour), at.Add(24*time.Hour))
+				blocked := core.PermissionBlocked
+				other.Permission = &blocked
+				wakeStoreSnapshot(t, storage, accounts[1], other)
+				config := policy.DefaultWake()
+				config.Enabled, config.FiveHour = true, reason == "five_hour_reset"
+				config.DailyEnabled = reason == "daily"
+				config.DailyTarget = 0
+				if config.DailyEnabled {
+					config.DailyTarget = 1
+				}
+				config.Timezone, config.DailyWindow = "UTC", "00:00-24:00"
+				config.Delay, config.AllowedHours = policy.Delay{}, []string{}
+				wakeStoreEnable(t, storage, config)
+				want := 1
+				if reason == "daily" {
+					want = 2
+				}
+				if count, err := storage.ScheduleWakes(ctx, at, "boot"); err != nil || count != want {
+					t.Fatal(count, err)
+				}
+				job := wakeStoreJobs(t, storage)[0]
+				if reason == "daily" {
+					// Daily scheduling also records a task for the other account.
+					for _, candidate := range wakeStoreJobs(t, storage) {
+						if candidate.AccountID == accounts[0].ID {
+							job = candidate
+						}
+					}
+				}
+				if _, err := storage.db.Exec("UPDATE wake_jobs SET scheduled_at=CASE WHEN id=? THEN ? ELSE ? END", job.ID, queryStamp(at), queryStamp(at.Add(time.Hour))); err != nil {
+					t.Fatal(err)
+				}
+				if phase == "prepared" {
+					if _, err := storage.PrepareWake(ctx, at); err != nil {
+						t.Fatal(err)
+					}
+				} else if phase == "checking" {
+					if _, err := storage.db.Exec("UPDATE accounts SET quota=NULL WHERE id=?", accounts[0].ID); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := storage.PrepareWake(ctx, at); !errors.Is(err, ErrNotFound) {
+						t.Fatal(err)
+					}
+				}
+				// Another account supplies the required capacity before the model is sent.
+				settledAt := at.Add(2 * time.Second)
+				wakeStoreActivity(t, storage, settledAt, 1)
+				wakeStoreQuota(t, storage, accounts[1], settledAt, core.WindowActive, at.Add(5*time.Hour), at.Add(24*time.Hour))
+				if phase == "prepared" {
+					if _, err := storage.AuthorizeWake(ctx, job.ID, settledAt); !errors.Is(err, ErrNotFound) {
+						t.Fatal("capacity changed before send", err)
+					}
+				} else if _, err := storage.PrepareWake(ctx, settledAt); !errors.Is(err, ErrNotFound) {
+					t.Fatal("unnecessary model prepared", err)
+				}
+				skipped, err := storage.Wake(ctx, job.ID)
+				if err != nil || skipped.Phase != "skipped" || skipped.HoldReason != "capacity_satisfied" || skipped.ErrorCode != "" || skipped.NextCheckAt != "" {
+					t.Fatal("capacity hold did not terminate", skipped, err)
+				}
+				page := readHistory(t, storage, TaskHistoryFilter{Type: "wake", Search: job.ID})
+				if page.Total != 1 || page.StatusCounts.Skipped != 1 || page.StatusCounts.Running != 0 || page.StatusCounts.Queued != 0 {
+					t.Fatal("old task still displayed as active", page)
+				}
+				for tick := 3; tick <= 5; tick++ {
+					if count, err := storage.ScheduleWakes(ctx, at.Add(time.Duration(tick)*time.Second), "boot"); err != nil || count != 0 {
+						t.Fatal("capacity skip was recreated without demand", count, err)
+					}
+				}
+				// Increased demand can reuse the same expired cycle, while the
+				// historical skipped task remains terminal and unchanged.
+				demandAt := at.Add(6 * time.Second)
+				wakeStoreActivity(t, storage, demandAt, 2)
+				wakeStoreQuota(t, storage, accounts[0], demandAt, core.WindowExpired, at.Add(-time.Second), at.Add(24*time.Hour))
+				if count, err := storage.ScheduleWakes(ctx, demandAt, "boot"); err != nil || count != 1 {
+					t.Fatal("same-cycle demand was lost", count, err)
+				}
+				if count, err := storage.ScheduleWakes(ctx, demandAt, "boot"); err != nil || count != 0 {
+					t.Fatal("same-cycle demand duplicated", count, err)
+				}
+				if _, err := storage.db.Exec("UPDATE wake_jobs SET scheduled_at=? WHERE phase='queued'", queryStamp(demandAt)); err != nil {
+					t.Fatal(err)
+				}
+				replacement, err := storage.PrepareWake(ctx, demandAt)
+				if err != nil || replacement.ID == job.ID || replacement.Cycle != job.Cycle {
+					t.Fatal("replacement not ready for demand", replacement, err)
+				}
+				if _, err = storage.AuthorizeWake(ctx, replacement.ID, demandAt); err != nil {
+					t.Fatal(err)
+				}
+				old, err := storage.Wake(ctx, job.ID)
+				if err != nil || old.Phase != "skipped" || old.UpdatedAt != skipped.UpdatedAt {
+					t.Fatal("historical skip mutated", old, err)
+				}
+				if reason != "five_hour_reset" {
+					return
+				}
+				if err = storage.FinishWake(ctx, replacement.ID, "verifying", "", demandAt); err != nil {
+					t.Fatal(err)
+				}
+				proofAt := demandAt.Add(2 * time.Second)
+				resetAt := proofAt.Add(5 * time.Hour)
+				wakeStoreActivity(t, storage, proofAt, 2)
+				wakeStoreQuota(t, storage, accounts[0], proofAt, core.WindowActive, resetAt, at.Add(24*time.Hour))
+				if _, err = storage.ScheduleWakes(ctx, proofAt, "boot"); err != nil {
+					t.Fatal(err)
+				}
+				verified, err := storage.Wake(ctx, replacement.ID)
+				if err != nil || verified.Phase != "completed" {
+					t.Fatal(verified, err)
+				}
+				// Advance over five hours with fresh inventory and activity, as a
+				// continuously running daemon would observe them.
+				nextAt := resetAt.Add(time.Second)
+				if _, err = storage.db.Exec("UPDATE inventory_state SET last_success_at=?", queryStamp(nextAt)); err != nil {
+					t.Fatal(err)
+				}
+				wakeStoreActivity(t, storage, nextAt, 2)
+				wakeStoreQuota(t, storage, accounts[0], nextAt, core.WindowExpired, resetAt, at.Add(24*time.Hour))
+				wakeStoreQuota(t, storage, accounts[1], nextAt, core.WindowActive, nextAt.Add(5*time.Hour), at.Add(24*time.Hour))
+				// Both observed reset boundaries have passed; the other account's
+				// already-active window will be skipped during its own preflight.
+				if count, err := storage.ScheduleWakes(ctx, nextAt, "boot"); err != nil || count != 2 {
+					t.Fatal("next reset cycle was lost", count, err)
+				}
+				next, err := storage.PrepareWake(ctx, nextAt)
+				if err != nil || next.ID == replacement.ID || next.ID == job.ID || next.Cycle != queryStamp(resetAt) {
+					t.Fatal("old task blocked next reset cycle", next, err)
+				}
+			})
+		}
+	}
+}
+
+func TestWakeCheckingReturnsToQueueWhenAdmissionIsHeld(t *testing.T) {
+	ctx := context.Background()
+	storage, accounts, _ := wakeStoreFixture(t, 1)
+	job, _, err := storage.CreateWake(ctx, "checking-held", WakeRequest{AccountID: accounts[0].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC().Add(time.Millisecond)
+	if _, err = storage.db.Exec("UPDATE accounts SET quota=NULL"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = storage.PrepareWake(ctx, at); !errors.Is(err, ErrNotFound) {
+		t.Fatal(err)
+	}
+	checking, err := storage.Wake(ctx, job.ID)
+	if err != nil || checking.Phase != "checking" {
+		t.Fatal(checking, err)
+	}
+	if _, err = storage.db.Exec("UPDATE event_state SET connected=0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = storage.PrepareWake(ctx, at.Add(2*time.Second)); !errors.Is(err, ErrNotFound) {
+		t.Fatal(err)
+	}
+	queued, err := storage.Wake(ctx, job.ID)
+	if err != nil || queued.Phase != "queued" || queued.HoldReason != "activity_unknown" {
+		t.Fatal("held preflight still displayed as executing", queued, err)
+	}
+}

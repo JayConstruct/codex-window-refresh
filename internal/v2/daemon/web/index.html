@@ -82,7 +82,7 @@
       <div class="overview-grid">
         <div id="overview-account-slot" class="account-slot">
           <section id="account-card" class="account-card card" aria-labelledby="accounts-title">
-            <div class="account-toolbar"><div class="account-heading"><h2 id="accounts-title">账号额度</h2><span id="accounts-count" class="muted">— 个账号</span></div><div class="account-actions"><div class="search-field"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><label for="accounts-search" class="sr-only">搜索账号</label><input id="accounts-search" type="search" placeholder="搜索账号" autocomplete="off"></div><label for="accounts-filter" class="sr-only">筛选账号状态</label><select id="accounts-filter"><option value="all">全部状态</option><option value="available">正常</option><option value="disabled">已禁用</option><option value="unavailable">暂不可用</option><option value="quota_exhausted">额度耗尽</option><option value="quota_restricted">额度受限</option><option value="attention">需要关注</option></select><button type="button" id="query" class="button button-primary" disabled>批量查询</button></div></div>
+            <div class="account-toolbar"><div class="account-heading"><h2 id="accounts-title">账号额度</h2><span id="accounts-count" class="muted">— 个账号</span></div><div class="account-actions"><div class="search-field"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><label for="accounts-search" class="sr-only">搜索账号</label><input id="accounts-search" type="search" placeholder="搜索账号" autocomplete="off"></div><label for="accounts-filter" class="sr-only">筛选账号状态</label><select id="accounts-filter"><option value="all">全部状态</option><option value="available">正常</option><option value="disabled">手动禁用</option><option value="unavailable">暂不可用</option><option value="quota_exhausted">额度耗尽</option><option value="quota_restricted">额度受限</option><option value="attention">需要关注</option></select><button type="button" id="query" class="button button-primary" disabled>批量查询</button></div></div>
             <p id="account-query-note" class="section-description">单账号立即查询 · 批量查询以后台当前能力为准</p>
             <p class="field-help account-status-help">CPA 启用/禁用真实修改认证文件；启用可能恢复业务及自动任务的额度消耗，禁用不发送模型、不清除未知结果防重。仅独立 Codex 认证文件可操作，虚拟子账号及配置密钥不支持。</p>
             <div class="table-scroll" tabindex="0" role="region" aria-label="账号额度表格，可横向滚动">
@@ -158,7 +158,7 @@
             <p id="wake-settings-validation" class="settings-validation" role="alert" hidden></p>
             <div id="wake-settings-conflict" class="settings-conflict" role="status" hidden>后台配置已变化或保存结果待核实。草稿保留；请显式重新读取后再保存。</div>
             <div class="settings-diff"><h3>待保存变更</h3><div id="wake-settings-diff"></div></div>
-            <label class="wake-consent" for="wake-settings-consent"><input id="wake-settings-consent" type="checkbox" disabled><span>我确认开启后的后台唤醒可能持续消耗账号模型额度，关闭网页不会停止执行。</span></label>
+            <label id="wake-settings-consent-row" class="wake-consent" for="wake-settings-consent" hidden><input id="wake-settings-consent" type="checkbox" disabled><span>我确认开启后的后台唤醒可能持续消耗账号模型额度，关闭网页不会停止执行。</span></label>
             <p class="field-help">保存规则不直接提交模型请求；开启后授权后台按规则运行。模型和唤醒提示词使用“模型与提示词”中独立保存的配置，不会顺带保存其他页面草稿。</p>
             <div class="settings-actions"><button id="wake-settings-save" class="button button-primary" type="submit" disabled>保存唤醒规则</button><button id="wake-settings-reload" class="button button-outline" type="button" disabled>重新读取并丢弃草稿</button></div>
             <p id="wake-settings-message" class="field-help" role="status">连接后读取后台设置；自动规则默认关闭。</p>
@@ -243,24 +243,6 @@
     <section data-view="diagnostics" aria-label="诊断与设置" hidden><div class="detail-grid"><section class="card detail-card"><div class="card-heading"><h2>连接诊断</h2><svg class="icon muted" aria-hidden="true"><use href="#icon-settings"/></svg></div><div id="diagnostics-content" class="diagnostics-list"><p class="empty-state">连接后显示后台实际状态</p></div></section><section class="card detail-card"><div class="card-heading"><h2>功能边界</h2></div><ul class="feature-list"><li><strong>数据来自真实后台</strong><span>未连接时不展示模拟账号或虚构指标。</span></li><li><strong>额度查询与模型请求分离</strong><span>当前额度查询不执行模型唤醒，不解除账号禁用。</span></li><li><strong>后台独立运行</strong><span>关闭页面不停止后台同步，重开页面后读取最新数据。</span></li><li><strong>查询能力以后台为准</strong><span id="diagnostic-query-note">连接后核实自动查询和随机延迟能力。模型唤醒及提示词配置尚未接入。</span></li></ul></section></div></section>
     <footer class="page-footer"><span>窗口助手 V2 · 真实后台数据</span><span>额度查询与模型请求分离</span></footer>
   </main>
-  <dialog id="quick-wake-dialog" class="quick-wake-dialog" aria-labelledby="quick-wake-title" hidden>
-    <form id="quick-wake-form" novalidate>
-      <h2 id="quick-wake-title">立即唤醒此账号</h2>
-      <p id="quick-wake-account" class="quick-wake-account"></p>
-      <p id="quick-wake-model" class="field-help">正在读取已保存模型…</p>
-      <p class="section-description">后台先查询额度并检查活动及账号绑定；符合条件才发送。不会绕过禁用、已有窗口或未知结果保护，也不会保存其他页面草稿。</p>
-      <label class="wake-consent" for="quick-wake-consent"><input id="quick-wake-consent" type="checkbox"><span>我确认唤醒此账号，符合条件时可能消耗一次模型请求额度。</span></label>
-      <div class="settings-actions"><button id="quick-wake-submit" class="button button-primary" type="submit" disabled>确认并唤醒</button><button id="quick-wake-cancel" class="button button-outline" type="button">取消</button></div>
-      <button id="quick-wake-history" class="text-button" type="button">查看唤醒记录</button>
-    </form>
-  </dialog>
-  <dialog id="account-status-dialog" class="quick-wake-dialog account-status-dialog" aria-labelledby="account-status-title" hidden>
-    <h2 id="account-status-title">CPA 账号启用 / 禁用</h2>
-    <p id="account-status-account" class="quick-wake-account"></p>
-    <p id="account-status-message" class="field-help" role="status" aria-live="polite"></p>
-    <p class="section-description">启用可能恢复正常业务及已授权自动任务，持续消耗额度。禁用不发送模型、不清除已有未知任务防重；不会改写其他账号的凭据。外部并发修改无法由此锁定。</p>
-    <div class="settings-actions"><button id="account-status-confirm" class="button button-primary" type="button" disabled>确认修改 CPA 状态</button><button id="account-status-verify" class="button button-outline" type="button" hidden disabled>只读核实 CPA 状态</button><button id="account-status-cancel" class="button button-outline" type="button">关闭</button></div>
-  </dialog>
   <dialog id="account-alias-dialog" class="quick-wake-dialog" aria-labelledby="account-alias-title" hidden>
     <form id="account-alias-form" novalidate><h2 id="account-alias-title">编辑浏览器别称</h2><p id="account-alias-account" class="quick-wake-account"></p><label for="account-alias-value" class="field-label">别称（留空恢复打码）</label><input id="account-alias-value" type="text" maxlength="80" autocomplete="off" aria-describedby="account-alias-help"><p id="account-alias-help" class="field-help">只保存在此浏览器、此 CPA 地址的显示偏好中，映射真实账号 ID；不改 CPA 文件名、身份、后台历史或日志。</p><p id="account-alias-message" class="field-help" role="status"></p><div class="settings-actions"><button id="account-alias-save" class="button button-primary" type="submit">保存别称</button><button id="account-alias-cancel" class="button button-outline" type="button">取消</button></div></form>
   </dialog>

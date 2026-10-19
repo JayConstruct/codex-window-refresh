@@ -81,14 +81,14 @@ test('past reset times await verification and disabled is not confused with depl
   assert.match(resetText('2026-10-17T11:00:00Z', Date.parse('2026-10-17T12:00:00Z')), /待核实/);
   assert.equal(resetText('0001-01-01T00:00:00Z'), '重置时间未知');
   assert.equal(age(undefined), '尚未观测');
-  assert.equal(accountStatus({status: 'disabled', quota: {permission: 'blocked'}}).label, '已禁用');
+  assert.equal(accountStatus({status: 'disabled', quota: {permission: 'blocked'}}).label, '手动禁用');
   assert.equal(accountStatus({status: 'available', quota: {permission: 'blocked'}}).label, '额度受限');
   assert.equal(accountStatus({status: 'unavailable'}).label, '暂不可用');
 });
 test('account badges distinguish depletion, restrictions and host state without guessing recovery', () => {
   const exhausted = {status: 'available', quota: {permission: 'allowed', five_hour: {ResetAt: '2000-01-01T00:00:00Z', Remaining: {Value: 0, Unit: 'percent'}}}};
   assert.equal(accountStatus(exhausted).label, '额度耗尽');
-  assert.equal(accountStatus({...exhausted, status: 'disabled', display_status: 'quota_exhausted'}).label, '已禁用');
+  assert.equal(accountStatus({...exhausted, status: 'disabled', display_status: 'quota_exhausted'}).label, '手动禁用');
   assert.equal(accountStatus({...exhausted, status: 'binding_unavailable'}).label, '身份待核实');
   assert.equal(accountStatus({...exhausted, status: 'unavailable'}).label, '暂不可用');
   assert.equal(accountStatus({status: 'available', quota: {weekly: {Remaining: {Value: 0, Unit: 'percent'}}}}).label, '额度耗尽');
@@ -476,65 +476,34 @@ test('active query rows show real waiting and querying counts and only persisted
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
 
-test('a delayed native close event cannot close a reopened quick-wake dialog or inherit its consent', async () => {
-  const ui = panel(url => url.endsWith('/model-settings') ? [200, modelSettings(1, modelConfig({default_model: 'saved-model'}))] : wakeResponse(url));
-  await ui.get('connect').onclick();
-  const wake = ui.get('accounts').children[0].children[5].children[0].children[1];
-  await wake.onclick(); ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
-  ui.get('quick-wake-cancel').onclick(); await wake.onclick();
-  ui.get('quick-wake-dialog').listeners.get('close')();
-  assert.equal(ui.get('quick-wake-dialog').open, true); assert.equal(ui.get('quick-wake-dialog').hidden, false);
-  assert.equal(ui.get('quick-wake-consent').checked, false); assert.equal(ui.get('quick-wake-submit').disabled, true);
-  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
-  ui.get('quick-wake-dialog').open = false; ui.get('quick-wake-dialog').listeners.get('close')();
-  assert.equal(ui.get('quick-wake-dialog').hidden, true);
-});
-
-test('overview immediate wake opens consent for the exact account without navigating or saving drafts', async () => {
-  let posted;
+test('overview wake waits for the saved model, locks duplicate clicks and submits without a dialog', async () => {
+  let release, posted;
   const ui = panel((url, options) => {
+    if (url.endsWith('/model-settings')) return new Promise(resolve => { release = () => resolve([200, modelSettings(1, modelConfig({default_model: 'saved-model'}))]); });
     if (url.endsWith('/wake-jobs') && options.method === 'POST') { posted = options; return [202, {...view('a', 20), job_id: 'quick-wake-job', account_id: JSON.parse(options.body).account_id, phase: 'queued'}]; }
-    if (url.endsWith('/model-settings')) return [200, modelSettings(1, modelConfig({default_model: 'saved-model'}))];
-    return wakeResponse(url, undefined);
+    return wakeResponse(url);
   });
-  await ui.get('connect').onclick();
-  ui.get('wake-account').value = 'unrelated manual draft';
-  const row = ui.get('accounts').children[0], buttons = row.children[5].children[0], wake = buttons.children[1];
-  assert.equal(buttons.children[0].textContent, '立即查询'); assert.equal(wake.textContent, '立即唤醒');
-  await wake.onclick();
-  assert.equal(ui.get('quick-wake-dialog').open, true); assert.equal(ui.get('page-title').textContent, '运行总览');
-  assert.equal(ui.get('quick-wake-account').textContent, 'codex-01');
-  assert.equal(ui.get('quick-wake-submit').disabled, true);
-  await ui.get('quick-wake-form').onsubmit({preventDefault() {}}); assert.equal(posted, undefined);
-  ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
-  assert.equal(ui.get('quick-wake-submit').disabled, false);
-  await ui.get('quick-wake-form').onsubmit({preventDefault() {}});
-  assert.ok(posted); assert.equal(posted.body, JSON.stringify({account_id: 'codex-01'}));
-  assert.ok(posted.headers['Idempotency-Key']);
-  assert.equal(ui.get('page-title').textContent, '运行总览'); assert.equal(ui.get('quick-wake-dialog').hidden, true);
-  assert.equal(ui.get('wake-account').value, 'unrelated manual draft');
+  await ui.get('connect').onclick(); ui.get('wake-account').value = 'unrelated manual draft';
+  const wake = () => ui.get('accounts').children[0].children[5].children[0].children[1];
+  const pending = wake().onclick(); await flush();
+  assert.equal(wake().disabled, true); await wake().onclick(); assert.equal(posted, undefined);
+  assert.equal(ui.get('quick-wake-dialog').open, undefined);
+  release(); await pending;
+  assert.ok(posted); assert.equal(posted.body, JSON.stringify({account_id: 'codex-01'})); assert.ok(posted.headers['Idempotency-Key']);
   assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
-  assert.equal(ui.calls.some(call => call.method === 'POST' && call.url.includes('settings')), false);
+  assert.equal(ui.get('page-title').textContent, '运行总览'); assert.equal(ui.get('wake-account').value, 'unrelated manual draft');
+  assert.equal(ui.get('quick-wake-dialog').open, undefined);
 });
-test('quick wake cancellation, missing model and disabled accounts cannot submit model tasks', async () => {
-  for (const missing of [false, true]) {
-    const ui = panel(url => url.endsWith('/model-settings') ? [200, modelSettings(1, modelConfig({default_model: missing ? '' : 'saved-model'}))] : wakeResponse(url));
-    await ui.get('connect').onclick();
-    await ui.get('accounts').children[0].children[5].children[0].children[1].onclick();
-    if (missing) {
-      ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
-      assert.equal(ui.get('quick-wake-submit').disabled, true);
-      await ui.get('quick-wake-form').onsubmit({preventDefault() {}});
-    }
-    ui.get('quick-wake-cancel').onclick();
-    assert.equal(ui.get('quick-wake-dialog').hidden, true);
-    assert.equal(ui.get('quick-wake-consent').checked, false);
-    assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+test('immediate wake rejects missing models, failed model reads and disabled accounts without opening a dialog', async () => {
+  for (const response of [[200, modelSettings(1, modelConfig({default_model: ''}))], [503, {error: 'backend_unavailable'}]]) {
+    const ui = panel(url => url.endsWith('/model-settings') ? response : wakeResponse(url));
+    await ui.get('connect').onclick(); const wake = () => ui.get('accounts').children[0].children[5].children[0].children[1];
+    await wake().onclick(); assert.equal(wake().disabled, false); assert.match(ui.get('wake-manual-message').textContent, /已保存模型/);
+    assert.equal(ui.get('quick-wake-dialog').open, undefined); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
   }
   const ui = panel(url => url.includes('/accounts?') ? [200, accountPage(20, [{id: 'disabled', status: 'disabled'}])] : wakeResponse(url));
   await ui.get('connect').onclick(); const wake = ui.get('accounts').children[0].children[5].children[0].children[1];
-  assert.equal(wake.disabled, true); await wake.onclick(); assert.equal(ui.get('quick-wake-dialog').open, undefined);
-  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  assert.equal(wake.disabled, true); await wake.onclick(); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
 test('wake response records remain readable and expanded after polling without exposing HTML or resending', async () => {
   const response = {recorded_at: '2026-10-18T12:00:00Z', stage: 'read', http_status: 429, event: 'response.failed', status: 'failed', upstream_error_code: 'rate_limit_exceeded', error_message: '<img src=x onerror=alert(1)>', response_text: 'Partial safe reply', bytes: 100, completed: false, truncated: true};
@@ -560,12 +529,10 @@ test('quick wake lost acknowledgement locks every account button and never submi
   await ui.get('connect').onclick();
   const wakeButton = () => ui.get('accounts').children[0].children[5].children[0].children[1];
   await wakeButton().onclick();
-  ui.get('quick-wake-consent').checked = true; ui.get('quick-wake-consent').onchange();
-  await ui.get('quick-wake-form').onsubmit({preventDefault() {}});
   assert.equal(writes, 1); assert.equal(wakeButton().disabled, true);
   assert.match(ui.get('wake-manual-message').textContent, /尚未确认/);
   await wakeButton().onclick();
-  assert.equal(ui.get('quick-wake-dialog').hidden, true);
+  assert.equal(ui.get('quick-wake-dialog').open, undefined);
   await ui.tick(5000); assert.equal(writes, 1); assert.equal(wakeButton().disabled, true);
 });
 
@@ -1039,7 +1006,7 @@ test('account updates reuse rows and buttons while refreshing quota, labels and 
   await ui.tick(5000);
   assert.equal(ui.get('accounts').children[0], row);
   assert.equal(row.children[5].children[0].children[0], button);
-  assert.match(row.textContent, /已禁用/);
+  assert.match(row.textContent, /手动禁用/);
   assert.equal(action.children.length, 1);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
@@ -1087,7 +1054,7 @@ test('periodic status reads update disabled, exhausted and recovered badges with
     {id: 'status-account', status: 'available', display_status: 'available', quota: {five_hour: {Remaining: {Value: 100, Unit: 'percent'}}}}];
   const ui = panel(url => url.endsWith('/overview') ? [200, {...overview(++revision), inventory: {status: 'ready', refresh_interval_seconds: 30}, dashboard: {...overview().dashboard, normal: 18, quota_exhausted: 1, quota_restricted: 1}}] : [200, accountPage(revision, [accounts[Math.min(revision - 1, 3)]])]);
   await ui.get('connect').onclick(); assert.match(ui.get('accounts').textContent, /正常/);
-  await ui.tick(5000); assert.match(ui.get('accounts').textContent, /已禁用/);
+  await ui.tick(5000); assert.match(ui.get('accounts').textContent, /手动禁用/);
   await ui.tick(5000); assert.match(ui.get('accounts').textContent, /额度耗尽/);
   await ui.tick(5000); assert.match(ui.get('accounts').textContent, /正常/);
   assert.match(ui.get('inventory').textContent, /30 秒/);
@@ -2513,6 +2480,43 @@ test('overview auto wake directly saves only the saved enabled flag and preserve
   assert.equal(settings.config.enabled, false); assert.equal(ui.get('wake-per-user').value, '0.5');
   assert.equal(ui.calls.filter(call => call.method === 'POST').length, 2);
 });
+test('automatic wake spend notice is acknowledged once across toggles, edits and reloads within one CPA mount', async () => {
+  const storage = {}; let settings = wakeSettings(1, wakeConfig({on_five_hour_reset: true}));
+  const response = (url, options) => {
+    if (url.endsWith('/wake-settings') && options.method === 'POST') { settings = wakeSettings(settings.revision + 1, JSON.parse(options.body).config); return [200, settings]; }
+    return wakeResponse(url, settings);
+  };
+  const ui = panel(response, {storage}); await openWake(ui);
+  assert.equal(ui.get('wake-overview-consent-row').hidden, true);
+  ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange();
+  assert.equal(ui.get('wake-overview-consent-row').hidden, false); assert.equal(mutations(ui).length, 0);
+  ui.get('wake-overview-consent').checked = true; await ui.get('wake-overview-consent').onchange();
+  assert.equal(settings.config.enabled, true); assert.equal(ui.get('wake-overview-consent-row').hidden, true);
+  ui.get('auto-wake').checked = false; await ui.get('auto-wake').onchange();
+  ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange(); assert.equal(settings.config.enabled, true);
+  edit(ui, 'wake-per-user', '0.5'); assert.equal(ui.get('wake-settings-consent-row').hidden, true);
+  assert.equal(ui.get('wake-settings-save').disabled, false); await submitWakeSettings(ui);
+  const restored = panel(response, {storage}); await openWake(restored);
+  assert.equal(restored.get('wake-overview-consent-row').hidden, true);
+  restored.get('auto-wake').checked = false; await restored.get('auto-wake').onchange();
+  restored.get('auto-wake').checked = true; await restored.get('auto-wake').onchange(); assert.equal(settings.config.enabled, true);
+  const other = panel(response, {storage, location: {...location, pathname: '/other' + location.pathname}}); await openWake(other);
+  edit(other, 'wake-per-user', '0.75'); assert.equal(other.get('wake-settings-consent-row').hidden, false);
+  assert.equal(other.get('wake-settings-save').disabled, true);
+});
+test('automatic wake acknowledgement lasts for the page when browser storage is blocked', async () => {
+  let settings = wakeSettings(1, wakeConfig({on_five_hour_reset: true}));
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-settings') && options.method === 'POST') { settings = wakeSettings(settings.revision + 1, JSON.parse(options.body).config); return [200, settings]; }
+    return wakeResponse(url, settings);
+  }, {storageBlocked: true});
+  await openWake(ui); ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange();
+  ui.get('wake-overview-consent').checked = true; await ui.get('wake-overview-consent').onchange();
+  ui.get('auto-wake').checked = false; await ui.get('auto-wake').onchange();
+  ui.get('auto-wake').checked = true; await ui.get('auto-wake').onchange();
+  assert.equal(settings.config.enabled, true); assert.equal(mutations(ui).length, 3);
+  assert.equal(ui.get('wake-overview-consent-row').hidden, true);
+});
 test('overview refuses enabling an empty rule set and settings capability alone cannot authorize execution', async () => {
   const ui = panel(url => url.endsWith('/overview') ? [200, wakeOverview('a', {model_execution: false})] : wakeResponse(url));
   await openWake(ui); assert.equal(ui.get('auto-wake').disabled, true); assert.equal(ui.get('wake-enabled').disabled, true);
@@ -2720,7 +2724,7 @@ test('CPA status resolver permits disabled files but rejects ambiguous and non-i
   assert.throws(() => resolveStatusAccount({files: [statusFile({id: 'file-only'})]}, file.name), {code: 'account_status_identity'});
 });
 
-test('CPA account switches PATCH only the uniquely mapped filename and binding then confirm with GET', async () => {
+test('CPA account switches directly PATCH the unique filename/binding and confirm with GET without a dialog', async () => {
   let file = statusFile();
   const ui = panel((url, options) => {
     if (url.endsWith('/auth-files')) return [200, {files: [file]}];
@@ -2729,36 +2733,46 @@ test('CPA account switches PATCH only the uniquely mapped filename and binding t
   });
   await ui.get('connect').onclick(); const button = statusSwitch(ui); button.focus();
   assert.equal(button.getAttribute('role'), 'switch'); assert.equal(button.getAttribute('aria-checked'), 'true');
-  await button.onclick(); assert.equal(ui.calls.some(call => call.method === 'PATCH'), false);
-  assert.match(ui.get('account-status-message').textContent, /不发送模型/);
-  await ui.get('account-status-confirm').onclick();
+  assert.equal(button.children[0].className, 'account-status-track');
+  await button.onclick();
   const writes = ui.calls.filter(call => call.method === 'PATCH'); assert.equal(writes.length, 1);
   assert.deepEqual(JSON.parse(writes[0].body), {name: file.name, auth_index: file.auth_index, disabled: true});
   assert.equal(writes[0].url, '/v0/management/auth-files/status'); assert.equal(writes[0].headers.Authorization, 'Bearer fixture-key');
   assert.equal(writes[0].credentials, 'omit'); assert.equal(writes[0].redirect, 'error');
   assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, 3);
-  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false'); assert.match(ui.get('account-status-state-message').textContent, /只读目录核实/);
-  ui.get('account-status-cancel').onclick(); assert.equal(ui.document.activeElement, button);
-  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
-  await statusSwitch(ui).onclick(); assert.match(ui.get('account-status-confirm').textContent, /启用.*额度消耗/);
-  await ui.get('account-status-confirm').onclick(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true');
-  assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 2);
+  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false');
+  assert.equal(ui.get('accounts').children[0].children[1].textContent, '手动禁用');
+  assert.equal(ui.get('account-status-dialog').open, undefined); assert.equal(ui.document.activeElement, button);
+  await statusSwitch(ui).onclick(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true');
+  assert.equal(ui.get('accounts').children[0].children[1].textContent, '正常');
+  assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 2); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
 
-test('CPA status writes hold a concurrency lock and never report success from the acknowledgement alone', async () => {
-  let file = statusFile(), releasePatch, releaseRead, reads = 0;
+test('CPA direct writes lock from the first read through verification and ignore repeated clicks', async () => {
+  let file = statusFile(), releaseFirst, releasePatch, releaseRead, reads = 0;
   const ui = panel((url, options) => {
-    if (url.endsWith('/auth-files/status')) return new Promise(resolve => { releasePatch = () => { file = {...file, disabled: true}; resolve([200, {status: 'ok', disabled: true}]); }; });
-    if (url.endsWith('/auth-files')) return ++reads === 3 ? new Promise(resolve => { releaseRead = () => resolve([200, {files: [file]}]); }) : [200, {files: [file]}];
+    if (url.endsWith('/auth-files/status')) return new Promise(resolve => { releasePatch = () => { file = {...file, disabled: true}; resolve([200, {status: 'ok'}]); }; });
+    if (url.endsWith('/auth-files')) {
+      reads++;
+      if (reads === 1) return new Promise(resolve => { releaseFirst = () => resolve([200, {files: [file]}]); });
+      if (reads === 3) return new Promise(resolve => { releaseRead = () => resolve([200, {files: [file]}]); });
+      return [200, {files: [file]}];
+    }
     return basic(url);
   });
-  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
-  const pending = ui.get('account-status-confirm').onclick(); await flush();
-  assert.equal(statusSwitch(ui).disabled, true); await ui.get('account-status-confirm').onclick(); await statusSwitch(ui).onclick();
-  assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
+  await ui.get('connect').onclick(); const pending = statusSwitch(ui).onclick(); await flush();
+  assert.equal(statusSwitch(ui).disabled, true); await statusSwitch(ui).onclick(); assert.equal(reads, 1);
+  releaseFirst(); await flush(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true');
+  await statusSwitch(ui).onclick(); assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
   releasePatch(); await flush(); assert.equal(ui.get('account-status-state-message').textContent, '');
-  assert.equal(ui.get('account-status-confirm').disabled, true); releaseRead(); await pending;
+  assert.equal(statusSwitch(ui).disabled, true); releaseRead(); await pending;
   assert.match(ui.get('account-status-state-message').textContent, /已禁用/);
+});
+
+test('a stale displayed status applies the clicked target without reversing a newer external change', async () => {
+  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [statusFile({disabled: true})]}] : basic(url));
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
+  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false'); assert.equal(mutations(ui).length, 0);
 });
 
 test('lost or 5xx PATCH results are never resent and GET-confirmed state is the only success signal', async () => {
@@ -2769,13 +2783,13 @@ test('lost or 5xx PATCH results are never resent and GET-confirmed state is the 
       if (url.endsWith('/auth-files')) return patches && failRead ? [503, {error: 'storage_unavailable'}] : [200, {files: [file]}];
       return basic(url);
     });
-    await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
-    assert.equal(ui.get('account-status-confirm').hidden, true); assert.equal(ui.get('account-status-verify').hidden, false);
+    await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
+    assert.match(statusSwitch(ui).textContent, /核实/);
     assert.equal(statusSwitch(ui).dataset.state, 'unknown'); assert.equal(ui.get('account-status-state-message').parentNode.dataset.tone, 'warning');
-    await ui.get('account-status-confirm').onclick(); await ui.get('account-status-verify').onclick(); assert.equal(patches, 1);
+    await statusSwitch(ui).onclick(); assert.equal(patches, 1);
     await ui.get('refresh').onclick(); assert.equal(statusSwitch(ui).dataset.state, 'unknown');
-    failRead = false; await ui.get('account-status-verify').onclick(); assert.equal(patches, 1);
-    assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false'); assert.match(ui.get('account-status-message').textContent, /已通过 CPA/);
+    failRead = false; await statusSwitch(ui).onclick(); assert.equal(patches, 1);
+    assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false'); assert.match(ui.get('account-status-state-message').textContent, /已通过 CPA/);
   }
 });
 
@@ -2785,7 +2799,7 @@ test('CPA post-persist failure can be confirmed by GET without replaying the mut
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [500, {error: 'hook failed'}]; }
     return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
   });
-  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   assert.equal(statusSwitch(ui).dataset.state, 'confirmed'); assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
 });
 
@@ -2798,11 +2812,11 @@ test('CPA status identity changes before and after PATCH fail closed without tou
       if (url.endsWith('/auth-files/status')) return [200, {status: 'ok', disabled: true}];
       return basic(url);
     });
-    await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+    await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
     assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, afterPatch ? 1 : 0);
     assert.equal(statusSwitch(ui).dataset.state, afterPatch ? 'unknown' : 'error');
     assert.equal(ui.get('account-status-state-message').textContent.includes('已通过'), false);
-    if (afterPatch) { restore = true; await ui.get('account-status-verify').onclick(); assert.equal(statusSwitch(ui).dataset.state, 'confirmed'); }
+    if (afterPatch) { restore = true; await statusSwitch(ui).onclick(); assert.equal(statusSwitch(ui).dataset.state, 'confirmed'); }
   }
 });
 
@@ -2810,7 +2824,7 @@ test('unsafe runtime and virtual row identities cannot toggle parent credentials
   for (const extra of [{runtime_only: true}, {plugin_virtual_child: true}, {attributes: {plugin_virtual_parent: 'parent'}}]) {
     const ui = panel(url => url.includes('/accounts?') ? [200, accountPage(1, [{id: 'codex-01', status: 'available', ...extra}])] : basic(url));
     await ui.get('connect').onclick(); assert.equal(statusSwitch(ui).disabled, true);
-    await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+    await statusSwitch(ui).onclick();
     assert.equal(ui.calls.some(call => call.url.includes('/auth-files')), false);
   }
 });
@@ -2821,10 +2835,11 @@ test('explicit refresh reconciles external CPA changes without stale daemon acco
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
     return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
   });
-  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   await ui.get('refresh').onclick(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false');
+  assert.equal(ui.get('accounts').children[0].children[1].textContent, '手动禁用');
   file = {...file, disabled: false}; await ui.get('refresh').onclick();
-  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true'); assert.match(ui.get('account-status-message').textContent, /重新只读核实/);
+  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true'); assert.equal(ui.get('accounts').children[0].children[1].textContent, '正常');
 });
 
 test('authentication loss during CPA PATCH preserves unknown intent across reconnect without a second write', async () => {
@@ -2833,10 +2848,9 @@ test('authentication loss during CPA PATCH preserves unknown intent across recon
     if (url.endsWith('/auth-files/status')) { patched = true; return [401, {error: 'unauthorized'}]; }
     return url.endsWith('/auth-files') ? [200, {files: [statusFile({disabled: patched})]}] : basic(url);
   });
-  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   assert.equal(ui.get('login-section').hidden, false); ui.get('key').value = 'reconnected-key'; await ui.get('connect').onclick();
-  await statusSwitch(ui).onclick(); assert.equal(ui.get('account-status-confirm').hidden, true);
-  await ui.get('account-status-verify').onclick(); assert.equal(statusSwitch(ui).dataset.state, 'confirmed');
+  await statusSwitch(ui).onclick(); assert.equal(statusSwitch(ui).dataset.state, 'confirmed');
   assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
 });
 
@@ -2968,8 +2982,7 @@ test('automatic CPA confirmation reads follow later external changes instead of 
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
     return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
   });
-  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
-  ui.get('account-status-cancel').onclick();
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   const button = statusSwitch(ui), reads = ui.calls.filter(call => call.url.endsWith('/auth-files')).length;
   button.focus(); await ui.tick(5000);
   assert.equal(button.getAttribute('aria-checked'), 'false', 'stale daemon data rolled back the verified CPA disable');
@@ -2990,8 +3003,7 @@ test('a failed automatic CPA confirmation read neither starves account reads nor
     if (url.endsWith('/overview')) return [200, overview(revision)];
     return [200, accountPage(revision, [{id: 'codex-01', status: 'available'}, {id: 'updated-' + revision, status: 'available'}])];
   });
-  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
-  ui.get('account-status-cancel').onclick();
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   const reads = ui.calls.filter(call => call.url.endsWith('/auth-files')).length;
   failing = true; revision = 2; await ui.tick(5000);
   assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, reads + 1);
@@ -3008,9 +3020,9 @@ test('automatic refresh never retries or silently clears an unknown CPA mutation
     if (url.endsWith('/auth-files')) return patched ? [503, {error: 'storage_unavailable'}] : [200, {files: [statusFile()]}];
     return basic(url);
   });
-  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   assert.equal(statusSwitch(ui).dataset.state, 'unknown');
-  ui.get('account-status-cancel').onclick(); const calls = ui.calls.filter(call => call.url.includes('/auth-files')).length;
+  const calls = ui.calls.filter(call => call.url.includes('/auth-files')).length;
   await ui.tick(5000); await ui.tick(5000);
   assert.equal(statusSwitch(ui).dataset.state, 'unknown');
   assert.equal(ui.calls.filter(call => call.url.includes('/auth-files')).length, calls);

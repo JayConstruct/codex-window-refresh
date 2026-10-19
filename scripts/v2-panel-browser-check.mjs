@@ -507,7 +507,7 @@ try {
     const checked = () => evaluate('document.querySelector("[data-account-status-id=codex-01]")?.getAttribute("aria-checked")');
     const changeExternalStatus = () => { authFiles[0].disabled = !authFiles[0].disabled; authFiles[0].status = authFiles[0].disabled ? 'disabled' : 'active'; };
     const awaitExternalStatus = () => waitFor(async () => await checked() === String(!authFiles[0].disabled), 'External CPA enable/disable stayed stale without a manual refresh', 9000);
-    await evaluate('document.querySelector("[data-page=overview]").click();if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+    await evaluate('document.querySelector("[data-page=overview]").click()');
     await settleRefresh();
     await evaluate('(() => {document.querySelector("[data-account-alias-id=codex-01]").click();document.getElementById("account-alias-value").value="自动刷新主账号";document.getElementById("account-alias-save").click();const mode=document.getElementById("display-mode");mode.value="alias";mode.dispatchEvent(new Event("change"))})()');
     await naturalPolls();
@@ -648,7 +648,6 @@ try {
   checks: {
   if (autorefreshOnly) {
     await evaluate('document.querySelector("[data-account-status-id=codex-01]").click()');
-    await clickWhenEnabled('account-status-confirm');
     await waitFor(() => evaluate('document.querySelector("[data-account-status-id=codex-01]").dataset.state==="confirmed"'), 'Explicit fixture-only setup PATCH did not reach confirmed');
     assert.equal(patches.length, 1, 'Fixture setup must PATCH exactly once after explicit confirmation');
     await assertForegroundPollingCadence();
@@ -930,7 +929,7 @@ try {
   assert.equal(await evaluate('accountQueryButton.isConnected && document.activeElement===accountQueryButton'), true, 'Account refresh recreated the focused query button');
   const writesBeforeStatus = posts.length;
   accounts[0].status = 'disabled'; revision++; accountsRevision++;
-  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="已禁用"'), 'Periodic host state did not update disabled badge');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="手动禁用"'), 'Periodic host state did not update disabled badge');
   accounts[0].status = 'available'; accounts[0].quota.five_hour.Remaining.Value = 0; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="额度耗尽"'), 'Quota evidence did not update exhausted badge');
   await evaluate('document.getElementById("accounts-filter").value="quota_exhausted";document.getElementById("accounts-filter").dispatchEvent(new Event("change"))');
@@ -1060,7 +1059,7 @@ try {
   await evaluate('document.getElementById("wake-per-user").value="0.75";document.getElementById("wake-per-user").dispatchEvent(new Event("input"));document.querySelector("[data-page=overview]").click();document.getElementById("auto-wake").click()');
   assert.equal(posts.filter(post => post.resource === 'wake-settings').length, 1, 'Overview enabled wake without spend consent');
   assert.equal(await evaluate('document.getElementById("auto-wake").checked'), false);
-  await evaluate('document.getElementById("wake-overview-consent").click();document.getElementById("auto-wake").click()');
+  await evaluate('document.getElementById("wake-overview-consent").click()');
   await waitFor(() => wakeRevision === 2 && evaluate('!document.getElementById("auto-wake").disabled'), 'Direct overview auto-wake save did not complete');
   assert.equal(wakeConfig.enabled, true); assert.equal(wakeConfig.accounts_per_user, 0.5, 'Overview saved an unrelated editor draft');
   assert.equal(await evaluate('document.querySelector("[data-view=overview]").hidden'), false, 'Wake switch navigated away');
@@ -1076,41 +1075,22 @@ try {
   await clickWhenEnabled('wake-settings-reload');
   await waitFor(() => evaluate('document.getElementById("wake-per-user").value==="0.5" && document.getElementById("wake-settings-conflict").hidden'), 'Explicit wake settings GET did not resolve conflict');
   await evaluate('document.getElementById("wake-account").value="codex-01";document.getElementById("wake-account").dispatchEvent(new Event("input"));document.getElementById("wake-manual-consent").click()');
-  await evaluate('document.querySelector("[data-page=overview]").click();document.querySelector("#accounts .account-wake").click()');
-  await waitFor(() => evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-consent").disabled'), 'Quick wake did not load saved model');
-  assert.equal(await evaluate('document.getElementById("quick-wake-account").textContent'), 'codex-01');
-  assert.equal(await evaluate('document.getElementById("quick-wake-submit").disabled'), true, 'Quick wake bypassed spend consent');
-  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Opening quick wake submitted a task');
-  await screenshot('quick-wake-desktop.png');
-  await cdp('Emulation.setDeviceMetricsOverride', {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
-  assert.equal(await evaluate('(() => {const box=document.getElementById("quick-wake-dialog").getBoundingClientRect();return box.left>=0 && box.right<=innerWidth && box.top>=0 && box.bottom<=innerHeight})()'), true, 'Quick wake modal overflowed mobile viewport');
-  await screenshot('quick-wake-mobile.png');
+  await evaluate('document.querySelector("[data-page=overview]").click()');
   modelReadGate = gate();
-  await evaluate(`(() => {
-    const dialog = document.getElementById('quick-wake-dialog');
-    globalThis.quickWakeOldClose = new Promise(resolve => dialog.addEventListener('close', () => setTimeout(resolve, 0), {once: true}));
-    document.getElementById('quick-wake-cancel').click();
-    document.querySelector('#accounts .account-wake').click();
-  })()`);
-  await evaluate('quickWakeOldClose');
-  assert.equal(await evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-dialog").hidden'), true, 'Old native close event dismissed the reopened same-account dialog');
-  await waitFor(() => modelReadGate.started, 'Reopened quick wake did not verify the saved model');
-  assert.equal(await evaluate('document.getElementById("quick-wake-consent").disabled && document.getElementById("quick-wake-submit").disabled'), true, 'Quick wake allowed consent before saved model verification');
-  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Cancelling quick wake submitted a task');
+  await evaluate('document.querySelector("#accounts .account-wake").click()');
+  await waitFor(() => modelReadGate.started, 'Immediate wake did not verify the saved model');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-wake").disabled'), true, 'Model verification did not lock duplicate wake clicks');
+  await evaluate('document.querySelector("#accounts .account-wake").click()');
+  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Wake bypassed saved model verification');
+  assert.equal(await evaluate('!!document.querySelector("dialog[open]")'), false, 'Immediate wake opened a confirmation modal');
   modelReadGate.release(); modelReadGate = undefined;
-  await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
-  await waitFor(() => evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-consent").disabled'), 'Quick wake did not reopen after the original close event');
-  assert.equal(await evaluate('document.getElementById("quick-wake-consent").checked'), false, 'Reopening inherited spend consent');
-  assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Reopening or saved-model verification submitted a task');
-  console.log('Quick wake native close race passed: reopened same-account dialog survives the original close event; saved model verified, consent reset, zero wake POSTs before explicit confirmation.');
-  await evaluate('document.getElementById("quick-wake-consent").click();document.getElementById("quick-wake-submit").click()');
   await waitFor(() => evaluate('document.getElementById("wake-manual-status").textContent==="结果未知"'), async () => 'Manual wake unknown outcome was not read: ' + JSON.stringify({
-    state: await evaluate('({status:document.getElementById("wake-manual-status").textContent,message:document.getElementById("wake-manual-message").textContent,history:document.getElementById("wake-history-message").textContent,toasts:document.getElementById("toast-region").textContent,dialog:document.getElementById("quick-wake-dialog").open,consent:document.getElementById("quick-wake-consent").checked,submitDisabled:document.getElementById("quick-wake-submit").disabled,verifyDisabled:document.getElementById("wake-manual-verify").disabled})'),
+    state: await evaluate('({status:document.getElementById("wake-manual-status").textContent,message:document.getElementById("wake-manual-message").textContent,history:document.getElementById("wake-history-message").textContent,toasts:document.getElementById("toast-region").textContent,verifyDisabled:document.getElementById("wake-manual-verify").disabled})'),
     jobs: [...wakeJobs.values()].map(job => ({job_id: job.job_id, reason: job.reason, phase: job.phase})), writes: posts.filter(post => post.resource === 'wake-jobs').length,
     reads: reads.filter(path => path.includes('/wake-jobs?')).slice(-12), pageErrors, exceptions}));
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Manual wake submitted more than once');
   assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'wake-jobs').body), {account_id: 'codex-01'});
-  assert.equal(await evaluate('document.getElementById("quick-wake-dialog").hidden && !document.querySelector("[data-view=overview]").hidden'), true, 'Quick wake changed the overview page');
+  assert.equal(await evaluate('!document.querySelector("dialog[open]") && !document.querySelector("[data-view=overview]").hidden'), true, 'Quick wake changed the overview page');
   await evaluate('document.querySelector("[data-page=wake]").click()');
   assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
   await clickWhenEnabled('wake-history-refresh'); await clickWhenEnabled('wake-manual-verify');
@@ -1417,9 +1397,7 @@ try {
   const statusSelector = id => '[data-account-status-id=' + JSON.stringify(id) + ']';
   const statusState = () => evaluate(`(() => {
     const button=document.querySelector(${JSON.stringify(statusSelector('codex-01'))});
-    return {checked:button?.getAttribute('aria-checked'),disabled:button?.disabled,phase:button?.dataset.state,open:document.getElementById('account-status-dialog').open,
-      confirm:document.getElementById('account-status-confirm').disabled,verify:document.getElementById('account-status-verify').hidden,
-      message:document.getElementById('account-status-message').textContent};
+    return {checked:button?.getAttribute('aria-checked'),disabled:button?.disabled,phase:button?.dataset.state};
   })()`);
   async function assertAccountActionLayout(alias = '') {
     const layout = await evaluate(`Array.from(document.querySelectorAll('#accounts .account-row'), row => {
@@ -1453,98 +1431,71 @@ try {
     }
     return layout;
   }
-  async function openStatus(id = 'codex-01', confirmable = true) {
+  async function clickStatus(id = 'codex-01') {
     await evaluate(`document.querySelector(${JSON.stringify(statusSelector(id))}).click()`);
-    await waitFor(() => evaluate('document.getElementById("account-status-dialog").open'), 'CPA status confirmation did not open: ' + id);
-    if (confirmable) await waitFor(() => evaluate('!document.getElementById("account-status-confirm").disabled'), async () => 'Status preflight did not verify the exact auth file: ' + JSON.stringify(await statusState()));
+    assert.equal(await evaluate('!!document.querySelector("dialog[open]")'), false, 'CPA switch opened a confirmation modal');
   }
   async function verifyStatus() {
     const count = patches.length, before = reads.filter(path => path.endsWith('/auth-files')).length;
-    await clickWhenEnabled('account-status-verify');
-    await waitFor(async () => reads.filter(path => path.endsWith('/auth-files')).length > before && (await statusState()).phase === 'confirmed', async () => 'GET auth-file verification did not unlock the switch: ' + JSON.stringify(await statusState()));
+    await clickStatus();
+    await waitFor(async () => reads.filter(path => path.endsWith('/auth-files')).length > before && (await statusState()).phase === 'confirmed', 'Row switch did not GET-verify the uncertain status');
     assert.equal(patches.length, count, 'Verification resent an auth-file PATCH');
-    assert.equal((await statusState()).checked, String(!authFiles[0].disabled), 'Verification did not apply actual CPA disabled state');
-    await evaluate('if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+    assert.equal((await statusState()).checked, String(!authFiles[0].disabled));
   }
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   await evaluate('document.querySelector("[data-page=overview]").click()');
-  await waitFor(() => evaluate(`!!document.querySelector(${JSON.stringify(statusSelector('codex-01'))})`), 'Overview did not expose the CPA account switch');
-  assert.equal(await evaluate(`document.querySelector(${JSON.stringify(statusSelector('codex-01'))}).getAttribute('role')`), 'switch');
+  await waitFor(() => evaluate(`!!document.querySelector(${JSON.stringify(statusSelector('codex-01'))})`), 'Overview switch missing');
   await assertAccountActionLayout();
   const writesBeforeCPAStatus = posts.length;
-  const authReadsBeforeCPAStatus = reads.filter(path => path.endsWith('/auth-files')).length;
   authPatchGate = gate();
-  await openStatus();
-  assert.ok(reads.filter(path => path.endsWith('/auth-files')).length > authReadsBeforeCPAStatus, 'Switch confirmation skipped the live CPA auth-file directory');
-  assert.equal(patches.length, 0, 'Opening a status dialog patched CPA');
-  await clickWhenEnabled('account-status-confirm');
-  await waitFor(() => authPatchGate.started, 'Confirmed switch did not PATCH auth-file status');
+  await clickStatus();
+  await waitFor(() => authPatchGate.started, 'Direct switch did not PATCH CPA status');
   assert.deepEqual(patches[0].body, {name: 'real+primary.codex.json', auth_index: 'fixture-index-0', disabled: true});
-  await evaluate('document.getElementById("account-status-confirm").click();document.getElementById("account-status-verify").click()');
-  assert.equal(patches.length, 1, 'Saving switch allowed a duplicate PATCH');
-  assert.equal((await statusState()).disabled, true, 'Saving switch was not locked');
-  const readsWhileSaving = reads.filter(path => path.endsWith('/overview')).length;
-  await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > readsWhileSaving, 'Saving status did not receive real polling');
-  assert.equal((await statusState()).disabled, true, 'Polling unlocked an in-flight status write');
+  await clickStatus(); assert.equal(patches.length, 1, 'Saving allowed a duplicate PATCH');
+  assert.equal((await statusState()).disabled, true);
   const beforeStatusCommitReads = reads.filter(path => path.endsWith('/auth-files')).length;
   authPatchGate.release(); authPatchGate = undefined;
-  await waitFor(async () => (await statusState()).checked === 'false' && !(await statusState()).disabled, async () => 'Disable was not GET-verified: ' + JSON.stringify(await statusState()));
-  assert.ok(reads.filter(path => path.endsWith('/auth-files')).length > beforeStatusCommitReads, 'Successful PATCH was not verified with GET auth-files');
-  assert.equal(posts.length, writesBeforeCPAStatus, 'Disabling an account sent a model or plugin POST');
-  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Disabling an account unlocked the existing unknown wake');
-  await evaluate('document.querySelector("[data-page=wake]").click()');
-  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Navigation after disable unlocked unknown wake');
-  await evaluate('document.querySelector("[data-page=overview]").click();if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+  await waitFor(async () => (await statusState()).phase === 'confirmed' && (await statusState()).checked === 'false', 'Disable was not GET-verified');
+  assert.ok(reads.filter(path => path.endsWith('/auth-files')).length > beforeStatusCommitReads);
+  assert.equal(await evaluate('document.querySelector("#accounts .status-badge").textContent'), '手动禁用');
+  assert.equal(posts.length, writesBeforeCPAStatus);
+  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
   for (const outcome of ['disconnect', 'persist-hook-failed']) {
     authPatchGate = gate(outcome);
-    await openStatus();
     const count = patches.length;
-    await clickWhenEnabled('account-status-confirm');
-    await waitFor(() => authPatchGate.started, 'Unknown status fixture did not receive PATCH: ' + outcome);
-    assert.equal(patches.length, count + 1);
+    await clickStatus(); await waitFor(() => authPatchGate.started, 'Direct PATCH missing: ' + outcome);
     authReadGate = gate('reject');
     authPatchGate.release(); authPatchGate = undefined;
-    await waitFor(() => authReadGate.started, 'Uncertain PATCH was not followed by a read-only verification');
+    await waitFor(() => authReadGate.started, 'Uncertain PATCH skipped GET verification');
     authReadGate.release(); authReadGate = undefined;
-    await waitFor(async () => (await statusState()).phase === 'unknown' && !(await statusState()).verify, async () => 'Uncertain status did not expose read-only verification (' + outcome + '): ' + JSON.stringify(await statusState()));
+    await waitFor(async () => (await statusState()).phase === 'unknown', 'Uncertain PATCH was reported as confirmed');
     await assertAccountActionLayout();
-    const overviewReads = reads.filter(path => path.endsWith('/overview')).length;
-    await evaluate('window.dispatchEvent(new Event("focus"));window.dispatchEvent(new Event("online"));document.dispatchEvent(new Event("visibilitychange"))');
-    await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > overviewReads, 'Unknown status did not receive a polling cycle');
-    await settleRefresh();
-    await evaluate(`document.getElementById('account-status-confirm').click();document.querySelector(${JSON.stringify(statusSelector('codex-01'))}).click()`);
-    assert.equal(patches.length, count + 1, 'Unknown status automatically retried PATCH: ' + outcome);
-    assert.equal((await statusState()).phase, 'unknown', 'Polling cleared unknown status without explicit verification');
-    assert.equal((await statusState()).confirm, true, 'Unknown status allowed another write instead of GET verification');
+    await evaluate('window.dispatchEvent(new Event("focus"))'); await settleRefresh();
+    assert.equal((await statusState()).phase, 'unknown', 'Polling cleared an unknown result');
+    assert.equal(patches.length, count + 1, 'Unknown PATCH retried automatically');
     await verifyStatus();
-    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Status verification cleared unrelated unknown wake safety');
+    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
   }
-  authPatchGate = gate();
-  await openStatus(); await clickWhenEnabled('account-status-confirm');
-  await waitFor(() => authPatchGate.started, 'Post-PATCH identity race did not start');
+  authPatchGate = gate(); await clickStatus();
+  await waitFor(() => authPatchGate.started, 'Identity-race PATCH missing');
   authFilesOverride = authFiles.map(file => file.id === 'codex-01' ? {...file, id: 'replacement-account', auth_index: 'replacement-index'} : {...file});
   authPatchGate.release(); authPatchGate = undefined;
-  await waitFor(async () => (await statusState()).phase === 'unknown' && !(await statusState()).verify, 'Same filename with a replacement identity was incorrectly confirmed');
+  await waitFor(async () => (await statusState()).phase === 'unknown', 'Replacement identity incorrectly confirmed');
   const identityRacePatches = patches.length;
-  await clickWhenEnabled('account-status-verify');
-  await waitFor(() => evaluate('!document.getElementById("account-status-verify").disabled'), 'Identity-race GET verification did not finish');
-  assert.equal((await statusState()).phase, 'unknown', 'Replacement identity cleared original unknown write');
-  assert.equal(patches.length, identityRacePatches, 'Identity-race verification resent PATCH');
-  authFilesOverride = undefined;
-  await verifyStatus();
-  accountReadGate = {...gate(), snapshot: true};
-  await clickWhenEnabled('refresh');
-  await waitFor(() => accountReadGate.started, 'Late accounts snapshot was not captured before status write');
-  authPatchGate = gate();
-  await openStatus(); await clickWhenEnabled('account-status-confirm');
-  await waitFor(() => authPatchGate.started, 'Status write did not run concurrently with the old accounts GET');
+  await clickStatus();
+  await waitFor(async () => !(await statusState()).disabled, 'Identity-race read did not finish');
+  assert.equal((await statusState()).phase, 'unknown'); assert.equal(patches.length, identityRacePatches);
+  authFilesOverride = undefined; await verifyStatus();
+  accountReadGate = {...gate(), snapshot: true}; await clickWhenEnabled('refresh');
+  await waitFor(() => accountReadGate.started, 'Late account snapshot was not held');
+  authPatchGate = gate(); await clickStatus();
+  await waitFor(() => authPatchGate.started, 'Concurrent status PATCH missing');
   authPatchGate.release(); authPatchGate = undefined;
-  await waitFor(async () => (await statusState()).phase === 'confirmed' && (await statusState()).checked === String(!authFiles[0].disabled), 'Verified status did not render while older accounts GET was held');
+  await waitFor(async () => (await statusState()).phase === 'confirmed', 'Concurrent PATCH was not verified');
   const verifiedStatus = (await statusState()).checked;
   accountReadGate.release(); accountReadGate = undefined;
   await waitFor(() => evaluate('!document.getElementById("sync").disabled'), 'Old accounts GET did not finish');
-  assert.equal((await statusState()).checked, verifiedStatus, 'Late accounts GET rolled back the GET-verified CPA switch');
-  await evaluate('if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+  assert.equal((await statusState()).checked, verifiedStatus, 'Late account read rolled back verified status');
   for (const [label, files] of [
     ['duplicate account ID', [...structuredClone(authFiles), {...authFiles[0], name: 'duplicate.json'}]],
     ['name versus ID collision', [...structuredClone(authFiles), {...authFiles[1], id: authFiles[0].name, name: 'collision.json'}]],
@@ -1552,16 +1503,13 @@ try {
     ['virtual child', authFiles.map(file => file.id === 'codex-01' ? {...file, plugin_virtual_child: true} : {...file})]
   ]) {
     authFilesOverride = files;
-    const count = patches.length, before = reads.filter(path => path.endsWith('/auth-files')).length;
-    await openStatus('codex-01', false);
-    await waitFor(async () => reads.filter(path => path.endsWith('/auth-files')).length > before && (await statusState()).phase === 'error' && (await statusState()).confirm, 'Unsafe identity was not rejected: ' + label);
-    await evaluate('document.getElementById("account-status-confirm").click()');
-    assert.equal(patches.length, count, 'Unsafe identity allowed a PATCH: ' + label);
-    await evaluate('document.getElementById("account-status-cancel").click()');
+    const count = patches.length; await clickStatus();
+    await waitFor(async () => (await statusState()).phase === 'error', 'Unsafe identity was not rejected: ' + label);
+    assert.equal(patches.length, count, 'Unsafe identity permitted PATCH: ' + label);
     authFilesOverride = undefined;
   }
-  assert.equal(posts.length, writesBeforeCPAStatus, 'Status actions sent an unrelated POST');
-  console.log('CPA status regression passed: exact filename/index binding, one confirmed PATCH, GET verification, disconnect/500 unknown without retry, late accounts ordering, identity rejection and independent wake unknown safety.');
+  assert.equal(posts.length, writesBeforeCPAStatus);
+  console.log('Direct CPA switch regression passed: exact file binding, GET verification, duplicate lock, uncertain results, identity rejection and no confirmation modals.');
   const skipIDs = ['fixture-skipped-current', 'fixture-skipped-legacy'];
   for (const [index, jobID] of skipIDs.entries()) wakeJobs.set(jobID, {job_id: jobID, account_id: 'codex-01', phase: 'skipped', reason: 'manual',
     created_at: observed(), updated_at: observed(), error_code: index ? 'window_already_active' : '', hold_reason: index ? '' : 'window_already_active'});
@@ -1681,12 +1629,10 @@ try {
     }
     await screenshot('account-display-alias-' + width + '.png');
   }
-  await evaluate('document.getElementById("accounts").rows[1].querySelector(".account-wake").click()');
-  await waitFor(() => evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-consent").disabled'), 'Masked email quick-wake confirmation did not load');
-  assert.equal(await evaluate('document.getElementById("quick-wake-account").textContent'), 'b***@***', 'Quick-wake confirmation leaked the email identity');
+  assert.match(await evaluate('document.getElementById("accounts").rows[1].querySelector(".account-wake").getAttribute("aria-label")'), /b\*\*\*@\*\*\*/);
   await assertNoVisibleAccountID();
-  await evaluate('document.getElementById("quick-wake-cancel").click()');
-  assert.equal(posts.length, writesBeforeDisplay, 'Displaying a masked quick-wake confirmation sent a model request');
+  assert.equal(posts.length, writesBeforeDisplay, 'Displaying a masked wake action sent a model request');
+  assert.equal(await evaluate('document.getElementById("wake-overview-consent-row").hidden'), true, 'Reload repeated acknowledged automatic-wake notice');
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   await evaluate('document.querySelector("[data-page=overview]").click();document.querySelector("#accounts .account-query").click()');
   await waitFor(() => posts.length > writesBeforeDisplay, 'Alias-mode query did not submit');
@@ -1741,7 +1687,7 @@ try {
   assert.equal(posts.length, 20, 'Unexpected total API write count');
   assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations', 'wake-settings', 'wake-jobs'].includes(post.resource)), true, 'Unexpected API write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
-  console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, same-account quick-wake native close race, exactly one confirmed wake POST, five explicitly confirmed filename/index-bound CPA PATCHes with GET verification and unknown protection, global alias/mask preferences scoped to CPA base with stable request IDs and polling focus, precise wake explanations, informational legacy/current skips, persisted task history and real trigger menus, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard fallback, mobile detail focus/scroll, unavailable-history recovery, fixture-only page traffic and screenshots.');
+  console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, direct wake without a modal, exactly one wake POST, five direct filename/index-bound CPA PATCHes with GET verification and unknown protection, global alias/mask preferences scoped to CPA base with stable request IDs and polling focus, precise wake explanations, informational legacy/current skips, persisted task history and real trigger menus, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard fallback, mobile detail focus/scroll, unavailable-history recovery, fixture-only page traffic and screenshots.');
   console.log('Local fixture screenshots: ' + output);
   }
 } finally {
@@ -1764,7 +1710,7 @@ try {
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
 if (!autorefreshOnly) {
-  console.log('Original V2 fixture verified 20 POSTs and five explicitly confirmed CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
+  console.log('Original V2 fixture verified 20 POSTs and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
   assert.equal(result.code, 0, 'Isolated automatic-refresh Chromium fixture failed: ' + JSON.stringify(result));

@@ -44,6 +44,14 @@ func wakeAdmission(ctx context.Context, tx *sql.Tx, job WakeJob, config policy.W
 	return wakeModelBusy(ctx, tx, job)
 }
 
+func holdUnsentWake(ctx context.Context, tx *sql.Tx, job WakeJob, hold string, at time.Time) error {
+	phase := "queued"
+	if hold == "capacity_satisfied" {
+		phase = "skipped"
+	}
+	return updateWake(ctx, tx, job, phase, "", hold, at)
+}
+
 func (st *Store) PrepareWake(ctx context.Context, at time.Time) (WakeJob, error) {
 	var prepared WakeJob
 	found := false
@@ -93,7 +101,7 @@ func (st *Store) PrepareWake(ctx context.Context, at time.Time) (WakeJob, error)
 				continue
 			}
 			if hold != "" {
-				if err = updateWake(ctx, tx, job, job.Phase, "", hold, at); err != nil {
+				if err = holdUnsentWake(ctx, tx, job, hold, at); err != nil {
 					return err
 				}
 				continue
@@ -218,7 +226,7 @@ func (st *Store) AuthorizeWake(ctx context.Context, id string, at time.Time) (Wa
 			return updateWake(ctx, tx, job, "queued", "", "configuration_changed", at)
 		}
 		if hold != "" {
-			return updateWake(ctx, tx, job, "queued", "", hold, at)
+			return holdUnsentWake(ctx, tx, job, hold, at)
 		}
 		baseline, err := readWakeBaseline(ctx, tx, account)
 		if err != nil {

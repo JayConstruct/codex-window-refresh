@@ -141,7 +141,7 @@
     return {percent, amount: percent === null && remaining?.Unit !== 'percent' && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + ' ' + (remaining.Unit || '') : '', reset: fullWindow ? '' : resetText(window?.ResetAt, now), source: sourceText(source), observedAt};
   }
   function accountStatus(account) {
-    if (account.status === 'disabled') return {label: '已禁用', kind: 'disabled'};
+    if (account.status === 'disabled') return {label: '手动禁用', kind: 'disabled'};
     if (account.status === 'removed') return {label: '已移除', kind: 'disabled'};
     if (account.status === 'binding_unavailable') return {label: '身份待核实', kind: 'unavailable'};
     if (account.status === 'unavailable') return {label: '暂不可用', kind: 'unavailable'};
@@ -502,9 +502,16 @@
   try { base = apiBase(context.location); } catch (error) { toasts.show('error', message(error.code), 'error'); return; }
   const displayPreferenceKey = 'cwr-v2-display:' + context.location.origin + base.slice(0, -API.length);
   const displayPreference = readDisplayPreference(context, displayPreferenceKey), displayIdentities = new Map(), displaySources = new WeakMap();
+  const wakeConsentKey = 'cwr-v2-auto-wake-consent:' + context.location.origin + base.slice(0, -API.length);
+  let wakeConsentAcknowledged = false, wakeConsentRequested = false;
+  try { wakeConsentAcknowledged = context.localStorage.getItem(wakeConsentKey) === '1'; } catch {}
+  function acknowledgeWakeConsent() {
+    wakeConsentAcknowledged = true;
+    try { context.localStorage.setItem(wakeConsentKey, '1'); } catch {}
+  }
   let displayMatcher = null, displayMatcherDirty = true;
   const statusOperations = new Map();
-  let statusSelection = '', statusOpener = null, aliasSelection = '', aliasOpener = null, statusReadSequence = 0;
+  let aliasSelection = '', aliasOpener = null, statusReadSequence = 0;
   let key = '', generation = 0, views = new ViewTracker(), pollTimer, connectRetryTimer;
   let connected = false, connecting = false, refreshing = false, refreshQueued = false, refreshForceQueued = false;
   let overviewData = null, accountsData = [], accountsRevision = 0, accountsViewRevision = -1, cursor = '', nextCursor = '', previousCursors = [], pageStart = 0, filteredTotal = null;
@@ -630,42 +637,28 @@
     const state = statusOperations.get(id);
     return !!state && (state.phase === 'unknown' || ['reading', 'checking', 'saving', 'verifying'].includes(state.phase) || state.phase === 'confirmed' && state.disabled);
   }
-  function renderStatusDialog() {
-    const state = statusOperations.get(statusSelection), busy = statusBusy();
-    $('account-status-confirm').hidden = state?.phase === 'unknown' || state?.phase === 'confirmed';
-    $('account-status-confirm').disabled = !connected || busy || state?.phase !== 'ready';
-    setText('account-status-confirm', state?.target === false ? '确认 CPA 启用（可能恢复额度消耗）' : '确认 CPA 禁用（不发送模型）');
-    $('account-status-verify').hidden = state?.phase !== 'unknown' && state?.phase !== 'error';
-    $('account-status-verify').disabled = !connected || busy || !state;
-    setText('account-status-message', state?.message || '正在核实 CPA 真实状态…');
-  }
-  function closeStatusDialog() {
-    const opener = statusOpener;
-    statusSelection = ''; statusOpener = null;
-    if ($('account-status-dialog').open) $('account-status-dialog').close();
-    $('account-status-dialog').hidden = true;
-    if (opener && document.documentElement.contains(opener)) opener.focus();
-  }
-  async function openStatusDialog(id, opener) {
+  async function toggleAccountStatus(id) {
     if (!connected || statusBusy()) return;
     const account = accountsData.find(item => item.id === id);
     if (!account || !independentAuthFile(account) || account.status === 'removed') return;
-    statusReadSequence++;
-    statusSelection = id; statusOpener = opener; setText('account-status-account', id);
-    $('account-status-dialog').hidden = false; $('account-status-dialog').showModal();
     const previous = statusOperations.get(id);
-    if (previous?.phase === 'unknown') { renderStatusDialog(); return; }
-    const current = generation, state = {phase: 'reading', sent: false, disabled: previous?.disabled, message: '正在读取 CPA 认证文件目录并核实唯一身份…'};
-    statusOperations.set(id, state); renderStatusDialog(); renderAccounts();
+    if (previous?.phase === 'unknown') return explicitlyVerifyStatus(id);
+    statusReadSequence++;
+    const current = generation, state = {phase: 'reading', sent: false, disabled: previous?.disabled,
+      target: !(previous?.disabled ?? (account.status === 'disabled')), message: '正在核实 CPA 账号状态…'};
+    statusOperations.set(id, state); renderAccounts();
     try {
       const identity = resolveStatusAccount(await api('/auth-files', {}, true), id);
       if (current !== generation || statusOperations.get(id) !== state) return;
-      state.before = identity; state.disabled = identity.disabled; state.target = !identity.disabled; state.phase = 'ready';
-      state.message = identity.disabled ? 'CPA 当前已禁用。确认启用后可能恢复正常业务和已授权自动任务的额度消耗；此操作本身不发送模型。' : 'CPA 当前已启用。确认禁用只修改此认证文件状态，不发送模型，也不解除未知任务防重。';
+      state.before = identity; state.disabled = identity.disabled;
+      if (identity.disabled === state.target) return await verifyStatusOperation(id, state, current);
+      state.phase = 'ready';
+      await updateAccountStatus(id, state);
     } catch (error) {
       if (current !== generation || statusOperations.get(id) !== state) return;
       state.phase = 'error'; state.message = message(error.code);
-    } finally { if (current === generation) { renderStatusDialog(); renderAccounts(); } }
+      feedback('account-status-state-message', state.message, 'error');
+    } finally { if (current === generation) renderAccounts(); }
   }
   async function verifyStatusOperation(id, state, current) {
     const identity = resolveStatusAccount(await api('/auth-files', {}, true), id);
@@ -676,37 +669,37 @@
     views.barrier(); feedback('account-status-state-message', state.message, 'success');
     return true;
   }
-  async function confirmStatusOperation() {
-    const id = statusSelection, state = statusOperations.get(id);
+  async function updateAccountStatus(id, state) {
     if (!connected || statusBusy() || state?.phase !== 'ready') return;
-    const current = generation; state.phase = 'checking'; state.message = '提交前重新核实文件身份与当前状态…'; renderStatusDialog(); renderAccounts();
+    const current = generation; state.phase = 'checking'; state.message = '提交前重新核实文件身份与当前状态…'; renderAccounts();
     try {
       const identity = resolveStatusAccount(await api('/auth-files', {}, true), id);
       if (current !== generation || statusOperations.get(id) !== state) return;
       if (!sameStatusIdentity(state.before, identity) || state.before.disabled !== identity.disabled) throw Object.assign(new Error('account_status_changed'), {code: 'account_status_changed'});
-      state.phase = 'saving'; state.sent = true; state.message = '正在提交一次 CPA 启停；不会重发，随后只读核实…'; views.barrier(); renderStatusDialog(); renderAccounts();
+      state.phase = 'saving'; state.sent = true; state.message = '正在提交一次 CPA 启停；不会重发，随后只读核实…'; views.barrier(); renderAccounts();
       try { await api('/auth-files/status', {method: 'PATCH', body: JSON.stringify({name: identity.name, auth_index: identity.index, disabled: state.target})}, true); }
       catch (error) { if (current !== generation) return; }
       if (current !== generation) return;
-      state.phase = 'verifying'; state.message = '已提交一次修改，正在 GET 核实真实状态；尚未确认成功…'; renderStatusDialog();
+      state.phase = 'verifying'; state.message = '已提交一次修改，正在 GET 核实真实状态；尚未确认成功…'; renderAccounts();
       await verifyStatusOperation(id, state, current);
     } catch (error) {
       if (current !== generation || statusOperations.get(id) !== state) return;
       state.phase = state.sent ? 'unknown' : 'error';
       state.message = state.sent ? message('account_status_unknown') + '。身份不一致、状态未匹配或读取失败时不会再次提交。' : message(error.code);
-      if (state.sent) feedback('account-status-state-message', state.message, 'warning');
-    } finally { if (current === generation) { renderStatusDialog(); renderAccounts(); } }
+      feedback('account-status-state-message', state.message, state.sent ? 'warning' : 'error');
+    } finally { if (current === generation) { renderAccounts(); } }
   }
-  async function explicitlyVerifyStatus() {
-    const id = statusSelection, state = statusOperations.get(id);
+  async function explicitlyVerifyStatus(id) {
+    const state = statusOperations.get(id);
     if (!connected || statusBusy() || !state || !['unknown', 'error'].includes(state.phase)) return;
-    if (!state.sent) return openStatusDialog(id, statusOpener);
-    const current = generation; state.phase = 'verifying'; state.message = '只读核实原文件，不重发 PATCH、不调用模型…'; renderStatusDialog(); renderAccounts();
+    if (!state.sent) return toggleAccountStatus(id);
+    const current = generation; state.phase = 'verifying'; state.message = '只读核实原文件，不重发 PATCH、不调用模型…'; renderAccounts();
     try { await verifyStatusOperation(id, state, current); }
     catch {
       if (current !== generation || statusOperations.get(id) !== state) return;
       state.phase = 'unknown'; state.message = message('account_status_unknown') + '。此次读取仍未确认原文件目标状态。';
-    } finally { if (current === generation) { renderStatusDialog(); renderAccounts(); } }
+      feedback('account-status-state-message', state.message, 'warning');
+    } finally { if (current === generation) { renderAccounts(); } }
   }
   async function refreshConfirmedStatuses(background = false) {
     if (statusBusy()) return;
@@ -727,7 +720,7 @@
           state.phase = 'error'; state.disabled = undefined; state.message = '当前无法核实原认证文件身份；旧的启停确认不再代表最新状态，请重新核实。';
         }
       }
-      renderStatusDialog(); renderAccounts();
+      renderAccounts();
     } catch {
       if (current === generation && sequence === statusReadSequence && !background) notice('CPA 启停状态重新读取失败，保留上次只读确认；后台轮询将继续只读核实。', 'warning');
     }
@@ -988,7 +981,7 @@
     $('wake-settings-fields').disabled = locked;
     $('wake-enabled').disabled = locked || !automaticWakeSupported();
     $('wake-settings-consent').disabled = locked || !automaticWakeSupported();
-    $('wake-settings-save').disabled = locked || !dirty || !!Object.keys(errors).length || wakeConflict || wakeNeedsVerification || draft.enabled && (!automaticWakeSupported() || !$('wake-settings-consent').checked);
+    $('wake-settings-save').disabled = locked || !dirty || !!Object.keys(errors).length || wakeConflict || wakeNeedsVerification || draft.enabled && (!automaticWakeSupported() || !wakeConsentAcknowledged && !$('wake-settings-consent').checked);
     $('wake-settings-reload').disabled = !connected || !supported || wakeLoading || wakeSaving;
     setText('wake-settings-status', !connected ? '等待连接' : !supported ? '尚未接入' : wakeSaving ? '保存中' : wakeLoading ? '读取中' : wakeNeedsVerification ? '需要核实' : wakeConflict ? '设置冲突' : dirty ? '未保存草稿' : savedWakeSettings ? '版本 ' + savedWakeSettings.revision : '尚未读取');
     setText('wake-settings-validation', Object.values(errors).join('；')); $('wake-settings-validation').hidden = !Object.keys(errors).length;
@@ -1008,7 +1001,8 @@
     $('auto-wake').checked = wakeSavingEnabled === null ? current && savedWakeSettings.config.enabled === true : wakeSavingEnabled;
     $('auto-wake').disabled = !connected || !automaticWakeSupported() || !current || wakeLoading || wakeSaving || wakeNeedsVerification;
     setAttribute($('auto-wake'), 'aria-busy', wakeSavingEnabled !== null);
-    $('wake-overview-consent-row').hidden = !automaticWakeSupported();
+    $('wake-overview-consent-row').hidden = !automaticWakeSupported() || wakeConsentAcknowledged || !wakeConsentRequested;
+    $('wake-settings-consent-row').hidden = !automaticWakeSupported() || wakeConsentAcknowledged || !draft.enabled;
     $('wake-overview-consent').disabled = !connected || !automaticWakeSupported() || !current || wakeLoading || wakeSaving || wakeNeedsVerification;
     $('wake-overview-reload').hidden = !connected || !supported || !wakeNeedsVerification && !!current;
     $('wake-overview-reload').disabled = !connected || !supported || wakeLoading || wakeSaving;
@@ -1044,11 +1038,14 @@
       if (direct) wakeOverviewMessage(Object.values(validated.errors).join('；') + '。请先编辑唤醒规则并明确保存。', 'error');
       renderWakeSettings(); return;
     }
-    if (validated.config.enabled && (!automaticWakeSupported() || !$(direct ? 'wake-overview-consent' : 'wake-settings-consent').checked)) {
+    if (validated.config.enabled && (!automaticWakeSupported() || !wakeConsentAcknowledged && !$(direct ? 'wake-overview-consent' : 'wake-settings-consent').checked)) {
+      wakeConsentRequested = direct;
       if (direct) wakeOverviewMessage('开启自动唤醒前，请先明确确认后台持续消耗模型额度。', 'warning');
       else feedback('wake-settings-message', '请明确确认开启后后台可能持续消耗模型额度，再保存。', 'warning');
       renderWakeSettings(); return;
     }
+    if (validated.config.enabled && !wakeConsentAcknowledged) acknowledgeWakeConsent();
+    wakeConsentRequested = false;
     if (basis.instance_id !== views.instance) { wakeNeedsVerification = true; wakeOverviewMessage('后台实例已变化，请重新读取唤醒设置后再保存。', 'warning'); renderWakeSettings(); return; }
     if (direct && basis.config.enabled === checked) { renderWakeSettings(); return; }
     const current = generation, sequence = views.begin('wake-settings'), draft = readWakeDraft(), original = wakeBase ? wakeConfigDraft(wakeBase.config) : null;
@@ -1162,7 +1159,7 @@
   async function submitManualWake(verify = false, quickAccount = '') {
     if (!connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading) return;
     if (verify && wakeTask?.job_id) return readWakeJob();
-    const consent = quickAccount ? quickAccount === quickWakeAccount && !accountStatusBlocksWake(quickAccount) && !quickWakeLoading && $('quick-wake-consent').checked && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount && account.status === 'available') : $('wake-manual-consent').checked;
+    const consent = quickAccount ? quickAccount === quickWakeAccount && !accountStatusBlocksWake(quickAccount) && !quickWakeLoading && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount && account.status === 'available') : $('wake-manual-consent').checked;
     if (wakeUnknown || (verify ? !wakeUnconfirmed || !wakeIntent : wakeUnconfirmed || wakeActive() || !consent)) return;
     if (!verify) {
       const account = quickAccount || resolveDisplayAccount($('wake-account').value);
@@ -1173,7 +1170,7 @@
     }
     if (wakeIntent.instance !== views.instance) { wakeUnknown = true; feedback('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。', 'warning'); renderManualWake(); return; }
     const current = generation; wakeSubmitting = true; renderManualWake();
-    feedback('wake-manual-message', verify ? '使用原标识与原账号核实同一唤醒任务，不创建替代请求…' : '提交一次明确确认的手动唤醒，后台将先查询额度并检查安全条件…');
+    feedback('wake-manual-message', verify ? '使用原标识与原账号核实同一唤醒任务，不创建替代请求…' : '正在提交手动唤醒，后台将先查询额度并检查安全条件…');
     try {
       const data = await api('/wake-jobs', {method: 'POST', headers: {'Idempotency-Key': wakeIntent.key}, body: wakeIntent.body});
       if (current !== generation) return;
@@ -1183,35 +1180,32 @@
       if (current !== generation) return;
       if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed', 'idempotency_conflict'].includes(error.code) || error.status >= 500 && error.code !== 'wake_unavailable') { wakeUnconfirmed = true; feedback('wake-manual-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请显式核实同一任务，保留原标识与原账号。', 'warning'); }
       else { wakeUnconfirmed = false; $('wake-manual-consent').checked = false; feedback('wake-manual-message', '唤醒请求未接受：' + message(error.code), 'error'); }
-    } finally { if (current === generation) { wakeSubmitting = false; if (quickAccount) closeQuickWake(); renderManualWake(); } }
+    } finally { if (current === generation) { wakeSubmitting = false; renderManualWake(); } }
   }
   function quickWakeBlocked() { return !connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading || wakeActive() || wakeUnconfirmed || wakeUnknown; }
   function renderQuickWake() {
     const blocked = quickWakeBlocked();
-    $('quick-wake-consent').disabled = blocked || quickWakeLoading;
     for (const button of document.querySelectorAll('[data-wake-account]')) {
       const disabled = blocked || !!quickWakeAccount || button.dataset.accountStatus !== 'available' || accountStatusBlocksWake(button.dataset.wakeAccount);
       if (button.disabled !== disabled) button.disabled = disabled;
     }
-    $('quick-wake-submit').disabled = blocked || accountStatusBlocksWake(quickWakeAccount) || quickWakeLoading || !$('quick-wake-consent').checked || !accountsData.some(account => account.id === quickWakeAccount && account.status === 'available') || !savedModelSettings?.config?.default_model || savedModelSettings.instance_id !== views.instance || modelNeedsVerification;
   }
   function closeQuickWake() {
-    quickWakeSequence++; quickWakeAccount = ''; quickWakeLoading = false; $('quick-wake-consent').checked = false;
-    if ($('quick-wake-dialog').open) $('quick-wake-dialog').close();
-    $('quick-wake-dialog').hidden = true; renderQuickWake();
+    quickWakeSequence++; quickWakeAccount = ''; quickWakeLoading = false; renderQuickWake();
   }
-  async function openQuickWake(id) {
+  async function startQuickWake(id) {
     if (quickWakeBlocked() || quickWakeAccount || accountStatusBlocksWake(id) || !accountsData.some(account => account.id === id && account.status === 'available')) return;
     const current = generation, sequence = ++quickWakeSequence;
-    quickWakeAccount = id; quickWakeLoading = true; $('quick-wake-consent').checked = false;
-    setText('quick-wake-account', id); setText('quick-wake-model', '正在读取已保存模型…');
-    $('quick-wake-dialog').hidden = false; $('quick-wake-dialog').showModal(); renderQuickWake();
-    const loaded = await reloadModelSettings();
-    if (current !== generation || sequence !== quickWakeSequence || quickWakeAccount !== id) return;
-    quickWakeLoading = false;
-    setText('quick-wake-model', loaded && savedModelSettings?.config?.default_model ? '已保存模型：' + savedModelSettings.config.default_model + '；执行使用后台已保存配置，不提交任何草稿。' : '未能核实已保存模型，请先在“模型与提示词”保存实际可用的默认模型后重试。');
-    if (!loaded) quickWakeLoading = true;
-    renderQuickWake();
+    quickWakeAccount = id; quickWakeLoading = true; renderQuickWake();
+    try {
+      const loaded = await reloadModelSettings();
+      if (current !== generation || sequence !== quickWakeSequence || quickWakeAccount !== id) return;
+      quickWakeLoading = false;
+      if (!loaded || !savedModelSettings?.config?.default_model || savedModelSettings.instance_id !== views.instance || modelNeedsVerification) {
+        feedback('wake-manual-message', '未能核实已保存模型，请先在“模型与提示词”保存实际可用的默认模型后重试。', 'error'); return;
+      }
+      await submitManualWake(false, id);
+    } finally { if (current === generation && sequence === quickWakeSequence) closeQuickWake(); }
   }
   function modelSupported() { return overviewData?.capabilities?.model_settings === true; }
   function editableGenerationPrompt() { return overviewData?.capabilities?.editable_generation_prompt === true; }
@@ -1565,7 +1559,7 @@
   function stop() {
     toasts.clear();
     closeQuickWake();
-    closeStatusDialog(); closeAliasDialog();
+    closeAliasDialog();
     for (const state of statusOperations.values()) {
       if (['reading', 'checking', 'saving', 'verifying'].includes(state.phase)) { state.phase = state.sent ? 'unknown' : 'error'; state.message = state.sent ? message('account_status_unknown') : '读取已中断，请重新核实 CPA 目录。'; }
     }
@@ -1584,6 +1578,7 @@
     generationSubmitting = false; generationReading = false;
     if (wakeSaving) { wakeConflict = true; wakeNeedsVerification = true; }
     if (wakeSubmitting && wakeIntent) wakeUnconfirmed = true;
+    wakeConsentRequested = false;
     wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false;
     $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false; $('wake-manual-consent').checked = false;
     generationCatalogSequence++; generationCatalog = null; generationCatalogLoading = false; generationCatalogError = '';
@@ -1657,7 +1652,7 @@
       const aliasButton = element('button', 'text-button account-alias', '编辑别称'); aliasButton.type = 'button'; aliasButton.dataset.accountAliasId = account.id; aliasButton.dataset.renderKey = 'alias';
       aliasButton.setAttribute('aria-label', '编辑账号 ' + account.id + ' 的浏览器别称'); aliasButton.onclick = function () { openAliasDialog(account.id, this); }; name.append(aliasButton);
       const state = statusOperations.get(account.id);
-      const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '已禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : accountStatus(account);
+      const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '手动禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : accountStatus(account);
       status.append(badge(value.label, value.kind));
       status.title = (account.status_observed_at ? 'CPA 状态：' + age(account.status_observed_at) + '同步。' : '') + (value.kind === 'attention' ? '额度状态来自最近一次额度观测；重置或恢复需重新核实，不以本地倒计时自动恢复正常。' : '后台定时同步 CPA 账号状态。');
       const five = element('td'), weekly = element('td'), observed = element('td'), action = element('td');
@@ -1673,15 +1668,18 @@
       wakeButton.dataset.wakeAccount = account.id; wakeButton.dataset.accountStatus = account.status;
       wakeButton.dataset.renderKey = 'wake'; button.dataset.renderKey = 'query';
       wakeButton.disabled = quickWakeBlocked() || !!quickWakeAccount || account.status !== 'available' || accountStatusBlocksWake(account.id);
-      wakeButton.setAttribute('aria-label', '立即唤醒账号 ' + account.id); wakeButton.onclick = () => openQuickWake(account.id);
+      wakeButton.setAttribute('aria-label', '立即唤醒账号 ' + account.id); wakeButton.onclick = () => startQuickWake(account.id);
       const enabled = typeof state?.disabled === 'boolean' ? !state.disabled : state?.before ? !state.before.disabled : account.status !== 'disabled';
-      const statusButton = element('button', 'account-status-switch', state?.phase === 'unknown' ? 'CPA 未知 · 核实' : enabled ? 'CPA 已启用 · 禁用' : 'CPA 已禁用 · 启用');
+      const statusButton = element('button', 'account-status-switch');
+      const statusTrack = element('span', 'account-status-track'); statusTrack.setAttribute('aria-hidden', 'true');
+      statusButton.append(statusTrack, element('span', 'account-status-label', state?.phase === 'unknown' ? '状态待核实' : enabled ? 'CPA 已启用' : 'CPA 已禁用'));
       statusButton.type = 'button'; statusButton.dataset.accountStatusId = account.id; statusButton.dataset.renderKey = 'cpa-status'; statusButton.dataset.state = state?.phase || 'idle';
+      statusButton.setAttribute('aria-busy', String(['reading', 'checking', 'saving', 'verifying'].includes(state?.phase)));
       statusButton.setAttribute('role', 'switch'); statusButton.setAttribute('aria-checked', String(enabled));
       statusButton.setAttribute('aria-label', (state?.phase === 'unknown' ? 'CPA 状态未知，仅可只读核实' : enabled ? 'CPA 已启用，点击禁用，不发送模型' : 'CPA 已禁用，点击启用，可能恢复额度消耗') + '：' + account.id);
       statusButton.disabled = !connected || statusBusy() || !independentAuthFile(account) || account.status === 'removed';
       statusButton.title = independentAuthFile(account) ? '真实修改 CPA 认证文件状态；启用可能恢复业务及自动任务的额度消耗，禁用不发送模型。' : '虚拟子账号、运行时或配置密钥不能独立启停；不会修改其父级凭据。';
-      statusButton.onclick = function () { return openStatusDialog(account.id, this); };
+      statusButton.onclick = function () { return toggleAccountStatus(account.id); };
       buttons.append(button, wakeButton, statusButton); action.append(buttons);
       if (['queued', 'running'].includes(account.pending_query?.phase)) action.append(queueAnnotation(account.pending_query, 'query-pending'));
       row.append(name, status, five, weekly, observed, action); rows.push(row);
@@ -2273,10 +2271,6 @@
   $('account-alias-form').onsubmit = event => { event.preventDefault(); saveAlias(); };
   $('account-alias-cancel').onclick = closeAliasDialog;
   $('account-alias-dialog').addEventListener('cancel', event => { event.preventDefault(); closeAliasDialog(); });
-  $('account-status-confirm').onclick = confirmStatusOperation;
-  $('account-status-verify').onclick = explicitlyVerifyStatus;
-  $('account-status-cancel').onclick = closeStatusDialog;
-  $('account-status-dialog').addEventListener('cancel', event => { event.preventDefault(); closeStatusDialog(); });
   for (const button of document.querySelectorAll('[data-page]')) {
     if (!Object.hasOwn(pages, button.dataset.page)) continue;
     button.setAttribute('title', pages[button.dataset.page][0]); button.setAttribute('aria-label', pages[button.dataset.page][0]);
@@ -2379,22 +2373,22 @@
   $('wake-settings-form').onsubmit = event => { event.preventDefault(); return saveWakeSettings(); };
   $('wake-settings-reload').onclick = () => reloadWakeSettings(true, true);
   $('wake-overview-reload').onclick = () => reloadWakeSettings(false, true);
-  $('wake-settings-consent').onchange = renderWakeSettings;
-  $('wake-overview-consent').onchange = renderWakeSettings;
-  $('auto-wake').onchange = () => saveWakeSettings(true, $('auto-wake').checked);
+  $('wake-settings-consent').onchange = () => { if ($('wake-settings-consent').checked) acknowledgeWakeConsent(); renderWakeSettings(); };
+  $('wake-overview-consent').onchange = () => {
+    if ($('wake-overview-consent').checked) {
+      const pendingEnable = wakeConsentRequested; acknowledgeWakeConsent(); wakeConsentRequested = false; renderWakeSettings();
+      if (pendingEnable) return saveWakeSettings(true, true);
+    }
+    renderWakeSettings();
+  };
+  $('auto-wake').onchange = () => { if (!$('auto-wake').checked) wakeConsentRequested = false; return saveWakeSettings(true, $('auto-wake').checked); };
   for (const id of Object.values(wakeFields)) $(id).addEventListener('input', () => {
     if ($('wake-settings-fields').disabled) return;
-    $('wake-settings-consent').checked = false; renderWakeSettings(); rememberFeedback('wake-settings-message', '唤醒草稿尚未保存；启用后可能持续消耗额度，请核对差异并明确确认。');
+    $('wake-settings-consent').checked = false; renderWakeSettings(); rememberFeedback('wake-settings-message', '唤醒草稿尚未保存，请核对差异后保存。');
   });
   $('wake-manual-form').onsubmit = event => { event.preventDefault(); return submitManualWake(); };
   $('wake-manual-verify').onclick = () => submitManualWake(true);
   $('wake-manual-consent').onchange = renderManualWake;
-  $('quick-wake-form').onsubmit = event => { event.preventDefault(); return submitManualWake(false, quickWakeAccount); };
-  $('quick-wake-consent').onchange = renderQuickWake;
-  $('quick-wake-cancel').onclick = closeQuickWake;
-  $('quick-wake-dialog').addEventListener('cancel', event => { event.preventDefault(); closeQuickWake(); });
-  $('quick-wake-dialog').addEventListener('close', () => { if (!$('quick-wake-dialog').open && quickWakeAccount) closeQuickWake(); });
-  $('quick-wake-history').onclick = () => { closeQuickWake(); navigate('wake'); };
   $('wake-account').oninput = () => { if (!$('wake-manual-fields').disabled) { $('wake-manual-consent').checked = false; renderManualWake(); } };
   $('wake-history-refresh').onclick = () => loadWakeJobs(true);
   $('history-refresh').onclick = () => { void loadHistory(); if (historySelected && !historyDetailLoading) void readHistoryDetail(); };

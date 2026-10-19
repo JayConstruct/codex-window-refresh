@@ -39,11 +39,17 @@ select { cursor: pointer; }
 .display-help { margin: -2px 0 14px; color: #64758b; font-size: 12px; overflow-wrap: anywhere; }
 .account-status-help { padding: 0 20px 12px; }
 .account-name .account-alias { display: block; margin-top: 5px; font-size: 12px; }
-.account-status-switch { grid-column: 1 / -1; justify-self: start; min-width: 140px; min-height: 32px; padding: 5px 9px; border: 1px solid #b7dfd9; background: #edf9f6; color: var(--teal-dark); font-size: 12px; white-space: nowrap; }
-.account-status-switch[aria-checked="false"] { color: #617086; border-color: #dbe3e9; background: #f4f7f9; }
-.account-status-switch[data-state="unknown"] { color: #8e651c; border-color: #e4d6af; background: #fff9eb; }
+.account-status-switch { grid-column: 1 / -1; justify-self: start; display: inline-flex; align-items: center; gap: 8px; min-width: 140px; min-height: 32px; padding: 4px 0; border: 0; background: transparent; color: var(--teal-dark); font-size: 12px; white-space: nowrap; }
+.account-status-track { position: relative; display: block; flex-shrink: 0; width: 40px; height: 23px; border: 1px solid #d1dce1; border-radius: 20px; background: #dfe6eb; transition: background .15s, border-color .15s; }
+.account-status-track::before { content: ""; position: absolute; top: 2px; left: 2px; width: 17px; height: 17px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #263a4e22; transition: transform .15s; }
+.account-status-switch[aria-checked="true"] .account-status-track { border-color: var(--teal); background: var(--teal); }
+.account-status-switch[aria-checked="true"] .account-status-track::before { transform: translateX(17px); }
+.account-status-switch[aria-checked="false"] { color: #617086; }
+.account-status-switch[data-state="unknown"] { color: #8e651c; }
+.account-status-switch[data-state="unknown"] .account-status-track { border-color: #e4d6af; background: #e4d6af; }
+.account-status-switch:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
 .account-status-switch:disabled { opacity: .55; }
-.account-status-dialog .settings-actions { flex-wrap: wrap; }
+@media (prefers-reduced-motion: reduce) { .account-status-track, .account-status-track::before { transition: none; } }
 .flip { transform: rotate(180deg); }
 .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 10; display: flex; flex-direction: column; width: var(--sidebar-width); padding: 22px 11px 26px 0; border-right: 1px solid var(--border); background: linear-gradient(155deg, #f9fcfd, #f3f9fb); }
 .brand { display: flex; align-items: flex-start; gap: 11px; padding: 0 11px 26px 23px; }
