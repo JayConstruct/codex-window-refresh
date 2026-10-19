@@ -82,7 +82,7 @@ func wakeAPIError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrInvalidWakeRequest):
 		apiError(w, 400, "invalid_wake_request")
 	case errors.Is(err, store.ErrWakeAccount):
-		apiError(w, 409, "wake_account_unavailable")
+		apiError(w, 409, store.WakeAccountErrorCode(err))
 	case errors.Is(err, store.ErrWakeModelMissing):
 		apiError(w, 409, "wake_model_missing")
 	default:
@@ -192,10 +192,21 @@ func wakeOutcome(err error) (string, string) {
 	if err == nil {
 		return "verifying", ""
 	}
+	if code := store.WakeAccountErrorCode(err); code != "" {
+		return "failed", code
+	}
 	switch err.Error() {
 	case "wake_model_busy":
 		return "queued", "model_busy"
-	case "account_identity_ambiguous", "account_identity_unavailable", "account_binding_changed", "account_not_found", "account_disabled", "wake_account_unavailable":
+	case "account_identity_ambiguous":
+		return "failed", "wake_account_ambiguous"
+	case "account_binding_changed":
+		return "failed", "wake_binding_changed"
+	case "account_not_found":
+		return "failed", "wake_account_not_found"
+	case "account_disabled":
+		return "failed", "wake_account_disabled"
+	case "account_identity_unavailable":
 		return "failed", "wake_account_unavailable"
 	case "wake_not_supported", "generation_not_supported", "wake_request_invalid", "wake_request_rejected":
 		return "failed", "wake_request_rejected"

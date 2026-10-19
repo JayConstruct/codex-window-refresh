@@ -193,6 +193,63 @@ func TestTaskHistoryProjectionPrivacyAndReadOnly(t *testing.T) {
 	}
 }
 
+func TestTaskHistorySkippedWakeIsNotAnError(t *testing.T) {
+	storage := openTest(t)
+	at := time.Now().UTC()
+	for index, code := range []string{"window_already_active", "wake_account_unavailable", "private-error-token"} {
+		id := fmt.Sprintf("legacy-skipped-%d", index)
+		seedHistoryWake(t, storage, id, "skipped", "manual", at)
+		if _, err := storage.db.Exec("UPDATE wake_jobs SET error_code=? WHERE id=?", code, id); err != nil {
+			t.Fatal(err)
+		}
+		job, err := storage.Wake(context.Background(), id)
+		if err != nil || job.Phase != "skipped" || job.ErrorCode != "" {
+			t.Fatal("skipped wake exposed an error", job, err)
+		}
+		if code == "window_already_active" && job.HoldReason != code {
+			t.Fatal("normal skip reason lost", job)
+		}
+	}
+	page := readHistory(t, storage, TaskHistoryFilter{Type: "wake", Limit: 100})
+	if page.Total != 3 || page.StatusCounts.Skipped != 3 || page.StatusCounts.Failed != 0 || page.StatusCounts.Unknown != 0 || page.Summary.Failed != 0 || page.Summary.Unknown != 0 {
+		t.Fatal("skipped wakes changed error counts", page)
+	}
+	for _, record := range page.Records {
+		if record.ErrorCode != "" || record.Failed != 0 || record.Status != "skipped" {
+			t.Fatal("skipped history exposed an error", record)
+		}
+		if record.JobID == "legacy-skipped-0" && record.HoldReason != "window_already_active" {
+			t.Fatal("normal history skip reason lost", record)
+		}
+	}
+	for _, code := range []string{"wake_account_unavailable", "private-error-token"} {
+		if result := readHistory(t, storage, TaskHistoryFilter{Search: code}); result.Total != 0 {
+			t.Fatal("hidden skipped error was searchable", result)
+		}
+	}
+}
+
+func TestTaskHistoryPreservesPreciseWakeCodesAndHolds(t *testing.T) {
+	storage := openTest(t)
+	at := time.Now().UTC()
+	for index, fixture := range wakeAccountCases() {
+		id := fmt.Sprintf("precise-wake-%d", index)
+		seedHistoryWake(t, storage, id, "failed", "manual", at)
+		if _, err := storage.db.Exec("UPDATE wake_jobs SET error_code=?,hold_reason=? WHERE id=?", fixture.code, fixture.code, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page := readHistory(t, storage, TaskHistoryFilter{Type: "wake", Limit: 100})
+	for _, record := range page.Records {
+		if !wakeAccountCode(record.ErrorCode) || record.HoldReason != record.ErrorCode {
+			t.Fatal("precise classification was swallowed", record)
+		}
+	}
+	if result := readHistory(t, storage, TaskHistoryFilter{Search: "wake_binding_changed"}); result.Total != 2 {
+		t.Fatal("precise error search failed", result)
+	}
+}
+
 func TestTaskHistoryQueryTimesFollowDurableCompletion(t *testing.T) {
 	for _, code := range []string{"", "quota_transport_failed"} {
 		t.Run("outcome_"+code, func(t *testing.T) {

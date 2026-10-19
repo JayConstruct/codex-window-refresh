@@ -991,6 +991,36 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual((status, restored['revision'], restored['config']), (200, 1, config))
         self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
 
+    def test_skipped_wakes_remain_informational_and_do_not_count_as_errors(self):
+        import datetime
+        import sqlite3
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, before = self.management('overview')
+        self.assertEqual(status, 200)
+        self.stop_daemon()
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+        with sqlite3.connect(self.root/'data'/'backend.sqlite') as database:
+            account = database.execute('SELECT a.id,a.auth_index,b.binding FROM accounts a '
+                                       'JOIN account_bindings b ON a.id=b.account_id WHERE a.id=?', ('a',)).fetchone()
+            self.assertIsNotNone(account)
+            for index, code in enumerate(['window_already_active', 'account_disabled', 'legacy-unrecognized-reason']):
+                database.execute('INSERT INTO wake_jobs(id,account_id,auth_index,binding,reason,cycle,phase,'
+                                 'scheduled_at,created_at,updated_at,error_code) '
+                                 "VALUES(?,?,?,?,'five_hour_reset',?,'skipped',?,?,?,?)",
+                                 ('skip-fixture-' + str(index), *account, 'cycle-' + str(index), stamp, stamp, stamp, code))
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, after = self.management('overview')
+        self.assertEqual(status, 200)
+        self.assertEqual(after['dashboard']['errors'], before['dashboard']['errors'])
+        events = [event for event in after['dashboard']['recent_events'] if event.get('job_id', '').startswith('skip-fixture-')]
+        self.assertEqual(len(events), 3)
+        self.assertTrue(all(event['severity'] == 'info' and event['phase'] == 'skipped' for event in events))
+        status, page = self.management('task-history', query={'search': ['skip-fixture-'], 'status': ['skipped']})
+        self.assertEqual((status, page['total'], page['status_counts']['failed'], page['status_counts']['unknown']), (200, 3, 0, 0))
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (0, 0, 0))
+
     def test_task_history_proxies_persistent_automatic_records_and_readonly_filters(self):
         import datetime
         import sqlite3
@@ -1061,7 +1091,7 @@ class NativeBridge(unittest.TestCase):
             self.assertEqual(self.management('wake-jobs', 'POST', request, 'wake-invalid')[0], 400)
         self.assertEqual(self.management('wake-jobs', 'POST', {'account_id': 'a'})[0], 400)
         status, rejected = self.management('wake-jobs', 'POST', {'account_id': 'antig'}, 'antig-cannot-wake')
-        self.assertEqual((status, rejected.get('error')), (409, 'wake_account_unavailable'))
+        self.assertEqual((status, rejected.get('error')), (409, 'wake_account_not_found'))
         request = {'account_id': 'a'}
         status, accepted = self.management('wake-jobs', 'POST', request, 'wake-safe-preflight')
         self.assertEqual(status, 202, accepted)

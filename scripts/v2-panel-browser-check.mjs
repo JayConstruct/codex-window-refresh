@@ -12,10 +12,11 @@ const api = '/cpa/v0/management/codex-window-refresh/v2/';
 const fixtureKey = 'local-v2-browser-fixture';
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
-const posts = [], reads = [], exceptions = [], pageErrors = [];
+const posts = [], patches = [], reads = [], exceptions = [], pageErrors = [];
 const jobs = new Map();
 let accountReadGate, settingsPostGate, settingsReadGate, modelReadGate, wakeReadGate, historyDetailGate;
 let historyUnavailable = false;
+let authReadGate, authPatchGate, authFilesOverride;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
@@ -39,6 +40,9 @@ const accounts = Array.from({length: 24}, (_, index) => {
       five_hour: {State: 'active', Remaining: {Value: percent, Unit: 'percent'}, ResetAt: later(4320), ConfirmedAt: observed()},
       weekly: {State: 'active', Remaining: {Value: [67, 91, 58, 34, 0, 12][index] ?? 67, Unit: 'percent'}, ResetAt: later(201600), ConfirmedAt: observed()}}};
 });
+const authFiles = accounts.map((account, index) => ({id: account.id, name: index === 0 ? 'real+primary.codex.json' : account.id + '.json',
+  provider: 'codex', source: 'memory', auth_index: 'fixture-index-' + index, disabled: account.status === 'disabled', runtime_only: index === 2,
+  ...(index === 3 ? {plugin_virtual_child: true} : {}), status: account.status === 'disabled' ? 'disabled' : 'active'}));
 const fixtureJobs = [
   {id: 'fixture-running', target: 'codex-07', phase: 'running', trigger: 'manual_single', querying: 1, waiting: 0, completed: 0, failed: 0, total: 1, created_at: observed(), updated_at: observed()},
   {id: 'fixture-waiting', target: 'codex-02', phase: 'running', trigger: 'periodic', scheduled_at: later(-60), hold_reason: 'excluded_hours', querying: 0, waiting: 1, completed: 0, failed: 0, total: 1, created_at: observed(), updated_at: observed()},
@@ -132,6 +136,7 @@ try {
   server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url, 'http://127.0.0.1');
+      if (url.pathname.startsWith('/other-cpa/')) url.pathname = '/cpa/' + url.pathname.slice('/other-cpa/'.length);
       if (url.pathname.startsWith(base)) {
         const name = url.pathname.slice(base.length), filenames = {status: 'index.html', 'panel.js': 'panel.js', 'panel.css': 'panel.css'};
         if (!filenames[name]) { response.writeHead(404); response.end(); return; }
@@ -139,13 +144,41 @@ try {
           'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"});
         response.end(await readFile(join(root, 'internal/v2/daemon/web', filenames[name]))); return;
       }
+      if (url.pathname === '/cpa/v0/management/auth-files/status') {
+        if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
+        assert.equal(request.method, 'PATCH', 'Auth status must never upload or overwrite credentials');
+        let body = ''; for await (const chunk of request) body += chunk;
+        const data = JSON.parse(body); patches.push({body: data, headers: request.headers, path: url.pathname});
+        assert.deepEqual(Object.keys(data).sort(), ['auth_index', 'disabled', 'name']);
+        assert.equal(typeof data.disabled, 'boolean');
+        const matches = authFiles.filter(file => file.name === data.name);
+        assert.equal(matches.length, 1, 'Status PATCH must target the exact unique filename, not an account ID');
+        const file = matches[0]; assert.equal(data.auth_index, file.auth_index); assert.equal(file.runtime_only, false); assert.notEqual(file.plugin_virtual_child, true);
+        const held = authPatchGate;
+        if (held) { held.started = true; await held.promise; }
+        if (held?.outcome === 'reject') { json(response, 400, {error: 'invalid_request'}); return; }
+        file.disabled = data.disabled; file.status = data.disabled ? 'disabled' : 'active';
+        const account = accounts.find(account => account.id === file.id); account.status = data.disabled ? 'disabled' : 'available';
+        accountsRevision++; revision++;
+        if (held?.outcome === 'persist-hook-failed') { json(response, 500, {error: 'post_persist_hook_failed'}); return; }
+        if (held?.outcome === 'disconnect') {
+          response.writeHead(200, {'Content-Type': 'application/json'}); response.write('{"status":');
+          setTimeout(() => response.destroy(), 50); return;
+        }
+        json(response, 200, {status: 'ok', disabled: file.disabled}); return;
+      }
       if (url.pathname === '/cpa/v0/management/auth-files' || url.pathname === '/cpa/v0/management/auth-files/models') {
         if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
         assert.equal(request.method, 'GET'); reads.push(url.pathname + url.search);
         if (url.pathname.endsWith('/models')) {
           assert.equal(url.searchParams.get('name'), 'codex-01');
           json(response, 200, {models: [{id: 'fixture-codex-catalog'}, {id: 'fixture-codex-other'}]});
-        } else json(response, 200, {files: [{id: 'codex-01', name: 'codex-01.json', provider: 'codex', auth_index: 'fixture-index', disabled: false}]});
+        } else {
+          const files = structuredClone(authFilesOverride || authFiles), held = authReadGate;
+          if (held) { held.started = true; await held.promise; }
+          if (held?.outcome === 'reject') { json(response, 503, {error: 'inventory_unavailable'}); return; }
+          json(response, 200, {files});
+        }
         return;
       }
       if (!url.pathname.startsWith(api)) { response.writeHead(404); response.end(); return; }
@@ -235,7 +268,7 @@ try {
         const held = historyDetailGate;
         if (held?.jobID === id) { held.started = true; await held.promise; json(response, 200, held.response); return; }
         const job = wakeJobs.get(id); if (!job) { json(response, 404, {error: 'not_found'}); return; }
-        if (job.reason === 'manual') { job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++; job.response = responseRecord; }
+        if (job.reason === 'manual' && job.key) { job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++; job.response = responseRecord; }
         json(response, 200, {...identity(), ...job}); return;
       }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
@@ -266,13 +299,14 @@ try {
         json(response, job ? 200 : 404, detail); return;
       }
       if (resource === 'accounts') {
-        if (accountReadGate) { accountReadGate.started = true; await accountReadGate.promise; }
+        const held = accountReadGate, snapshot = held?.snapshot ? {identity: identity(), revision: accountsRevision, accounts: structuredClone(accounts)} : undefined;
+        if (held) { held.started = true; await held.promise; }
         if (url.searchParams.has('after') && Number(url.searchParams.get('revision')) !== accountsRevision) { json(response, 409, {error: 'view_changed'}); return; }
         const search = (url.searchParams.get('search') || '').toLowerCase(), status = url.searchParams.get('status') || 'all';
-        const filtered = accounts.filter(account => account.id.toLowerCase().includes(search) && (status === 'all' || status === accountDisplayStatus(account) || status === 'attention' && !['available', 'disabled'].includes(accountDisplayStatus(account))));
+        const filtered = (snapshot?.accounts || accounts).filter(account => account.id.toLowerCase().includes(search) && (status === 'all' || status === accountDisplayStatus(account) || status === 'attention' && !['available', 'disabled'].includes(accountDisplayStatus(account))));
         const page = filtered.filter(account => account.id > (url.searchParams.get('after') || '')).slice(0, Number(url.searchParams.get('limit') || 6));
         const last = page.at(-1)?.id, next = filtered.some(account => account.id > last) ? last : '';
-        json(response, 200, {...identity(), accounts_revision: accountsRevision, accounts: page, next_after: next, total: 24, filter_total: filtered.length}); return;
+        json(response, 200, {...(snapshot?.identity || identity()), accounts_revision: snapshot?.revision ?? accountsRevision, accounts: page, next_after: next, total: 24, filter_total: filtered.length}); return;
       }
       json(response, 404, {error: 'not_found'});
     } catch (error) { exceptions.push(String(error)); json(response, 500, {error: 'fixture_failed'}); }
@@ -372,7 +406,7 @@ try {
     await writeFile(join(output, name), Buffer.from(capture.data, 'base64'));
   }
   await cdp('Page.enable'); await cdp('Runtime.enable'); await cdp('Log.enable'); await cdp('Network.enable');
-  await cdp('Page.addScriptToEvaluateOnNewDocument', {source: `localStorage.setItem('cli-proxy-auth', JSON.stringify({state:{managementKey:${JSON.stringify(fixtureKey)},apiBase:location.origin+'/cpa'}}));`});
+  await cdp('Page.addScriptToEvaluateOnNewDocument', {source: `localStorage.setItem('cli-proxy-auth', JSON.stringify({state:{managementKey:${JSON.stringify(fixtureKey)},apiBase:location.origin+(location.pathname.startsWith('/other-cpa/')?'/other-cpa':'/cpa')}}));`});
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   await cdp('Page.navigate', {url: origin + base + 'status'});
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
@@ -384,7 +418,7 @@ try {
   assert.equal(await evaluate('document.getElementById("auto-wake").disabled'), true);
   assert.equal(await evaluate('document.getElementById("five-hour-query").disabled'), false);
   assert.match(await evaluate('document.getElementById("accounts").rows[0].textContent'), /等待查询 · 手动批量.*后计划查询/);
-  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector("button").textContent'), '立即查询');
+  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector(".account-query").textContent'), '立即查询');
   assert.match(await evaluate('Array.from(document.querySelectorAll("#tasks .task-item")).find(node=>node.textContent.includes("等待 23")).querySelector(".task-heading").textContent'), /查询中/);
   assert.match(await evaluate('Array.from(document.querySelectorAll("#tasks .task-item")).find(node=>node.textContent.includes("处于排除时段")).textContent'), /等待查询.*已到计划时间/s);
   assert.equal(await evaluate('document.body.textContent.includes("近期活跃用户")'), false);
@@ -583,17 +617,17 @@ try {
   const countdownBefore = await evaluate('document.querySelector(".query-pending").textContent');
   await new Promise(resolve => setTimeout(resolve, 2100));
   assert.notEqual(await evaluate('document.querySelector(".query-pending").textContent'), countdownBefore, 'Queued countdown did not update');
-  await evaluate('document.getElementById("accounts").querySelector("button").click()');
+  await evaluate('document.getElementById("accounts").querySelector(".account-query").click()');
   await waitFor(() => posts.some(post => post.resource === 'jobs'), 'Single account query not dispatched');
   assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'jobs').body), {kind: 'quota_query', account_id: 'codex-01'});
   assert.ok(posts.find(post => post.resource === 'jobs').headers['idempotency-key']);
-  await waitFor(() => evaluate('!document.getElementById("accounts").querySelector("button").disabled'), 'Single query did not restore its button');
+  await waitFor(() => evaluate('!document.getElementById("accounts").querySelector(".account-query").disabled'), 'Single query did not restore its button');
   await waitFor(() => evaluate('!document.getElementById("accounts").rows[0].querySelector(".query-pending")'), 'Single query did not promote queued account');
   await evaluate('document.getElementById("query").click()');
   await waitFor(() => posts.filter(post => post.resource === 'jobs').length === 2, 'Batch query not dispatched');
   assert.deepEqual(JSON.parse(posts.filter(post => post.resource === 'jobs')[1].body), {kind: 'quota_query', account_id: ''});
   await waitFor(() => evaluate('document.getElementById("accounts").rows[0].textContent.includes("处于排除时段")'), 'Queue-only revision did not reload account pending state');
-  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector("button").textContent'), '立即查询');
+  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector(".account-query").textContent'), '立即查询');
   await evaluate('document.querySelector("[data-page=history]").click()');
   await waitFor(() => evaluate(`!!document.querySelector('#history-list [data-render-key="query:fixture-bulk"] button')`), 'Persisted query history did not load');
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /处于排除时段/);
@@ -634,7 +668,7 @@ try {
   await waitFor(() => evaluate('document.getElementById("accounts").rows.length===6'), 'Search did not reset');
   accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.querySelector("progress").value===11'), 'Background refresh not applied');
-  await evaluate('globalThis.accountQueryButton=document.getElementById("accounts").rows[0].querySelector("button");accountQueryButton.focus()');
+  await evaluate('globalThis.accountQueryButton=document.getElementById("accounts").rows[0].querySelector(".account-query");accountQueryButton.focus()');
   const accountReadsBeforeFocus = reads.filter(path => path.includes('/accounts?')).length;
   accounts[0].quota.weekly.Remaining.Value = 66; revision++; accountsRevision++;
   await waitFor(() => reads.filter(path => path.includes('/accounts?')).length > accountReadsBeforeFocus, 'Account focus test did not receive background data');
@@ -1113,6 +1147,289 @@ try {
     await screenshot('task-error-details-' + width + '.png');
   }
   assert.equal(posts.length, writesBeforeDetails, 'Reading error details created work');
+  const statusSelector = id => '[data-account-status-id=' + JSON.stringify(id) + ']';
+  const statusState = () => evaluate(`(() => {
+    const button=document.querySelector(${JSON.stringify(statusSelector('codex-01'))});
+    return {checked:button?.getAttribute('aria-checked'),disabled:button?.disabled,phase:button?.dataset.state,open:document.getElementById('account-status-dialog').open,
+      confirm:document.getElementById('account-status-confirm').disabled,verify:document.getElementById('account-status-verify').hidden,
+      message:document.getElementById('account-status-message').textContent};
+  })()`);
+  async function assertAccountActionLayout(alias = '') {
+    const layout = await evaluate(`Array.from(document.querySelectorAll('#accounts .account-row'), row => {
+      const rectangle=node=>{const box=node.getBoundingClientRect();return {width:box.width,height:box.height,top:box.top,bottom:box.bottom}};
+      const name=row.querySelector('.account-name strong'), style=getComputedStyle(name);
+      return {row:rectangle(row),query:rectangle(row.querySelector('.account-query:not(.account-wake)')),
+        wake:rectangle(row.querySelector('.account-wake')),status:rectangle(row.querySelector('[data-account-status-id]')),
+        alias:{...rectangle(name),text:name.textContent,title:name.title,whiteSpace:style.whiteSpace,overflow:style.overflow,textOverflow:style.textOverflow,scrollWidth:name.scrollWidth,clientWidth:name.clientWidth}};
+    })`);
+    assert.equal(layout.length, 6, 'Desktop action layout did not exercise a complete account page');
+    for (const [index, account] of layout.entries()) {
+      const detail = 'row ' + index + ': ' + JSON.stringify(account);
+      assert.ok(account.status.width >= 120, 'CPA switch was squeezed below a readable width: ' + detail);
+      for (const action of ['query', 'wake', 'status']) {
+        assert.ok(account[action].height >= 28 && account[action].height <= 40, 'Account action became stretched or too small (' + action + '): ' + detail);
+      }
+      assert.ok(Math.abs(account.query.top - account.wake.top) <= 1, 'Query and wake buttons no longer share their first action row: ' + detail);
+      assert.ok(account.status.top >= Math.max(account.query.bottom, account.wake.bottom), 'CPA status switch must occupy a separate second action row: ' + detail);
+      assert.ok(account.row.height <= 140, 'Account row became excessively tall: ' + detail);
+    }
+    if (alias) {
+      const name = layout[0].alias;
+      assert.equal(name.text, alias, 'Ellipsis changed the literal alias text');
+      assert.equal(name.title, alias, 'Truncated alias lost its full privacy-safe title');
+      assert.equal(name.whiteSpace, 'nowrap', 'Long alias wrapped into multiple lines');
+      assert.equal(name.overflow, 'hidden', 'Long alias was not clipped within its account column');
+      assert.equal(name.textOverflow, 'ellipsis', 'Long alias did not use an ellipsis');
+      assert.ok(name.height <= 24 && name.scrollWidth > name.clientWidth, 'Long alias did not exercise single-line truncation: ' + JSON.stringify(name));
+    }
+    return layout;
+  }
+  async function openStatus(id = 'codex-01', confirmable = true) {
+    await evaluate(`document.querySelector(${JSON.stringify(statusSelector(id))}).click()`);
+    await waitFor(() => evaluate('document.getElementById("account-status-dialog").open'), 'CPA status confirmation did not open: ' + id);
+    if (confirmable) await waitFor(() => evaluate('!document.getElementById("account-status-confirm").disabled'), async () => 'Status preflight did not verify the exact auth file: ' + JSON.stringify(await statusState()));
+  }
+  async function verifyStatus() {
+    const count = patches.length, before = reads.filter(path => path.endsWith('/auth-files')).length;
+    await clickWhenEnabled('account-status-verify');
+    await waitFor(async () => reads.filter(path => path.endsWith('/auth-files')).length > before && (await statusState()).phase === 'confirmed', async () => 'GET auth-file verification did not unlock the switch: ' + JSON.stringify(await statusState()));
+    assert.equal(patches.length, count, 'Verification resent an auth-file PATCH');
+    assert.equal((await statusState()).checked, String(!authFiles[0].disabled), 'Verification did not apply actual CPA disabled state');
+    await evaluate('if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+  }
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
+  await evaluate('document.querySelector("[data-page=overview]").click()');
+  await waitFor(() => evaluate(`!!document.querySelector(${JSON.stringify(statusSelector('codex-01'))})`), 'Overview did not expose the CPA account switch');
+  assert.equal(await evaluate(`document.querySelector(${JSON.stringify(statusSelector('codex-01'))}).getAttribute('role')`), 'switch');
+  await assertAccountActionLayout();
+  const writesBeforeCPAStatus = posts.length;
+  const authReadsBeforeCPAStatus = reads.filter(path => path.endsWith('/auth-files')).length;
+  authPatchGate = gate();
+  await openStatus();
+  assert.ok(reads.filter(path => path.endsWith('/auth-files')).length > authReadsBeforeCPAStatus, 'Switch confirmation skipped the live CPA auth-file directory');
+  assert.equal(patches.length, 0, 'Opening a status dialog patched CPA');
+  await clickWhenEnabled('account-status-confirm');
+  await waitFor(() => authPatchGate.started, 'Confirmed switch did not PATCH auth-file status');
+  assert.deepEqual(patches[0].body, {name: 'real+primary.codex.json', auth_index: 'fixture-index-0', disabled: true});
+  await evaluate('document.getElementById("account-status-confirm").click();document.getElementById("account-status-verify").click()');
+  assert.equal(patches.length, 1, 'Saving switch allowed a duplicate PATCH');
+  assert.equal((await statusState()).disabled, true, 'Saving switch was not locked');
+  const readsWhileSaving = reads.filter(path => path.endsWith('/overview')).length;
+  await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > readsWhileSaving, 'Saving status did not receive real polling');
+  assert.equal((await statusState()).disabled, true, 'Polling unlocked an in-flight status write');
+  const beforeStatusCommitReads = reads.filter(path => path.endsWith('/auth-files')).length;
+  authPatchGate.release(); authPatchGate = undefined;
+  await waitFor(async () => (await statusState()).checked === 'false' && !(await statusState()).disabled, async () => 'Disable was not GET-verified: ' + JSON.stringify(await statusState()));
+  assert.ok(reads.filter(path => path.endsWith('/auth-files')).length > beforeStatusCommitReads, 'Successful PATCH was not verified with GET auth-files');
+  assert.equal(posts.length, writesBeforeCPAStatus, 'Disabling an account sent a model or plugin POST');
+  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Disabling an account unlocked the existing unknown wake');
+  await evaluate('document.querySelector("[data-page=wake]").click()');
+  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Navigation after disable unlocked unknown wake');
+  await evaluate('document.querySelector("[data-page=overview]").click();if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+  for (const outcome of ['disconnect', 'persist-hook-failed']) {
+    authPatchGate = gate(outcome);
+    await openStatus();
+    const count = patches.length;
+    await clickWhenEnabled('account-status-confirm');
+    await waitFor(() => authPatchGate.started, 'Unknown status fixture did not receive PATCH: ' + outcome);
+    assert.equal(patches.length, count + 1);
+    authReadGate = gate('reject');
+    authPatchGate.release(); authPatchGate = undefined;
+    await waitFor(() => authReadGate.started, 'Uncertain PATCH was not followed by a read-only verification');
+    authReadGate.release(); authReadGate = undefined;
+    await waitFor(async () => (await statusState()).phase === 'unknown' && !(await statusState()).verify, async () => 'Uncertain status did not expose read-only verification (' + outcome + '): ' + JSON.stringify(await statusState()));
+    await assertAccountActionLayout();
+    const overviewReads = reads.filter(path => path.endsWith('/overview')).length;
+    await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > overviewReads, 'Unknown status did not receive a polling cycle');
+    await evaluate(`document.getElementById('account-status-confirm').click();document.querySelector(${JSON.stringify(statusSelector('codex-01'))}).click()`);
+    assert.equal(patches.length, count + 1, 'Unknown status automatically retried PATCH: ' + outcome);
+    assert.equal((await statusState()).phase, 'unknown', 'Polling cleared unknown status without explicit verification');
+    assert.equal((await statusState()).confirm, true, 'Unknown status allowed another write instead of GET verification');
+    await verifyStatus();
+    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Status verification cleared unrelated unknown wake safety');
+  }
+  authPatchGate = gate();
+  await openStatus(); await clickWhenEnabled('account-status-confirm');
+  await waitFor(() => authPatchGate.started, 'Post-PATCH identity race did not start');
+  authFilesOverride = authFiles.map(file => file.id === 'codex-01' ? {...file, id: 'replacement-account', auth_index: 'replacement-index'} : {...file});
+  authPatchGate.release(); authPatchGate = undefined;
+  await waitFor(async () => (await statusState()).phase === 'unknown' && !(await statusState()).verify, 'Same filename with a replacement identity was incorrectly confirmed');
+  const identityRacePatches = patches.length;
+  await clickWhenEnabled('account-status-verify');
+  await waitFor(() => evaluate('!document.getElementById("account-status-verify").disabled'), 'Identity-race GET verification did not finish');
+  assert.equal((await statusState()).phase, 'unknown', 'Replacement identity cleared original unknown write');
+  assert.equal(patches.length, identityRacePatches, 'Identity-race verification resent PATCH');
+  authFilesOverride = undefined;
+  await verifyStatus();
+  accountReadGate = {...gate(), snapshot: true};
+  await clickWhenEnabled('refresh');
+  await waitFor(() => accountReadGate.started, 'Late accounts snapshot was not captured before status write');
+  authPatchGate = gate();
+  await openStatus(); await clickWhenEnabled('account-status-confirm');
+  await waitFor(() => authPatchGate.started, 'Status write did not run concurrently with the old accounts GET');
+  authPatchGate.release(); authPatchGate = undefined;
+  await waitFor(async () => (await statusState()).phase === 'confirmed' && (await statusState()).checked === String(!authFiles[0].disabled), 'Verified status did not render while older accounts GET was held');
+  const verifiedStatus = (await statusState()).checked;
+  accountReadGate.release(); accountReadGate = undefined;
+  await waitFor(() => evaluate('!document.getElementById("sync").disabled'), 'Old accounts GET did not finish');
+  assert.equal((await statusState()).checked, verifiedStatus, 'Late accounts GET rolled back the GET-verified CPA switch');
+  await evaluate('if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+  for (const [label, files] of [
+    ['duplicate account ID', [...structuredClone(authFiles), {...authFiles[0], name: 'duplicate.json'}]],
+    ['name versus ID collision', [...structuredClone(authFiles), {...authFiles[1], id: authFiles[0].name, name: 'collision.json'}]],
+    ['runtime-only', authFiles.map(file => file.id === 'codex-01' ? {...file, runtime_only: true} : {...file})],
+    ['virtual child', authFiles.map(file => file.id === 'codex-01' ? {...file, plugin_virtual_child: true} : {...file})]
+  ]) {
+    authFilesOverride = files;
+    const count = patches.length, before = reads.filter(path => path.endsWith('/auth-files')).length;
+    await openStatus('codex-01', false);
+    await waitFor(async () => reads.filter(path => path.endsWith('/auth-files')).length > before && (await statusState()).phase === 'error' && (await statusState()).confirm, 'Unsafe identity was not rejected: ' + label);
+    await evaluate('document.getElementById("account-status-confirm").click()');
+    assert.equal(patches.length, count, 'Unsafe identity allowed a PATCH: ' + label);
+    await evaluate('document.getElementById("account-status-cancel").click()');
+    authFilesOverride = undefined;
+  }
+  assert.equal(posts.length, writesBeforeCPAStatus, 'Status actions sent an unrelated POST');
+  console.log('CPA status regression passed: exact filename/index binding, one confirmed PATCH, GET verification, disconnect/500 unknown without retry, late accounts ordering, identity rejection and independent wake unknown safety.');
+  const skipIDs = ['fixture-skipped-current', 'fixture-skipped-legacy'];
+  for (const [index, jobID] of skipIDs.entries()) wakeJobs.set(jobID, {job_id: jobID, account_id: 'codex-01', phase: 'skipped', reason: 'manual',
+    created_at: observed(), updated_at: observed(), error_code: index ? 'window_already_active' : '', hold_reason: index ? '' : 'window_already_active'});
+  revision++;
+  await evaluate('document.querySelector("[data-page=history]").click()');
+  await historyFilter('history-search', 'fixture-skipped-', 'input');
+  const skipSummary = await assertHistoryData();
+  assert.equal(skipSummary.total, 2); assert.equal(skipSummary.summary.failed, 0); assert.equal(skipSummary.summary.unknown, 0);
+  assert.equal(await evaluate('document.getElementById("history-attention").textContent'), '0', 'Skipped tasks increased the attention/error count');
+  assert.doesNotMatch(await evaluate('document.getElementById("history-list").textContent'), /请求失败|账号绑定已变化|错误详情/);
+  for (const jobID of skipIDs) {
+    await evaluate(`document.querySelector('#history-list [data-render-key="wake:${jobID}"] button').click()`);
+    await waitFor(() => evaluate('document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'Skipped task detail did not load');
+    assert.match(await evaluate('document.getElementById("history-detail-body").textContent'), /活动窗口|无需.*唤醒/);
+    assert.equal(await evaluate('document.querySelectorAll("#history-detail-body .task-error-details,#history-detail-body .task-errors").length'), 0, 'Normal skip rendered an error card: ' + jobID);
+    assert.equal(await evaluate('document.getElementById("history-detail-safety").hidden'), true, 'Normal skip showed an unknown/error safety warning');
+  }
+  await evaluate('document.querySelector("[data-page=wake]").click()'); await clickWhenEnabled('wake-history-refresh');
+  for (const jobID of skipIDs) {
+    assert.equal(await evaluate(`document.querySelector('#wake-history [data-render-key="wake:${jobID}"]')?.querySelectorAll('.task-error-details,.task-errors').length`), 0, 'Wake history classified a skip as an error: ' + jobID);
+  }
+  const preciseWakeErrors = [
+    ['wake_account_not_found', /未找到此账号|账号已不存在/], ['wake_account_disabled', /已禁用此账号|账号已停用/],
+    ['wake_host_unavailable', /CPA.*无法提供该账号/], ['wake_inventory_stale', /账号状态.*(?:未同步|过期)/],
+    ['wake_account_ambiguous', /账号匹配不唯一/], ['wake_binding_missing', /缺少.*绑定/],
+    ['wake_binding_changed', /账号绑定已变更/], ['wake_account_unavailable', /无法核实账号.*唤醒/]
+  ];
+  await evaluate('document.querySelector("[data-page=history]").click()');
+  for (const [code, text] of preciseWakeErrors) {
+    const jobID = 'fixture-precise-' + code;
+    wakeJobs.set(jobID, {job_id: jobID, account_id: 'codex-01', phase: 'failed', reason: 'manual', error_code: code, created_at: observed(), updated_at: observed()}); revision++;
+    await historyFilter('history-search', jobID, 'input');
+    await evaluate(`document.querySelector('#history-list [data-render-key="wake:${jobID}"] button').click()`);
+    await waitFor(() => evaluate('document.getElementById("history-verify").getAttribute("aria-busy")==="false"'), 'Precise wake failure detail did not load: ' + code);
+    const explanation = await evaluate('document.getElementById("history-detail-body").textContent');
+    assert.match(explanation, text, 'Wake failure lost its precise explanation: ' + code);
+    if (code === 'wake_account_unavailable') assert.doesNotMatch(explanation, /账号凭据绑定已变化|账号绑定已变更/, 'Old generic wake failure incorrectly asserted a binding change');
+    if (code === 'wake_host_unavailable') assert.doesNotMatch(explanation, /CPA.*(?:连接断开|未连接)/, 'Unavailable account incorrectly asserted host disconnection');
+  }
+  assert.equal(posts.length, writesBeforeCPAStatus, 'Inspecting skips or wake failures submitted work');
+  await clickWhenEnabled('history-detail-close');
+  await historyFilter('history-search', '', 'input');
+  async function displayMode(mode) {
+    await evaluate(`(() => {const modeField=document.getElementById('display-mode');modeField.value=${JSON.stringify(mode)};modeField.dispatchEvent(new Event('change'))})()`);
+    assert.equal(await evaluate('document.getElementById("display-mode").value'), mode);
+  }
+  async function setAlias(id, alias) {
+    await evaluate(`document.querySelector('[data-account-alias-id="${id}"]').click()`);
+    await waitFor(() => evaluate('document.getElementById("account-alias-dialog").open'), 'Alias editor did not open');
+    await evaluate(`(() => {const aliasField=document.getElementById('account-alias-value');aliasField.value=${JSON.stringify(alias)};aliasField.dispatchEvent(new Event('input'))})()`);
+    await clickWhenEnabled('account-alias-save');
+    await waitFor(() => evaluate('!document.getElementById("account-alias-dialog").open'), 'Alias editor did not save locally');
+  }
+  async function assertNoVisibleAccountID() {
+    const leaked = await evaluate(`(() => {
+      const visible=node=>!!node.getClientRects().length && getComputedStyle(node).visibility!=='hidden';
+      const text=[];const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
+      while(walker.nextNode()){const node=walker.currentNode;if(visible(node.parentElement)&&!node.parentElement.closest('script,style,input,textarea,select'))text.push(node.textContent)}
+      const attributes=Array.from(document.querySelectorAll('[title],[aria-label]')).filter(visible).map(node=>(node.title||'')+' '+(node.getAttribute('aria-label')||''));
+      return text.concat(attributes).filter(value=>/codex-\\d{2}|persisted-(?:wake-)?account-\\d+|antigravity-(?:fixture|disabled)|error-fixture-account-\\d+|real\\+primary\\.codex\\.json|bravo\\.fixture@example\\.test/.test(value));
+    })()`);
+    assert.deepEqual(leaked, [], 'Masked/alias mode leaked visible account identities');
+    assert.equal(await evaluate('Array.from(document.querySelectorAll("#generation-account-options option"),option=>option.value+" "+option.textContent+" "+option.label).some(value=>/codex-\\d{2}|antigravity-(?:fixture|disabled)/.test(value))'), false, 'Account dropdown suggestions leaked raw identities');
+  }
+  await evaluate('document.querySelector("[data-page=overview]").click()');
+  accounts[1].id = 'bravo.fixture@example.test'; accountsRevision++; revision++;
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[1]?.querySelector("strong")?.textContent==="bravo.fixture@example.test"'), 'Email display fixture did not reach account rendering');
+  const writesBeforeDisplay = posts.length, patchesBeforeDisplay = patches.length;
+  await displayMode('masked');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), 'c***1');
+  assert.equal(await evaluate('document.getElementById("accounts").rows[1].querySelector("strong").textContent'), 'b***@***', 'Email account was not masked');
+  for (const page of ['overview', 'accounts', 'query', 'models', 'wake', 'history', 'diagnostics']) {
+    await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
+    await assertNoVisibleAccountID();
+  }
+  await evaluate('document.querySelector("[data-page=overview]").click()');
+  const injectedAlias = '<img src=x onerror=globalThis.aliasExecuted=true>主账号';
+  await setAlias('codex-01', injectedAlias);
+  await clickWhenEnabled('next');
+  await waitFor(() => evaluate('!!document.querySelector("[data-account-alias-id=codex-07]")'), 'Second page did not expose alias editing');
+  await setAlias('codex-07', '值班账号');
+  await clickWhenEnabled('previous');
+  await waitFor(() => evaluate('!!document.querySelector("[data-account-alias-id=codex-01]")'), 'Alias editing did not return to the first page');
+  await displayMode('alias');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), injectedAlias);
+  assert.equal(await evaluate('document.querySelectorAll("#accounts img,#account-alias-dialog img").length'), 0, 'Alias became executable HTML');
+  assert.notEqual(await evaluate('globalThis.aliasExecuted'), true);
+  assert.match(await evaluate('document.getElementById("tasks").textContent'), /值班账号/, 'Overview task target did not use the saved alias');
+  await evaluate('globalThis.aliasButton=document.querySelector("[data-account-alias-id=codex-01]");aliasButton.focus()');
+  const aliasReads = reads.filter(path => path.includes('/accounts?')).length;
+  accounts[0].quota.weekly.Remaining.Value = 63; accountsRevision++; revision++;
+  await waitFor(() => reads.filter(path => path.includes('/accounts?')).length > aliasReads, 'Alias focus test did not receive actual account polling');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].cells[3].textContent.includes("63%")'), 'Alias polling did not render new quota');
+  assert.equal(await evaluate('aliasButton.isConnected && document.activeElement===aliasButton'), true, 'Polling replaced the focused alias button');
+  await evaluate('aliasButton.click();const field=document.getElementById("account-alias-value");field.focus();field.value="未保存别称";field.dispatchEvent(new Event("input"));field.setSelectionRange(1,3)');
+  const overviewBeforeAliasDraft = reads.filter(path => path.endsWith('/overview')).length;
+  await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > overviewBeforeAliasDraft, 'Alias draft did not receive real polling');
+  assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("account-alias-value").value,document.getElementById("account-alias-value").selectionStart,document.getElementById("account-alias-value").selectionEnd]'), ['account-alias-value', '未保存别称', 1, 3], 'Polling disturbed alias draft or selection');
+  await evaluate('document.getElementById("account-alias-cancel").click()');
+  for (const page of ['overview', 'accounts', 'query', 'models', 'wake', 'history', 'diagnostics']) {
+    await evaluate(`document.querySelector('[data-page="${page}"]').click()`); await assertNoVisibleAccountID();
+  }
+  assert.equal(posts.length, writesBeforeDisplay, 'Local display preferences posted to CPA');
+  assert.equal(patches.length, patchesBeforeDisplay, 'Local display preferences patched CPA');
+  const preferenceKey = 'cwr-v2-display:' + origin + '/cpa';
+  assert.deepEqual(await evaluate(`JSON.parse(localStorage.getItem(${JSON.stringify(preferenceKey)}))`), {mode: 'alias', aliases: {'codex-01': injectedAlias, 'codex-07': '值班账号'}});
+  await cdp('Page.reload');
+  await waitFor(() => evaluate('document.getElementById("accounts")?.rows.length===6 && document.getElementById("login-section")?.hidden'), 'Display persistence reload did not connect');
+  assert.equal(await evaluate('document.getElementById("display-mode").value'), 'alias');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), injectedAlias);
+  for (const width of [1586, 390]) {
+    await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Alias-mode overview overflow at ' + width);
+    if (width === 1586) {
+      const layout = await assertAccountActionLayout(injectedAlias);
+      console.log('Desktop account action layout passed: ' + JSON.stringify(layout.map(account => ({rowHeight: account.row.height, statusWidth: account.status.width, statusHeight: account.status.height, queryHeight: account.query.height, wakeHeight: account.wake.height}))));
+    }
+    await screenshot('account-display-alias-' + width + '.png');
+  }
+  await evaluate('document.getElementById("accounts").rows[1].querySelector(".account-wake").click()');
+  await waitFor(() => evaluate('document.getElementById("quick-wake-dialog").open && !document.getElementById("quick-wake-consent").disabled'), 'Masked email quick-wake confirmation did not load');
+  assert.equal(await evaluate('document.getElementById("quick-wake-account").textContent'), 'b***@***', 'Quick-wake confirmation leaked the email identity');
+  await assertNoVisibleAccountID();
+  await evaluate('document.getElementById("quick-wake-cancel").click()');
+  assert.equal(posts.length, writesBeforeDisplay, 'Displaying a masked quick-wake confirmation sent a model request');
+  await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
+  await evaluate('document.querySelector("[data-page=overview]").click();document.querySelector("#accounts .account-query").click()');
+  await waitFor(() => posts.length > writesBeforeDisplay, 'Alias-mode query did not submit');
+  assert.deepEqual(JSON.parse(posts.at(-1).body), {kind: 'quota_query', account_id: 'codex-01'}, 'Alias changed the request account ID');
+  assert.equal(posts.at(-1).resource, 'jobs');
+  await cdp('Page.navigate', {url: origin + '/other-cpa/v0/resource/plugins/codex-window-refresh/status'});
+  await waitFor(() => evaluate('document.getElementById("accounts")?.rows.length===6 && document.getElementById("login-section")?.hidden'), 'Second CPA base fixture did not connect');
+  assert.equal(await evaluate('document.getElementById("display-mode").value'), 'original', 'Display preferences leaked to another CPA base on the same origin');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), 'codex-01', 'Alias leaked to another CPA base');
+  await cdp('Page.navigate', {url: origin + base + 'status'});
+  await waitFor(() => evaluate('document.getElementById("accounts")?.rows.length===6 && document.getElementById("login-section")?.hidden'), 'Original CPA base did not reconnect');
+  assert.equal(await evaluate('document.getElementById("display-mode").value'), 'alias');
+  await displayMode('original');
+  console.log('Display/skip regression passed: precise wake explanations, informational current/legacy skips without error cards/counts, all-page alias/mask text and accessibility rendering, XSS-safe aliases, polling focus/draft preservation, reload/base-scoped local preferences and unchanged request identity.');
   const writesBeforeHTTP = posts.length;
   await cdp('Emulation.setDeviceMetricsOverride', {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
   await cdp('Page.navigate', {url: httpOrigin + base + 'status'});
@@ -1144,10 +1461,12 @@ try {
   assert.equal(posts.filter(post => post.resource === 'prompt-generations').length, 1, 'Unexpected generation write count');
   assert.equal(posts.filter(post => post.resource === 'wake-settings').length, 4, 'Unexpected wake settings writes');
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Unexpected model wake writes');
-  assert.equal(posts.length, 19, 'Unexpected total API write count');
+  assert.equal(patches.length, 5, 'Unexpected auth-file status PATCH count');
+  assert.equal(patches.every(patch => patch.path === '/cpa/v0/management/auth-files/status' && patch.body.name === 'real+primary.codex.json' && patch.body.auth_index === 'fixture-index-0'), true, 'Status PATCH escaped the exact auth file binding');
+  assert.equal(posts.length, 20, 'Unexpected total API write count');
   assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations', 'wake-settings', 'wake-jobs'].includes(post.resource)), true, 'Unexpected API write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
-  console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, same-account quick-wake native close race, exactly one confirmed wake POST, persisted task history and real trigger menus, skipped/cancelled tabs, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard rejection/unavailable API fallback, filter/expansion focus preservation, explicit mobile detail focus/scroll/close return, unavailable-history recovery, fixture-only page traffic, and top-page screenshots at 2560x1600, 1280x900 and 390x844 plus mobile detail.');
+  console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, same-account quick-wake native close race, exactly one confirmed wake POST, five explicitly confirmed filename/index-bound CPA PATCHes with GET verification and unknown protection, global alias/mask preferences scoped to CPA base with stable request IDs and polling focus, precise wake explanations, informational legacy/current skips, persisted task history and real trigger menus, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard fallback, mobile detail focus/scroll, unavailable-history recovery, fixture-only page traffic and screenshots.');
   console.log('Local fixture screenshots: ' + output);
 } finally {
   accountReadGate?.release();
@@ -1156,6 +1475,8 @@ try {
   modelReadGate?.release();
   wakeReadGate?.release();
   historyDetailGate?.release();
+  authReadGate?.release();
+  authPatchGate?.release();
   if (socket) socket.close();
   if (browser && browser.exitCode === null && browser.signalCode === null) {
     browser.kill('SIGTERM');

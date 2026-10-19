@@ -297,6 +297,8 @@ func readDashboard(ctx context.Context, tx *sql.Tx, revision, accountsRevision u
 			detail = "模型已返回，等待窗口证据核实"
 		} else if phase == "completed" {
 			detail = "模型唤醒已核实活动窗口"
+		} else if phase == "skipped" {
+			detail = "模型唤醒已跳过，无需重复唤醒"
 		}
 		dashboard.RecentEvents = append(dashboard.RecentEvents, DashboardEvent{ID: "wake:" + id, Kind: "model_wake", At: updated, Phase: phase, JobID: id, AccountID: accountID, Detail: detail, Code: "model_wake_" + phase, Severity: severity})
 	}

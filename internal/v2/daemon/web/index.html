@@ -55,11 +55,13 @@
     <header class="page-header">
       <div><h1 id="page-title">运行总览</h1><p id="page-description">掌握账号额度与实时任务</p></div>
       <div class="header-actions">
+        <div class="display-control"><label for="display-mode">账号显示</label><select id="display-mode" aria-describedby="display-help"><option value="original">原始</option><option value="masked">打码</option><option value="alias">别称</option></select></div>
         <div class="auto-update" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span><span id="auto-status">连接后自动更新</span><span class="update-separator" aria-hidden="true">·</span><time id="last-updated">尚未同步</time></div>
         <button type="button" id="sync" class="button button-outline" disabled><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg>同步 CPA</button>
         <button type="button" id="refresh" class="button button-icon" aria-label="刷新页面数据" title="刷新页面数据" disabled><svg class="icon" aria-hidden="true"><use href="#icon-refresh"/></svg></button>
       </div>
     </header>
+    <p id="display-help" class="display-help">仅影响当前浏览器显示，按 CPA 地址保存；别称在账号行编辑。未设别称时打码。主动输入的账号 ID 可保留原始值；请求身份、后台历史及日志不会因此打码。</p>
 
     <section id="login-section" class="login-card card" aria-labelledby="login-title">
       <div class="login-intro"><span class="login-icon"><svg class="icon" aria-hidden="true"><use href="#icon-lock"/></svg></span><div><h2 id="login-title">连接 CPA 管理服务</h2><p>使用管理密钥读取真实数据，密钥仅保留在当前页面内存中。</p></div></div>
@@ -82,6 +84,7 @@
           <section id="account-card" class="account-card card" aria-labelledby="accounts-title">
             <div class="account-toolbar"><div class="account-heading"><h2 id="accounts-title">账号额度</h2><span id="accounts-count" class="muted">— 个账号</span></div><div class="account-actions"><div class="search-field"><svg class="icon" aria-hidden="true"><use href="#icon-search"/></svg><label for="accounts-search" class="sr-only">搜索账号</label><input id="accounts-search" type="search" placeholder="搜索账号" autocomplete="off"></div><label for="accounts-filter" class="sr-only">筛选账号状态</label><select id="accounts-filter"><option value="all">全部状态</option><option value="available">正常</option><option value="disabled">已禁用</option><option value="unavailable">暂不可用</option><option value="quota_exhausted">额度耗尽</option><option value="quota_restricted">额度受限</option><option value="attention">需要关注</option></select><button type="button" id="query" class="button button-primary" disabled>批量查询</button></div></div>
             <p id="account-query-note" class="section-description">单账号立即查询 · 批量查询以后台当前能力为准</p>
+            <p class="field-help account-status-help">CPA 启用/禁用真实修改认证文件；启用可能恢复业务及自动任务的额度消耗，禁用不发送模型、不清除未知结果防重。仅独立 Codex 认证文件可操作，虚拟子账号及配置密钥不支持。</p>
             <div class="table-scroll" tabindex="0" role="region" aria-label="账号额度表格，可横向滚动">
               <table class="accounts-table"><thead><tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col">5 小时剩余</th><th scope="col">周剩余</th><th scope="col">最近更新</th><th scope="col">操作</th></tr></thead><tbody id="accounts"><tr><td class="empty-state" colspan="6"><svg class="icon empty-icon" aria-hidden="true"><use href="#icon-accounts"/></svg><strong>等待连接 CPA</strong><span>连接后自动读取账号与已保存的额度数据</span></td></tr></tbody></table>
             </div>
@@ -251,6 +254,17 @@
       <button id="quick-wake-history" class="text-button" type="button">查看唤醒记录</button>
     </form>
   </dialog>
+  <dialog id="account-status-dialog" class="quick-wake-dialog account-status-dialog" aria-labelledby="account-status-title" hidden>
+    <h2 id="account-status-title">CPA 账号启用 / 禁用</h2>
+    <p id="account-status-account" class="quick-wake-account"></p>
+    <p id="account-status-message" class="field-help" role="status" aria-live="polite"></p>
+    <p class="section-description">启用可能恢复正常业务及已授权自动任务，持续消耗额度。禁用不发送模型、不清除已有未知任务防重；不会改写其他账号的凭据。外部并发修改无法由此锁定。</p>
+    <div class="settings-actions"><button id="account-status-confirm" class="button button-primary" type="button" disabled>确认修改 CPA 状态</button><button id="account-status-verify" class="button button-outline" type="button" hidden disabled>只读核实 CPA 状态</button><button id="account-status-cancel" class="button button-outline" type="button">关闭</button></div>
+  </dialog>
+  <dialog id="account-alias-dialog" class="quick-wake-dialog" aria-labelledby="account-alias-title" hidden>
+    <form id="account-alias-form" novalidate><h2 id="account-alias-title">编辑浏览器别称</h2><p id="account-alias-account" class="quick-wake-account"></p><label for="account-alias-value" class="field-label">别称（留空恢复打码）</label><input id="account-alias-value" type="text" maxlength="80" autocomplete="off" aria-describedby="account-alias-help"><p id="account-alias-help" class="field-help">只保存在此浏览器、此 CPA 地址的显示偏好中，映射真实账号 ID；不改 CPA 文件名、身份、后台历史或日志。</p><p id="account-alias-message" class="field-help" role="status"></p><div class="settings-actions"><button id="account-alias-save" class="button button-primary" type="submit">保存别称</button><button id="account-alias-cancel" class="button button-outline" type="button">取消</button></div></form>
+  </dialog>
+  <p id="account-status-state-message" role="status" hidden></p>
   <section id="toast-region" class="toast-region" aria-label="操作提示" tabindex="-1"><p id="catalog-feedback" hidden></p></section>
   <script src="panel.js"></script>
 </body>

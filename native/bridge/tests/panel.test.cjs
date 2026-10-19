@@ -186,7 +186,7 @@ function panel(respond, options = {}) {
   let nextTimer = 0;
   const get = id => {
     if (!elements.has(id)) {
-      const node = new Element(); elements.set(id, node);
+      const node = new Element(); node.id = id; elements.set(id, node);
       if (id !== 'document-root') elements.get('document-root')?.append(node);
     }
     return elements.get(id);
@@ -215,7 +215,7 @@ function panel(respond, options = {}) {
         if (selector === '[data-view]') return panels;
         const nodes = [...new Set([...elements.values()].flatMap(walk))];
         if (selector.startsWith('.')) return nodes.filter(node => node.className === selector.slice(1));
-        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase', '[data-wake-account]': 'wakeAccount', '[data-history-status]': 'historyStatus', '[data-history-count]': 'historyCount'}[selector];
+        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase', '[data-wake-account]': 'wakeAccount', '[data-account-status-id]': 'accountStatusId', '[data-account-alias-id]': 'accountAliasId', '[data-history-status]': 'historyStatus', '[data-history-count]': 'historyCount'}[selector];
         return attribute ? nodes.filter(node => Object.hasOwn(node.dataset, attribute)) : [];
       }},
     location: options.location || location, navigator: {userAgent: 'fixture', ...options.navigator}, isSecureContext: options.secure || false,
@@ -2680,4 +2680,214 @@ test('older wake history snapshots cannot roll a known unknown outcome back to a
   jobRevision = 29; phase = 'queued'; await ui.get('wake-history-refresh').onclick();
   assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-status').textContent, '结果未知');
   await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
+});
+
+const statusFile = overrides => ({id: 'codex-01', name: 'private+credential.json', auth_index: 'auth-index-01', provider: 'codex', source: 'memory', runtime_only: false, disabled: false, ...overrides});
+const statusSwitch = (ui, id = 'codex-01') => ui.document.querySelectorAll('[data-account-status-id]').find(node => node.dataset.accountStatusId === id);
+const aliasButton = (ui, id = 'codex-01') => ui.document.querySelectorAll('[data-account-alias-id]').find(node => node.dataset.accountAliasId === id);
+const changeDisplay = (ui, mode) => { ui.get('display-mode').value = mode; ui.get('display-mode').onchange(); };
+
+test('CPA status resolver permits disabled files but rejects ambiguous and non-independent identities', () => {
+  const {resolveStatusAccount, sameStatusIdentity} = require('../../../internal/v2/daemon/web/panel.js');
+  const file = statusFile({disabled: true}), resolved = resolveStatusAccount({files: [file]}, file.id);
+  assert.equal(resolved.name, file.name); assert.equal(resolved.index, file.auth_index); assert.equal(resolved.disabled, true);
+  assert.equal(sameStatusIdentity(resolved, {...resolved, disabled: false}), true);
+  assert.equal(sameStatusIdentity(resolved, {...resolved, id: 'replacement'}), false);
+  for (const files of [[file, {...file}], [file, statusFile({id: 'other', name: file.name, auth_index: 'other-index'})],
+    [file, statusFile({id: 'other', name: file.id, auth_index: 'other-index'})], [file, statusFile({id: file.name, name: 'other.json', auth_index: 'other-index'})],
+    [file, statusFile({id: 'other', name: 'other.json'})], ...[{runtime_only: true}, {runtime_only: 'false'}, {source: 'config'}, {plugin_virtual_child: true},
+      {metadata: {plugin_virtual_parent_id: 'parent'}}, {parent_id: 'parent'}, {provider: 'antigravity'}, {disabled: 'false'}, {auth_index: ''}, {name: '../secret.json'}].map(patch => [{...file, ...patch}])]) {
+    assert.throws(() => resolveStatusAccount({files}, file.id), {code: 'account_status_identity'});
+  }
+  assert.throws(() => resolveStatusAccount({files: [statusFile({id: 'file-only'})]}, file.name), {code: 'account_status_identity'});
+});
+
+test('CPA account switches PATCH only the uniquely mapped filename and binding then confirm with GET', async () => {
+  let file = statusFile();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/auth-files')) return [200, {files: [file]}];
+    if (url.endsWith('/auth-files/status')) { file = {...file, disabled: JSON.parse(options.body).disabled}; return [200, {status: 'ok', disabled: file.disabled}]; }
+    return basic(url);
+  });
+  await ui.get('connect').onclick(); const button = statusSwitch(ui); button.focus();
+  assert.equal(button.getAttribute('role'), 'switch'); assert.equal(button.getAttribute('aria-checked'), 'true');
+  await button.onclick(); assert.equal(ui.calls.some(call => call.method === 'PATCH'), false);
+  assert.match(ui.get('account-status-message').textContent, /不发送模型/);
+  await ui.get('account-status-confirm').onclick();
+  const writes = ui.calls.filter(call => call.method === 'PATCH'); assert.equal(writes.length, 1);
+  assert.deepEqual(JSON.parse(writes[0].body), {name: file.name, auth_index: file.auth_index, disabled: true});
+  assert.equal(writes[0].url, '/v0/management/auth-files/status'); assert.equal(writes[0].headers.Authorization, 'Bearer fixture-key');
+  assert.equal(writes[0].credentials, 'omit'); assert.equal(writes[0].redirect, 'error');
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, 3);
+  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false'); assert.match(ui.get('account-status-state-message').textContent, /只读目录核实/);
+  ui.get('account-status-cancel').onclick(); assert.equal(ui.document.activeElement, button);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  await statusSwitch(ui).onclick(); assert.match(ui.get('account-status-confirm').textContent, /启用.*额度消耗/);
+  await ui.get('account-status-confirm').onclick(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true');
+  assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 2);
+});
+
+test('CPA status writes hold a concurrency lock and never report success from the acknowledgement alone', async () => {
+  let file = statusFile(), releasePatch, releaseRead, reads = 0;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/auth-files/status')) return new Promise(resolve => { releasePatch = () => { file = {...file, disabled: true}; resolve([200, {status: 'ok', disabled: true}]); }; });
+    if (url.endsWith('/auth-files')) return ++reads === 3 ? new Promise(resolve => { releaseRead = () => resolve([200, {files: [file]}]); }) : [200, {files: [file]}];
+    return basic(url);
+  });
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
+  const pending = ui.get('account-status-confirm').onclick(); await flush();
+  assert.equal(statusSwitch(ui).disabled, true); await ui.get('account-status-confirm').onclick(); await statusSwitch(ui).onclick();
+  assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
+  releasePatch(); await flush(); assert.equal(ui.get('account-status-state-message').textContent, '');
+  assert.equal(ui.get('account-status-confirm').disabled, true); releaseRead(); await pending;
+  assert.match(ui.get('account-status-state-message').textContent, /已禁用/);
+});
+
+test('lost or 5xx PATCH results are never resent and GET-confirmed state is the only success signal', async () => {
+  for (const lost of [true, false]) {
+    let file = statusFile(), failRead = true, patches = 0;
+    const ui = panel((url, options) => {
+      if (url.endsWith('/auth-files/status')) { patches++; file = {...file, disabled: true}; return lost ? Promise.reject(new Error('lost response')) : [500, {error: 'post-persist hook failed'}]; }
+      if (url.endsWith('/auth-files')) return patches && failRead ? [503, {error: 'storage_unavailable'}] : [200, {files: [file]}];
+      return basic(url);
+    });
+    await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+    assert.equal(ui.get('account-status-confirm').hidden, true); assert.equal(ui.get('account-status-verify').hidden, false);
+    assert.equal(statusSwitch(ui).dataset.state, 'unknown'); assert.equal(ui.get('account-status-state-message').parentNode.dataset.tone, 'warning');
+    await ui.get('account-status-confirm').onclick(); await ui.get('account-status-verify').onclick(); assert.equal(patches, 1);
+    await ui.get('refresh').onclick(); assert.equal(statusSwitch(ui).dataset.state, 'unknown');
+    failRead = false; await ui.get('account-status-verify').onclick(); assert.equal(patches, 1);
+    assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false'); assert.match(ui.get('account-status-message').textContent, /已通过 CPA/);
+  }
+});
+
+test('CPA post-persist failure can be confirmed by GET without replaying the mutation', async () => {
+  let file = statusFile();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [500, {error: 'hook failed'}]; }
+    return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
+  });
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  assert.equal(statusSwitch(ui).dataset.state, 'confirmed'); assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
+});
+
+test('CPA status identity changes before and after PATCH fail closed without touching a replacement', async () => {
+  for (const afterPatch of [false, true]) {
+    let reads = 0, restore = false;
+    const file = statusFile(), replacement = {...file, id: 'replacement-account', auth_index: 'replacement-index', disabled: true};
+    const ui = panel((url, options) => {
+      if (url.endsWith('/auth-files')) { reads++; return [200, {files: [restore ? {...file, disabled: true} : reads > (afterPatch ? 2 : 1) ? replacement : file]}]; }
+      if (url.endsWith('/auth-files/status')) return [200, {status: 'ok', disabled: true}];
+      return basic(url);
+    });
+    await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+    assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, afterPatch ? 1 : 0);
+    assert.equal(statusSwitch(ui).dataset.state, afterPatch ? 'unknown' : 'error');
+    assert.equal(ui.get('account-status-state-message').textContent.includes('已通过'), false);
+    if (afterPatch) { restore = true; await ui.get('account-status-verify').onclick(); assert.equal(statusSwitch(ui).dataset.state, 'confirmed'); }
+  }
+});
+
+test('unsafe runtime and virtual row identities cannot toggle parent credentials', async () => {
+  for (const extra of [{runtime_only: true}, {plugin_virtual_child: true}, {attributes: {plugin_virtual_parent: 'parent'}}]) {
+    const ui = panel(url => url.includes('/accounts?') ? [200, accountPage(1, [{id: 'codex-01', status: 'available', ...extra}])] : basic(url));
+    await ui.get('connect').onclick(); assert.equal(statusSwitch(ui).disabled, true);
+    await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+    assert.equal(ui.calls.some(call => call.url.includes('/auth-files')), false);
+  }
+});
+
+test('explicit refresh reconciles external CPA changes without stale daemon accounts rolling back confirmation', async () => {
+  let file = statusFile();
+  const ui = panel((url, options) => {
+    if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
+    return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
+  });
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  await ui.get('refresh').onclick(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false');
+  file = {...file, disabled: false}; await ui.get('refresh').onclick();
+  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true'); assert.match(ui.get('account-status-message').textContent, /重新只读核实/);
+});
+
+test('authentication loss during CPA PATCH preserves unknown intent across reconnect without a second write', async () => {
+  let patched = false;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/auth-files/status')) { patched = true; return [401, {error: 'unauthorized'}]; }
+    return url.endsWith('/auth-files') ? [200, {files: [statusFile({disabled: patched})]}] : basic(url);
+  });
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  assert.equal(ui.get('login-section').hidden, false); ui.get('key').value = 'reconnected-key'; await ui.get('connect').onclick();
+  await statusSwitch(ui).onclick(); assert.equal(ui.get('account-status-confirm').hidden, true);
+  await ui.get('account-status-verify').onclick(); assert.equal(statusSwitch(ui).dataset.state, 'confirmed');
+  assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
+});
+
+test('display preferences default to original, survive blocked storage, and remain CPA mount isolated', async () => {
+  const storage = {}, ui = panel(basic, {storage}); await ui.get('connect').onclick();
+  assert.equal(ui.get('display-mode').value, 'original'); assert.match(ui.get('accounts').textContent, /codex-01/);
+  changeDisplay(ui, 'masked'); assert.match(ui.get('accounts').textContent, /c\*\*\*1/); assert.doesNotMatch(ui.get('accounts').textContent, /codex-01/);
+  const preference = 'cwr-v2-display:' + origin;
+  assert.deepEqual(JSON.parse(storage[preference]), {mode: 'masked', aliases: {}});
+  const restored = panel(basic, {storage}); await restored.get('connect').onclick(); assert.equal(restored.get('display-mode').value, 'masked');
+  const other = panel(basic, {storage, location: {...location, pathname: '/other' + location.pathname}}); await other.get('connect').onclick(); assert.equal(other.get('display-mode').value, 'original');
+  const blocked = panel(basic, {storageBlocked: true}); await blocked.get('connect').onclick(); changeDisplay(blocked, 'masked');
+  assert.doesNotMatch(blocked.get('accounts').textContent, /codex-01/); assert.match(blocked.get('notice').textContent, /当前页面/);
+  changeDisplay(ui, 'original'); assert.match(ui.get('accounts').textContent, /codex-01/);
+});
+
+test('aliases map true identity only in browser display and never change requests or history', async () => {
+  const id = 'private+user@example.net', file = statusFile({id}), record = historyRecord({account_id: id});
+  const ui = panel((url, options) => {
+    if (url.endsWith('/overview')) { const data = overview(); data.dashboard.recent_jobs = [{...view(), job_id: 'running-job', account_id: id, phase: 'queued'}]; data.dashboard.recent_events = [{kind: 'model_wake', phase: 'skipped', account_id: id, hold_reason: 'window_already_active'}]; return [200, data]; }
+    if (url.includes('/accounts?')) return [200, accountPage(1, [{id, status: 'available'}])];
+    if (url.includes('/task-history?')) return [200, historyPage([record])];
+    if (url.endsWith('/auth-files')) return [200, {files: [file]}];
+    if (url.endsWith('/jobs') && options.method === 'POST') return [202, {...view(), job_id: 'private-query', phase: 'queued'}];
+    return basic(url);
+  });
+  await ui.get('connect').onclick(); changeDisplay(ui, 'alias');
+  const editor = aliasButton(ui, id); editor.focus(); editor.onclick(); ui.get('account-alias-value').value = '私人账号';
+  ui.get('account-alias-form').onsubmit({preventDefault() {}}); assert.equal(ui.get('account-alias-dialog').hidden, true); assert.equal(ui.document.activeElement, editor);
+  for (const name of ['accounts', 'tasks', 'recent-events', 'job']) { assert.doesNotMatch(ui.get(name).textContent, /private\+user@example\.net/); assert.match(ui.get(name).textContent, /私人账号/); }
+  for (const node of descendants(ui.get('accounts'))) for (const name of ['title', 'aria-label']) assert.equal((node.getAttribute(name) || node.title || '').includes(id), false);
+  ui.nav.find(node => node.dataset.page === 'history').listeners.get('click')(); await flush();
+  assert.match(ui.get('history-list').textContent, /私人账号/); assert.equal(record.account_id, id);
+  ui.get('account').value = '私人账号'; await ui.get('query-single').onclick();
+  assert.equal(JSON.parse(ui.calls.find(call => call.url.endsWith('/jobs') && call.method === 'POST').body).account_id, id);
+  assert.equal(ui.get('account').value, '私人账号');
+  changeDisplay(ui, 'original'); assert.match(ui.get('accounts').textContent, /private\+user@example\.net/);
+  assert.equal(ui.calls.some(call => /settings/.test(call.url) && call.method === 'POST'), false);
+});
+
+test('short IDs only mask identity tokens and do not rewrite words or input titles unsafely', async () => {
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) { const data = overview(); data.dashboard.recent_events = [{detail: 'catalog alpha / a / /path/a', kind: 'other'}]; return [200, data]; }
+    return [200, accountPage(1, [{id: 'a', status: 'available'}])];
+  });
+  await ui.get('connect').onclick(); ui.get('account').value = 'a'; ui.get('account').setAttribute('title', '账号 a');
+  changeDisplay(ui, 'masked'); assert.match(ui.get('recent-events').textContent, /catalog alpha \/ \*\*\* \/ \/path\/\*\*\*/);
+  assert.equal(ui.get('account').value, 'a'); assert.equal(ui.get('account').getAttribute('title'), '账号 ***');
+  changeDisplay(ui, 'original'); assert.equal(ui.get('account').getAttribute('title'), '账号 a');
+});
+
+test('normal wake skips never show error details or inflate failed-unknown attention counts', async () => {
+  for (const legacy of [false, true]) {
+    const record = historyRecord({type: 'wake', status: 'skipped', account_id: 'codex-01', error_code: legacy ? 'window_already_active' : '', hold_reason: legacy ? '' : 'window_already_active'});
+    const job = {...view('a', 30), job_id: record.job_id, account_id: record.account_id, phase: 'skipped', error_code: record.error_code, hold_reason: record.hold_reason};
+    const ui = panel(url => url.includes('/task-history?') ? [200, historyPage([record], {summary: {...historyPage().summary, skipped: 1}})]
+      : url.includes('/wake-jobs?job_id=') ? [200, job] : url.includes('/wake-jobs?limit=') ? [200, {...view('a', 30), jobs: [job]}] : wakeResponse(url));
+    await openWake(ui); assert.doesNotMatch(ui.get('wake-history').textContent, /错误详情|请求失败/); assert.match(ui.get('wake-history').textContent, /正常跳过.*已有活动窗口/);
+    ui.nav.find(node => node.dataset.page === 'history').listeners.get('click')(); await flush(); historyButtons(ui)[0].onclick(); await flush();
+    assert.equal(ui.get('history-attention').textContent, '0'); assert.doesNotMatch(ui.get('history-detail-body').textContent, /错误详情|请求失败/);
+    assert.match(ui.get('history-detail-body').textContent, /正常跳过原因/); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  }
+});
+
+test('wake precision codes are contextual and the legacy generic code never claims a changed binding', () => {
+  const {taskDiagnostic} = require('../../../internal/v2/daemon/web/panel.js');
+  assert.match(taskDiagnostic('wake_account_not_found').title, /Codex.*提供方/);
+  assert.doesNotMatch(taskDiagnostic('wake_account_not_found').title, /不存在|已删除/);
+  assert.doesNotMatch(taskDiagnostic('wake_account_disabled').title, /未发送|已发送/);
+  assert.match(taskDiagnostic('wake_binding_changed').title, /绑定已变更/);
+  const generic = taskDiagnostic('wake_account_unavailable'); assert.match(generic.title, /无法核实/); assert.doesNotMatch(generic.title + generic.advice, /绑定已变化|绑定已变更/);
 });

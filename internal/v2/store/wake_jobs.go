@@ -55,6 +55,12 @@ func scanWake(row interface{ Scan(...any) error }) (WakeJob, error) {
 	var job WakeJob
 	err := row.Scan(&job.ID, &job.AccountID, &job.Account.AuthIndex, &job.Account.Binding, &job.Reason, &job.Cycle, &job.Phase, &job.ErrorCode, &job.HoldReason, &job.ScheduledAt, &job.CreatedAt, &job.UpdatedAt, &job.QueryJobID, &job.QueryGate, &job.Model, &job.Prompt, &job.PolicyRevision, &job.ModelRevision, &job.VerificationAttempts, &job.HoldUntil, &job.NextCheckAt)
 	job.Account.ID, job.Account.Status, job.Account.Provider = job.AccountID, "available", "codex"
+	if job.Phase == "skipped" {
+		if job.HoldReason == "" && job.ErrorCode == "window_already_active" {
+			job.HoldReason = job.ErrorCode
+		}
+		job.ErrorCode = ""
+	}
 	return job, err
 }
 
@@ -172,10 +178,7 @@ func (st *Store) CreateWake(ctx context.Context, key string, request WakeRequest
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		account, err := generationAccount(ctx, tx, request.AccountID)
-		if errors.Is(err, ErrGenerationAccount) {
-			return ErrWakeAccount
-		}
+		account, err := wakeAccount(ctx, tx, request.AccountID, time.Now().UTC())
 		if err != nil {
 			return err
 		}
@@ -236,10 +239,18 @@ func (st *Store) FinishWakeWithResponse(ctx context.Context, id, phase, code str
 	if phase != "verifying" && phase != "unknown" && phase != "failed" && !(phase == "queued" && code == "model_busy") {
 		return ErrInvalidWakeRequest
 	}
-	switch code {
-	case "", "wake_outcome_unknown", "wake_interrupted", "wake_request_rejected", "wake_account_unavailable", "model_busy":
+	switch {
+	case wakeAccountCode(code):
+	case code == "" || code == "wake_outcome_unknown" || code == "wake_interrupted" || code == "wake_request_rejected" || code == "model_busy":
 	default:
 		code = "wake_outcome_unknown"
+	}
+	if response != nil && (phase == "failed" || phase == "queued") {
+		preflight := response.Stage == "preflight" && response.HTTPStatus == 0 && response.Bytes == 0 && !response.Completed && !response.CloseFailed
+		budgetRefusal := phase == "queued" && code == "model_busy" && response.Stage == "open" && response.Bytes == 0 && !response.Completed && !response.CloseFailed
+		if !preflight && !budgetRefusal {
+			phase, code = "unknown", "wake_outcome_unknown"
+		}
 	}
 	return st.write(ctx, func(tx *sql.Tx) error {
 		var result sql.Result

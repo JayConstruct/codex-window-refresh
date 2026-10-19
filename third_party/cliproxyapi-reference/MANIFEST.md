@@ -4,6 +4,8 @@
 
 公开仓库仅保留本来源清单和上游 MIT [LICENSE](LICENSE)。实现核对时使用过的上游源码快照保留在本地并由 `.gitignore` 排除，不是本插件的构建依赖，不随公开源码包分发。部分上游文件包含硬编码 OAuth 客户端凭据，因此公开发布使用固定提交的来源链接供查阅，而不复制这些源码。没有编译或运行完整官方宿主；源码中的字段定义不代表本地部署已启用对应能力。
 
+2026-10-19 补充只读核对同一提交的认证文件状态管理：`auth_files_fields.go`、`auth_files.go` 与 `server_management.go`，用于验证独立启停端点和文件名/账号索引身份限定。此次不下载或发布完整上游源码，具体边界见 [V2 账号开关说明](../../docs/backend-v2-account-controls.md)。
+
 以下列出核对过的上游路径、Git blob SHA 和固定源码链接；表中路径不表示公开仓库包含该文件。构建与版本兼容应以目标部署的实际提交重新验证。
 
 | 上游路径 | Git blob SHA | 上游固定链接 |
@@ -45,5 +47,7 @@
 | `internal/api/handlers/management/api_tools.go` | `c03020527a84287a0c066e692ca6ff18020232f7` | [source](https://github.com/router-for-me/CLIProxyAPI/blob/3de4e248f6bb12fc7dfafb183404f3b248578922/internal/api/handlers/management/api_tools.go) |
 | `internal/api/handlers/management/plugin_quota.go` | `be8d1e731dc1fa68dbc5690ee91e528febf90a28` | [source](https://github.com/router-for-me/CLIProxyAPI/blob/3de4e248f6bb12fc7dfafb183404f3b248578922/internal/api/handlers/management/plugin_quota.go) |
 | `internal/api/server_management.go` | `12a2ba53715c24ac5beb51d43651bf9b6f139753` | [source](https://github.com/router-for-me/CLIProxyAPI/blob/3de4e248f6bb12fc7dfafb183404f3b248578922/internal/api/server_management.go) |
+| `internal/api/handlers/management/auth_files_fields.go` | `7304b06d90fcfa59198890e39da70ab0d436c87d` | [source](https://github.com/router-for-me/CLIProxyAPI/blob/3de4e248f6bb12fc7dfafb183404f3b248578922/internal/api/handlers/management/auth_files_fields.go) |
+| `internal/api/handlers/management/auth_files.go` | `0a4ed74f70f5d62c9ed74988334239ec05c6c587` | [source](https://github.com/router-for-me/CLIProxyAPI/blob/3de4e248f6bb12fc7dfafb183404f3b248578922/internal/api/handlers/management/auth_files.go) |
 | `internal/api/server_management_v8.go` | `7f68dad013406a70ebee6f34c4ba1daae096568a` | [source](https://github.com/router-for-me/CLIProxyAPI/blob/3de4e248f6bb12fc7dfafb183404f3b248578922/internal/api/server_management_v8.go) |
 

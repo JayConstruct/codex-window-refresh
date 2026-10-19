@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"math"
 	"time"
@@ -30,17 +29,6 @@ func readWakeBaseline(ctx context.Context, tx *sql.Tx, account Account) (wakeBas
 		return wakeBaseline{Binding: account.Binding}, nil
 	}
 	return baseline, nil
-}
-
-func wakeAccount(ctx context.Context, tx *sql.Tx, id string) (Account, error) {
-	var account Account
-	var raw string
-	err := tx.QueryRowContext(ctx, `SELECT a.id,a.auth_index,a.status,COALESCE(a.quota,''),b.binding FROM accounts a JOIN account_bindings b ON b.account_id=a.id WHERE a.id=? AND a.status='available' AND a.auth_index!='' AND b.binding!='' AND NOT EXISTS(SELECT 1 FROM accounts other WHERE other.id!=a.id AND other.auth_index=a.auth_index AND other.status!='removed')`, id).Scan(&account.ID, &account.AuthIndex, &account.Status, &raw, &account.Binding)
-	if errors.Is(err, sql.ErrNoRows) {
-		return account, ErrWakeAccount
-	}
-	account.Provider, account.Quota = "codex", json.RawMessage(raw)
-	return account, err
 }
 
 func wakeInventoryReady(ctx context.Context, tx *sql.Tx, at time.Time) (bool, error) {

@@ -82,10 +82,12 @@ func NormalizeWakeResponse(response WakeResponse) WakeResponse {
 			response.Truncated = true
 		}
 	}
-	switch response.ErrorCode {
-	case "", "wake_model_busy", "account_identity_ambiguous", "account_identity_unavailable", "account_binding_changed", "account_not_found", "account_disabled", "wake_account_unavailable", "generation_not_supported", "wake_not_supported", "wake_request_invalid", "wake_request_rejected", "wake_delivery_unknown", "wake_outcome_unknown", "wake_interrupted", "model_busy", "context_deadline_exceeded", "context_canceled":
-	default:
-		response.ErrorCode = "wake_outcome_unknown"
+	if !wakeAccountCode(response.ErrorCode) {
+		switch response.ErrorCode {
+		case "", "wake_model_busy", "account_identity_ambiguous", "account_identity_unavailable", "account_binding_changed", "account_not_found", "account_disabled", "generation_not_supported", "wake_not_supported", "wake_request_invalid", "wake_request_rejected", "wake_delivery_unknown", "wake_outcome_unknown", "wake_interrupted", "model_busy", "context_deadline_exceeded", "context_canceled":
+		default:
+			response.ErrorCode = "wake_outcome_unknown"
+		}
 	}
 	return response
 }

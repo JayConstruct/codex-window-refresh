@@ -303,12 +303,12 @@ func verifyWakes(ctx context.Context, tx *sql.Tx, at time.Time) error {
 		if err = updateWake(ctx, tx, job, job.Phase, job.ErrorCode, job.HoldReason, at); err != nil {
 			return err
 		}
-		account, err := wakeAccount(ctx, tx, job.AccountID)
+		account, err := wakeBoundAccount(ctx, tx, job, at)
 		if err != nil && !errors.Is(err, ErrWakeAccount) {
 			return err
 		}
-		if errors.Is(err, ErrWakeAccount) || account.Binding != job.Account.Binding || account.AuthIndex != job.Account.AuthIndex {
-			if err = updateWake(ctx, tx, job, job.Phase, job.ErrorCode, "wake_account_unavailable", at); err != nil {
+		if errors.Is(err, ErrWakeAccount) {
+			if err = updateWake(ctx, tx, job, job.Phase, job.ErrorCode, WakeAccountErrorCode(err), at); err != nil {
 				return err
 			}
 			continue

@@ -227,7 +227,7 @@ func TestWakeMissingModelAndUnavailableAccountAreExplicit(t *testing.T) {
 		t.Fatal(response.Code, response.Body.String())
 	}
 	response = request(service, "POST", "/api/v2/wake-jobs", `{"account_id":"not-found"}`, "missing")
-	if response.Code != 409 || !strings.Contains(response.Body.String(), "wake_account_unavailable") {
+	if response.Code != 409 || !strings.Contains(response.Body.String(), "wake_account_not_found") {
 		t.Fatal(response.Code, response.Body.String())
 	}
 	assertNoWakeReadsOrSends(t, source)
@@ -291,8 +291,19 @@ func TestWakeOutcomeIsConservativeAndSanitized(t *testing.T) {
 		{"wake_delivery_unknown", "unknown", "wake_outcome_unknown"},
 		{"wake_response_invalid", "unknown", "wake_outcome_unknown"},
 		{"private credential failure", "unknown", "wake_outcome_unknown"},
-		{"account_binding_changed", "failed", "wake_account_unavailable"},
-		{"account_disabled", "failed", "wake_account_unavailable"},
+		{"account_binding_changed", "failed", "wake_binding_changed"},
+		{"account_disabled", "failed", "wake_account_disabled"},
+		{"account_not_found", "failed", "wake_account_not_found"},
+		{"account_identity_ambiguous", "failed", "wake_account_ambiguous"},
+		{"account_identity_unavailable", "failed", "wake_account_unavailable"},
+		{"wake_account_unavailable", "failed", "wake_account_unavailable"},
+		{"wake_account_not_found", "failed", "wake_account_not_found"},
+		{"wake_account_disabled", "failed", "wake_account_disabled"},
+		{"wake_host_unavailable", "failed", "wake_host_unavailable"},
+		{"wake_inventory_stale", "failed", "wake_inventory_stale"},
+		{"wake_account_ambiguous", "failed", "wake_account_ambiguous"},
+		{"wake_binding_missing", "failed", "wake_binding_missing"},
+		{"wake_binding_changed", "failed", "wake_binding_changed"},
 		{"wake_not_supported", "failed", "wake_request_rejected"},
 		{"generation_not_supported", "failed", "wake_request_rejected"},
 		{"wake_request_invalid", "failed", "wake_request_rejected"},
@@ -305,6 +316,42 @@ func TestWakeOutcomeIsConservativeAndSanitized(t *testing.T) {
 		if phase != fixture.phase || code != fixture.public {
 			t.Fatal(fixture.code, phase, code)
 		}
+	}
+}
+
+func TestWakeAPIReturnsOnlyVerifiedAccountClassifications(t *testing.T) {
+	for _, fixture := range []struct {
+		name     string
+		accounts []store.Account
+		failed   bool
+		code     string
+	}{
+		{"deleted", nil, false, "wake_account_not_found"},
+		{"disabled", []store.Account{{ID: "wake-account", AuthIndex: "private-index", Binding: "private-binding", Status: "disabled"}}, false, "wake_account_disabled"},
+		{"unavailable", []store.Account{{ID: "wake-account", AuthIndex: "private-index", Binding: "private-binding", Status: "unavailable"}}, false, "wake_host_unavailable"},
+		{"missing binding", []store.Account{{ID: "wake-account", AuthIndex: "private-index", Status: "available"}}, false, "wake_binding_missing"},
+		{"ambiguous", []store.Account{{ID: "wake-account", AuthIndex: "private-index", Binding: "private-binding", Status: "available"}, {ID: "duplicate", AuthIndex: "private-index", Binding: "other-private-binding", Status: "available"}}, false, "wake_account_ambiguous"},
+		{"unresolved identity", []store.Account{{ID: "wake-account", Status: "binding_unavailable"}}, false, "wake_account_unavailable"},
+		{"unavailable inventory", nil, true, "wake_inventory_stale"},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			source := &wakeSource{}
+			service, storage := wakeService(t, source)
+			var err error
+			if fixture.failed {
+				err = storage.InventoryFailed(context.Background())
+			} else {
+				err = storage.SyncInventory(context.Background(), fixture.accounts)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := request(service, "POST", "/api/v2/wake-jobs", wakeBody, "classification")
+			if response.Code != 409 || !strings.Contains(response.Body.String(), fixture.code) || strings.Contains(response.Body.String(), "private-") {
+				t.Fatal("unsafe or imprecise API error", response.Code, response.Body.String())
+			}
+			assertNoWakeReadsOrSends(t, source)
+		})
 	}
 }
 
@@ -412,6 +459,29 @@ func TestWakeWorkerRunsWithoutPageAndVerifiesWithoutResending(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 	if source.wakeCalls.Load() != 1 {
 		t.Fatal("completed wake was resent")
+	}
+}
+
+func TestWakeWorkerPersistsPrecisePreflightFailures(t *testing.T) {
+	for _, code := range []string{"wake_account_not_found", "wake_account_disabled", "wake_host_unavailable", "wake_inventory_stale", "wake_account_ambiguous", "wake_binding_missing", "wake_binding_changed", "wake_account_unavailable"} {
+		t.Run(code, func(t *testing.T) {
+			source := &workerWakeSource{}
+			source.execute = func(context.Context, store.Account, string, string) error { return errors.New(code) }
+			service, storage := prepareWakeWorker(t, source)
+			initial := acceptWake(t, service, "worker-preflight")
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() { defer close(done); service.Run(ctx) }()
+			defer func() { cancel(); <-done }()
+			finished := awaitWake(t, storage, initial.ID, "failed")
+			if finished.ErrorCode != code || finished.Response == nil || finished.Response.ErrorCode != code || source.wakeCalls.Load() != 1 {
+				t.Fatal("worker swallowed precise classification", finished, source.wakeCalls.Load())
+			}
+			response := request(service, "GET", "/api/v2/wake-jobs?job_id="+initial.ID, "", "")
+			if response.Code != 200 || !strings.Contains(response.Body.String(), code) || strings.Contains(response.Body.String(), "private-binding") || strings.Contains(response.Body.String(), "private-prompt") {
+				t.Fatal("unsafe or imprecise worker result", response.Code, response.Body.String())
+			}
+		})
 	}
 }
 

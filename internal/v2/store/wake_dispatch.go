@@ -75,12 +75,9 @@ func (st *Store) PrepareWake(ctx context.Context, at time.Time) (WakeJob, error)
 			return err
 		}
 		for _, job := range jobs {
-			account, err := wakeAccount(ctx, tx, job.AccountID)
-			if err != nil && !errors.Is(err, ErrWakeAccount) {
-				return err
-			}
-			if errors.Is(err, ErrWakeAccount) || account.AuthIndex != job.Account.AuthIndex || account.Binding != job.Account.Binding {
-				if err = updateWake(ctx, tx, job, "failed", "wake_account_unavailable", "", at); err != nil {
+			account, err := wakeBoundAccount(ctx, tx, job, at)
+			if err != nil {
+				if err = wakePreflightFailure(ctx, tx, job, err, at); err != nil {
 					return err
 				}
 				continue
@@ -118,7 +115,7 @@ func (st *Store) PrepareWake(ctx context.Context, at time.Time) (WakeJob, error)
 			}
 			decision := wakeQuotaDecision(snapshot, baseline, job, at)
 			if decision == "active_window" {
-				if err = updateWake(ctx, tx, job, "skipped", "window_already_active", "", at); err != nil {
+				if err = updateWake(ctx, tx, job, "skipped", "", "window_already_active", at); err != nil {
 					return err
 				}
 				continue
@@ -206,12 +203,9 @@ func (st *Store) AuthorizeWake(ctx context.Context, id string, at time.Time) (Wa
 		if err != nil {
 			return err
 		}
-		account, err := wakeAccount(ctx, tx, job.AccountID)
-		if err != nil && !errors.Is(err, ErrWakeAccount) {
-			return err
-		}
-		if errors.Is(err, ErrWakeAccount) || account.AuthIndex != job.Account.AuthIndex || account.Binding != job.Account.Binding {
-			return updateWake(ctx, tx, job, "failed", "wake_account_unavailable", "", at)
+		account, err := wakeBoundAccount(ctx, tx, job, at)
+		if err != nil {
+			return wakePreflightFailure(ctx, tx, job, err, at)
 		}
 		hold, err := wakeAdmission(ctx, tx, job, settings.Config, at)
 		if err != nil {
@@ -234,7 +228,7 @@ func (st *Store) AuthorizeWake(ctx context.Context, id string, at time.Time) (Wa
 		_ = json.Unmarshal(account.Quota, &snapshot)
 		decision := wakeQuotaDecision(snapshot, baseline, job, at)
 		if decision == "active_window" {
-			return updateWake(ctx, tx, job, "skipped", "window_already_active", "", at)
+			return updateWake(ctx, tx, job, "skipped", "", "window_already_active", at)
 		}
 		if decision != "" {
 			return updateWake(ctx, tx, job, "queued", "", decision, at)

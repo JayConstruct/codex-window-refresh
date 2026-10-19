@@ -69,12 +69,8 @@ func (c *CPA) executeWake(ctx context.Context, account store.Account, model, pro
 	if ctx.Err() != nil {
 		return errors.New("wake_request_invalid")
 	}
-	if err := c.generationAccount(ctx, account); err != nil {
-		switch err.Error() {
-		case "account_not_found", "account_binding_changed", "account_disabled", "account_identity_unavailable":
-			return err
-		}
-		return errors.New("account_identity_unavailable")
+	if err := c.wakeAccount(ctx, account); err != nil {
+		return err
 	}
 	if ctx.Err() != nil {
 		return errors.New("wake_request_invalid")

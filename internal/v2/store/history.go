@@ -107,7 +107,8 @@ const taskHistorySQL = `WITH tasks AS (
  w.account_id,w.created_at,w.updated_at,w.scheduled_at,'',
  CASE WHEN w.phase IN ('sending','verifying','unknown','completed')
  OR (w.phase='failed' AND EXISTS(SELECT 1 FROM wake_responses response WHERE response.job_id=w.id)) THEN w.model ELSE '' END,
- '' AS finished_at,w.error_code,w.hold_reason,0 FROM wake_jobs w
+ '' AS finished_at,CASE WHEN w.phase='skipped' THEN '' ELSE w.error_code END,
+ CASE WHEN w.phase='skipped' AND w.hold_reason='' AND w.error_code='window_already_active' THEN w.error_code ELSE w.hold_reason END,0 FROM wake_jobs w
  ) `
 
 func historyChoice(value string, choices ...string) bool {
@@ -180,8 +181,11 @@ func historySearchValues(ctx context.Context, tx *sql.Tx, search string) ([]any,
 }
 
 func historyHoldReason(code string) string {
+	if wakeAccountCode(code) {
+		return code
+	}
 	switch code {
-	case "", "inventory_unavailable", "wake_rule_disabled", "outside_allowed_hours", "capacity_satisfied", "quota_unknown", "weekly_reset_conflict", "active_window", "quota_blocked", "weekly_reset_unconfirmed", "activity_unknown", "account_busy", "model_busy", "verification_pending", "wake_account_unavailable", "excluded_hours", "model_missing", "configuration_changed":
+	case "", "inventory_unavailable", "wake_rule_disabled", "outside_allowed_hours", "capacity_satisfied", "quota_unknown", "weekly_reset_conflict", "active_window", "window_already_active", "quota_blocked", "weekly_reset_unconfirmed", "activity_unknown", "account_busy", "model_busy", "verification_pending", "excluded_hours", "model_missing", "configuration_changed":
 		return code
 	default:
 		return "wake_outcome_unknown"

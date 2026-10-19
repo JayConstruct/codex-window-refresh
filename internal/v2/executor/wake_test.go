@@ -175,9 +175,22 @@ func TestWakePreflightRejectsInvalidInputAndIdentityWithoutSending(t *testing.T)
 			account.Provider = "antigravity"
 		}, "generation_not_supported"},
 		{"disabled snapshot", func(_ *CPA, _ *generationHost, account *store.Account, _, _ *string) { account.Status = "disabled" }, "account_disabled"},
-		{"missing binding", func(_ *CPA, _ *generationHost, account *store.Account, _, _ *string) { account.Binding = "" }, "account_identity_unavailable"},
-		{"missing index", func(_ *CPA, _ *generationHost, account *store.Account, _, _ *string) { account.AuthIndex = "" }, "account_identity_unavailable"},
+		{"missing binding", func(_ *CPA, _ *generationHost, account *store.Account, _, _ *string) { account.Binding = "" }, "wake_binding_missing"},
+		{"missing index", func(_ *CPA, _ *generationHost, account *store.Account, _, _ *string) { account.AuthIndex = "" }, "wake_binding_missing"},
 		{"missing account", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) { host.inventory = `{"files":[]}` }, "account_not_found"},
+		{"inventory disabled", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
+			host.inventory = `{"files":[{"id":"a","auth_index":"i","provider":"codex","disabled":true}]}`
+		}, "account_disabled"},
+		{"inventory unavailable", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
+			host.inventory = `{"files":[{"id":"a","auth_index":"i","provider":"codex","unavailable":true}]}`
+		}, "wake_host_unavailable"},
+		{"inventory missing index", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
+			host.inventory = `{"files":[{"id":"a","provider":"codex"}]}`
+		}, "wake_binding_missing"},
+		{"inventory missing provider", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
+			host.inventory = `{"files":[{"id":"a","auth_index":"i"}]}`
+		}, "account_identity_unavailable"},
+		{"missing upstream binding", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) { host.upstream = "" }, "wake_binding_missing"},
 		{"replaced upstream", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) { host.upstream = "new-upstream" }, "account_binding_changed"},
 		{"replaced index", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
 			host.inventory = `{"files":[{"id":"a","auth_index":"new","provider":"codex"}]}`
@@ -191,21 +204,31 @@ func TestWakePreflightRejectsInvalidInputAndIdentityWithoutSending(t *testing.T)
 		}, "account_disabled"},
 		{"runtime unavailable", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
 			host.runtime = `{"auth":{"id":"a","auth_index":"i","provider":"codex","status":"unavailable"}}`
+		}, "wake_host_unavailable"},
+		{"unknown runtime status", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
+			host.runtime = `{"auth":{"id":"a","auth_index":"i","provider":"codex","status":"error"}}`
+		}, "account_identity_unavailable"},
+		{"empty runtime", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) { host.runtime = `{}` }, "account_identity_unavailable"},
+		{"runtime missing provider", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
+			host.runtime = `{"auth":{"id":"a","auth_index":"i"}}`
 		}, "account_identity_unavailable"},
 		{"runtime only", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
 			host.runtime = `{"auth":{"id":"a","auth_index":"i","provider":"codex","runtime_only":true}}`
-		}, "account_binding_changed"},
+		}, "account_identity_unavailable"},
 		{"duplicate id", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
 			host.inventory = `{"files":[{"id":"a","auth_index":"i","provider":"codex"},{"id":"a","auth_index":"j","provider":"other"}]}`
-		}, "account_identity_unavailable"},
+		}, "wake_account_ambiguous"},
 		{"duplicate index", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
 			host.inventory = `{"files":[{"id":"a","auth_index":"i","provider":"codex"},{"id":"b","auth_index":"i","provider":"other"}]}`
-		}, "account_identity_unavailable"},
+		}, "wake_account_ambiguous"},
 		{"oversize inventory", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
 			host.inventory = `{"files":[` + strings.Repeat(`{"id":"a","provider":"codex"},`, 10000) + `{"id":"a","provider":"codex"}]}`
 		}, "account_identity_unavailable"},
 		{"private callback error", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
 			host.authErr = errors.New("private bearer secret")
+		}, "account_identity_unavailable"},
+		{"unverified callback classification", func(_ *CPA, host *generationHost, _ *store.Account, _, _ *string) {
+			host.authErr = errors.New("account_binding_changed")
 		}, "account_identity_unavailable"},
 	}
 	for _, test := range tests {
@@ -234,6 +257,8 @@ func TestWakeUnknownNeverReexecutesAndAlwaysClosesOwnedStream(t *testing.T) {
 	}{
 		{"execute lost acknowledgement", func(host *generationHost) { host.executeErr = errors.New("private execute failure") }},
 		{"execute rejection after send", func(host *generationHost) { host.executeErr = errors.New("generation_request_invalid") }},
+		{"account rejection after send", func(host *generationHost) { host.executeErr = errors.New("account_disabled") }},
+		{"binding error after send", func(host *generationHost) { host.readErr = errors.New("wake_binding_changed") }},
 		{"read error", func(host *generationHost) { host.readErr = errors.New("private read failure") }},
 		{"close error", func(host *generationHost) { host.closeErr = errors.New("private close failure") }},
 		{"non-success status", func(host *generationHost) { host.opened.StatusCode = 429 }},

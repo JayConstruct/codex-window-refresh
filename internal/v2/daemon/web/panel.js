@@ -255,6 +255,42 @@
     if (account.provider !== provider || ['disabled', 'runtime_only'].some(name => account[name] !== undefined && account[name] !== false) || typeof account.auth_index !== 'string' || !account.auth_index.trim() || /[\p{Cc}]/u.test(account.auth_index)) return invalid();
     return {id, provider, index: account.auth_index};
   }
+  function independentAuthFile(account) {
+    if (!account || typeof account !== 'object' || Array.isArray(account)) return false;
+    if (account.runtime_only !== undefined && account.runtime_only !== false) return false;
+    if (account.source !== undefined && !['file', 'memory'].includes(account.source)) return false;
+    const unsafe = value => value && typeof value === 'object' && Object.entries(value).some(([name, child]) => /virtual|parent|api.?key|configured/i.test(name) && child !== false && child !== null && child !== undefined && child !== '' || child && typeof child === 'object' && unsafe(child));
+    return !unsafe(account);
+  }
+  function resolveStatusAccount(data, id) {
+    const invalid = () => { throw Object.assign(new Error('account_status_identity'), {code: 'account_status_identity'}); };
+    const safe = value => typeof value === 'string' && value.trim() === value && !!value && new TextEncoder().encode(value).length <= 1024 && !/[\p{Cc}]/u.test(value);
+    if (!safe(id) || !data || !Array.isArray(data.files) || data.files.length > 10000 || data.files.some(file => !file || typeof file !== 'object' || Array.isArray(file))) return invalid();
+    const matches = data.files.filter(file => file.id === id);
+    if (matches.length !== 1) return invalid();
+    const file = matches[0];
+    if (!independentAuthFile(file) || !safe(file.name) || /[\\/]/.test(file.name) || ['.', '..'].includes(file.name) || !safe(file.auth_index) || file.provider !== 'codex' || typeof file.disabled !== 'boolean') return invalid();
+    if (data.files.some(other => other !== file && (other.name === file.name || other.id === file.name || other.name === id || other.auth_index === file.auth_index))) return invalid();
+    return {id, name: file.name, index: file.auth_index, provider: file.provider, disabled: file.disabled};
+  }
+  function sameStatusIdentity(before, after) {
+    return ['id', 'name', 'index', 'provider'].every(name => before[name] === after[name]);
+  }
+  function maskedAccount(id) {
+    const characters = Array.from(String(id));
+    if (String(id).includes('@')) return characters[0] + '***@***';
+    return characters.length > 2 ? characters[0] + '***' + characters.at(-1) : '***';
+  }
+  function readDisplayPreference(context, name) {
+    try {
+      const saved = JSON.parse(context.localStorage.getItem(name)), aliases = Object.create(null);
+      if (!saved || !['original', 'masked', 'alias'].includes(saved.mode)) return {mode: 'original', aliases};
+      if (saved.aliases && typeof saved.aliases === 'object' && !Array.isArray(saved.aliases)) for (const [id, alias] of Object.entries(saved.aliases).slice(0, 10000)) {
+        if (typeof alias === 'string' && alias.trim() && alias.length <= 80 && !/[\p{Cc}]/u.test(alias)) aliases[id] = alias.trim();
+      }
+      return {mode: saved.mode, aliases};
+    } catch { return {mode: 'original', aliases: Object.create(null)}; }
+  }
   function parseModelPhrases(text) {
     return text.split(/\r\n|\n|\r/).map(phrase => phrase.trim()).filter(Boolean);
   }
@@ -297,7 +333,9 @@
     throw new Error('无法生成随机预览，请稍后重试');
   }
   Object.assign(codes, {invalid_wake_request: '手动唤醒参数无效，请检查 Codex 账号 ID', wake_model_missing: '请先独立保存实际可用的唤醒模型，再确认执行'});
-  Object.assign(codes, {wake_settings_unavailable: '后台未提供唤醒设置能力', wake_unavailable: '后台未提供模型唤醒能力', invalid_wake_settings: '唤醒设置无效，请检查字段', wake_settings_conflict: '唤醒设置已在后台变化，请重新读取核实', invalid_wake_job: '手动唤醒参数无效', wake_account_unavailable: '唤醒账号不可用或绑定已变化', wake_model_unavailable: '请先保存实际可用的唤醒模型', wake_outcome_unknown: '唤醒结果未知，可能已消耗额度，禁止重发', wake_interrupted: '唤醒被中断，请核实原任务，禁止重发', wake_request_rejected: '模型请求未被接受', wake_quota_unknown: '额度证据未知，跳过模型请求', wake_active_window: '账号已有活动窗口，无需重复唤醒'});
+  Object.assign(codes, {wake_settings_unavailable: '后台未提供唤醒设置能力', wake_unavailable: '后台未提供模型唤醒能力', invalid_wake_settings: '唤醒设置无效，请检查字段', wake_settings_conflict: '唤醒设置已在后台变化，请重新读取核实', invalid_wake_job: '手动唤醒参数无效', wake_account_unavailable: '无法核实账号当前是否可用于唤醒，请同步后重试', wake_model_unavailable: '请先保存实际可用的唤醒模型', wake_outcome_unknown: '唤醒结果未知，可能已消耗额度，禁止重发', wake_interrupted: '唤醒被中断，请核实原任务，禁止重发', wake_request_rejected: '模型请求未被接受', wake_quota_unknown: '额度证据未知，跳过模型请求', wake_active_window: '账号已有活动窗口，无需重复唤醒'});
+  Object.assign(codes, {wake_account_not_found: '已同步的 Codex 账号清单中未找到此账号，请核对账号 ID 或提供方', wake_account_disabled: 'CPA 已禁用此账号，请核实账号状态', wake_host_unavailable: 'CPA 当前无法提供该账号，请稍后重试', wake_inventory_stale: 'CPA 账号状态尚未同步或已过期，请同步后重试', wake_account_ambiguous: '账号匹配不唯一', wake_binding_missing: '缺少可核实的凭据绑定，请同步 CPA 后重试', wake_binding_changed: '账号绑定已变更，请刷新后重试'});
+  Object.assign(codes, {account_status_identity: '无法唯一核实独立认证文件，未修改 CPA；请检查账号目录与文件绑定', account_status_unknown: 'CPA 启停结果未知，不会重发；请显式只读核实', account_status_changed: '认证文件身份或状态已变化，未提交启停；请重新读取核实'});
   Object.assign(codes, {model_catalog_account_invalid: '账号身份、提供方或文件别名无法唯一核实，请刷新账号目录后重试', model_catalog_unavailable: 'CPA 未提供账号模型目录，可继续手动填写模型', model_catalog_changed: '账号目录或绑定已变化，请重新读取模型'});
   codes.invalid_model_settings = '模型与提示词设置无效，请检查字段';
   codes.generation_accounts_unavailable = '生成账号目录暂不可用，请稍后刷新核实';
@@ -305,12 +343,18 @@
   codes.model_settings_conflict = '后台模型配置已变化，请重新读取并丢弃草稿后再编辑';
   Object.assign(codes, {prompt_generation_unavailable: '后台未提供候选生成功能', invalid_prompt_generation: '生成参数无效，请检查账号、模型和数量', generation_account_unavailable: '生成账号不可用或凭据绑定已变化，请检查账号状态', generation_response_invalid: '模型返回的候选短句无效', generation_request_rejected: '模型请求被拒绝', generation_interrupted: '生成被中断，可能已消耗额度', generation_outcome_unknown: '生成结果未知，可能已消耗额度', idempotency_key_required: '缺少有效的请求标识', job_id_required: '缺少有效的生成任务标识'});
   function message(code) { return typeof code === 'string' && Object.hasOwn(codes, code) ? codes[code] : '请求失败，请查看诊断信息'; }
+  function skippedReason(job) {
+    const reasons = {active_window: '已有活动窗口，无需重复唤醒', window_already_active: '已有活动窗口，无需重复唤醒', wake_active_window: '已有活动窗口，无需重复唤醒', wake_rule_disabled: '自动唤醒规则已关闭', capacity_satisfied: '目标容量已满足', quota_pending: '额度尚待核实，本次不发送模型请求', quota_unknown: '额度证据未知，本次不发送模型请求', wake_quota_unknown: '额度证据未知，本次不发送模型请求', quota_blocked: '额度受限，本次不发送模型请求', activity_unknown: '业务活动证据未知，本次不重复发送', weekly_reset_conflict: '周重置状态冲突，本次不发送模型请求', outside_allowed_hours: '尚未进入允许时段', model_busy: '模型执行资源繁忙，本次不发送', model_missing: '尚未保存可用唤醒模型', account_busy: '账号有其他执行任务，本次不重复发送'};
+    const reason = job.hold_reason || job.error_code;
+    return reasons[reason] || (Object.hasOwn(codes, reason) ? message(reason) : '未满足后台安全执行条件，本次已跳过');
+  }
   function taskDiagnostic(code) {
     const known = typeof code === 'string' && Object.hasOwn(codes, code);
     const safe = known ? code : 'task_error_unknown';
     let stage = '后台任务', advice = '查看 CPA 和插件后台同一时间的本地日志；核实原因后再手动操作。页面未保存上游原始响应。';
     if (/^bridge_|^host_callback_|^backend_/.test(safe)) { stage = 'CPA 本地连接'; advice = '检查 CPA 与独立后台服务、私有 socket 和接入层版本，不必通过模型请求测试连接。'; }
-    else if (/^account_|^generation_account|^wake_account/.test(safe)) { stage = '账号身份与状态核实'; advice = '刷新 CPA 账号目录，核对账号是否删除、禁用、暂不可用或凭据绑定已变化；不会自动更换账号。'; }
+    else if (/^wake_(account|host|inventory|binding)_/.test(safe)) { stage = '唤醒账号安全核实'; advice = safe === 'wake_binding_changed' ? '刷新 CPA 目录，核对该账号新的凭据绑定；不会自动更换账号或重发已有未知任务。' : '同步 CPA 账号目录后核对上述具体状态；不会自动更换账号或清除未知任务防重。'; }
+    else if (/^account_|^generation_account/.test(safe)) { stage = '账号身份与状态核实'; advice = '刷新 CPA 账号目录，核对账号是否删除、禁用、暂不可用或凭据绑定已变化；不会自动更换账号。'; }
     else if (safe === 'quota_authentication_failed' || safe === 'quota_credential_missing') { stage = '额度凭据认证'; advice = '在 CPA 中核实并更新该账号凭据。认证失败不等同于额度耗尽，也不会解除禁用。'; }
     else if (safe === 'quota_upstream_rate_limited') { stage = '额度接口 · HTTP 429'; advice = '等待上游限流解除，降低查询频率或增加随机延迟；不要连续提交相同批量任务。'; }
     else if (safe === 'quota_upstream_forbidden') { stage = '额度接口 · HTTP 403'; advice = '核对账号访问权限、区域及该账号代理配置；不能仅凭拒绝访问推断额度耗尽。'; }
@@ -448,7 +492,7 @@
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {wakeDefaults, wakeConfigDraft, validateWakeDraft});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {createToastCenter});
-  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {taskDiagnostic});
+  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {taskDiagnostic, resolveStatusAccount, sameStatusIdentity, independentAuthFile, maskedAccount, readDisplayPreference, skippedReason});
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
@@ -456,6 +500,11 @@
   for (const id of ['error', 'notice', 'rules-message', 'wake-overview-message', 'settings-message', 'wake-settings-message', 'wake-manual-message', 'wake-history-message', 'model-message', 'generation-message']) $(id).hidden = true;
   let base;
   try { base = apiBase(context.location); } catch (error) { toasts.show('error', message(error.code), 'error'); return; }
+  const displayPreferenceKey = 'cwr-v2-display:' + context.location.origin + base.slice(0, -API.length);
+  const displayPreference = readDisplayPreference(context, displayPreferenceKey), displayIdentities = new Map(), displaySources = new WeakMap();
+  let displayMatcher = null, displayMatcherDirty = true;
+  const statusOperations = new Map();
+  let statusSelection = '', statusOpener = null, aliasSelection = '', aliasOpener = null, statusReadSequence = 0;
   let key = '', generation = 0, views = new ViewTracker(), pollTimer;
   let connected = false, connecting = false, refreshing = false;
   let overviewData = null, accountsData = [], accountsRevision = 0, accountsViewRevision = -1, cursor = '', nextCursor = '', previousCursors = [], pageStart = 0, filteredTotal = null;
@@ -482,7 +531,200 @@
   const settingsFields = {automatic: 'settings-automatic', fiveHour: 'settings-five-hour', weekly: 'settings-weekly', interval: 'settings-interval', timezone: 'settings-timezone', delayMin: 'settings-delay-min', delayMax: 'settings-delay-max', excluded: 'settings-excluded'};
   const pending = new Map(), controllers = new Set(), queryBusy = new Set(), unresolved = new Map();
   const errorLimits = new Map();
-  const setText = (id, text) => { if ($(id) && $(id).textContent !== String(text)) $(id).textContent = text; };
+  const setText = (id, text) => { if ($(id)) { if ($(id).textContent !== String(text)) $(id).textContent = text; applyDisplayPrivacy($(id)); } };
+  function displayAccount(id) {
+    if (displayPreference.mode === 'original') return id;
+    return displayPreference.mode === 'alias' && Object.hasOwn(displayPreference.aliases, id) ? displayPreference.aliases[id] : maskedAccount(id);
+  }
+  function displayText(value) {
+    let text = String(value);
+    if (displayPreference.mode === 'original') return text;
+    if (displayIdentities.has(text)) return displayAccount(displayIdentities.get(text));
+    if (displayMatcherDirty) {
+      const entries = [...displayIdentities.keys()].sort((first, second) => second.length - first.length);
+      displayMatcher = entries.length ? new RegExp('(?<![\\p{L}\\p{N}_])(?:' + entries.map(raw => raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')(?![\\p{L}\\p{N}_])', 'gu') : null;
+      displayMatcherDirty = false;
+    }
+    if (displayMatcher) text = text.replace(displayMatcher, raw => displayAccount(displayIdentities.get(raw)));
+    return text.replace(/[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, raw => maskedAccount(raw));
+  }
+  function rememberDisplayIdentity(raw, id) {
+    if (raw !== id && displayIdentities.get(raw) === raw) return;
+    if (displayIdentities.get(raw) === id) return;
+    displayIdentities.set(raw, id); displayMatcherDirty = true;
+  }
+  function rememberDisplayIdentities(data, collection = '') {
+    if (!data || typeof data !== 'object') return;
+    if (Array.isArray(data)) { for (const item of data) rememberDisplayIdentities(item, collection); return; }
+    if (typeof data.account_id === 'string' && data.account_id) rememberDisplayIdentity(data.account_id, data.account_id);
+    if (typeof data.target === 'string' && data.target) rememberDisplayIdentity(data.target, data.target);
+    if (['accounts', 'files'].includes(collection) && typeof data.id === 'string' && data.id) {
+      rememberDisplayIdentity(data.id, data.id);
+      if (collection === 'files') for (const name of ['name', 'email', 'label']) if (typeof data[name] === 'string' && data[name]) rememberDisplayIdentity(data[name], data.id);
+    }
+    for (const [name, value] of Object.entries(data)) if (value && typeof value === 'object') rememberDisplayIdentities(value, name);
+  }
+  function applyDisplayPrivacy(root) {
+    if (!root) return;
+    const tag = String(root.tagName || '').toLowerCase();
+    if (['script', 'style'].includes(tag)) return;
+    let source = displaySources.get(root);
+    if (!source) { source = {}; displaySources.set(root, source); }
+    const transform = (name, read, write) => {
+      const current = read();
+      if (typeof current !== 'string') return;
+      if (!source[name] || current !== source[name].last) source[name] = {raw: current, last: current};
+      const next = displayText(source[name].raw);
+      if (next !== current) write(next);
+      source[name].last = next;
+    };
+    for (const name of ['title', 'aria-label', 'label']) if (root.hasAttribute?.(name)) transform(name, () => root.getAttribute(name), value => root.setAttribute(name, value));
+    if (root.title && !root.hasAttribute?.('title')) transform('titleProperty', () => root.title, value => { root.title = value; });
+    if (['input', 'textarea'].includes(tag)) return;
+    if (tag === 'option' && root.parentNode?.id === 'generation-account-options') transform('value', () => root.value, value => { root.value = value; });
+    if (!root.childNodes?.length) transform('text', () => root.textContent, value => { root.textContent = value; });
+    else for (const child of Array.from(root.childNodes)) applyDisplayPrivacy(child);
+  }
+  function persistDisplayPreference() {
+    try { context.localStorage.setItem(displayPreferenceKey, JSON.stringify(displayPreference)); return true; }
+    catch { notice('显示偏好仅在当前页面生效；浏览器拒绝本地保存。', 'info'); return false; }
+  }
+  function closeAliasDialog() {
+    const opener = aliasOpener;
+    aliasSelection = ''; aliasOpener = null;
+    if ($('account-alias-dialog').open) $('account-alias-dialog').close();
+    $('account-alias-dialog').hidden = true;
+    if (opener && document.documentElement.contains(opener)) opener.focus();
+  }
+  function openAliasDialog(id, opener) {
+    aliasSelection = id; aliasOpener = opener;
+    setText('account-alias-account', id); setText('account-alias-message', '');
+    $('account-alias-value').value = displayPreference.aliases[id] || '';
+    $('account-alias-dialog').hidden = false; $('account-alias-dialog').showModal();
+  }
+  function saveAlias() {
+    if (!aliasSelection) return;
+    const alias = $('account-alias-value').value.trim();
+    if (alias.length > 80 || /[\p{Cc}]/u.test(alias) || alias && ([...displayIdentities.keys()].some(id => alias.includes(id)) || alias.includes('@'))) {
+      setText('account-alias-message', '请使用不含原始账号、文件名、邮箱或控制字符的简短别称。'); return;
+    }
+    if (alias) displayPreference.aliases[aliasSelection] = alias;
+    else delete displayPreference.aliases[aliasSelection];
+    persistDisplayPreference(); closeAliasDialog(); applyDisplayPrivacy(document.documentElement);
+  }
+  function statusBusy() { return [...statusOperations.values()].some(state => ['reading', 'checking', 'saving', 'verifying'].includes(state.phase)); }
+  function accountStatusBlocksWake(id) {
+    const state = statusOperations.get(id);
+    return !!state && (state.phase === 'unknown' || ['reading', 'checking', 'saving', 'verifying'].includes(state.phase) || state.phase === 'confirmed' && state.disabled);
+  }
+  function renderStatusDialog() {
+    const state = statusOperations.get(statusSelection), busy = statusBusy();
+    $('account-status-confirm').hidden = state?.phase === 'unknown' || state?.phase === 'confirmed';
+    $('account-status-confirm').disabled = !connected || busy || state?.phase !== 'ready';
+    setText('account-status-confirm', state?.target === false ? '确认 CPA 启用（可能恢复额度消耗）' : '确认 CPA 禁用（不发送模型）');
+    $('account-status-verify').hidden = state?.phase !== 'unknown' && state?.phase !== 'error';
+    $('account-status-verify').disabled = !connected || busy || !state;
+    setText('account-status-message', state?.message || '正在核实 CPA 真实状态…');
+  }
+  function closeStatusDialog() {
+    const opener = statusOpener;
+    statusSelection = ''; statusOpener = null;
+    if ($('account-status-dialog').open) $('account-status-dialog').close();
+    $('account-status-dialog').hidden = true;
+    if (opener && document.documentElement.contains(opener)) opener.focus();
+  }
+  async function openStatusDialog(id, opener) {
+    if (!connected || statusBusy()) return;
+    const account = accountsData.find(item => item.id === id);
+    if (!account || !independentAuthFile(account) || account.status === 'removed') return;
+    statusReadSequence++;
+    statusSelection = id; statusOpener = opener; setText('account-status-account', id);
+    $('account-status-dialog').hidden = false; $('account-status-dialog').showModal();
+    const previous = statusOperations.get(id);
+    if (previous?.phase === 'unknown') { renderStatusDialog(); return; }
+    const current = generation, state = {phase: 'reading', sent: false, disabled: previous?.disabled, message: '正在读取 CPA 认证文件目录并核实唯一身份…'};
+    statusOperations.set(id, state); renderStatusDialog(); renderAccounts();
+    try {
+      const identity = resolveStatusAccount(await api('/auth-files', {}, true), id);
+      if (current !== generation || statusOperations.get(id) !== state) return;
+      state.before = identity; state.disabled = identity.disabled; state.target = !identity.disabled; state.phase = 'ready';
+      state.message = identity.disabled ? 'CPA 当前已禁用。确认启用后可能恢复正常业务和已授权自动任务的额度消耗；此操作本身不发送模型。' : 'CPA 当前已启用。确认禁用只修改此认证文件状态，不发送模型，也不解除未知任务防重。';
+    } catch (error) {
+      if (current !== generation || statusOperations.get(id) !== state) return;
+      state.phase = 'error'; state.message = message(error.code);
+    } finally { if (current === generation) { renderStatusDialog(); renderAccounts(); } }
+  }
+  async function verifyStatusOperation(id, state, current) {
+    const identity = resolveStatusAccount(await api('/auth-files', {}, true), id);
+    if (current !== generation || statusOperations.get(id) !== state) return false;
+    if (!state.before || !sameStatusIdentity(state.before, identity) || identity.disabled !== state.target) throw Object.assign(new Error('account_status_unknown'), {code: 'account_status_unknown'});
+    state.phase = 'confirmed'; state.disabled = identity.disabled;
+    state.message = '已通过 CPA 只读目录核实：当前' + (identity.disabled ? '已禁用；未发送模型，未知任务防重保持不变。' : '已启用；正常业务及已授权自动任务可能恢复额度消耗。') + '此结果不保证外部后续修改。';
+    views.barrier(); feedback('account-status-state-message', state.message, 'success');
+    return true;
+  }
+  async function confirmStatusOperation() {
+    const id = statusSelection, state = statusOperations.get(id);
+    if (!connected || statusBusy() || state?.phase !== 'ready') return;
+    const current = generation; state.phase = 'checking'; state.message = '提交前重新核实文件身份与当前状态…'; renderStatusDialog(); renderAccounts();
+    try {
+      const identity = resolveStatusAccount(await api('/auth-files', {}, true), id);
+      if (current !== generation || statusOperations.get(id) !== state) return;
+      if (!sameStatusIdentity(state.before, identity) || state.before.disabled !== identity.disabled) throw Object.assign(new Error('account_status_changed'), {code: 'account_status_changed'});
+      state.phase = 'saving'; state.sent = true; state.message = '正在提交一次 CPA 启停；不会重发，随后只读核实…'; views.barrier(); renderStatusDialog(); renderAccounts();
+      try { await api('/auth-files/status', {method: 'PATCH', body: JSON.stringify({name: identity.name, auth_index: identity.index, disabled: state.target})}, true); }
+      catch (error) { if (current !== generation) return; }
+      if (current !== generation) return;
+      state.phase = 'verifying'; state.message = '已提交一次修改，正在 GET 核实真实状态；尚未确认成功…'; renderStatusDialog();
+      await verifyStatusOperation(id, state, current);
+    } catch (error) {
+      if (current !== generation || statusOperations.get(id) !== state) return;
+      state.phase = state.sent ? 'unknown' : 'error';
+      state.message = state.sent ? message('account_status_unknown') + '。身份不一致、状态未匹配或读取失败时不会再次提交。' : message(error.code);
+      if (state.sent) feedback('account-status-state-message', state.message, 'warning');
+    } finally { if (current === generation) { renderStatusDialog(); renderAccounts(); } }
+  }
+  async function explicitlyVerifyStatus() {
+    const id = statusSelection, state = statusOperations.get(id);
+    if (!connected || statusBusy() || !state || !['unknown', 'error'].includes(state.phase)) return;
+    if (!state.sent) return openStatusDialog(id, statusOpener);
+    const current = generation; state.phase = 'verifying'; state.message = '只读核实原文件，不重发 PATCH、不调用模型…'; renderStatusDialog(); renderAccounts();
+    try { await verifyStatusOperation(id, state, current); }
+    catch {
+      if (current !== generation || statusOperations.get(id) !== state) return;
+      state.phase = 'unknown'; state.message = message('account_status_unknown') + '。此次读取仍未确认原文件目标状态。';
+    } finally { if (current === generation) { renderStatusDialog(); renderAccounts(); } }
+  }
+  async function refreshConfirmedStatuses() {
+    if (statusBusy()) return;
+    const confirmed = [...statusOperations].filter(([, state]) => state.phase === 'confirmed');
+    if (!confirmed.length) return;
+    const current = generation, sequence = ++statusReadSequence;
+    try {
+      const data = await api('/auth-files', {}, true);
+      if (current !== generation || sequence !== statusReadSequence) return;
+      for (const [id, state] of confirmed) {
+        if (statusOperations.get(id) !== state || state.phase !== 'confirmed') continue;
+        try {
+          const identity = resolveStatusAccount(data, id);
+          if (!sameStatusIdentity(state.before, identity)) throw new Error('changed');
+          state.disabled = identity.disabled; state.before = identity;
+          state.message = '已重新只读核实 CPA 当前' + (identity.disabled ? '已禁用。' : '已启用，业务及自动任务可能消耗额度。');
+        } catch {
+          state.phase = 'error'; state.disabled = undefined; state.message = '当前无法核实原认证文件身份；旧的启停确认不再代表最新状态，请重新核实。';
+        }
+      }
+      renderStatusDialog(); renderAccounts();
+    } catch {
+      if (current === generation && sequence === statusReadSequence) notice('CPA 启停状态重新读取失败，保留上次只读确认；请再次显式刷新核实。', 'warning');
+    }
+  }
+  function resolveDisplayAccount(value) {
+    const raw = value.trim();
+    if (displayIdentities.get(raw) === raw || displayPreference.mode === 'original') return raw;
+    const matches = [...new Set(displayIdentities.values())].filter(id => displayAccount(id) === raw);
+    return matches.length === 1 ? matches[0] : matches.length ? '' : raw;
+  }
   function updateChildren(parent, children) {
     const previous = Array.from(parent.childNodes);
     const keyed = new Map(previous.filter(node => node.dataset?.renderKey).map(node => [node.dataset.renderKey, node]));
@@ -514,6 +756,7 @@
     for (let index = 0; index < desired.length; index++) {
       if (parent.childNodes[index] !== desired[index]) parent.insertBefore(desired[index], parent.childNodes[index] || null);
     }
+    applyDisplayPrivacy(parent);
   }
   const sidebarPreference = 'cwr-v2-sidebar:' + base;
   function renderSidebar(collapsed, persist = false) {
@@ -558,7 +801,7 @@
   function report(error) {
     feedback('error', message(error.code || error.message) + '。已显示的数据可能已过期。', 'error');
   }
-  function feedback(id, text, tone = 'info') { toasts.show(id, text, tone); }
+  function feedback(id, text, tone = 'info') { toasts.show(id, text, tone); applyDisplayPrivacy($(id)); }
   function rememberFeedback(id, text) { toasts.dismiss(id, true); setText(id, text); $(id).hidden = true; }
   function notice(text, tone = 'success') { feedback('notice', text, tone); }
   function clearError() { toasts.dismiss('error', true); $('error').hidden = true; $('error').textContent = ''; }
@@ -818,6 +1061,7 @@
   }
   function wakeActive() { return wakeTask && !['completed', 'skipped', 'failed', 'unknown', 'cancelled'].includes(wakeTask.phase); }
   function wakeHoldText(reason) {
+    if (Object.hasOwn(codes, reason) && /^wake_(account_|host_|inventory_|binding_)/.test(reason)) return message(reason);
     return {quota_pending: '等待额度查询', quota_unknown: '额度证据未知，暂不发送', quota_blocked: '额度受限', active_window: '已有活动窗口，防止重复唤醒', weekly_reset_conflict: '周重置状态冲突', activity_unknown: '业务活动证据未知', account_busy: '账号有其他执行任务', capacity_satisfied: '目标容量已满足', outside_allowed_hours: '尚未进入允许时段', model_busy: '模型执行资源繁忙', model_missing: '尚未保存可用唤醒模型', verification_pending: '等待结果核实'}[reason] || (reason ? '后台暂缓执行，请查看诊断' : '');
   }
   function renderWakeHistory() {
@@ -829,9 +1073,10 @@
       heading.append(element('strong', '', job.account_id || '指定账号'), badge(wakePhases[job.phase] || '状态未知', ['failed', 'unknown'].includes(job.phase) ? 'attention' : 'available'));
       item.append(heading, element('p', 'task-description', wakeReasons[job.reason] || '后台唤醒任务'));
       if (job.scheduled_at) item.append(element('small', 'task-description', '后台计划：' + (Number.isFinite(timestamp(job.scheduled_at)) ? new Date(job.scheduled_at).toLocaleString('zh-CN', {hour12: false}) : '待核实')));
-      if (job.hold_reason) item.append(element('p', 'task-description', wakeHoldText(job.hold_reason)));
-      if (['failed', 'unknown'].includes(job.phase) || job.error_code && ['skipped', 'cancelled'].includes(job.phase)) item.append(taskErrorDetails(job.error_code || (job.phase === 'unknown' ? 'wake_outcome_unknown' : 'wake_request_rejected'), job, '', 'wake'));
-      if (job.response) item.append(wakeResponseDetails(job.response));
+      if (job.phase === 'skipped') item.append(element('p', 'task-description', '正常跳过：' + skippedReason(job)));
+      else if (job.hold_reason) item.append(element('p', 'task-description', wakeHoldText(job.hold_reason)));
+      if (['failed', 'unknown'].includes(job.phase)) item.append(taskErrorDetails(job.error_code || (job.phase === 'unknown' ? 'wake_outcome_unknown' : 'wake_request_rejected'), job, '', 'wake'));
+      if (job.response && job.phase !== 'skipped') item.append(wakeResponseDetails(job.response));
       else if (['failed', 'unknown'].includes(job.phase)) item.append(element('p', 'muted', '未保存模型响应记录：可能是旧任务或尚未进入模型发送阶段，已有错误分类仍可查看。'));
       if (job.phase === 'unknown') item.append(element('p', 'error-text', '可能已消耗额度；禁止重发，仅可读取原任务。'));
       const time = element('small', 'task-time', age(job.updated_at || job.created_at)); time.dataset.observedAt = job.updated_at || job.created_at || ''; item.append(time);
@@ -864,7 +1109,7 @@
     if (wakeTask?.job_id === data.job_id && wakeTask.instance_id === data.instance_id && Number.isSafeInteger(wakeTask.view_revision) && Number.isSafeInteger(data.view_revision) && data.view_revision < wakeTask.view_revision) return;
     wakeTask = data; wakeUnconfirmed = false; wakeUnknown = data.phase === 'unknown';
     if (['completed', 'skipped', 'failed', 'cancelled'].includes(data.phase)) $('wake-manual-consent').checked = false;
-    feedback('wake-manual-message', wakeUnknown ? '唤醒结果未知，可能已消耗额度。不会重发；只能核实已有任务。' : data.phase === 'completed' ? '唤醒任务已完成；请以后台核实的额度和窗口状态为准。' : data.phase === 'skipped' ? '后台已跳过此次唤醒：' + (wakeHoldText(data.hold_reason) || '不满足安全执行条件') : data.phase === 'failed' ? '唤醒失败：' + message(data.error_code) : data.phase === 'cancelled' ? '唤醒任务已取消，未开始的工作不会继续发送。' : '任务已接受：' + wakePhases[data.phase] + '。页面只读取进度，不会再次提交模型请求。', wakeUnknown ? 'warning' : data.phase === 'failed' ? 'error' : data.phase === 'completed' ? 'success' : 'info');
+    feedback('wake-manual-message', wakeUnknown ? '唤醒结果未知，可能已消耗额度。不会重发；只能核实已有任务。' : data.phase === 'completed' ? '唤醒任务已完成；请以后台核实的额度和窗口状态为准。' : data.phase === 'skipped' ? '正常跳过此次唤醒：' + skippedReason(data) : data.phase === 'failed' ? '唤醒失败：' + message(data.error_code) : data.phase === 'cancelled' ? '唤醒任务已取消，未开始的工作不会继续发送。' : '任务已接受：' + wakePhases[data.phase] + '。页面只读取进度，不会再次提交模型请求。', wakeUnknown ? 'warning' : data.phase === 'failed' ? 'error' : data.phase === 'completed' ? 'success' : 'info');
   }
   async function readWakeJob(id = wakeTask?.job_id) {
     if (!connected || !wakeExecutionSupported() || !id || wakeReading || wakeSubmitting) return;
@@ -899,10 +1144,10 @@
   async function submitManualWake(verify = false, quickAccount = '') {
     if (!connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading) return;
     if (verify && wakeTask?.job_id) return readWakeJob();
-    const consent = quickAccount ? quickAccount === quickWakeAccount && !quickWakeLoading && $('quick-wake-consent').checked && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount && account.status === 'available') : $('wake-manual-consent').checked;
+    const consent = quickAccount ? quickAccount === quickWakeAccount && !accountStatusBlocksWake(quickAccount) && !quickWakeLoading && $('quick-wake-consent').checked && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount && account.status === 'available') : $('wake-manual-consent').checked;
     if (wakeUnknown || (verify ? !wakeUnconfirmed || !wakeIntent : wakeUnconfirmed || wakeActive() || !consent)) return;
     if (!verify) {
-      const account = quickAccount || $('wake-account').value.trim();
+      const account = quickAccount || resolveDisplayAccount($('wake-account').value);
       if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account)) { feedback('wake-manual-message', '请输入完整有效的 Codex 账号 ID，并确认可能消耗模型额度。', 'error'); return; }
       try { wakeIntent = {key: requestID(context.crypto), instance: views.instance, body: JSON.stringify({account_id: account})}; }
       catch (error) { feedback('wake-manual-message', message(error.code), 'error'); return; }
@@ -926,8 +1171,8 @@
   function renderQuickWake() {
     const blocked = quickWakeBlocked();
     $('quick-wake-consent').disabled = blocked || quickWakeLoading;
-    for (const button of document.querySelectorAll('[data-wake-account]')) button.disabled = blocked || !!quickWakeAccount || button.dataset.accountStatus !== 'available';
-    $('quick-wake-submit').disabled = blocked || quickWakeLoading || !$('quick-wake-consent').checked || !accountsData.some(account => account.id === quickWakeAccount && account.status === 'available') || !savedModelSettings?.config?.default_model || savedModelSettings.instance_id !== views.instance || modelNeedsVerification;
+    for (const button of document.querySelectorAll('[data-wake-account]')) button.disabled = blocked || !!quickWakeAccount || button.dataset.accountStatus !== 'available' || accountStatusBlocksWake(button.dataset.wakeAccount);
+    $('quick-wake-submit').disabled = blocked || accountStatusBlocksWake(quickWakeAccount) || quickWakeLoading || !$('quick-wake-consent').checked || !accountsData.some(account => account.id === quickWakeAccount && account.status === 'available') || !savedModelSettings?.config?.default_model || savedModelSettings.instance_id !== views.instance || modelNeedsVerification;
   }
   function closeQuickWake() {
     quickWakeSequence++; quickWakeAccount = ''; quickWakeLoading = false; $('quick-wake-consent').checked = false;
@@ -935,7 +1180,7 @@
     $('quick-wake-dialog').hidden = true; renderQuickWake();
   }
   async function openQuickWake(id) {
-    if (quickWakeBlocked() || quickWakeAccount || !accountsData.some(account => account.id === id && account.status === 'available')) return;
+    if (quickWakeBlocked() || quickWakeAccount || accountStatusBlocksWake(id) || !accountsData.some(account => account.id === id && account.status === 'available')) return;
     const current = generation, sequence = ++quickWakeSequence;
     quickWakeAccount = id; quickWakeLoading = true; $('quick-wake-consent').checked = false;
     setText('quick-wake-account', id); setText('quick-wake-model', '正在读取已保存模型…');
@@ -1061,7 +1306,7 @@
     return Array.isArray(providers) ? providers.includes(provider) : provider === 'codex';
   }
   function generationAccountState() {
-    const id = $('generation-account').value.trim();
+    const id = resolveDisplayAccount($('generation-account').value);
     if (!generationCatalogSupported()) return {allowed: generationProviderSupported('codex'), provider: 'codex', text: generationProviderSupported('codex') ? '旧版后台未提供账号目录，仅支持手动输入 Codex 账号 ID。' : '当前后台未提供账号目录，且未声明支持手动 Codex 账号生成。'};
     if (generationCatalogLoading) return {allowed: false, text: '正在读取本地 CPA 账号目录，请稍候。'};
     if (!generationCatalog || generationCatalog.instance !== views.instance || generationCatalogError) return {allowed: false, text: '账号目录尚未核实，请刷新生成账号。'};
@@ -1093,7 +1338,8 @@
         option.label = generationProviderName(account.provider) + ' · ' + ({available: '可用', disabled: '已禁用', unavailable: '暂不可用', binding_unavailable: '绑定不可用'}[account.status]);
         option.textContent = option.label; return option;
       }));
-      const selected = generationCatalog.accounts.find(account => account.id === $('generation-account').value.trim());
+      applyDisplayPrivacy($('generation-account-options'));
+      const selected = generationCatalog.accounts.find(account => account.id === resolveDisplayAccount($('generation-account').value));
       if (selected && !generationAccountIdentity) generationAccountIdentity = {id: selected.id, provider: selected.provider};
       if (explicit) feedback('catalog-feedback', '已读取 ' + generationCatalog.accounts.length + ' 个生成账号，未调用模型。', 'success');
     } catch (error) {
@@ -1146,9 +1392,9 @@
     const status = kind === 'wake' ? 'model-catalog-status' : 'generation-model-status';
     if (!connected || state.loading || kind === 'generation' && !generationAccountState().allowed) return;
     clearModelCatalog(kind);
-    const id = $(target).value.trim(), provider = kind === 'wake' ? 'codex' : generationAccountState().provider;
+    const id = resolveDisplayAccount($(target).value), provider = kind === 'wake' ? 'codex' : generationAccountState().provider;
     const sequence = state.sequence, current = generation, instance = views.instance;
-    const currentRequest = () => current === generation && sequence === state.sequence && instance === views.instance && $(target).value.trim() === id && (kind === 'wake' || generationAccountState().provider === provider);
+    const currentRequest = () => current === generation && sequence === state.sequence && instance === views.instance && resolveDisplayAccount($(target).value) === id && (kind === 'wake' || generationAccountState().provider === provider);
     state.loading = true; renderModelCatalogs(); setText(status, '正在读取并核对 CPA 本地模型目录…');
     try {
       const before = resolveModelAccount(await api('/auth-files', {}, true), id, provider);
@@ -1230,7 +1476,7 @@
     if (verify ? !generationUnconfirmed || !generationIntent : generationUnconfirmed || generationActive() || !$('generation-consent').checked) return;
     if (!verify) {
       if (!generationAccountState().allowed) { feedback('generation-message', '请先核实可用的生成账号与提供方；' + generationAccountState().text, 'error'); return; }
-      const account = $('generation-account').value.trim(), model = $('generation-model').value, rawCount = $('generation-count').value;
+      const account = resolveDisplayAccount($('generation-account').value), model = $('generation-model').value, rawCount = $('generation-count').value;
       const count = /^\d+$/.test(rawCount) ? Number(rawCount) : NaN;
       if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account) || !model || new TextEncoder().encode(model).length > 200 || /[\s\p{Cc}]/u.test(model) || !Number.isSafeInteger(count) || count < 1 || count > 20) { feedback('generation-message', '请输入有效账号 ID、无空白的实际模型标识及 1–20 的整数数量，并确认消耗额度。', 'error'); return; }
       const prompt = editableGenerationPrompt() ? $('generation-prompt').value : '';
@@ -1296,6 +1542,10 @@
   function stop() {
     toasts.clear();
     closeQuickWake();
+    closeStatusDialog(); closeAliasDialog();
+    for (const state of statusOperations.values()) {
+      if (['reading', 'checking', 'saving', 'verifying'].includes(state.phase)) { state.phase = state.sent ? 'unknown' : 'error'; state.message = state.sent ? message('account_status_unknown') : '读取已中断，请重新核实 CPA 目录。'; }
+    }
     errorLimits.clear();
     generation++; connected = false; connecting = false; key = '';
     clearTimeout(pollTimer); clearTimeout(filterTimer); clearTimeout(historyTimer);
@@ -1343,6 +1593,7 @@
       if (current !== generation) throw Object.assign(new Error('stale'), {code: 'stale'});
       if (!response.ok) throw Object.assign(new Error('request_failed'), {code: typeof data?.error === 'string' && Object.hasOwn(codes, data.error) ? data.error : 'network', status: response.status});
       if (data === null || typeof data !== 'object' || Array.isArray(data)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      rememberDisplayIdentities(data); applyDisplayPrivacy(document.documentElement);
       return data;
     } catch (error) {
       if (error.code) throw error;
@@ -1379,8 +1630,11 @@
     for (const account of accountsData) {
       const row = element('tr', 'account-row'), name = element('td', 'account-name');
       row.dataset.renderKey = 'account:' + account.id;
-      name.append(element('strong', '', account.id));
-      const status = element('td'), value = accountStatus(account);
+      const identityLabel = element('strong', '', account.id); identityLabel.title = account.id; name.append(identityLabel);
+      const aliasButton = element('button', 'text-button account-alias', '编辑别称'); aliasButton.type = 'button'; aliasButton.dataset.accountAliasId = account.id; aliasButton.dataset.renderKey = 'alias';
+      aliasButton.setAttribute('aria-label', '编辑账号 ' + account.id + ' 的浏览器别称'); aliasButton.onclick = function () { openAliasDialog(account.id, this); }; name.append(aliasButton);
+      const state = statusOperations.get(account.id);
+      const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '已禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : accountStatus(account);
       status.append(badge(value.label, value.kind));
       status.title = (account.status_observed_at ? 'CPA 状态：' + age(account.status_observed_at) + '同步。' : '') + (value.kind === 'attention' ? '额度状态来自最近一次额度观测；重置或恢复需重新核实，不以本地倒计时自动恢复正常。' : '后台定时同步 CPA 账号状态。');
       const five = element('td'), weekly = element('td'), observed = element('td'), action = element('td');
@@ -1395,9 +1649,17 @@
       const wakeButton = element('button', 'account-query account-wake', '立即唤醒'); wakeButton.type = 'button';
       wakeButton.dataset.wakeAccount = account.id; wakeButton.dataset.accountStatus = account.status;
       wakeButton.dataset.renderKey = 'wake'; button.dataset.renderKey = 'query';
-      wakeButton.disabled = quickWakeBlocked() || !!quickWakeAccount || account.status !== 'available';
+      wakeButton.disabled = quickWakeBlocked() || !!quickWakeAccount || account.status !== 'available' || accountStatusBlocksWake(account.id);
       wakeButton.setAttribute('aria-label', '立即唤醒账号 ' + account.id); wakeButton.onclick = () => openQuickWake(account.id);
-      buttons.append(button, wakeButton); action.append(buttons);
+      const enabled = typeof state?.disabled === 'boolean' ? !state.disabled : state?.before ? !state.before.disabled : account.status !== 'disabled';
+      const statusButton = element('button', 'account-status-switch', state?.phase === 'unknown' ? 'CPA 未知 · 核实' : enabled ? 'CPA 已启用 · 禁用' : 'CPA 已禁用 · 启用');
+      statusButton.type = 'button'; statusButton.dataset.accountStatusId = account.id; statusButton.dataset.renderKey = 'cpa-status'; statusButton.dataset.state = state?.phase || 'idle';
+      statusButton.setAttribute('role', 'switch'); statusButton.setAttribute('aria-checked', String(enabled));
+      statusButton.setAttribute('aria-label', (state?.phase === 'unknown' ? 'CPA 状态未知，仅可只读核实' : enabled ? 'CPA 已启用，点击禁用，不发送模型' : 'CPA 已禁用，点击启用，可能恢复额度消耗') + '：' + account.id);
+      statusButton.disabled = !connected || statusBusy() || !independentAuthFile(account) || account.status === 'removed';
+      statusButton.title = independentAuthFile(account) ? '真实修改 CPA 认证文件状态；启用可能恢复业务及自动任务的额度消耗，禁用不发送模型。' : '虚拟子账号、运行时或配置密钥不能独立启停；不会修改其父级凭据。';
+      statusButton.onclick = function () { return openStatusDialog(account.id, this); };
+      buttons.append(button, wakeButton, statusButton); action.append(buttons);
       if (['queued', 'running'].includes(account.pending_query?.phase)) action.append(queueAnnotation(account.pending_query, 'query-pending'));
       row.append(name, status, five, weekly, observed, action); rows.push(row);
     }
@@ -1434,8 +1696,8 @@
     const time = element('small', 'task-time', age(job.updated_at || job.created_at)); time.dataset.observedAt = job.updated_at || job.created_at || '';
     item.append(heading, element('p', 'task-description', description), time);
     if (['queued', 'blocked', 'running'].includes(job.phase) && (job.scheduled_at || job.hold_reason)) item.append(queueAnnotation({...job, phase: waiting > 0 ? 'queued' : phase}));
-    if (job.error_code) item.append(taskErrorDetails(job.error_code, job));
-    const failed = Array.isArray(job.items) ? job.items.filter(result => result.phase === 'failed' || result.error_code) : [];
+    if (job.error_code && ['failed', 'unknown'].includes(job.phase)) item.append(taskErrorDetails(job.error_code, job));
+    const failed = Array.isArray(job.items) ? job.items.filter(result => ['failed', 'unknown'].includes(result.phase)) : [];
     if (failed.length) {
       const errors = element('details', 'task-results task-errors'); errors.dataset.renderKey = 'errors';
       errors.append(element('summary', '', '逐账号错误详情 · ' + failed.length + ' 个账号'));
@@ -1490,6 +1752,7 @@
   }
   function historyResult(record) {
     const status = record.status || record.phase;
+    if (status === 'skipped') return '正常跳过：' + skippedReason(record);
     if (record.type === 'query' && ['queued', 'blocked', 'running'].includes(status)) {
       const querying = Array.isArray(record.items) ? record.items.filter(item => item.phase === 'running').length : record.querying;
       const waiting = jobWaiting(record), parts = [];
@@ -1537,9 +1800,10 @@
     if (job && record.type === 'query') {
       const results = element('section', 'history-detail-section'); results.dataset.renderKey = 'query-results'; results.append(element('h3', '', '逐账号执行结果'), taskElement({...job, ...metadataRecord}, true, status)); content.append(results);
     } else if (job && record.type === 'wake') {
-      const response = element('section', 'history-detail-section'); response.dataset.renderKey = 'wake-results'; response.append(element('h3', '', '响应与错误'));
-      if (metadataRecord.error_code && !['window_verified', 'window_already_active', 'wake_rule_disabled'].includes(metadataRecord.error_code) || ['failed', 'unknown'].includes(status)) response.append(taskErrorDetails(metadataRecord.error_code || (status === 'unknown' ? 'wake_outcome_unknown' : 'wake_request_rejected'), {...job, ...metadataRecord}, '', 'wake'));
-      if (job.response) response.append(wakeResponseDetails(job.response));
+      const response = element('section', 'history-detail-section'); response.dataset.renderKey = 'wake-results'; response.append(element('h3', '', status === 'skipped' ? '正常跳过原因' : '响应与错误'));
+      if (['failed', 'unknown'].includes(status)) response.append(taskErrorDetails(metadataRecord.error_code || (status === 'unknown' ? 'wake_outcome_unknown' : 'wake_request_rejected'), {...job, ...metadataRecord}, '', 'wake'));
+      if (status === 'skipped') response.append(element('p', 'muted', skippedReason(metadataRecord)));
+      else if (job.response) response.append(wakeResponseDetails(job.response));
       else response.append(element('p', 'muted', '后台未保存模型响应记录；不推断是否发送或返回了什么内容。'));
       content.append(response);
     }
@@ -1689,11 +1953,13 @@
       const time = element('time', 'event-time', Number.isFinite(at) ? new Date(at).toLocaleTimeString('zh-CN', {hour12: false}) : '—');
       let detail;
       if (event.kind === 'inventory_sync' || event.kind === 'inventory') detail = event.phase === 'unavailable' ? 'CPA 账号同步失败，后台正在重试' : 'CPA 同步完成，账号状态已更新';
+      else if (event.kind === 'model_wake') detail = (event.account_id || '模型唤醒') + ' · ' + (event.phase === 'skipped' ? '唤醒已跳过 · ' + skippedReason(event) : wakePhases[event.phase] || event.detail || '唤醒状态已更新');
       else if (event.phase) detail = (event.account_id || '批量查询') + ' · ' + (phaseNames[event.phase] || '查询任务');
       else detail = event.detail || event.message || '后台状态已更新';
       item.append(time, element('span', 'event-dot'), element('span', 'event-description', detail)); $('recent-events').append(item);
     }
     if (!events.length) $('recent-events').append(element('div', 'empty-state', connected ? '暂无最近事件' : '连接后显示真实事件'));
+    applyDisplayPrivacy($('recent-events'));
   }
   function renderOverview() {
     const data = overviewData, stats = data?.dashboard, ready = data?.inventory?.status === 'ready' && data?.activity?.connected !== false;
@@ -1734,6 +2000,7 @@
     $('diagnostics-content').replaceChildren(...rows.map(([label, value]) => {
       const row = element('div', 'diagnostic-row'); row.append(element('span', '', label), element('strong', '', value)); return row;
     }));
+    applyDisplayPrivacy($('diagnostics-content'));
   }
   async function accounts(reset = false, expectedRevision = accountsRevision, background = false) {
     const current = generation, sequence = views.begin('accounts'), filtersAt = filterSequence;
@@ -1810,6 +2077,8 @@
     if (!connected || refreshing) return;
     const current = generation; refreshing = true;
     try {
+      if (forceAccounts) await refreshConfirmedStatuses();
+      if (current !== generation) return;
       const data = await overview();
       if (current !== generation || !data) return;
       if (!updatingAccounts && (forceAccounts || data.accounts_revision !== accountsRevision || data.view_revision !== accountsViewRevision)) {
@@ -1853,6 +2122,8 @@
       if (current !== generation || !data) return;
       connected = true; connecting = false; $('login-section').hidden = true;
       setConnection('独立后台已连接 · 页面每 5 秒更新'); setText('auto-status', '数据自动更新'); $('auto-status').dataset.state = 'online'; controls();
+      await refreshConfirmedStatuses();
+      if (current !== generation) return;
       await accounts(true);
       if (current !== generation) return;
       if (wakeSettingsSupported()) await reloadWakeSettings();
@@ -1937,6 +2208,19 @@
     filterTimer = setTimeout(() => { if (current === generation && connected) void accounts(true).catch(report); }, 200);
   }
   $('sidebar-toggle').onclick = () => renderSidebar($('app-sidebar').dataset.collapsed !== 'true', true);
+  $('display-mode').value = displayPreference.mode;
+  $('display-mode').onchange = () => {
+    if (!['original', 'masked', 'alias'].includes($('display-mode').value)) return;
+    displayPreference.mode = $('display-mode').value; persistDisplayPreference(); applyDisplayPrivacy(document.documentElement);
+    renderGeneration();
+  };
+  $('account-alias-form').onsubmit = event => { event.preventDefault(); saveAlias(); };
+  $('account-alias-cancel').onclick = closeAliasDialog;
+  $('account-alias-dialog').addEventListener('cancel', event => { event.preventDefault(); closeAliasDialog(); });
+  $('account-status-confirm').onclick = confirmStatusOperation;
+  $('account-status-verify').onclick = explicitlyVerifyStatus;
+  $('account-status-cancel').onclick = closeStatusDialog;
+  $('account-status-dialog').addEventListener('cancel', event => { event.preventDefault(); closeStatusDialog(); });
   for (const button of document.querySelectorAll('[data-page]')) {
     if (!Object.hasOwn(pages, button.dataset.page)) continue;
     button.setAttribute('title', pages[button.dataset.page][0]); button.setAttribute('aria-label', pages[button.dataset.page][0]);
@@ -1949,7 +2233,7 @@
   if ($('disconnect')) $('disconnect').onclick = () => { stop(); setConnection('已断开，后台仍持续运行'); setText('metric-status', '未连接'); };
   $('query').onclick = () => submitQuery();
   if ($('query-single')) $('query-single').onclick = () => {
-    const target = $('account').value.trim();
+    const target = resolveDisplayAccount($('account').value);
     if (!target || target.length > 256 || /[\x00\r\n]/.test(target)) { report({code: 'invalid_account_id'}); return; }
     return submitQuery(target);
   };
@@ -2018,7 +2302,7 @@
   $('generation-account').oninput = () => {
     if ($('generation-fields').disabled) return;
     clearModelCatalog('generation');
-    const id = $('generation-account').value.trim(), selected = generationCatalog?.accounts.find(account => account.id === id);
+    const id = resolveDisplayAccount($('generation-account').value), selected = generationCatalog?.accounts.find(account => account.id === id);
     if (selected?.provider === 'antigravity' && generationAccountIdentity?.provider !== 'antigravity' || selected && generationAccountIdentity && selected.provider !== generationAccountIdentity.provider) $('generation-model').value = '';
     if (selected) generationAccountIdentity = {id: selected.id, provider: selected.provider};
     $('generation-consent').checked = false; renderGeneration();
