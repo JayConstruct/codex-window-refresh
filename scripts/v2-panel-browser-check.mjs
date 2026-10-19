@@ -10,10 +10,12 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const base = '/cpa/v0/resource/plugins/codex-window-refresh/';
 const api = '/cpa/v0/management/codex-window-refresh/v2/';
 const fixtureKey = 'local-v2-browser-fixture';
+const autorefreshOnly = process.env.CWR_AUTOREFRESH_ONLY === '1';
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], patches = [], reads = [], exceptions = [], pageErrors = [];
 const jobs = new Map();
+const resourceReadGates = new Map(), unavailableResources = new Set();
 let accountReadGate, settingsPostGate, settingsReadGate, modelReadGate, wakeReadGate, historyDetailGate;
 let historyUnavailable = false;
 let authReadGate, authPatchGate, authFilesOverride;
@@ -32,6 +34,7 @@ const generationAccounts = [
 let queryConfig = {timezone: 'Asia/Shanghai', automatic: false, interval_seconds: 300, on_five_hour_expiry: false,
   on_weekly_expiry: false, random_delay: {min_seconds: 5, max_seconds: 60}, excluded_hours: []};
 const observed = () => new Date().toISOString();
+const overviewObservedAt = observed();
 const later = seconds => new Date(Date.now() + seconds * 1000).toISOString();
 const accounts = Array.from({length: 24}, (_, index) => {
   const percent = [82, 100, 46, 65, 0, 0][index] ?? 72;
@@ -142,7 +145,7 @@ try {
         if (!filenames[name]) { response.writeHead(404); response.end(); return; }
         response.writeHead(200, {'Content-Type': name === 'status' ? 'text/html; charset=utf-8' : name.endsWith('.js') ? 'text/javascript' : 'text/css',
           'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"});
-        response.end(await readFile(join(root, 'internal/v2/daemon/web', filenames[name]))); return;
+        response.end(await readFile(name === 'panel.js' && process.env.CWR_FIXTURE_PANEL_JS || join(root, 'internal/v2/daemon/web', filenames[name]))); return;
       }
       if (url.pathname === '/cpa/v0/management/auth-files/status') {
         if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
@@ -253,6 +256,9 @@ try {
         json(response, 202, {job_id: id, instance_id: 'local-browser-fixture'}); return;
       }
       reads.push(request.url);
+      const resourceGate = resourceReadGates.get(resource);
+      if (resourceGate) { resourceGate.started = true; resourceGate.arrivals = (resourceGate.arrivals || 0) + 1; await resourceGate.promise; }
+      if (unavailableResources.has(resource)) { json(response, 503, {error: resource + '_unavailable'}); return; }
       if (resource === 'task-history') {
         assert.equal(request.method, 'GET');
         if (historyUnavailable) { json(response, 503, {error: 'task_history_unavailable'}); return; }
@@ -289,9 +295,9 @@ try {
       if (resource === 'overview') {
         json(response, 200, {...identity(), version: '0.2.0-rc.4', accounts_revision: accountsRevision, query_settings: {revision: settingsRevision, config: queryConfig}, read_only: true, query_concurrency: 8,
           capabilities: {quota_query: true, passive_quota: true, model_execution: wakeCapable, wake_settings: wakeCapable, automatic_wake: wakeCapable, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true, generation_accounts: true, prompt_generation_providers: ['codex', 'antigravity'], editable_generation_prompt: true}, activity: {connected: true},
-          inventory: {status: 'ready', last_success_at: observed()}, dashboard: {total: 24, available: 20, disabled: 2, unavailable: 2, capacity: 16, unknown_quota: 4, errors: 2,
+          inventory: {status: 'ready', last_success_at: overviewObservedAt}, dashboard: {total: 24, available: 20, disabled: 2, unavailable: 2, capacity: 16, unknown_quota: 4, errors: 2,
             tasks: {active: 3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
-            recent_events: [{kind: 'quota_query', at: observed(), account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: observed(), account_id: '', phase: 'queued'}, {kind: 'inventory', at: observed(), phase: 'ready'}]}}); return;
+            recent_events: [{kind: 'quota_query', at: overviewObservedAt, account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: overviewObservedAt, account_id: '', phase: 'queued'}, {kind: 'inventory', at: overviewObservedAt, phase: 'ready'}]}}); return;
       }
       if (resource === 'jobs') {
         const job = jobs.get(url.searchParams.get('job_id')), detail = job ? {...job, ...identity()} : {error: 'not_found'};
@@ -332,6 +338,7 @@ try {
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   let serial = 0;
   const pending = new Map();
+  const networkRequests = [], inFlightRequests = new Set();
   function cdp(method, params = {}) {
     return new Promise((resolve, reject) => {
       const id = ++serial, timer = setTimeout(() => { pending.delete(id); reject(new Error('CDP timeout: ' + method)); }, 15000);
@@ -346,7 +353,12 @@ try {
     }
     if (data.method === 'Runtime.exceptionThrown') pageErrors.push(data.params.exceptionDetails);
     if (data.method === 'Log.entryAdded' && data.params.entry.source === 'security') pageErrors.push(data.params.entry.text);
-    if (data.method === 'Network.requestWillBeSent' && /^https?:/.test(data.params.request.url) && !fixtureOrigins.has(new URL(data.params.request.url).origin)) pageErrors.push('Non-fixture network request: ' + data.params.request.url);
+    if (data.method === 'Network.requestWillBeSent' && /^https?:/.test(data.params.request.url)) {
+      const request = data.params.request;
+      networkRequests.push({url: request.url, method: request.method}); inFlightRequests.add(data.params.requestId);
+      if (!fixtureOrigins.has(new URL(request.url).origin)) pageErrors.push('Non-fixture network request: ' + request.url);
+    }
+    if (['Network.loadingFinished', 'Network.loadingFailed'].includes(data.method)) inFlightRequests.delete(data.params.requestId);
   });
   async function evaluate(expression) {
     const result = await cdp('Runtime.evaluate', {expression, returnByValue: true, awaitPromise: true});
@@ -405,12 +417,254 @@ try {
     const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
     await writeFile(join(output, name), Buffer.from(capture.data, 'base64'));
   }
+  const readCountFor = resource => reads.filter(path => new URL(path, 'http://fixture').pathname.endsWith('/' + resource)).length;
+  async function settleRefresh() {
+    await waitFor(() => inFlightRequests.size === 0, 'Automatic refresh did not finish its independent reads');
+    await evaluate('document.hidden ? Promise.resolve() : new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+  }
+  async function naturalPolls(count = 1) {
+    const before = readCountFor('overview');
+    await waitFor(() => readCountFor('overview') >= before + count, 'No real timer-driven overview reads', count * 6500 + 1500);
+    await settleRefresh();
+  }
+  async function assertForegroundPollingCadence() {
+    const phases = fixtureJobs.map(job => job.phase);
+    try {
+      fixtureJobs.forEach(job => { job.phase = 'completed'; });
+      await evaluate('window.dispatchEvent(new Event("focus"))');
+      await settleRefresh();
+      const idleAt = Date.now();
+      await naturalPolls();
+      const idleElapsed = Date.now() - idleAt;
+      assert.ok(idleElapsed >= 4200 && idleElapsed <= 7500, 'Idle foreground polling lost its five-second cadence: ' + idleElapsed);
+      console.log('Autorefresh native idle foreground poll after ' + idleElapsed + ' ms.');
+    } finally { fixtureJobs.forEach((job, index) => { job.phase = phases[index]; }); }
+    await evaluate('window.dispatchEvent(new Event("focus"))');
+    await settleRefresh();
+    const activeAt = Date.now();
+    await naturalPolls();
+    const activeElapsed = Date.now() - activeAt;
+    assert.ok(activeElapsed >= 1100 && activeElapsed <= 3500, 'Active-task polling lost its 1.5-second cadence: ' + activeElapsed);
+    console.log('Autorefresh native active foreground poll after ' + activeElapsed + ' ms.');
+  }
+  async function startMutationProbe(ids) {
+    await evaluate(`(() => {
+      const roots = ${JSON.stringify(ids)}.map(id => document.getElementById(id));
+      const retained = roots.flatMap(root => [root, ...root.querySelectorAll('*')]);
+      const stats = {attributes: 0, redundantAttributes: 0, elementChurn: 0, staticTextWrites: 0, redundantTimeWrites: 0, realTimeWrites: 0, transitions: 0, animations: 0, loadingFlashes: 0, samples: []};
+      const sample = (kind, node, value) => { if (stats.samples.length < 12) stats.samples.push({kind, node: node.id || node.className || node.nodeName, value}); };
+      const observer = new MutationObserver(records => {
+        for (const [index, record] of records.entries()) {
+          const node = record.target.nodeType === Node.TEXT_NODE ? record.target.parentElement : record.target;
+          if (record.type === 'attributes') {
+            const nextRecord = records.slice(index + 1).find(next => next.type === 'attributes' && next.target === record.target && next.attributeName === record.attributeName);
+            const next = nextRecord ? nextRecord.oldValue : record.target.getAttribute(record.attributeName);
+            if (record.attributeName === 'title' && record.oldValue !== next && node.matches('.quota-cell')) continue;
+            stats.attributes++;
+            if (record.oldValue === next) stats.redundantAttributes++;
+            sample('attribute:' + record.attributeName, node, [record.oldValue, next]);
+          } else if (record.type === 'childList' && [...record.addedNodes, ...record.removedNodes].some(child => child.nodeType === Node.ELEMENT_NODE)) {
+            stats.elementChurn++; sample('elementChurn', node, record.removedNodes.length + '/' + record.addedNodes.length);
+          } else {
+            const before = record.type === 'characterData' ? record.oldValue : Array.from(record.removedNodes, child => child.textContent).join('');
+            const normalizeCountdown = value => value.replace(/(?:\\d+\\s*(?:天|小时|分|秒)\\s*)+后计划查询/g, '后计划查询');
+            const historyCountdown = node.matches('#history-list td:nth-child(5)') && before !== node.textContent && before.includes('后计划查询') && normalizeCountdown(before) === normalizeCountdown(node.textContent);
+            const timed = historyCountdown || !!node.closest('[data-reset-at],[data-observed-at],[data-queue-phase]');
+            if (!timed) { stats.staticTextWrites++; sample('staticText', node, [before, node.textContent]); }
+            else if (before === record.target.textContent) { stats.redundantTimeWrites++; sample('sameTimeText', node, before); }
+            else stats.realTimeWrites++;
+          }
+        }
+      });
+      roots.forEach(root => observer.observe(root, {subtree: true, childList: true, characterData: true, characterDataOldValue: true, attributes: true, attributeOldValue: true}));
+      const onMotion = event => { if (roots.some(root => root.contains(event.target))) stats[event.type === 'transitionrun' ? 'transitions' : 'animations']++; };
+      document.addEventListener('transitionrun', onMotion, true); document.addEventListener('animationstart', onMotion, true);
+      const loadingObserver = new MutationObserver(records => {
+        for (const record of records) {
+          if (record.type === 'attributes' && record.oldValue === 'false' && record.target.getAttribute('aria-busy') === 'true') stats.loadingFlashes++;
+          if (record.type === 'childList' && Array.from(record.addedNodes, node => node.textContent).join('').includes('正在读取')) stats.loadingFlashes++;
+        }
+      });
+      for (const id of ['history-refresh', 'history-verify', 'history-message', 'history-detail-message']) loadingObserver.observe(document.getElementById(id), {subtree: true, childList: true, attributes: true, attributeFilter: ['aria-busy'], attributeOldValue: true});
+      globalThis.autorefreshProbe = {stats, retained, focus: document.activeElement, stop() {
+        observer.disconnect(); loadingObserver.disconnect(); document.removeEventListener('transitionrun', onMotion, true); document.removeEventListener('animationstart', onMotion, true);
+        return {...stats, retained: retained.length, detached: retained.filter(node => !node.isConnected).length, focusRetained: document.activeElement === this.focus};
+      }};
+    })()`);
+  }
+  async function endMutationProbe(label) {
+    const stats = await evaluate('autorefreshProbe.stop()');
+    console.log('Autorefresh mutation budget [' + label + ']: ' + JSON.stringify(stats));
+    return stats;
+  }
+  function assertMutationBudget(stats, label) {
+    for (const key of ['attributes', 'elementChurn', 'staticTextWrites', 'redundantTimeWrites', 'transitions', 'animations', 'loadingFlashes', 'detached']) assert.equal(stats[key], 0, label + ' exceeded ' + key + ' budget: ' + JSON.stringify(stats));
+    assert.equal(stats.focusRetained, true, label + ' stole keyboard focus');
+  }
+  async function runAutorefreshChecks() {
+    const postCount = posts.length, patchCount = patches.length, requestStart = networkRequests.length;
+    const initialDisabled = authFiles[0].disabled, initialMode = await evaluate('document.getElementById("display-mode").value');
+    const checked = () => evaluate('document.querySelector("[data-account-status-id=codex-01]")?.getAttribute("aria-checked")');
+    const changeExternalStatus = () => { authFiles[0].disabled = !authFiles[0].disabled; authFiles[0].status = authFiles[0].disabled ? 'disabled' : 'active'; };
+    const awaitExternalStatus = () => waitFor(async () => await checked() === String(!authFiles[0].disabled), 'External CPA enable/disable stayed stale without a manual refresh', 9000);
+    await evaluate('document.querySelector("[data-page=overview]").click();if(document.getElementById("account-status-dialog").open)document.getElementById("account-status-cancel").click()');
+    await settleRefresh();
+    await evaluate('(() => {document.querySelector("[data-account-alias-id=codex-01]").click();document.getElementById("account-alias-value").value="自动刷新主账号";document.getElementById("account-alias-save").click();const mode=document.getElementById("display-mode");mode.value="alias";mode.dispatchEvent(new Event("change"))})()');
+    await naturalPolls();
+    await evaluate('document.querySelector("[data-account-status-id=codex-01]").focus()');
+    await startMutationProbe(['accounts', 'tasks', 'recent-events', 'diagnostics-content']);
+    await naturalPolls(2);
+    const overviewBudget = await endMutationProbe('same-state overview + alias, two native polls');
+    await screenshot('autorefresh-same-state-alias.png');
+    const stableRevision = revision, stableAccountsRevision = accountsRevision, authBefore = readCountFor('auth-files');
+    changeExternalStatus();
+    await awaitExternalStatus();
+    assert.ok(readCountFor('auth-files') > authBefore, 'Timer-driven refresh skipped the live CPA status directory');
+    assert.equal(revision, stableRevision); assert.equal(accountsRevision, stableAccountsRevision);
+    assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), '自动刷新主账号', 'Polling lost the privacy-safe alias');
+    await screenshot('autorefresh-external-cpa-status.png');
+    console.log('Autorefresh external CPA change passed without accounts/view revision changes or manual refresh.');
+
+    let backgroundTarget;
+    try {
+      backgroundTarget = (await cdp('Target.createTarget', {url: 'about:blank', background: false})).targetId;
+      await cdp('Target.activateTarget', {targetId: backgroundTarget});
+      await waitFor(() => evaluate('document.hidden'), 'Real Chromium tab activation did not hide the panel');
+      await settleRefresh();
+      const hiddenAt = Date.now(), hiddenReads = readCountFor('overview');
+      await new Promise(resolve => setTimeout(resolve, 6500));
+      assert.equal(readCountFor('overview'), hiddenReads, 'Hidden page kept the foreground 1.5/5 second polling rate');
+      await waitFor(() => readCountFor('overview') > hiddenReads, 'Hidden page did not poll within its 30 second interval', 27500);
+      console.log('Autorefresh native hidden-tab poll after ' + (Date.now() - hiddenAt) + ' ms.');
+      await settleRefresh();
+      const visibleReads = readCountFor('overview'), visibleAuthReads = readCountFor('auth-files');
+      changeExternalStatus();
+      await cdp('Target.activateTarget', {targetId: target.id});
+      await waitFor(async () => !await evaluate('document.hidden') && readCountFor('overview') > visibleReads && readCountFor('auth-files') > visibleAuthReads && await checked() === String(!authFiles[0].disabled), 'Returning to a visible Chromium tab did not immediately GET fresh CPA state', 1400);
+      await settleRefresh();
+      await screenshot('autorefresh-native-visible-return.png');
+    } finally {
+      if (backgroundTarget) { await cdp('Target.activateTarget', {targetId: target.id}); await cdp('Target.closeTarget', {targetId: backgroundTarget}); }
+    }
+
+    let onlineReads;
+    await cdp('Network.emulateNetworkConditions', {offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1});
+    try {
+      await waitFor(() => evaluate('!navigator.onLine'), 'Chromium did not enter a real offline state');
+      changeExternalStatus();
+      onlineReads = readCountFor('auth-files');
+    } finally {
+      await cdp('Network.emulateNetworkConditions', {offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1});
+    }
+    await waitFor(async () => await evaluate('navigator.onLine') && readCountFor('auth-files') > onlineReads && await checked() === String(!authFiles[0].disabled), 'Native online recovery did not immediately GET current CPA state', 1400);
+    await settleRefresh();
+    await screenshot('autorefresh-native-online-recovery.png');
+    const focusReads = readCountFor('overview');
+    await evaluate('window.dispatchEvent(new Event("focus"))');
+    await waitFor(() => readCountFor('overview') > focusReads, 'Window focus did not immediately read the overview', 1200);
+    await settleRefresh();
+
+    const overviewGate = gate(), mergedBefore = readCountFor('overview');
+    resourceReadGates.set('overview', overviewGate);
+    try {
+      await evaluate('for(let index=0;index<8;index++){window.dispatchEvent(new Event("focus"));window.dispatchEvent(new Event("online"));document.dispatchEvent(new Event("visibilitychange"));}');
+      await waitFor(() => overviewGate.started, 'Resume event burst did not start GET overview', 1200);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      assert.equal(overviewGate.arrivals, 1, 'Resume event burst overlapped overview requests');
+    } finally { resourceReadGates.delete('overview'); overviewGate.release(); }
+    await settleRefresh();
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.ok(readCountFor('overview') - mergedBefore <= 2, 'Resume events queued more than one follow-up refresh');
+    const mergedSettled = readCountFor('overview');
+    await new Promise(resolve => setTimeout(resolve, 1800));
+    assert.ok(readCountFor('overview') - mergedSettled <= 1, 'Resume events stacked polling timers');
+
+    await evaluate('document.querySelector("[data-page=history]").click()');
+    await settleRefresh();
+    const accountsGate = gate(), historyBeforeGate = readCountFor('task-history');
+    resourceReadGates.set('accounts', accountsGate); revision++; accountsRevision++;
+    try {
+      await waitFor(() => accountsGate.started, 'Independent account read did not start');
+      await waitFor(() => readCountFor('task-history') > historyBeforeGate, 'Held accounts GET blocked the independent history GET', 1200);
+      assert.equal(await evaluate('document.getElementById("auto-status").dataset.state'), 'online', 'A held resource misreported the entire connection');
+    } finally { resourceReadGates.delete('accounts'); accountsGate.release(); }
+    await settleRefresh();
+    unavailableResources.add('accounts'); revision++; accountsRevision++;
+    try {
+      const historyBeforeFailure = readCountFor('task-history'), accountsBeforeFailure = readCountFor('accounts');
+      await naturalPolls();
+      assert.ok(readCountFor('accounts') > accountsBeforeFailure);
+      assert.ok(readCountFor('task-history') > historyBeforeFailure, 'Failed accounts GET blocked history refresh');
+      assert.notEqual(await evaluate('document.getElementById("auto-status").dataset.state'), 'offline', 'One failed resource marked the healthy overview connection offline');
+      assert.equal(await evaluate('document.getElementById("login-section").hidden && !document.getElementById("refresh").disabled'), true, 'One failed resource disconnected the authenticated panel');
+    } finally { unavailableResources.delete('accounts'); }
+    await naturalPolls();
+    await evaluate('document.querySelector(\'#history-list [data-render-key="wake:persisted-wake-0"] button\').click()');
+    await settleRefresh();
+    await evaluate('globalThis.autorefreshDetails=document.querySelector("#history-detail-body [data-render-key=wake-response]");autorefreshDetails.open=true;autorefreshDetails.querySelector("summary").focus()');
+    await startMutationProbe(['history-list', 'history-detail-body']);
+    await naturalPolls(2);
+    const historyBudget = await endMutationProbe('background history + expanded response');
+    assert.equal(await evaluate('autorefreshDetails.isConnected && autorefreshDetails.open'), true, 'Background history collapsed the saved response');
+    await screenshot('autorefresh-history-no-loading-flash.png');
+    await evaluate('document.getElementById("history-detail-close").click();document.querySelector("[data-page=query]").click()');
+    const queryDraftBefore = await evaluate('document.getElementById("settings-excluded").value');
+    await evaluate('(() => {const field=document.getElementById("settings-excluded");field.value="02:00-03:00";field.dispatchEvent(new Event("input"));field.focus();field.setSelectionRange(1,4)})()');
+    await naturalPolls(2);
+    assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("settings-excluded").value,document.getElementById("settings-excluded").selectionStart,document.getElementById("settings-excluded").selectionEnd]'), ['settings-excluded', '02:00-03:00', 1, 4], 'Native polling changed the query draft/focus/selection');
+    await evaluate(`(() => {const restoredQuery=document.getElementById('settings-excluded');restoredQuery.value=${JSON.stringify(queryDraftBefore)};restoredQuery.dispatchEvent(new Event('input'));document.querySelector('[data-page=models]').click()})()`);
+    await settleRefresh();
+    const modelDraftBefore = await evaluate('document.getElementById("model-default-prompt").value');
+    await evaluate('(() => {const field=document.getElementById("model-default-prompt");field.value="自动刷新保留的模型草稿";field.dispatchEvent(new Event("input"));field.focus();field.setSelectionRange(2,5)})()');
+    const modelGate = gate(), quotaBefore = accounts[0].quota.five_hour.Remaining.Value;
+    resourceReadGates.set('model-settings', modelGate);
+    accounts[0].quota.five_hour.Remaining.Value = 61; accountsRevision++; revision++;
+    try {
+      await waitFor(() => modelGate.started, 'Background model settings did not start');
+      await waitFor(() => evaluate('document.querySelector("#accounts progress").value===61'), 'Held model settings blocked fresh account quota', 1200);
+      assert.deepEqual(await evaluate('[document.activeElement.id,document.getElementById("model-default-prompt").value,document.getElementById("model-default-prompt").selectionStart,document.getElementById("model-default-prompt").selectionEnd]'), ['model-default-prompt', '自动刷新保留的模型草稿', 2, 5], 'Independent polling lost the model draft/focus/selection');
+    } finally { resourceReadGates.delete('model-settings'); modelGate.release(); }
+    await settleRefresh();
+    accounts[0].quota.five_hour.Remaining.Value = quotaBefore; accountsRevision++; revision++;
+    await evaluate(`(() => {const restoredModel=document.getElementById('model-default-prompt');restoredModel.value=${JSON.stringify(modelDraftBefore)};restoredModel.dispatchEvent(new Event('input'));document.querySelector('[data-page=overview]').click()})()`);
+    if (authFiles[0].disabled !== initialDisabled) changeExternalStatus();
+    await awaitExternalStatus();
+    await evaluate(`(() => {document.querySelector('[data-account-alias-id=codex-01]').click();document.getElementById('account-alias-value').value='';document.getElementById('account-alias-save').click();const restoredMode=document.getElementById('display-mode');restoredMode.value=${JSON.stringify(initialMode)};restoredMode.dispatchEvent(new Event('change'))})()`);
+    await settleRefresh();
+    assert.equal(posts.length, postCount, 'Automatic refresh dispatched a plugin POST/model request');
+    assert.equal(patches.length, patchCount, 'Automatic refresh PATCHed CPA status');
+    assert.equal(networkRequests.slice(requestStart).every(request => request.method === 'GET'), true, 'Automatic refresh issued a non-GET request');
+    assert.equal(networkRequests.slice(requestStart).some(request => new URL(request.url).pathname.endsWith('/auth-files/models')), false, 'Automatic refresh fetched the opt-in model catalog');
+    assertMutationBudget(overviewBudget, 'Same-state overview + alias');
+    assertMutationBudget(historyBudget, 'Background history');
+    console.log('Autorefresh regression passed: real timer CPA changes, native hidden/visible and offline/online recovery, focus, merged resume reads, independent held/failed resources, zero same-value DOM churn/loading flashes, preserved alias/details/drafts/focus/selection and zero POST/PATCH/model traffic.');
+  }
   await cdp('Page.enable'); await cdp('Runtime.enable'); await cdp('Log.enable'); await cdp('Network.enable');
   await cdp('Page.addScriptToEvaluateOnNewDocument', {source: `localStorage.setItem('cli-proxy-auth', JSON.stringify({state:{managementKey:${JSON.stringify(fixtureKey)},apiBase:location.origin+(location.pathname.startsWith('/other-cpa/')?'/other-cpa':'/cpa')}}));`});
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   await cdp('Page.navigate', {url: origin + base + 'status'});
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
   await evaluate('document.fonts.ready.then(() => true)');
+  checks: {
+  if (autorefreshOnly) {
+    await evaluate('document.querySelector("[data-account-status-id=codex-01]").click()');
+    await clickWhenEnabled('account-status-confirm');
+    await waitFor(() => evaluate('document.querySelector("[data-account-status-id=codex-01]").dataset.state==="confirmed"'), 'Explicit fixture-only setup PATCH did not reach confirmed');
+    assert.equal(patches.length, 1, 'Fixture setup must PATCH exactly once after explicit confirmation');
+    await assertForegroundPollingCadence();
+    await runAutorefreshChecks();
+    assert.equal(posts.length, 0, 'Read-only Chromium suite submitted plugin/model work');
+    assert.equal(patches.length, 1, 'Read-only Chromium suite added an unconfirmed CPA PATCH');
+    await evaluate('document.getElementById("disconnect").click()');
+    await settleRefresh();
+    const afterDisconnect = networkRequests.length;
+    await evaluate('window.dispatchEvent(new Event("online"));window.dispatchEvent(new Event("focus"));document.dispatchEvent(new Event("visibilitychange"))');
+    await new Promise(resolve => setTimeout(resolve, 1800));
+    assert.equal(networkRequests.length, afterDisconnect, 'Resume events restored credentials after explicit disconnect');
+    assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
+    console.log('Autorefresh-only Chromium checks passed; screenshots: ' + output);
+    break checks;
+  }
   assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24');
   assert.equal(await evaluate('document.getElementById("metric-capacity").textContent'), '16 / 20');
   assert.equal(posts.length, 0, 'Opening the page dispatched a write');
@@ -924,8 +1178,14 @@ try {
   const latestHistory = () => new URL(historyReads().at(-1), origin);
   async function historyFilter(id, value, event = 'change') {
     const before = historyReads().length;
+    const parameter = {'history-search': 'search', 'history-kind': 'type', 'history-source': 'source', 'history-trigger': 'trigger', 'history-page-size': 'limit'}[id];
     await evaluate(`(() => {const input=document.getElementById(${JSON.stringify(id)});input.value=${JSON.stringify(value)};input.dispatchEvent(new Event(${JSON.stringify(event)}))})()`);
-    await waitFor(async () => historyReads().length > before && await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'Task history filter did not finish: ' + id);
+    await waitFor(async () => {
+      if (historyReads().length <= before || parameter && (latestHistory().searchParams.get(parameter) || '') !== value) return false;
+      const expected = taskHistory(latestHistory().searchParams).records.map(record => record.type + ':' + record.job_id);
+      return await evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false" && ' +
+        'JSON.stringify(Array.from(document.querySelectorAll("#history-list tr[data-render-key]"), row => row.dataset.renderKey)) === ' + JSON.stringify(JSON.stringify(expected)));
+    }, 'Task history filter did not render its matching response: ' + id + '=' + value);
   }
   async function assertHistoryData() {
     const expected = taskHistory(latestHistory().searchParams);
@@ -1082,6 +1342,7 @@ try {
   assert.equal(await evaluate('taskResponse.isConnected && taskResponse.open && document.activeElement===taskResponseSummary'), true, 'Task polling reset response expansion or focus');
   for (const [width, height] of [[2560, 1600], [1280, 900], [390, 844]]) {
     await cdp('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor: 1, mobile: width < 600});
+    await evaluate('document.fonts.ready.then(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))');
     assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Task history overflow at ' + width);
     assert.equal(await evaluate('document.querySelector(".history-table-scroll").clientWidth > 0 && document.getElementById("history-detail").getBoundingClientRect().width > 0'), true, 'Task table or details hidden at ' + width);
     if (width === 2560) assert.equal(await evaluate('document.getElementById("history-detail").getBoundingClientRect().left >= document.querySelector(".history-card").getBoundingClientRect().right'), true, 'Desktop task details are not right aligned');
@@ -1091,7 +1352,13 @@ try {
       await evaluate('document.getElementById("history-detail-body").scrollTop=document.getElementById("history-detail-body").scrollHeight');
       assert.equal(await evaluate('document.getElementById("history-detail-body").scrollTop>0'), true, 'Long response did not exercise detail scrolling');
       await assertUnknownSafety(true);
-      assert.equal(await evaluate('document.querySelector(".history-detail-actions").getBoundingClientRect().bottom<=innerHeight'), true, 'Detail actions left the desktop viewport');
+      const geometry = await evaluate(`(() => {
+        const rect = selector => {const box=document.querySelector(selector).getBoundingClientRect();return {top:box.top,bottom:box.bottom,width:box.width,height:box.height};};
+        return {width:innerWidth,height:innerHeight,scrollY,actions:rect('.history-detail-actions'),body:rect('#history-detail-body'),detail:rect('#history-detail'),viewport:{height:visualViewport.height,offsetTop:visualViewport.offsetTop}};
+      })()`);
+      console.log('Task history desktop action geometry: ' + JSON.stringify(geometry));
+      if (geometry.actions.bottom > geometry.height) await screenshot('task-history-actions-outside-' + width + '.png');
+      assert.equal(geometry.actions.bottom <= geometry.height, true, 'Detail actions left the desktop viewport: ' + JSON.stringify(geometry));
     }
     await screenshot('task-history-' + width + 'x' + height + '.png');
     if (width === 390) {
@@ -1160,6 +1427,7 @@ try {
       const name=row.querySelector('.account-name strong'), style=getComputedStyle(name);
       return {row:rectangle(row),query:rectangle(row.querySelector('.account-query:not(.account-wake)')),
         wake:rectangle(row.querySelector('.account-wake')),status:rectangle(row.querySelector('[data-account-status-id]')),
+        pending:row.querySelector('.query-pending') ? {text:row.querySelector('.query-pending').textContent,...rectangle(row.querySelector('.query-pending'))} : null,
         alias:{...rectangle(name),text:name.textContent,title:name.title,whiteSpace:style.whiteSpace,overflow:style.overflow,textOverflow:style.textOverflow,scrollWidth:name.scrollWidth,clientWidth:name.clientWidth}};
     })`);
     assert.equal(layout.length, 6, 'Desktop action layout did not exercise a complete account page');
@@ -1171,6 +1439,7 @@ try {
       }
       assert.ok(Math.abs(account.query.top - account.wake.top) <= 1, 'Query and wake buttons no longer share their first action row: ' + detail);
       assert.ok(account.status.top >= Math.max(account.query.bottom, account.wake.bottom), 'CPA status switch must occupy a separate second action row: ' + detail);
+      if (account.row.height > 140) await screenshot('account-action-row-too-tall-' + index + '.png');
       assert.ok(account.row.height <= 140, 'Account row became excessively tall: ' + detail);
     }
     if (alias) {
@@ -1240,7 +1509,9 @@ try {
     await waitFor(async () => (await statusState()).phase === 'unknown' && !(await statusState()).verify, async () => 'Uncertain status did not expose read-only verification (' + outcome + '): ' + JSON.stringify(await statusState()));
     await assertAccountActionLayout();
     const overviewReads = reads.filter(path => path.endsWith('/overview')).length;
+    await evaluate('window.dispatchEvent(new Event("focus"));window.dispatchEvent(new Event("online"));document.dispatchEvent(new Event("visibilitychange"))');
     await waitFor(() => reads.filter(path => path.endsWith('/overview')).length > overviewReads, 'Unknown status did not receive a polling cycle');
+    await settleRefresh();
     await evaluate(`document.getElementById('account-status-confirm').click();document.querySelector(${JSON.stringify(statusSelector('codex-01'))}).click()`);
     assert.equal(patches.length, count + 1, 'Unknown status automatically retried PATCH: ' + outcome);
     assert.equal((await statusState()).phase, 'unknown', 'Polling cleared unknown status without explicit verification');
@@ -1452,8 +1723,12 @@ try {
   unauthorized = true;
   await waitFor(() => evaluate('!document.getElementById("login-section").hidden && document.getElementById("query").disabled'), 'Expired authentication did not stop polling');
   const readCount = reads.length;
+  const requestsAfterUnauthorized = networkRequests.length;
+  unauthorized = false;
+  await evaluate('window.dispatchEvent(new Event("focus"));window.dispatchEvent(new Event("online"));document.dispatchEvent(new Event("visibilitychange"))');
   await new Promise(resolve => setTimeout(resolve, 1800));
   assert.equal(reads.length, readCount, 'Authentication failure kept polling');
+  assert.equal(networkRequests.length, requestsAfterUnauthorized, 'Resume events restored credentials after HTTP 401');
   assert.equal(exceptions.length, 0, JSON.stringify(exceptions));
   assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
   assert.equal(posts.filter(post => post.resource === 'settings').length, 8, 'Unexpected settings write after browser checks');
@@ -1468,7 +1743,9 @@ try {
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
   console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, same-account quick-wake native close race, exactly one confirmed wake POST, five explicitly confirmed filename/index-bound CPA PATCHes with GET verification and unknown protection, global alias/mask preferences scoped to CPA base with stable request IDs and polling focus, precise wake explanations, informational legacy/current skips, persisted task history and real trigger menus, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard fallback, mobile detail focus/scroll, unavailable-history recovery, fixture-only page traffic and screenshots.');
   console.log('Local fixture screenshots: ' + output);
+  }
 } finally {
+  for (const held of resourceReadGates.values()) held.release();
   accountReadGate?.release();
   settingsPostGate?.release();
   settingsReadGate?.release();
@@ -1485,4 +1762,11 @@ try {
   }
   if (server) await new Promise(resolve => server.close(resolve));
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
+}
+if (!autorefreshOnly) {
+  console.log('Original V2 fixture verified 20 POSTs and five explicitly confirmed CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
+  const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
+  assert.equal(result.code, 0, 'Isolated automatic-refresh Chromium fixture failed: ' + JSON.stringify(result));
+  console.log('V2 full and isolated automatic-refresh Chromium fixtures both passed.');
 }

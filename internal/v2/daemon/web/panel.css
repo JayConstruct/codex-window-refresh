@@ -347,7 +347,7 @@ select { cursor: pointer; }
 .history-pages button[aria-current="page"] { color: #fff; background: var(--teal); border-color: var(--teal); }
 .history-scope { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; font-size: 12px; line-height: 1.65; }
 .history-scope .icon { width: 17px; height: 17px; margin-top: 1px; }
-.history-detail { position: sticky; top: 16px; display: flex; flex-direction: column; min-width: 0; max-height: max(280px, calc(100dvh - 350px)); padding: 16px 18px; }
+.history-detail { position: sticky; top: 16px; display: flex; flex-direction: column; min-width: 0; max-height: var(--history-detail-height, max(280px, calc(100dvh - 350px))); padding: 16px 18px; }
 .history-detail > .history-heading, .history-detail > .field-help, .history-detail > .history-unknown, #history-copy-fallback, .history-detail-actions { flex-shrink: 0; }
 #history-detail-title { scroll-margin-top: 20px; }
 #history-copy-fallback input { width: 100%; min-width: 0; }

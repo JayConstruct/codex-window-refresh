@@ -145,21 +145,34 @@ function panel(respond, options = {}) {
   class Element {
     constructor(tag = 'div') {
       this.nodeType = tag === '#text' ? 3 : 1;
-      this.tagName = tag; this.children = []; this.value = ''; this.checked = false; this.disabled = false; this.hidden = false; this.dataset = {};
-      this.attributes = new Map(); this.listeners = new Map(); this._text = ''; this.parentNode = null;
+      this.tagName = tag; this.children = []; this.value = ''; this.checked = false; this.disabled = false; this.hidden = false;
+      this.datasetWrites = [];
+      this.dataset = new Proxy({}, {set: (target, name, value) => {
+        this.datasetWrites.push({name, value: String(value)}); target[name] = String(value); return true;
+      }});
+      this.attributes = new Map(); this.attributeWrites = []; this.listeners = new Map(); this._text = ''; this.parentNode = null;
+      this.textWrites = 0; this.replaceChildrenCalls = 0;
       this.classList = {toggle() {}};
     }
-    set textContent(value) { this._text = String(value); this.children = []; }
+    set value(value) {
+      const next = String(value);
+      this.valueWrites = (this.valueWrites || 0) + 1;
+      if (this._value !== next) {
+        this._value = next; this.selectionStart = next.length; this.selectionEnd = next.length; this.selectionDirection = 'none';
+      }
+    }
+    get value() { return this._value; }
+    set textContent(value) { this.textWrites++; this._text = String(value); this.children = []; }
     get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
     get childNodes() { return this.children; }
-    replaceChildren(...children) { this._text = ''; this.children = []; this.append(...children); }
+    replaceChildren(...children) { this.replaceChildrenCalls++; this._text = ''; this.children = []; this.append(...children); }
     append(...children) {
       for (const child of children) {
         if (child.parentNode) child.parentNode.children = child.parentNode.children.filter(item => item !== child);
         child.parentNode = this; this.children.push(child);
       }
     }
-    setAttribute(name, value) { this.attributes.set(name, value); }
+    setAttribute(name, value) { this.attributeWrites.push({name, value: String(value)}); this.attributes.set(name, String(value)); }
     getAttributeNames() { return [...this.attributes.keys()]; }
     getAttribute(name) { return this.attributes.get(name) ?? null; }
     hasAttribute(name) { return this.attributes.has(name); }
@@ -182,7 +195,7 @@ function panel(respond, options = {}) {
     showModal() { this.open = true; }
     close() { this.open = false; }
   }
-  const elements = new Map(), timers = new Map(), calls = [], events = new Map(), storage = options.storage || {};
+  const elements = new Map(), timers = new Map(), calls = [], events = new Map(), documentEvents = new Map(), storage = options.storage || {};
   let nextTimer = 0;
   const get = id => {
     if (!elements.has(id)) {
@@ -204,7 +217,10 @@ function panel(respond, options = {}) {
   root.append(...nav, ...panels);
   const walk = node => [node, ...node.children.flatMap(walk)];
   const context = vm.createContext({
-    document: {documentElement: get('document-root'), activeElement: null, getElementById: get, createElement: tag => new Element(tag),
+    document: {documentElement: get('document-root'), activeElement: null, hidden: options.hidden || false,
+      get visibilityState() { return this.hidden ? 'hidden' : 'visible'; },
+      addEventListener: (name, callback) => documentEvents.set(name, callback),
+      getElementById: get, createElement: tag => new Element(tag),
       createElementNS: (namespace, tag) => {
         const node = new Element(tag), className = {baseVal: ''};
         Object.defineProperty(node, 'className', {get: () => className});
@@ -235,7 +251,7 @@ function panel(respond, options = {}) {
     const entry = [...timers.entries()].find(([, timer]) => timer.delay === delay);
     assert.ok(entry, 'missing timer ' + delay); timers.delete(entry[0]); await entry[1].fn();
   }
-  return {get, timers, calls, nav, panels, events, tick, storage, document: context.document, clock: context};
+  return {get, timers, calls, nav, panels, events, documentEvents, tick, storage, document: context.document, clock: context};
 }
 function basic(url) { return url.includes('/task-history?') ? [200, historyPage()] : url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
 function historyRecord(overrides = {}) {
@@ -2109,7 +2125,7 @@ test('generation directory unavailable errors have a readable message and never 
   assert.equal(ui.get('generation-submit').disabled, true); await submitCandidates(ui);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
-test('directory loading, read failure and stale instances block new generation without automatic retry', async () => {
+test('directory read retries remain read-only and keep generation blocked until the explicit account is verified', async () => {
   let resolveCatalog;
   const ui = panel(url => url.endsWith('/generation-accounts') ? new Promise(resolve => { resolveCatalog = resolve; }) : directoryResponse(url));
   await openModels(ui); configureCandidateRequest(ui);
@@ -2117,8 +2133,10 @@ test('directory loading, read failure and stale instances block new generation w
   await submitCandidates(ui); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
   resolveCatalog([200, generationDirectory('stale-instance')]); await flush();
   assert.match(ui.get('generation-directory-status').textContent, /失败/); assert.equal(ui.get('generation-submit').disabled, true);
-  await ui.tick(5000); assert.equal(ui.calls.filter(call => call.url.endsWith('/generation-accounts')).length, 1);
-  const retry = ui.get('generation-refresh-accounts').onclick(); resolveCatalog([503, {error: 'storage_unavailable'}]); await retry;
+  await ui.tick(5000); assert.equal(ui.calls.filter(call => call.url.endsWith('/generation-accounts')).length, 2);
+  assert.equal(ui.get('generation-submit').disabled, true); await submitCandidates(ui);
+  assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+  resolveCatalog([503, {error: 'storage_unavailable'}]); await flush();
   assert.equal(ui.get('generation-submit').disabled, true); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
   const success = ui.get('generation-refresh-accounts').onclick(); resolveCatalog([200, generationDirectory()]); await success;
   assert.equal(ui.get('generation-submit').disabled, false);
@@ -2890,4 +2908,314 @@ test('wake precision codes are contextual and the legacy generic code never clai
   assert.doesNotMatch(taskDiagnostic('wake_account_disabled').title, /未发送|已发送/);
   assert.match(taskDiagnostic('wake_binding_changed').title, /绑定已变更/);
   const generic = taskDiagnostic('wake_account_unavailable'); assert.match(generic.title, /无法核实/); assert.doesNotMatch(generic.title + generic.advice, /绑定已变化|绑定已变更/);
+});
+
+const refreshTimers = ui => [...ui.timers.values()].filter(timer => [1500, 5000, 30000].includes(timer.delay));
+const mutations = ui => ui.calls.filter(call => call.method && call.method !== 'GET');
+
+test('unchanged automatic reads retain event, diagnostic and all editor diff subtrees without rewriting attributes', async () => {
+  const data = configuredOverview();
+  data.capabilities = {...data.capabilities, ...wakeOverview().capabilities};
+  data.dashboard.recent_events = [{kind: 'inventory_sync', at: '2026-10-19T01:00:00Z', phase: 'completed'}];
+  const ui = panel(url => url.endsWith('/overview') ? [200, data] : url.endsWith('/model-settings') ? [200, modelSettings()]
+    : url.endsWith('/wake-settings') ? [200, wakeSettings()] : [200, accountPage()]);
+  await openModels(ui);
+  edit(ui, 'settings-interval', '90'); edit(ui, 'model-default', 'local-model'); edit(ui, 'wake-per-user', '0.5');
+  const ids = ['recent-events', 'diagnostics-content', 'settings-diff', 'model-diff', 'wake-settings-diff'];
+  const retained = ids.map(id => ({id, nodes: descendants(ui.get(id))}));
+  const fields = ['settings-interval', 'model-default', 'wake-per-user', 'five-hour-query', 'auto-wake'].map(id => ({id, node: ui.get(id), writes: ui.get(id).attributeWrites.length}));
+  for (let round = 0; round < 2; round++) {
+    await ui.tick(5000);
+    for (const {id, nodes} of retained) {
+      const current = descendants(ui.get(id));
+      assert.equal(current.length, nodes.length, id + ' changed its subtree size');
+      nodes.forEach((node, index) => assert.equal(current[index], node, id + ' detached unchanged node ' + index));
+    }
+    for (const {id, node, writes} of fields) assert.equal(node.attributeWrites.length, writes, id + ' rewrote unchanged attributes');
+  }
+  assert.equal(mutations(ui).length, 0);
+});
+
+test('unchanged account datasets and countdown text are not rewritten by automatic refresh', async () => {
+  const now = Date.parse('2026-10-19T01:00:00Z'), data = overview();
+  const account = {id: 'stable-times', status: 'available', pending_query: {phase: 'queued', trigger: 'manual_single'}, quota: {
+    five_hour: {Remaining: {Value: 50, Unit: 'percent'}, ResetAt: '2026-10-19T02:00:00Z', ConfirmedAt: '2026-10-19T00:59:00Z'}
+  }};
+  const ui = panel(url => url.endsWith('/overview') ? [200, data] : [200, accountPage(1, [account])]);
+  ui.clock.Date = class extends Date {
+    constructor(...args) { super(...(args.length ? args : [now])); }
+    static now() { return now; }
+  };
+  await ui.get('connect').onclick();
+  const row = ui.get('accounts').children[0], nodes = descendants(row);
+  const timed = nodes.filter(node => ['resetAt', 'observedAt', 'queuePhase'].some(name => Object.hasOwn(node.dataset, name)));
+  assert.ok(timed.length >= 3);
+  const writes = nodes.map(node => ({node, attributes: node.attributeWrites.length, dataset: node.datasetWrites.length, text: node.textWrites}));
+  data.view_revision = 2;
+  await ui.tick(5000);
+  assert.equal(ui.get('accounts').children[0], row);
+  for (const {node, attributes, dataset, text} of writes) {
+    assert.equal(node.attributeWrites.length, attributes, 'unchanged account attribute was rewritten');
+    assert.equal(node.datasetWrites.length, dataset, 'unchanged account dataset was rewritten');
+    if (timed.includes(node)) assert.equal(node.textWrites, text, 'unchanged countdown text was rewritten');
+  }
+  assert.equal(mutations(ui).length, 0);
+});
+
+test('automatic CPA confirmation reads follow later external changes instead of retaining the local override forever', async () => {
+  let file = statusFile();
+  const ui = panel(url => {
+    if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
+    return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
+  });
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  ui.get('account-status-cancel').onclick();
+  const button = statusSwitch(ui), reads = ui.calls.filter(call => call.url.endsWith('/auth-files')).length;
+  button.focus(); await ui.tick(5000);
+  assert.equal(button.getAttribute('aria-checked'), 'false', 'stale daemon data rolled back the verified CPA disable');
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, reads + 1);
+  file = {...file, disabled: false}; await ui.tick(5000);
+  assert.equal(statusSwitch(ui), button); assert.equal(ui.document.activeElement, button);
+  assert.equal(button.getAttribute('aria-checked'), 'true', 'external CPA enable is hidden by a stale local confirmation');
+  file = {...file, disabled: true}; await ui.tick(5000);
+  assert.equal(button.getAttribute('aria-checked'), 'false');
+  assert.equal(mutations(ui).length, 1); assert.equal(mutations(ui)[0].method, 'PATCH');
+});
+
+test('a failed automatic CPA confirmation read neither starves account reads nor prevents a later retry', async () => {
+  let file = statusFile(), failing = false, revision = 1;
+  const ui = panel(url => {
+    if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
+    if (url.endsWith('/auth-files')) return failing ? [503, {error: 'storage_unavailable'}] : [200, {files: [file]}];
+    if (url.endsWith('/overview')) return [200, overview(revision)];
+    return [200, accountPage(revision, [{id: 'codex-01', status: 'available'}, {id: 'updated-' + revision, status: 'available'}])];
+  });
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  ui.get('account-status-cancel').onclick();
+  const reads = ui.calls.filter(call => call.url.endsWith('/auth-files')).length;
+  failing = true; revision = 2; await ui.tick(5000);
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, reads + 1);
+  assert.match(ui.get('accounts').textContent, /updated-2/);
+  assert.equal(ui.get('auto-status').dataset.state, 'online');
+  failing = false; file = {...file, disabled: false}; await ui.tick(5000);
+  assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true'); assert.equal(mutations(ui).length, 1);
+});
+
+test('automatic refresh never retries or silently clears an unknown CPA mutation', async () => {
+  let patched = false;
+  const ui = panel(url => {
+    if (url.endsWith('/auth-files/status')) { patched = true; return [503, {error: 'storage_unavailable'}]; }
+    if (url.endsWith('/auth-files')) return patched ? [503, {error: 'storage_unavailable'}] : [200, {files: [statusFile()]}];
+    return basic(url);
+  });
+  await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await ui.get('account-status-confirm').onclick();
+  assert.equal(statusSwitch(ui).dataset.state, 'unknown');
+  ui.get('account-status-cancel').onclick(); const calls = ui.calls.filter(call => call.url.includes('/auth-files')).length;
+  await ui.tick(5000); await ui.tick(5000);
+  assert.equal(statusSwitch(ui).dataset.state, 'unknown');
+  assert.equal(ui.calls.filter(call => call.url.includes('/auth-files')).length, calls);
+  assert.equal(mutations(ui).length, 1);
+});
+
+test('visibility, focus and online recovery read immediately and keep one visibility-aware poll timer', async () => {
+  let revision = 1;
+  const ui = panel(url => url.endsWith('/overview') ? [200, overview(revision)] : [200, accountPage(revision, [{id: 'visible-' + revision, status: 'available'}])]);
+  await ui.get('connect').onclick();
+  assert.equal(typeof ui.documentEvents.get('visibilitychange'), 'function');
+  assert.equal(typeof ui.events.get('focus'), 'function');
+  ui.document.hidden = true; ui.documentEvents.get('visibilitychange')(); await flush();
+  assert.equal(refreshTimers(ui).length, 1); assert.equal(refreshTimers(ui)[0].delay, 30000);
+  revision++; await ui.tick(30000);
+  assert.match(ui.get('accounts').textContent, /visible-2/);
+  for (const event of ['visibilitychange', 'focus', 'online']) {
+    const reads = ui.calls.filter(call => call.url.endsWith('/overview')).length;
+    revision++; ui.document.hidden = false;
+    (event === 'visibilitychange' ? ui.documentEvents : ui.events).get(event)(); await flush();
+    assert.equal(ui.calls.filter(call => call.url.endsWith('/overview')).length, reads + 1, event + ' did not read immediately');
+    assert.match(ui.get('accounts').textContent, new RegExp('visible-' + revision));
+    assert.equal(refreshTimers(ui).length, 1); assert.equal(refreshTimers(ui)[0].delay, 5000);
+  }
+  assert.equal(mutations(ui).length, 0);
+});
+
+test('foreground signals coalesce a pending refresh and schedule at most one catch-up read', async () => {
+  let reads = 0, release;
+  const ui = panel(url => {
+    if (!url.endsWith('/overview')) return [200, accountPage(reads)];
+    if (++reads === 2) return new Promise(resolve => { release = () => resolve([200, overview(2)]); });
+    return [200, overview(reads)];
+  });
+  await ui.get('connect').onclick();
+  const pending = ui.tick(5000); await flush();
+  assert.equal(typeof ui.events.get('focus'), 'function');
+  for (let signal = 0; signal < 3; signal++) { ui.events.get('focus')(); ui.events.get('online')(); }
+  await flush(); assert.equal(reads, 2, 'foreground signals started overlapping overview reads');
+  release(); await pending; await flush();
+  assert.equal(reads, 3, 'foreground signals must merge into exactly one catch-up read');
+  assert.equal(refreshTimers(ui).length, 1); assert.equal(mutations(ui).length, 0);
+});
+
+test('foreground recovery cannot reconnect after explicit disconnect or authentication expiry', async () => {
+  for (const unauthorized of [false, true]) {
+    let reads = 0;
+    const ui = panel(url => url.endsWith('/overview') ? (++reads > 1 && unauthorized ? [401, {error: 'unauthorized'}] : [200, overview()]) : basic(url));
+    await ui.get('connect').onclick();
+    if (unauthorized) await ui.tick(5000); else ui.get('disconnect').onclick();
+    const calls = ui.calls.length;
+    assert.equal(typeof ui.events.get('focus'), 'function');
+    ui.events.get('focus')(); ui.events.get('online')(); ui.documentEvents.get('visibilitychange')(); ui.events.get('pageshow')({persisted: true}); await flush();
+    assert.equal(ui.calls.length, calls); assert.equal(refreshTimers(ui).length, 0);
+    assert.equal(ui.get('login-section').hidden, false); assert.equal(mutations(ui).length, 0);
+  }
+});
+
+test('optional account or job poll failures do not starve history reads or mislabel a healthy connection', async () => {
+  for (const failure of ['accounts', 'jobs']) {
+    let revision = 1, failing = false;
+    const ui = panel((url, options) => {
+      if (url.endsWith('/overview')) return [200, overview(revision)];
+      if (url.includes('/accounts?')) return failing && failure === 'accounts' ? [503, {error: 'storage_unavailable'}] : [200, accountPage(revision)];
+      if (url.endsWith('/jobs') && options.method === 'POST') return [202, {...view('a', revision), job_id: 'optional-read', phase: 'queued'}];
+      if (url.includes('/jobs?')) return failing && failure === 'jobs' ? [503, {error: 'storage_unavailable'}] : [200, {...view('a', revision), job_id: 'optional-read', phase: 'running', items: []}];
+      if (url.includes('/task-history?')) return [200, historyPage([historyRecord({account_id: 'history-' + revision})], view('a', revision))];
+      return basic(url);
+    });
+    await openHistory(ui);
+    if (failure === 'jobs') await ui.get('query').onclick();
+    const reads = ui.calls.filter(call => call.url.includes('/task-history?')).length, writes = mutations(ui).length;
+    revision++; failing = true; await ui.tick(failure === 'jobs' ? 1500 : 5000);
+    assert.equal(ui.calls.filter(call => call.url.includes('/task-history?')).length, reads + 1, failure + ' failure blocked the history read');
+    assert.match(ui.get('history-list').textContent, /history-2/);
+    assert.notEqual(ui.get('auto-status').dataset.state, 'offline'); assert.match(ui.get('connection').textContent, /已连接/);
+    assert.doesNotMatch(ui.get('connection').textContent, /连接中断|连接失败/);
+    assert.equal(mutations(ui).length, writes);
+  }
+});
+
+test('a pending optional account read cannot delay model polling or overwrite the focused editor selection', async () => {
+  let revision = 1, settings = modelSettings(), release;
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) return [200, {...modelOverview(), ...view('a', revision), accounts_revision: revision}];
+    if (url.endsWith('/model-settings')) return [200, settings];
+    if (url.includes('/accounts?') && revision > 1) return new Promise(resolve => { release = () => resolve([503, {error: 'storage_unavailable'}]); });
+    return [200, accountPage()];
+  });
+  await openModels(ui); edit(ui, 'model-default-prompt', '  local unsaved draft  ');
+  const input = ui.get('model-default-prompt'); input.focus(); input.selectionStart = 3; input.selectionEnd = 11; input.selectionDirection = 'backward';
+  const reads = ui.calls.filter(call => call.url.endsWith('/model-settings')).length;
+  revision++; settings = modelSettings(2, modelConfig({default_model: 'remote-model'}));
+  const pending = ui.tick(5000); await flush();
+  assert.equal(typeof release, 'function');
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/model-settings')).length, reads + 1, 'a slow account request blocked independent model reads');
+  assert.equal(ui.document.activeElement, input); assert.equal(input.value, '  local unsaved draft  ');
+  assert.equal(input.selectionStart, 3); assert.equal(input.selectionEnd, 11); assert.equal(input.selectionDirection, 'backward');
+  assert.equal(ui.get('model-fields').disabled, false); assert.equal(ui.get('model-conflict').hidden, false);
+  release(); await pending;
+  assert.equal(ui.document.activeElement, input); assert.equal(input.value, '  local unsaved draft  ');
+  assert.equal(input.selectionStart, 3); assert.equal(input.selectionEnd, 11); assert.equal(mutations(ui).length, 0);
+});
+
+test('unchanged background history reads keep results visible without loading flicker', async () => {
+  let reads = 0, release;
+  const page = historyPage([historyRecord()]);
+  const ui = panel(url => url.includes('/task-history?') && ++reads > 1 ? new Promise(resolve => { release = () => resolve([200, page]); })
+    : url.includes('/task-history?') ? [200, page] : basic(url));
+  await openHistory(ui);
+  const button = historyButtons(ui)[0], state = ui.get('history-message').textContent;
+  const tabs = ui.get('history-tabs').children.map(node => ({node, writes: node.attributeWrites.length}));
+  const busyWrites = ui.get('history-refresh').attributeWrites.length;
+  button.focus(); const pending = ui.tick(5000); await flush();
+  assert.equal(typeof release, 'function');
+  assert.equal(ui.get('history-message').textContent, state); assert.doesNotMatch(ui.get('history-message').textContent, /正在读取|加载/);
+  assert.equal(ui.get('history-refresh').getAttribute('aria-busy'), 'false');
+  assert.equal(historyButtons(ui)[0], button); assert.equal(ui.document.activeElement, button);
+  release(); await pending;
+  for (const {node, writes} of tabs) assert.equal(node.attributeWrites.length, writes, 'unchanged history tab aria-pressed was rewritten');
+  assert.equal(ui.get('history-refresh').attributeWrites.length, busyWrites, 'background history reads rewrote an unchanged busy attribute');
+  assert.equal(historyButtons(ui)[0], button); assert.equal(ui.document.activeElement, button); assert.equal(mutations(ui).length, 0);
+});
+
+test('initial network, timeout and server failures retry connection using read-only requests and memory-only credentials', async () => {
+  for (const failure of ['network', 'timeout', 'server']) {
+    let reads = 0;
+    const ui = panel((url, options) => {
+      if (!url.endsWith('/overview')) return [200, accountPage()];
+      if (++reads > 1) return [200, overview()];
+      if (failure === 'network') throw new Error('fixture network failure');
+      if (failure === 'timeout') return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(new Error('fixture timeout'))));
+      return [503, {error: 'storage_unavailable'}];
+    });
+    const connecting = ui.get('connect').onclick(); await flush();
+    if (failure === 'timeout') await ui.tick(10000);
+    await connecting;
+    assert.equal(reads, 1); assert.equal(ui.get('key').value, '');
+    assert.equal(refreshTimers(ui).length, 1); assert.equal(refreshTimers(ui)[0].delay, 5000);
+    await ui.tick(5000); await flush();
+    assert.equal(reads, 2); assert.equal(ui.get('login-section').hidden, true);
+    assert.match(ui.get('accounts').textContent, /codex-01/); assert.match(ui.get('connection').textContent, /已连接/);
+    assert.equal(refreshTimers(ui).length, 1); assert.equal(refreshTimers(ui)[0].delay, 5000);
+    assert.equal(ui.calls.every(call => call.headers.Authorization === 'Bearer fixture-key'), true);
+    assert.equal(JSON.stringify(ui.storage).includes('fixture-key'), false); assert.equal(mutations(ui).length, 0);
+  }
+});
+
+test('initial authentication rejection and disconnect cancel connection retries without reusing stored credentials', async () => {
+  for (const status of [401, 403, 503]) {
+    const ui = panel(url => url.endsWith('/overview') ? [status, {error: status === 503 ? 'storage_unavailable' : 'unauthorized'}] : basic(url));
+    await ui.get('connect').onclick();
+    if (status === 503) {
+      assert.equal(refreshTimers(ui).length, 1); ui.get('disconnect').onclick();
+    }
+    const calls = ui.calls.length;
+    ui.events.get('focus')(); ui.events.get('online')(); ui.documentEvents.get('visibilitychange')(); await flush();
+    assert.equal(ui.calls.length, calls); assert.equal(refreshTimers(ui).length, 0);
+    assert.equal(ui.get('login-section').hidden, false); assert.equal(mutations(ui).length, 0);
+  }
+});
+
+test('back-forward cache resumes read-only updates with in-memory authentication and preserves the input draft', async () => {
+  const ui = panel(basic);
+  await ui.get('connect').onclick();
+  const input = ui.get('account'); input.value = 'unsaved-account'; input.focus(); input.selectionStart = 2; input.selectionEnd = 7;
+  const calls = ui.calls.length;
+  ui.events.get('pagehide')({persisted: true});
+  assert.equal(refreshTimers(ui).length, 0); assert.equal(ui.get('login-section').hidden, true);
+  ui.events.get('pageshow')({persisted: true}); await flush();
+  assert.ok(ui.calls.length > calls); assert.equal(refreshTimers(ui).length, 1);
+  assert.equal(ui.get('login-section').hidden, true); assert.equal(ui.document.activeElement, input);
+  assert.equal(input.value, 'unsaved-account'); assert.equal(input.selectionStart, 2); assert.equal(input.selectionEnd, 7);
+  assert.equal(JSON.stringify(ui.storage).includes('fixture-key'), false); assert.equal(mutations(ui).length, 0);
+  ui.events.get('pagehide')({persisted: false});
+  const stopped = ui.calls.length;
+  ui.events.get('focus')(); ui.events.get('online')(); ui.events.get('pageshow')({persisted: true}); await flush();
+  assert.equal(ui.calls.length, stopped); assert.equal(refreshTimers(ui).length, 0);
+});
+
+test('desktop history details fit the actual remaining viewport without rewriting an unchanged height or overriding mobile layout', async () => {
+  for (const mobile of [false, true]) {
+    const ui = panel(basic, {mobile});
+    await openHistory(ui);
+    let top = 389.28125;
+    const detail = ui.get('history-detail'), values = new Map(), writes = [];
+    detail.style = {getPropertyValue: name => values.get(name) || '', setProperty: (name, value) => { values.set(name, value); writes.push(value); }};
+    detail.getBoundingClientRect = () => ({top}); ui.clock.innerHeight = 900;
+    ui.events.get('resize')();
+    if (mobile) { assert.equal(writes.length, 0); continue; }
+    assert.equal(values.get('--history-detail-height'), '494px');
+    ui.events.get('resize')(); assert.equal(writes.length, 1);
+    top = 16; ui.events.get('scroll')(); assert.equal(values.get('--history-detail-height'), '868px');
+    ui.clock.visualViewport = {height: 800}; ui.events.get('resize')();
+    assert.equal(values.get('--history-detail-height'), '768px'); assert.equal(mutations(ui).length, 0);
+  }
+});
+
+test('returning from the back-forward cache cannot reuse a saved CPA key after explicit disconnect', async () => {
+  const ui = panel(basic, {storage: {managementKey: JSON.stringify('fixture-key')}});
+  await flush();
+  assert.equal(ui.get('login-section').hidden, true);
+  ui.get('disconnect').onclick();
+  const calls = ui.calls.length;
+  ui.events.get('pageshow')({persisted: true}); ui.events.get('focus')(); ui.events.get('online')(); await flush();
+  assert.equal(ui.calls.length, calls); assert.equal(refreshTimers(ui).length, 0);
+  assert.equal(ui.get('login-section').hidden, false); assert.equal(mutations(ui).length, 0);
 });

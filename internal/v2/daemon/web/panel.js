@@ -505,8 +505,8 @@
   let displayMatcher = null, displayMatcherDirty = true;
   const statusOperations = new Map();
   let statusSelection = '', statusOpener = null, aliasSelection = '', aliasOpener = null, statusReadSequence = 0;
-  let key = '', generation = 0, views = new ViewTracker(), pollTimer;
-  let connected = false, connecting = false, refreshing = false;
+  let key = '', generation = 0, views = new ViewTracker(), pollTimer, connectRetryTimer;
+  let connected = false, connecting = false, refreshing = false, refreshQueued = false, refreshForceQueued = false;
   let overviewData = null, accountsData = [], accountsRevision = 0, accountsViewRevision = -1, cursor = '', nextCursor = '', previousCursors = [], pageStart = 0, filteredTotal = null;
   let filterTimer, filterSequence = 0, updatingAccounts = false, syncing = false;
   let savedSettings = null, settingsBase = null, settingsLoading = false, settingsSaving = false, settingsConflict = false, activePage = 'overview';
@@ -515,12 +515,12 @@
   const modelCatalogs = {wake: {sequence: 0, loading: false}, generation: {sequence: 0, loading: false}};
   let modelCatalogInstance = '';
   let generationIntent = null, generationTask = null, generationSubmitting = false, generationReading = false, generationUnconfirmed = false, generationUnknown = false;
-  let generationCatalog = null, generationCatalogLoading = false, generationCatalogError = '', generationCatalogAttempt = '', generationCatalogSequence = 0, generationAccountIdentity = null;
-  let savedWakeSettings = null, wakeBase = null, wakeLoading = false, wakePolling = false, wakeSaving = false, wakeConflict = false, wakeNeedsVerification = false, wakeSettingsAttempt = '', wakeSavingEnabled = null;
+  let generationCatalog = null, generationCatalogLoading = false, generationCatalogError = '', generationCatalogSequence = 0, generationAccountIdentity = null;
+  let savedWakeSettings = null, wakeBase = null, wakeLoading = false, wakePolling = false, wakeSaving = false, wakeConflict = false, wakeNeedsVerification = false, wakeSavingEnabled = null;
   let wakeIntent = null, wakeTask = null, wakeSubmitting = false, wakeReading = false, wakeUnconfirmed = false, wakeUnknown = false, wakeJobsLoading = false, wakeJobs = [];
   let quickWakeAccount = '', quickWakeLoading = false, quickWakeSequence = 0;
-  let historyData = null, historyLoading = false, historyError = '', historyTimer, historySequence = 0, historyDetailSequence = 0;
-  let historySelected = null, historyJob = null, historyDetailLoading = false, historyDetailError = '';
+  let historyData = null, historyLoading = false, historyPolling = false, historyError = '', historyTimer, historySequence = 0, historyDetailSequence = 0;
+  let historySelected = null, historyJob = null, historyDetailLoading = false, historyDetailPolling = false, historyDetailError = '';
   let historyDetailOpener = null, historyCopySequence = 0;
   const historyFilters = {search: '', type: '', source: '', trigger: '', date: 'all', status: '', page: 1, limit: 10};
   const wakeFields = {enabled: 'wake-enabled', fiveHour: 'wake-five-hour', weekly: 'wake-weekly', timezone: 'wake-timezone', delayMin: 'wake-delay-min', delayMax: 'wake-delay-max', allowed: 'wake-allowed', perUser: 'wake-per-user', maximum: 'wake-max-accounts', daily: 'wake-daily', dailyWindow: 'wake-daily-window', dailyTarget: 'wake-daily-target'};
@@ -531,7 +531,20 @@
   const settingsFields = {automatic: 'settings-automatic', fiveHour: 'settings-five-hour', weekly: 'settings-weekly', interval: 'settings-interval', timezone: 'settings-timezone', delayMin: 'settings-delay-min', delayMax: 'settings-delay-max', excluded: 'settings-excluded'};
   const pending = new Map(), controllers = new Set(), queryBusy = new Set(), unresolved = new Map();
   const errorLimits = new Map();
-  const setText = (id, text) => { if ($(id)) { if ($(id).textContent !== String(text)) $(id).textContent = text; applyDisplayPrivacy($(id)); } };
+  const setText = (id, text) => { if ($(id)) setLiveText($(id), text); };
+  function setLiveText(node, text) {
+    const raw = String(text), value = displayText(raw);
+    if (node.textContent !== value) node.textContent = value;
+    const leaf = node.childNodes.length === 1 && node.childNodes[0].nodeType === 3 ? node.childNodes[0] : node;
+    const source = displaySources.get(leaf) || {};
+    source.text = {raw, last: value}; displaySources.set(leaf, source);
+  }
+  function setAttribute(node, name, value) {
+    if (node.getAttribute(name) !== String(value)) node.setAttribute(name, String(value));
+  }
+  function setData(node, name, value) {
+    if (node.dataset[name] !== String(value)) node.dataset[name] = String(value);
+  }
   function displayAccount(id) {
     if (displayPreference.mode === 'original') return id;
     return displayPreference.mode === 'alias' && Object.hasOwn(displayPreference.aliases, id) ? displayPreference.aliases[id] : maskedAccount(id);
@@ -695,7 +708,7 @@
       state.phase = 'unknown'; state.message = message('account_status_unknown') + '。此次读取仍未确认原文件目标状态。';
     } finally { if (current === generation) { renderStatusDialog(); renderAccounts(); } }
   }
-  async function refreshConfirmedStatuses() {
+  async function refreshConfirmedStatuses(background = false) {
     if (statusBusy()) return;
     const confirmed = [...statusOperations].filter(([, state]) => state.phase === 'confirmed');
     if (!confirmed.length) return;
@@ -716,7 +729,7 @@
       }
       renderStatusDialog(); renderAccounts();
     } catch {
-      if (current === generation && sequence === statusReadSequence) notice('CPA 启停状态重新读取失败，保留上次只读确认；请再次显式刷新核实。', 'warning');
+      if (current === generation && sequence === statusReadSequence && !background) notice('CPA 启停状态重新读取失败，保留上次只读确认；后台轮询将继续只读核实。', 'warning');
     }
   }
   function resolveDisplayAccount(value) {
@@ -725,7 +738,8 @@
     const matches = [...new Set(displayIdentities.values())].filter(id => displayAccount(id) === raw);
     return matches.length === 1 ? matches[0] : matches.length ? '' : raw;
   }
-  function updateChildren(parent, children) {
+  function updateChildren(parent, children, prepared = false) {
+    if (!prepared) for (const child of children) applyDisplayPrivacy(child);
     const previous = Array.from(parent.childNodes);
     const keyed = new Map(previous.filter(node => node.dataset?.renderKey).map(node => [node.dataset.renderKey, node]));
     const used = new Set();
@@ -735,6 +749,7 @@
       const current = key ? keyed.get(key) : previous[index];
       if (!compatible(current, next) || used.has(current) || !key && current.dataset?.renderKey) return next;
       used.add(current);
+      if (displaySources.has(next)) displaySources.set(current, displaySources.get(next));
       if (current.nodeType === 3) {
         if (current.textContent !== next.textContent) current.textContent = next.textContent;
         return current;
@@ -746,9 +761,9 @@
         if (name in next && current[name] !== next[name]) current[name] = next[name];
       }
       for (const name of Object.keys(current.dataset)) if (!Object.hasOwn(next.dataset, name)) delete current.dataset[name];
-      Object.assign(current.dataset, next.dataset);
+      for (const [name, value] of Object.entries(next.dataset)) if (current.dataset[name] !== value) current.dataset[name] = value;
       current.onclick = next.onclick; current.onchange = next.onchange;
-      if (next.childNodes.length) updateChildren(current, Array.from(next.childNodes));
+      if (next.childNodes.length) updateChildren(current, Array.from(next.childNodes), true);
       else if (current.textContent !== next.textContent) current.textContent = next.textContent;
       return current;
     });
@@ -756,7 +771,7 @@
     for (let index = 0; index < desired.length; index++) {
       if (parent.childNodes[index] !== desired[index]) parent.insertBefore(desired[index], parent.childNodes[index] || null);
     }
-    applyDisplayPrivacy(parent);
+    if (!prepared) applyDisplayPrivacy(parent);
   }
   const sidebarPreference = 'cwr-v2-sidebar:' + base;
   function renderSidebar(collapsed, persist = false) {
@@ -839,25 +854,27 @@
     $('settings-fields').disabled = !connected || !supported || !settingsBase || settingsSaving || settingsLoading;
     $('settings-save').disabled = !connected || !supported || !dirty || !!Object.keys(errors).length || settingsConflict || settingsNeedsVerification || settingsSaving || settingsLoading;
     $('settings-reload').disabled = !connected || !supported || settingsSaving || settingsLoading;
-    for (const [name, id] of Object.entries(settingsFields)) $(id).setAttribute('aria-invalid', errors[name] ? 'true' : 'false');
+    for (const [name, id] of Object.entries(settingsFields)) setAttribute($(id), 'aria-invalid', !!errors[name]);
     setText('settings-validation', Object.values(errors).join('；')); $('settings-validation').hidden = !Object.keys(errors).length;
     $('settings-conflict').hidden = !settingsConflict;
     setText('settings-status', !connected ? '等待连接' : !supported ? '尚未接入' : settingsLoading ? '读取中' : settingsSaving ? '保存中' : settingsConflict ? '设置冲突' : dirty ? '未保存草稿' : savedSettings ? '版本 ' + savedSettings.revision : '尚未读取');
-    const diff = $('settings-diff'); diff.replaceChildren();
+    const diff = $('settings-diff'), rows = [];
     if (settingsBase) {
       const original = configDraft(settingsBase.config), labels = {automatic: '定期自动查询', fiveHour: '5 小时到期查询', weekly: '周限额到期查询', interval: '查询间隔（秒）', timezone: '时区', delayMin: '最小延迟（秒）', delayMax: '最大延迟（秒）', excluded: '排除时段'};
       const display = value => typeof value === 'boolean' ? value ? '开启' : '关闭' : value || '无';
       for (const name of Object.keys(settingsFields)) {
         if (draft[name] === original[name]) continue;
         const row = element('div', 'settings-diff-row');
-        row.append(element('strong', '', labels[name]), element('span', '', display(original[name]) + ' → ' + display(draft[name]))); diff.append(row);
+        row.dataset.renderKey = name;
+        row.append(element('strong', '', labels[name]), element('span', '', display(original[name]) + ' → ' + display(draft[name]))); rows.push(row);
       }
-      if (!dirty) diff.append(element('p', '', '暂无修改。只有点击“保存并应用”才会写入后台。'));
-    } else diff.append(element('p', '', connected && !supported ? '当前后台未提供查询设置能力，不能保存规则。' : '连接后读取已保存设置'));
+      if (!dirty) rows.push(element('p', '', '暂无修改。只有点击“保存并应用”才会写入后台。'));
+    } else rows.push(element('p', '', connected && !supported ? '当前后台未提供查询设置能力，不能保存规则。' : '连接后读取已保存设置'));
+    updateChildren(diff, rows);
     for (const [id, name] of [['five-hour-query', 'on_five_hour_expiry'], ['weekly-query', 'on_weekly_expiry']]) {
       $(id).checked = savingRule?.field === name ? savingRule.checked : savedSettings?.config?.[name] === true;
       $(id).disabled = !connected || !supported || !savedSettings || settingsNeedsVerification || settingsSaving || settingsLoading;
-      $(id).setAttribute('aria-busy', savingRule?.field === name ? 'true' : 'false');
+      setAttribute($(id), 'aria-busy', savingRule?.field === name);
     }
     renderWakeSettings();
     $('rules-reload').hidden = !connected || !supported || !settingsNeedsVerification && !!savedSettings;
@@ -976,20 +993,21 @@
     setText('wake-settings-status', !connected ? '等待连接' : !supported ? '尚未接入' : wakeSaving ? '保存中' : wakeLoading ? '读取中' : wakeNeedsVerification ? '需要核实' : wakeConflict ? '设置冲突' : dirty ? '未保存草稿' : savedWakeSettings ? '版本 ' + savedWakeSettings.revision : '尚未读取');
     setText('wake-settings-validation', Object.values(errors).join('；')); $('wake-settings-validation').hidden = !Object.keys(errors).length;
     $('wake-settings-conflict').hidden = !wakeConflict && !wakeNeedsVerification;
-    for (const [name, id] of Object.entries(wakeFields)) $(id).setAttribute('aria-invalid', errors[name] ? 'true' : 'false');
-    const diff = $('wake-settings-diff'); diff.replaceChildren();
+    for (const [name, id] of Object.entries(wakeFields)) setAttribute($(id), 'aria-invalid', !!errors[name]);
+    const diff = $('wake-settings-diff'), rows = [];
     if (wakeBase) {
       const original = wakeConfigDraft(wakeBase.config), labels = {enabled: '自动唤醒', fiveHour: '五小时重置', weekly: '周重置', timezone: '时区', delayMin: '最小启动延迟', delayMax: '最大启动延迟', allowed: '普通允许时段', perUser: '每用户账号数', maximum: '账号上限', daily: '每日准备', dailyWindow: '每日准备窗口', dailyTarget: '每日目标容量'};
       const display = value => typeof value === 'boolean' ? value ? '开启' : '关闭' : value || '全天';
       for (const name of Object.keys(wakeFields)) if (original[name] !== draft[name]) {
-        const row = element('div', 'settings-diff-row'); row.append(element('strong', '', labels[name]), element('span', '', display(original[name]) + ' → ' + display(draft[name]))); diff.append(row);
+        const row = element('div', 'settings-diff-row'); row.dataset.renderKey = name; row.append(element('strong', '', labels[name]), element('span', '', display(original[name]) + ' → ' + display(draft[name]))); rows.push(row);
       }
-      if (!dirty) diff.append(element('p', '', '暂无修改。只有明确保存才会更新后台规则。'));
-    } else diff.append(element('p', '', supported ? '连接后读取真实后台规则。' : '当前后台未提供唤醒规则，不会发送模型请求。'));
+      if (!dirty) rows.push(element('p', '', '暂无修改。只有明确保存才会更新后台规则。'));
+    } else rows.push(element('p', '', supported ? '连接后读取真实后台规则。' : '当前后台未提供唤醒规则，不会发送模型请求。'));
+    updateChildren(diff, rows);
     const current = savedWakeSettings?.instance_id === views.instance;
     $('auto-wake').checked = wakeSavingEnabled === null ? current && savedWakeSettings.config.enabled === true : wakeSavingEnabled;
     $('auto-wake').disabled = !connected || !automaticWakeSupported() || !current || wakeLoading || wakeSaving || wakeNeedsVerification;
-    $('auto-wake').setAttribute('aria-busy', wakeSavingEnabled === null ? 'false' : 'true');
+    setAttribute($('auto-wake'), 'aria-busy', wakeSavingEnabled !== null);
     $('wake-overview-consent-row').hidden = !automaticWakeSupported();
     $('wake-overview-consent').disabled = !connected || !automaticWakeSupported() || !current || wakeLoading || wakeSaving || wakeNeedsVerification;
     $('wake-overview-reload').hidden = !connected || !supported || !wakeNeedsVerification && !!current;
@@ -1001,7 +1019,7 @@
     if (!connected || !wakeSettingsSupported() || wakeLoading || wakePolling || wakeSaving || wakeNeedsVerification && !explicit) return false;
     const current = generation, sequence = views.begin('wake-settings');
     wakeLoading = discard || explicit || !wakeBase; wakePolling = !wakeLoading;
-    wakeSettingsAttempt = views.instance; renderWakeSettings();
+    renderWakeSettings();
     try {
       const data = await api('/wake-settings');
       if (current !== generation || !views.accept('wake-settings', sequence, data) || !applyWakeSettings(data, discard)) return false;
@@ -1016,7 +1034,7 @@
       return false;
     } finally { if (current === generation) { wakeLoading = false; wakePolling = false; renderWakeSettings(); } }
   }
-  function ensureWakeSettings() { if (wakeSettingsSupported() && wakeSettingsAttempt !== views.instance) void reloadWakeSettings(); }
+  function ensureWakeSettings() { if (wakeSettingsSupported() && (!savedWakeSettings || savedWakeSettings.instance_id !== views.instance)) void reloadWakeSettings(); }
   async function saveWakeSettings(direct = false, checked = false) {
     if (!connected || !wakeSettingsSupported() || wakeLoading || wakeSaving || wakeNeedsVerification) { renderWakeSettings(); return; }
     const basis = direct ? savedWakeSettings : wakeBase;
@@ -1171,7 +1189,10 @@
   function renderQuickWake() {
     const blocked = quickWakeBlocked();
     $('quick-wake-consent').disabled = blocked || quickWakeLoading;
-    for (const button of document.querySelectorAll('[data-wake-account]')) button.disabled = blocked || !!quickWakeAccount || button.dataset.accountStatus !== 'available' || accountStatusBlocksWake(button.dataset.wakeAccount);
+    for (const button of document.querySelectorAll('[data-wake-account]')) {
+      const disabled = blocked || !!quickWakeAccount || button.dataset.accountStatus !== 'available' || accountStatusBlocksWake(button.dataset.wakeAccount);
+      if (button.disabled !== disabled) button.disabled = disabled;
+    }
     $('quick-wake-submit').disabled = blocked || accountStatusBlocksWake(quickWakeAccount) || quickWakeLoading || !$('quick-wake-consent').checked || !accountsData.some(account => account.id === quickWakeAccount && account.status === 'available') || !savedModelSettings?.config?.default_model || savedModelSettings.instance_id !== views.instance || modelNeedsVerification;
   }
   function closeQuickWake() {
@@ -1227,7 +1248,7 @@
     $('model-fields').disabled = locked;
     $('model-save').disabled = locked || !dirty || !!Object.keys(errors).length || modelConflict || modelNeedsVerification;
     $('model-reload').disabled = !connected || !supported || modelSaving || modelLoading;
-    for (const [name, id] of Object.entries(modelFields)) $(id).setAttribute('aria-invalid', errors[name] ? 'true' : 'false');
+    for (const [name, id] of Object.entries(modelFields)) setAttribute($(id), 'aria-invalid', !!errors[name]);
     setText('model-validation', Object.values(errors).join('；')); $('model-validation').hidden = !Object.keys(errors).length;
     $('model-conflict').hidden = !modelConflict && !modelNeedsVerification;
     setText('model-status', !connected ? '等待连接' : !supported ? '尚未接入' : modelSaving ? '保存中' : modelLoading ? '读取中' : modelNeedsVerification ? '需要核实' : modelConflict ? '设置冲突' : dirty ? '未保存草稿' : savedModelSettings ? '版本 ' + savedModelSettings.revision : '尚未读取');
@@ -1237,17 +1258,19 @@
     for (const id of ['model-import', 'model-export', 'model-deduplicate', 'model-clear', 'model-confirm-action', 'model-cancel-action']) $(id).disabled = locked;
     $('model-confirmation').hidden = !modelConfirmation;
     setText('model-confirmation-text', modelConfirmation === 'clear' ? '确认清空短句池草稿？保存后才影响后台。' : '确认去除重复短句并保留首次出现的顺序？保存后才影响后台。');
-    const diff = $('model-diff'); diff.replaceChildren();
+    const diff = $('model-diff'), rows = [];
     if (modelBase) {
       const original = modelConfigDraft(modelBase.config), labels = {default_model: '默认模型', default_prompt: '默认提示词', five_hour_model: '五小时模型覆盖', five_hour_prompt: '五小时提示词覆盖', weekly_model: '周模型覆盖', weekly_prompt: '周提示词覆盖', generation_prompt: '候选生成提示词', prompt_mode: '提示词策略', phrases: '短句池'};
       const display = (name, value) => name === 'prompt_mode' ? value === 'random' ? '随机短句' : '固定提示词' : value || (name === 'generation_prompt' ? '内置生成提示词' : name === 'default_model' ? '未指定模型' : name === 'phrases' ? '空' : '继承默认');
       for (const name of currentModelFields()) {
         if (draft[name] === original[name]) continue;
         const row = element('div', 'settings-diff-row model-diff-row');
-        row.append(element('strong', '', labels[name]), element('span', '', display(name, original[name]) + ' → ' + display(name, draft[name]))); diff.append(row);
+        row.dataset.renderKey = name;
+        row.append(element('strong', '', labels[name]), element('span', '', display(name, original[name]) + ' → ' + display(name, draft[name]))); rows.push(row);
       }
-      if (!dirty) diff.append(element('p', '', '暂无修改。编辑、导入和本地预览均不写入后台，也不发送模型请求。'));
-    } else diff.append(element('p', '', connected && !supported ? '当前后台未提供模型配置能力。' : '进入本页后读取已保存配置。'));
+      if (!dirty) rows.push(element('p', '', '暂无修改。编辑、导入和本地预览均不写入后台，也不发送模型请求。'));
+    } else rows.push(element('p', '', connected && !supported ? '当前后台未提供模型配置能力。' : '进入本页后读取已保存配置。'));
+    updateChildren(diff, rows);
     renderGeneration();
   }
   async function reloadModelSettings(discard = false, explicit = false) {
@@ -1323,7 +1346,7 @@
     if (!connected || !generationCatalogSupported() || generationCatalogLoading) return;
     clearModelCatalog('generation');
     const current = generation, instance = views.instance, sequence = ++generationCatalogSequence;
-    generationCatalogLoading = true; generationCatalogAttempt = instance; generationCatalogError = ''; renderGeneration();
+    generationCatalogLoading = true; generationCatalogError = ''; renderGeneration();
     try {
       const data = await api('/generation-accounts');
       if (current !== generation || sequence !== generationCatalogSequence || instance !== views.instance) return;
@@ -1351,7 +1374,7 @@
     }
   }
   function ensureGenerationAccounts() {
-    if (generationCatalogSupported() && generationCatalogAttempt !== views.instance) void reloadGenerationAccounts();
+    if (generationCatalogSupported() && (!generationCatalog || generationCatalog.instance !== views.instance || generationCatalogError)) void reloadGenerationAccounts();
   }
   async function boundedManagementJSON(response) {
     const invalid = () => Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
@@ -1522,7 +1545,7 @@
   function setConnection(text) {
     setText('connection', text);
     setText('sidebar-connection', connected ? 'CPA 已连接' : connecting ? '正在连接 CPA' : 'CPA 未连接');
-    if ($('sidebar-connection')) $('sidebar-connection').dataset.connected = String(connected);
+    if ($('sidebar-connection')) setData($('sidebar-connection'), 'connected', connected);
   }
   function controls() {
     for (const id of ['query', 'query-single', 'refresh', 'sync']) if ($(id)) $(id).disabled = !connected || syncing && id === 'sync' || queryBusy.has('batch') && id === 'query';
@@ -1548,22 +1571,22 @@
     }
     errorLimits.clear();
     generation++; connected = false; connecting = false; key = '';
-    clearTimeout(pollTimer); clearTimeout(filterTimer); clearTimeout(historyTimer);
+    clearTimeout(pollTimer); clearTimeout(connectRetryTimer); clearTimeout(filterTimer); clearTimeout(historyTimer);
     historySequence++; historyDetailSequence++;
-    historyData = null; historySelected = null; historyJob = null; historyLoading = false; historyDetailLoading = false; historyError = ''; historyDetailError = '';
+    historyData = null; historySelected = null; historyJob = null; historyLoading = false; historyPolling = false; historyDetailLoading = false; historyDetailPolling = false; historyError = ''; historyDetailError = '';
     historyDetailOpener = null; clearHistoryCopy();
     for (const controller of controllers) controller.abort();
     controllers.clear(); queryBusy.clear(); pending.clear();
-    refreshing = false; updatingAccounts = false; syncing = false; settingsLoading = false; settingsSaving = false; settingsNeedsVerification = false; savingRule = null;
+    refreshing = false; refreshQueued = false; refreshForceQueued = false; updatingAccounts = false; syncing = false; settingsLoading = false; settingsSaving = false; settingsNeedsVerification = false; savingRule = null;
     if (modelSaving) { modelConflict = true; modelNeedsVerification = true; }
     modelLoading = false; modelPolling = false; modelSaving = false; modelConfirmation = '';
     if (generationSubmitting && generationIntent) generationUnconfirmed = true;
     generationSubmitting = false; generationReading = false;
     if (wakeSaving) { wakeConflict = true; wakeNeedsVerification = true; }
     if (wakeSubmitting && wakeIntent) wakeUnconfirmed = true;
-    wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false; wakeSettingsAttempt = '';
+    wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false;
     $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false; $('wake-manual-consent').checked = false;
-    generationCatalogSequence++; generationCatalog = null; generationCatalogLoading = false; generationCatalogError = ''; generationCatalogAttempt = '';
+    generationCatalogSequence++; generationCatalog = null; generationCatalogLoading = false; generationCatalogError = '';
     clearModelCatalog('wake'); clearModelCatalog('generation');
     $('generation-account-options').replaceChildren();
     ruleMessage('');
@@ -1674,9 +1697,9 @@
     controls();
   }
   function updateTimes() {
-    for (const node of document.querySelectorAll('[data-reset-at]')) node.textContent = resetText(node.dataset.resetAt);
-    for (const node of document.querySelectorAll('[data-observed-at]')) node.textContent = (node.dataset.quotaSource ? node.dataset.quotaSource + ' · ' : '') + age(node.dataset.observedAt);
-    for (const node of document.querySelectorAll('[data-queue-phase]')) node.textContent = queueText({phase: node.dataset.queuePhase, scheduled_at: node.dataset.scheduledAt, trigger: node.dataset.trigger, hold_reason: node.dataset.holdReason});
+    for (const node of document.querySelectorAll('[data-reset-at]')) setLiveText(node, resetText(node.dataset.resetAt));
+    for (const node of document.querySelectorAll('[data-observed-at]')) setLiveText(node, (node.dataset.quotaSource ? node.dataset.quotaSource + ' · ' : '') + age(node.dataset.observedAt));
+    for (const node of document.querySelectorAll('[data-queue-phase]')) setLiveText(node, queueText({phase: node.dataset.queuePhase, scheduled_at: node.dataset.scheduledAt, trigger: node.dataset.trigger, hold_reason: node.dataset.holdReason}));
   }
   function queueAnnotation(query, className = 'queue-time') {
     const node = element('small', className, queueText(query));
@@ -1738,7 +1761,7 @@
   }
   function resetHistory() {
     clearTimeout(historyTimer); historySequence++; historyDetailSequence++;
-    historyData = null; historySelected = null; historyJob = null; historyLoading = false; historyDetailLoading = false; historyError = ''; historyDetailError = '';
+    historyData = null; historySelected = null; historyJob = null; historyLoading = false; historyPolling = false; historyDetailLoading = false; historyDetailPolling = false; historyError = ''; historyDetailError = '';
     historyDetailOpener = null; clearHistoryCopy();
     renderHistory();
   }
@@ -1776,7 +1799,7 @@
     const record = historySelected, body = $('history-detail-body');
     $('history-detail-close').disabled = !record;
     $('history-verify').disabled = !connected || !record;
-    $('history-verify').setAttribute('aria-busy', String(historyDetailLoading));
+    setAttribute($('history-verify'), 'aria-busy', historyDetailLoading);
     $('history-copy').disabled = !record;
     const job = historyJob, metadataRecord = record ? historyMetadata(record, job) : null, status = metadataRecord?.status || metadataRecord?.phase;
     $('history-detail-safety').hidden = status !== 'unknown';
@@ -1809,6 +1832,14 @@
     }
     updateChildren(body, [content]);
   }
+  function fitHistoryDetail() {
+    const panel = $('history-detail');
+    if (activePage !== 'history' || panel.hidden || !panel.getBoundingClientRect || !panel.style?.setProperty || context.matchMedia?.('(max-width: 1100px)').matches) return;
+    const viewport = context.visualViewport?.height || context.innerHeight;
+    if (!Number.isFinite(viewport)) return;
+    const height = Math.max(280, Math.floor(viewport - Math.max(16, panel.getBoundingClientRect().top) - 16)) + 'px';
+    if (panel.style.getPropertyValue('--history-detail-height') !== height) panel.style.setProperty('--history-detail-height', height);
+  }
   function renderHistory() {
     const data = historyData, stats = data?.stats, pagination = data?.pagination;
     const count = name => Number.isSafeInteger(stats?.[name]) && stats[name] >= 0 ? stats[name] : null;
@@ -1819,7 +1850,7 @@
     setText('history-today-detail', stats ? '自动 ' + (count('today_automatic') ?? '—') + ' · 手动 ' + (count('today_manual') ?? '—') : '等待后台统计');
     setText('history-active-detail', '执行中 ' + (count('running') ?? '—') + ' · 排队中 ' + (count('queued') ?? '—'));
     setText('history-attention-detail', '失败 ' + (count('failed') ?? '—') + ' · 结果未知 ' + (count('unknown') ?? '—'));
-    for (const button of document.querySelectorAll('[data-history-status]')) button.setAttribute('aria-pressed', String(button.dataset.historyStatus === historyFilters.status));
+    for (const button of document.querySelectorAll('[data-history-status]')) setAttribute(button, 'aria-pressed', button.dataset.historyStatus === historyFilters.status);
     for (const node of document.querySelectorAll('[data-history-count]')) { const name = node.dataset.historyCount; const value = count(name === 'all' ? 'total' : name) ?? stats?.by_status?.[name]; if (node.textContent !== String(value ?? '—')) node.textContent = String(value ?? '—'); }
     setText('history-count', pagination ? pagination.total + ' 条' : '— 条');
     setText('history-message', !connected ? '连接后读取后台持久任务记录。' : historyError ? '任务记录暂不可用：' + historyError + '。' + (data ? '以下为上次成功读取的记录，非最新数据。' : '未以总览中的局部任务代替全部历史。') : historyLoading ? '正在读取后台持久任务记录…' : '仅展示后台持久记录；自动刷新不执行查询或唤醒。');
@@ -1840,18 +1871,18 @@
     $('history-previous').disabled = !connected || !pagination || page <= 1;
     $('history-next').disabled = !connected || !pagination || page >= totalPages;
     $('history-refresh').disabled = !connected;
-    $('history-refresh').setAttribute('aria-busy', String(historyLoading));
+    setAttribute($('history-refresh'), 'aria-busy', historyLoading);
     const pages = [...new Set([1, page - 1, page, page + 1, totalPages].filter(value => value > 0 && value <= totalPages))].sort((first, second) => first - second), buttons = [];
     for (const [index, value] of pages.entries()) {
       if (index && value > pages[index - 1] + 1) buttons.push(element('span', 'muted', '…'));
       const button = element('button', 'button button-small', String(value)); button.type = 'button'; button.dataset.renderKey = 'page:' + value; button.disabled = !connected; button.setAttribute('aria-label', '任务第 ' + value + ' 页'); if (value === page) button.setAttribute('aria-current', 'page'); button.onclick = () => changeHistoryPage(value); buttons.push(button);
     }
-    updateChildren($('history-pages'), buttons); renderHistoryDetail();
+    updateChildren($('history-pages'), buttons); renderHistoryDetail(); fitHistoryDetail();
   }
-  async function loadHistory() {
+  async function loadHistory(background = false) {
     if (!connected) return;
     const current = generation, sequence = ++historySequence, query = historyQuery(historyFilters), view = views.begin('task-history');
-    historyLoading = true; renderHistory();
+    historyLoading = !background || !historyData; historyPolling = true; renderHistory();
     try {
       const data = await api(query);
       if (current !== generation || sequence !== historySequence) return;
@@ -1867,13 +1898,13 @@
     } catch (error) {
       if (current !== generation || sequence !== historySequence || error.code === 'stale') return;
       historyError = error.status === 404 ? '当前接入层尚未提供任务记录接口，请升级并重启 CPA 接入层' : message(error.code);
-    } finally { if (current === generation && sequence === historySequence) { historyLoading = false; renderHistory(); } }
+    } finally { if (current === generation && sequence === historySequence) { historyLoading = false; historyPolling = false; renderHistory(); } }
   }
-  async function readHistoryDetail() {
+  async function readHistoryDetail(background = false) {
     const record = historySelected;
     if (!connected || !record) return;
     const current = generation, sequence = ++historyDetailSequence, resource = 'history-detail:' + record.id, view = views.begin(resource);
-    historyDetailLoading = true; renderHistoryDetail();
+    historyDetailLoading = !background || !historyJob; historyDetailPolling = true; renderHistoryDetail();
     try {
       const data = await api((record.type === 'wake' ? '/wake-jobs' : '/jobs') + '?job_id=' + encodeURIComponent(record.job_id));
       if (current !== generation || sequence !== historyDetailSequence || historySelected?.id !== record.id) return;
@@ -1882,7 +1913,7 @@
       if (!views.accept(resource, view, data)) return;
       historyJob = data; historyDetailError = '';
     } catch (error) { if (current === generation && sequence === historyDetailSequence && error.code !== 'stale') historyDetailError = message(error.code); }
-    finally { if (current === generation && sequence === historyDetailSequence) { historyDetailLoading = false; renderHistoryDetail(); } }
+    finally { if (current === generation && sequence === historyDetailSequence) { historyDetailLoading = false; historyDetailPolling = false; renderHistoryDetail(); } }
   }
   function selectHistory(record, job = null, opener = document.activeElement) {
     if (historySelected?.id !== record.id) { historyDetailSequence++; historyJob = null; historyDetailError = ''; clearHistoryCopy(); }
@@ -1946,20 +1977,20 @@
     setText('job', latest ? (phaseNames[displayedJobPhase(latest)] || '查询任务') + ' · ' + (latest.account_id || latest.target || '全部账号') : '查询额度不发送模型请求');
   }
   function renderEvents() {
-    const events = overviewData?.dashboard?.recent_events || [];
-    $('recent-events').replaceChildren();
+    const events = overviewData?.dashboard?.recent_events || [], rows = [];
     for (const event of events.slice(0, 3)) {
       const item = element('div', 'event-item'), at = timestamp(event.at || event.created_at);
+      item.dataset.renderKey = event.id || event.kind + ':' + (event.job_id || event.account_id || rows.length);
       const time = element('time', 'event-time', Number.isFinite(at) ? new Date(at).toLocaleTimeString('zh-CN', {hour12: false}) : '—');
       let detail;
       if (event.kind === 'inventory_sync' || event.kind === 'inventory') detail = event.phase === 'unavailable' ? 'CPA 账号同步失败，后台正在重试' : 'CPA 同步完成，账号状态已更新';
       else if (event.kind === 'model_wake') detail = (event.account_id || '模型唤醒') + ' · ' + (event.phase === 'skipped' ? '唤醒已跳过 · ' + skippedReason(event) : wakePhases[event.phase] || event.detail || '唤醒状态已更新');
       else if (event.phase) detail = (event.account_id || '批量查询') + ' · ' + (phaseNames[event.phase] || '查询任务');
       else detail = event.detail || event.message || '后台状态已更新';
-      item.append(time, element('span', 'event-dot'), element('span', 'event-description', detail)); $('recent-events').append(item);
+      item.append(time, element('span', 'event-dot'), element('span', 'event-description', detail)); rows.push(item);
     }
-    if (!events.length) $('recent-events').append(element('div', 'empty-state', connected ? '暂无最近事件' : '连接后显示真实事件'));
-    applyDisplayPrivacy($('recent-events'));
+    if (!events.length) rows.push(element('div', 'empty-state', connected ? '暂无最近事件' : '连接后显示真实事件'));
+    updateChildren($('recent-events'), rows);
   }
   function renderOverview() {
     const data = overviewData, stats = data?.dashboard, ready = data?.inventory?.status === 'ready' && data?.activity?.connected !== false;
@@ -1997,10 +2028,9 @@
       ['模型执行', wakeExecutionSupported() ? '已接入，仅明确授权的任务可执行' : '尚未接入'], ['后台异常', data?.last_error ? message(data.last_error) : '无已报告异常'],
       ['账号同步异常', inventory?.error_code ? message(inventory.error_code) : '无已报告异常']
     ];
-    $('diagnostics-content').replaceChildren(...rows.map(([label, value]) => {
-      const row = element('div', 'diagnostic-row'); row.append(element('span', '', label), element('strong', '', value)); return row;
+    updateChildren($('diagnostics-content'), rows.map(([label, value]) => {
+      const row = element('div', 'diagnostic-row'); row.dataset.renderKey = label; row.append(element('span', '', label), element('strong', '', value)); return row;
     }));
-    applyDisplayPrivacy($('diagnostics-content'));
   }
   async function accounts(reset = false, expectedRevision = accountsRevision, background = false) {
     const current = generation, sequence = views.begin('accounts'), filtersAt = filterSequence;
@@ -2058,6 +2088,7 @@
     renderOverview(); return data;
   }
   async function pollJobs() {
+    const failures = [];
     for (const [id, previous] of [...pending]) {
       if (['completed', 'failed', 'cancelled'].includes(previous.phase)) continue;
       const current = generation, resource = 'job:' + id, sequence = views.begin(resource);
@@ -2068,49 +2099,68 @@
         if (job.phase === 'failed') notice('查询任务已结束：' + message(job.error_code || job.items?.find(item => item.error_code)?.error_code || 'quota_query_failed'), 'error');
       } catch (error) {
         if (current !== generation || error.code === 'stale') return;
-        if (error.status === 404 || error.status === 410) pending.delete(id); else throw error;
+        if (error.status === 404 || error.status === 410) pending.delete(id); else failures.push(error);
       }
     }
     renderTasks();
+    if (failures.length) throw failures[0];
   }
   async function refresh(forceAccounts = false) {
-    if (!connected || refreshing) return;
+    if (!connected) return;
+    if (refreshing) { refreshQueued = true; refreshForceQueued ||= forceAccounts; return; }
     const current = generation; refreshing = true;
     try {
-      if (forceAccounts) await refreshConfirmedStatuses();
-      if (current !== generation) return;
-      const data = await overview();
-      if (current !== generation || !data) return;
-      if (!updatingAccounts && (forceAccounts || data.accounts_revision !== accountsRevision || data.view_revision !== accountsViewRevision)) {
-        await accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing);
-      }
-      await pollJobs();
-      if (activePage === 'history') { if (!historyLoading) await loadHistory(); if (historySelected && !historyDetailLoading) await readHistoryDetail(); }
-      if (wakeSettingsSupported() && wakeSettingsAttempt !== views.instance) await reloadWakeSettings();
-      if (activePage === 'wake') { await reloadWakeSettings(); await loadWakeJobs(); }
-      if (wakeActive()) await readWakeJob();
-      if (activePage === 'models') { ensureGenerationAccounts(); await reloadModelSettings(); await pollGeneration(); }
-      if (current !== generation) return;
-      updateTimes();
-      setText('auto-status', '数据自动更新'); $('auto-status').dataset.state = 'online'; setConnection('独立后台已连接 · 页面每 5 秒更新'); clearError();
+      do {
+        forceAccounts ||= refreshForceQueued; refreshQueued = false; refreshForceQueued = false;
+        const data = await overview();
+        if (current !== generation || !data) return;
+        const failures = [], reads = [];
+        const read = action => reads.push(Promise.resolve().then(() => {
+          if (current === generation && connected) return action();
+        }).catch(error => {
+          if (current === generation && error.code !== 'stale') failures.push(error);
+          else if (error.code === 'unauthorized') report(error);
+        }));
+        read(() => refreshConfirmedStatuses(!forceAccounts));
+        if (!updatingAccounts && (forceAccounts || data.accounts_revision !== accountsRevision || data.view_revision !== accountsViewRevision)) {
+          read(() => accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing));
+        }
+        read(pollJobs);
+        if (activePage === 'history') {
+          if (!historyPolling) read(() => loadHistory(true));
+          if (historySelected && !historyDetailPolling) read(() => readHistoryDetail(true));
+        }
+        if (wakeSettingsSupported()) read(() => reloadWakeSettings());
+        if (activePage === 'wake') read(() => loadWakeJobs());
+        if (wakeActive()) read(() => readWakeJob());
+        if (activePage === 'models') { ensureGenerationAccounts(); read(() => reloadModelSettings()); read(() => pollGeneration()); }
+        await Promise.all(reads);
+        if (current !== generation) return;
+        updateTimes();
+        setText('auto-status', failures.length ? '部分数据待更新 · 自动重试' : '数据自动更新');
+        setData($('auto-status'), 'state', failures.length ? 'degraded' : 'online');
+        setConnection('独立后台已连接 · 页面自动更新');
+        if (failures.length) report(failures[0]); else clearError();
+        forceAccounts = false;
+      } while (refreshQueued && current === generation && connected);
     } catch (error) {
       if (error.code === 'stale') return;
       if (current === generation) {
-        setText('auto-status', '连接中断 · 自动重试'); $('auto-status').dataset.state = 'offline'; setConnection('后台连接中断，正在重试');
+        setText('auto-status', '连接中断 · 自动重试'); setData($('auto-status'), 'state', 'offline'); setConnection('后台连接中断，正在重试');
         setText('metric-status', '连接中断'); setText('metric-status-detail', '保留最后已知状态');
       }
       if (current === generation || error.code === 'unauthorized') report(error);
-    } finally { if (current === generation) refreshing = false; }
+    } finally { if (current === generation) { refreshing = false; refreshQueued = false; refreshForceQueued = false; monitor(current); } }
   }
   function monitor(current) {
     clearTimeout(pollTimer);
-    if (current !== generation || !connected) return;
+    if (current !== generation || !connected || refreshing) return;
     const active = recentJobs().some(job => !['completed', 'failed', 'cancelled'].includes(job.phase));
     pollTimer = setTimeout(async () => {
       if (current !== generation || !connected) return;
       await refresh();
       if (current === generation && connected) monitor(current);
-    }, active ? 1500 : 5000);
+    }, document.hidden ? 30000 : active ? 1500 : 5000);
   }
   async function connect(value) {
     stop(); views = new ViewTracker(); overviewData = null; accountsRevision = -1; accountsViewRevision = -1;
@@ -2121,7 +2171,7 @@
       const data = await overview();
       if (current !== generation || !data) return;
       connected = true; connecting = false; $('login-section').hidden = true;
-      setConnection('独立后台已连接 · 页面每 5 秒更新'); setText('auto-status', '数据自动更新'); $('auto-status').dataset.state = 'online'; controls();
+      setConnection('独立后台已连接 · 页面自动更新'); setText('auto-status', '数据自动更新'); setData($('auto-status'), 'state', 'online'); controls();
       await refreshConfirmedStatuses();
       if (current !== generation) return;
       await accounts(true);
@@ -2135,7 +2185,13 @@
     } catch (error) {
       if (current !== generation && error.code !== 'unauthorized') return;
       if (current === generation && connected) { report(error); monitor(current); }
-      else { stop(); setConnection('连接失败，请重新连接'); report(error); }
+      else if (current === generation && (['network', 'timeout', 'backend_unavailable', 'bridge_unavailable', 'storage_unavailable'].includes(error.code) || error.status >= 500)) {
+        setConnection('暂时无法连接 · 5 秒后自动重试'); setText('auto-status', '连接中断 · 自动重试');
+        report(error);
+        connectRetryTimer = setTimeout(() => {
+          if (current === generation && !connected && !connecting) void connect(value);
+        }, 5000);
+      } else { stop(); setConnection('连接失败，请重新连接'); report(error); }
     } finally { if (current === generation) { connecting = false; controls(); } }
   }
   async function submitQuery(target = '') {
@@ -2370,9 +2426,23 @@
   };
   for (const button of document.querySelectorAll('[data-page]')) button.addEventListener('click', () => navigate(button.dataset.page));
   for (const button of document.querySelectorAll('[data-action="batch"]')) button.addEventListener('click', () => submitQuery());
-  context.addEventListener?.('pagehide', stop);
-  context.addEventListener?.('online', () => { if (connected) { void refresh(); monitor(generation); } });
-  context.addEventListener?.('pageshow', event => { if (event.persisted && !connected) { const saved = readPanelKey(context, base); if (saved) void connect(saved); } });
+  function resumeUpdates() {
+    if (!connected || document.hidden) return;
+    void refresh(); monitor(generation);
+  }
+  document.addEventListener?.('visibilitychange', () => {
+    if (document.hidden) monitor(generation); else resumeUpdates();
+  });
+  context.addEventListener?.('focus', resumeUpdates);
+  context.addEventListener?.('resize', fitHistoryDetail);
+  context.addEventListener?.('scroll', fitHistoryDetail, {passive: true});
+  context.addEventListener?.('pagehide', event => {
+    if (event.persisted) clearTimeout(pollTimer); else stop();
+  });
+  context.addEventListener?.('online', resumeUpdates);
+  context.addEventListener?.('pageshow', event => {
+    if (event.persisted) resumeUpdates();
+  });
   navigate('overview'); controls(); renderAccounts(); renderTasks(); renderEvents(); renderDiagnostics();
   const saved = readPanelKey(context, base);
   if (saved) void connect(saved);

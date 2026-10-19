@@ -14,7 +14,7 @@ rc.10 保留候选、账号及历史控件的焦点和详情展开状态，修�
 
 首次升级 rc.8 时先保持自动唤醒及五小时、周、每日规则关闭，核对实际模型、时区与允许时段，再显式手动唤醒一个测试账号。手动操作会先只读查额度和活动保护，可能跳过或阻塞，不保证一定发送；若发送则可能消耗模型额度。模型完成与窗口核实分开显示，结果未知不得换新键重复发送。确认行为后再按需保存开启自动规则。自动规则默认关闭并不覆盖旧版中用户已经明确保存的设置。
 
-升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.15 发布说明](releases/v0.2.0-rc.15.md)。
+升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.16 发布说明](releases/v0.2.0-rc.16.md)。
 
 旧后台不能直接打开迁移后的新库，回退必须停服务并恢复升级前一致的数据库备份，不能仅替换旧二进制。安装器激活失败时会使用临时一致备份恢复，但成功后会清理该副本；需要日后手动降级时，升级前须另行保存停机或 SQLite 在线一致备份。
 
@@ -24,7 +24,7 @@ rc.12 在额度查询完成时同步已核实的宿主账号状态，并提供�
 
 ## 首次切换
 
-当前 rc.15 提供主页面 CPA 认证文件启停、账号打码/本地别称、精确唤醒原因及跳过非错误展示。**后台为 rc.15，接入层沿用 rc.14；首次切换或从 rc.13 及更早版本更新须显式 `--restart`，重启 CPA 注册统一任务记录路由。**数据库仍为 schema 9，从 rc.13/rc.14 升级不增加迁移。更早版本升级仍须遵循下面的一致备份和降级限制，详见 [rc.15 发布说明](releases/v0.2.0-rc.15.md)。
+当前 rc.16 在 rc.15 的账号启停、打码/别称和精确唤醒诊断基础上，完善全自动读取、断网恢复与无变化不重绘，并修复窄屏详情越界。**后台为 rc.16，接入层沿用 rc.14；首次切换或从 rc.13 及更早版本更新须显式 `--restart`，重启 CPA 注册统一任务记录路由。**数据库仍为 schema 9，从 rc.13/rc.14/rc.15 升级不增加迁移。更早版本升级仍须遵循下面的一致备份和降级限制，详见 [rc.16 发布说明](releases/v0.2.0-rc.16.md)。
 
 rc.13 新增快捷唤醒与持久响应记录，数据库升级至 schema 9，首次启动自动迁移并保留现有任务及防重状态。升级前另存停机或 SQLite 在线一致备份；不能把旧后台直接换回迁移后的新库。原生接入层仍为 rc.8，详见 [rc.13 发布说明](releases/v0.2.0-rc.13.md)。
 
@@ -45,7 +45,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.15` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.16` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -55,11 +55,11 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-本次从 rc.14 更新到 rc.15 时，只有安装器确认接入层文件一致才可省略 `--restart`，仅重启后台。从 rc.13 及更早版本更新或接入层文件变化时，确认可重启 CPA 后须使用 `--restart`，安装器仍在写入前检查。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.15`。
+本次从 rc.14/rc.15 更新到 rc.16 时，只有安装器确认接入层文件一致才可省略 `--restart`，仅重启后台。从 rc.13 及更早版本更新或接入层文件变化时，确认可重启 CPA 后须使用 `--restart`，安装器仍在写入前检查。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.16`。
 
 `latest` 会按数值比较全部已发布 V2 rc 版本，不取发布列表第一条，也不使用排除预发布的 GitHub `/releases/latest`。下载的独立入口会重新获取两份 Python 安装器，不复用下载目录中的旧副本；只有完整源码目录（含上级 `go.mod`）使用本地安装器，运行前须自行更新源码。离线安装继续使用下文的包内 Python 入口。
 
-**后台和接入层独立记录版本**。本次后台为 rc.15，接入层为 rc.14；接入层 rc.14 已提供统一任务记录路由，历史 rc.8 接入层不能替代它。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
+**后台和接入层独立记录版本**。本次后台为 rc.16，接入层为 rc.14；接入层 rc.14 已提供统一任务记录路由，历史 rc.8 接入层不能替代它。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
 
 普通 v1 的 `install.sh` 不自动选择 v2 包；检测到已有 v2 安装记录时拒绝覆盖。不能通过旧脚本把正在运行的 v2 改回 v1。
 
@@ -83,7 +83,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.15 --package /path/codex-window-refresh-v2_v0.2.0-rc.15_linux_amd64.tar.gz \
+  --version v0.2.0-rc.16 --package /path/codex-window-refresh-v2_v0.2.0-rc.16_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 

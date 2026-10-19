@@ -6,7 +6,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查�
 
 ## 一键安装或更新
 
-重建后的 **v0.2.0-rc.15 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+重建后的 **v0.2.0-rc.16 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --restart
@@ -20,7 +20,7 @@ v2 提供额度查询、活动观测、模型配置、显式手动短句候选�
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest
 ```
 
-可用 `--version v0.2.0-rc.15` 固定本次版本。**本次后台为 rc.15，接入层沿用 rc.14**，以安装器核实的实际版本为准；从 rc.14 更新且接入层文件一致时可仅重启后台，从 rc.13 或更早版本更新、首次安装或接入层文件变化时必须在末尾添加 `--restart`。数据库保持 schema 9，升级前须另存一致备份；更早版本升级仍受既有迁移和降级限制。
+可用 `--version v0.2.0-rc.16` 固定本次版本。**本次后台为 rc.16，接入层沿用 rc.14**，以安装器核实的实际版本为准；从 rc.14/rc.15 更新且接入层文件一致时可仅重启后台，从 rc.13 或更早版本更新、首次安装或接入层文件变化时必须在末尾添加 `--restart`。数据库保持 schema 9，升级前须另存一致备份；更早版本升级仍受既有迁移和降级限制。
 
 rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总览与侧栏布局，默认自动更新。已接入持久化批量随机延迟、定期及五小时/周到期额度查询、网页设置与差异预览；手动单账号立即查询，查询均不发送模型请求。自动查询默认关闭，模型唤醒仍明确禁用。升级 rc.5 须添加 `--restart` 更新接入层；数据库迁移与降级限制见[发布说明](docs/releases/v0.2.0-rc.5.md)。
 
@@ -45,6 +45,8 @@ rc.13 在账号“立即查询”旁新增“立即唤醒”，当前页确认�
 rc.14 重做统一任务记录，展示后台持久保存的手动及自动查询、唤醒任务，支持全量筛选分页、统计和只读详情。完善真实查询耗时、排队进度、常驻未知警告、HTTP 复制与手机焦点；修复乱序状态回退、响应更新失焦及快捷唤醒快速重开。数据库仍为 schema 9，接入层更新至 rc.14，须显式 `--restart`；详见 [rc.14 发布说明](docs/releases/v0.2.0-rc.14.md)。
 
 rc.15 增加主页面 CPA 认证文件启停，按真实文件名和索引确认修改，随后只读核实，结果不明不重发。账号支持原始、打码与浏览器本地别称显示；唤醒错误按实际账号、绑定和同步状态细分，已跳过任务不再计作错误。数据库仍为 schema 9，接入层沿用 rc.14，详见 [rc.15 发布说明](docs/releases/v0.2.0-rc.15.md)。
+
+rc.16 优化为连接后全自动读取后台结果，返回前台及网络恢复时立即补读，临时连接故障自动重试，CPA 外部启停变化自动核实。只更新变化内容，减少定时闪烁，保留焦点、草稿及展开详情；读取失败相互隔离，并修复窄屏任务详情操作越界。刷新不额外查询额度或调用模型，认证失效/主动断开不自动恢复，详见 [rc.16 发布说明](docs/releases/v0.2.0-rc.16.md)。
 
 ## 旧版 V1 安装与更新（不更新 V2）
 
