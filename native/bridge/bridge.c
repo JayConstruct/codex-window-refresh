@@ -779,9 +779,9 @@ static J *proxy(J*req) {
     invalid:curl_easy_cleanup(curl);
     return http_error(400,"invalid_management_request");
 }
-static J *registration(void) {
+static J *registration(unsigned schema) {
     J*r=json_object_new_object(),*metadata=json_object_new_object(),*cap=json_object_new_object();
-    json_object_object_add(r,"schema_version",json_object_new_int(6));
+    json_object_object_add(r,"schema_version",json_object_new_int((int)schema));
     json_object_object_add(metadata,"Name",json_object_new_string("codex-window-refresh"));
     json_object_object_add(metadata,"Version",json_object_new_string(CWR_VERSION));
     json_object_object_add(metadata,"Author",json_object_new_string("codex-window-refresh contributors"));
@@ -790,6 +790,10 @@ static J *registration(void) {
     json_object_object_add(r,"metadata",metadata);
     json_object_object_add(cap,"management_api",json_object_new_boolean(1));
     json_object_object_add(cap,"request_interceptor",json_object_new_boolean(1));
+    if(schema>=7) {
+        json_object_object_add(cap,"request_interceptor_omit_body_before",json_object_new_boolean(1));
+        json_object_object_add(cap,"request_interceptor_omit_body_after",json_object_new_boolean(1));
+    }
     json_object_object_add(cap,"request_lifecycle_plugin",json_object_new_boolean(1));
     json_object_object_add(cap,"response_interceptor",json_object_new_boolean(1));
     json_object_object_add(cap,"response_stream_interceptor",json_object_new_boolean(1));
@@ -850,7 +854,7 @@ static int plugin_call(char*method,uint8_t*payload,size_t size,Buffer*out) {
         if(json_object_get_int(field(req,"schema_version"))<6)reply=error("schema_incompatible");
         else if(running&&stopping&&!stop_runtime(1))reply=error("bridge_still_draining");
         else if(!start_runtime())reply=error("bridge_initialization_failed");
-        else reply=registration();
+        else reply=registration(json_object_get_int(field(req,"schema_version"))>=7?7u:6u);
     }
     else if(!strcmp(method,"plugin.quiesce")||!strcmp(method,"plugin.shutdown")) {
         reply=stop_runtime(1)?ok(json_object_new_object()):error("bridge_still_draining");
