@@ -87,8 +87,34 @@ class NativeBridge(unittest.TestCase):
         self.process = None
         self.addCleanup(self.cleanup)
         registration = self.call('plugin.register', {'schema_version': 6})
+        self.assertEqual(registration["result"]["schema_version"], 6)
+        self.assertNotIn("request_interceptor_omit_body_before", registration["result"]["capabilities"])
         self.assertTrue(registration['ok'], registration)
         self.assert_host_registration(registration)
+
+    def test_schema7_omits_unused_interceptor_request_bodies(self):
+        registration = self.call('plugin.reconfigure', {'schema_version': 7})
+        self.assertTrue(registration['ok'], registration)
+        result = registration['result']
+        self.assertEqual(result['schema_version'], 7)
+        caps = result['capabilities']
+        self.assertTrue(caps['request_interceptor'])
+        self.assertTrue(caps['request_interceptor_omit_body_before'])
+        self.assertTrue(caps['request_interceptor_omit_body_after'])
+        self.assertTrue(caps['response_stream_interceptor'])
+        self.assertTrue(caps['websocket_response_observer'])
+        self.assertEqual(self.call('request.intercept_before',
+                                   {'RequestID': 'schema7', 'Metadata': {}}),
+                         {'ok': True, 'result': {}})
+        self.assertEqual(self.call('request.intercept_after',
+                                   {'RequestID': 'schema7', 'Metadata': {}}),
+                         {'ok': True, 'result': {}})
+        previous = self.call('plugin.reconfigure', {'schema_version': 6})
+        self.assertEqual(previous['result']['schema_version'], 6)
+        self.assertNotIn('request_interceptor_omit_body_before',
+                         previous['result']['capabilities'])
+        self.assertNotIn('request_interceptor_omit_body_after',
+                         previous['result']['capabilities'])
 
     @staticmethod
     def host_accepts_registration(registration):
