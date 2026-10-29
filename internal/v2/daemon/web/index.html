@@ -178,41 +178,66 @@
       </div>
     </section>
     <section data-view="scheduling" aria-label="账号调度与重置卡" hidden>
-      <div class="detail-grid">
-        <section class="card detail-card"><h2>业务账号调度</h2>
-          <p class="section-description">按项目选择首选账号，优先使用临近重置的剩余额度。已有会话优先保持账号，项目偏好与重置时间仅用于首次分配和失效后的重选。</p>
-          <form id="scheduling-form">
-            <fieldset id="scheduling-fields" disabled><legend class="sr-only">调度与重置卡规则</legend>
+      <div class="scheduling-layout">
+        <form id="scheduling-form" novalidate>
+          <fieldset id="scheduling-fields" class="scheduling-settings" disabled><legend class="sr-only">调度与重置卡规则</legend>
+            <section class="card detail-card scheduling-card" aria-labelledby="routing-title">
+              <div class="card-heading"><h2 id="routing-title">业务账号调度</h2><span id="routing-status" class="planned-badge">尚未读取</span></div>
+              <p class="section-description">按项目选择首选账号，已有会话优先保持账号。项目偏好与重置时间用于首次分配和失效后的重选。</p>
+              <div class="scheduling-switches">
               <label class="switch-row"><span>启用业务账号调度</span><input id="routing-enabled" class="switch" type="checkbox"></label>
               <label class="switch-row"><span>优先使用临近重置的账号</span><input id="routing-reset" class="switch" type="checkbox"></label>
+              <label class="switch-row"><span>子代理继承父会话账号</span><input id="routing-subagent" class="switch" type="checkbox"></label>
+              </div>
+              <label class="field-label" for="routing-projects">项目首选账号</label><textarea id="routing-projects" rows="3" placeholder="project-a = account-1, account-2" aria-describedby="routing-projects-help"></textarea>
+              <p id="routing-projects-help" class="field-help">每行一个项目，等号后填写完整账号 ID，多个账号用英文逗号分隔。使用配套 cwr-codex 启动器为目录设置项目标识。</p>
+              <details id="routing-advanced" class="scheduling-advanced"><summary>并发、额度与会话设置</summary>
               <div class="settings-grid">
                 <div><label class="field-label" for="routing-cap">单账号并发上限</label><input id="routing-cap" type="number" min="1" max="128" required></div>
                 <div><label class="field-label" for="routing-age">额度最长有效时间（秒）</label><input id="routing-age" type="number" min="5" max="3600" required></div>
                 <div><label class="field-label" for="routing-session">会话空闲失效时间（秒）</label><input id="routing-session" type="number" min="1" max="86400" required></div>
               </div>
-              <h3>插件会话粘性</h3>
-              <label class="switch-row"><span>子代理继承父会话账号</span><input id="routing-subagent" class="switch" type="checkbox"></label>
               <label class="field-label" for="routing-rebind">失败后的重绑定条件</label>
               <select id="routing-rebind"><option value="quota">额度耗尽或认证失效时重绑定</option><option value="any">额度、认证或临时上游故障时重绑定</option></select>
               <p class="field-help">插件调度开启后统一管理主会话、子代理和分支绑定。临时故障默认只为本次请求回退，保留原绑定；子代理失败不修改父会话。绑定账号并发满时返回繁忙。绑定仅保存在接入层内存，CPA 重启后重新分配。</p>
-              <label class="field-label" for="routing-projects">项目首选账号</label><textarea id="routing-projects" rows="6" placeholder="project-a = account-1, account-2"></textarea>
-              <p class="field-help">每行一个项目标识，等号后填写 CPA 完整账号 ID，多个账号用英文逗号分隔。使用配套 cwr-codex 启动器为目录设置项目标识。</p>
-              <h3>官方赠送重置卡</h3>
+              </details>
+            </section>
+            <section class="card detail-card scheduling-card" aria-labelledby="cards-title">
+              <div class="card-heading"><h2 id="cards-title">官方赠送重置卡</h2><span id="cards-status" class="planned-badge">尚未读取</span></div>
+              <p class="section-description">额度查询可同步卡片数量。查询到期详情及自动使用需要后台安装支持此协议的 Codex CLI。</p>
+              <div class="scheduling-switches">
               <label class="switch-row"><span>后台查询重置卡详情</span><input id="cards-enabled" class="switch" type="checkbox"></label>
-              <label class="switch-row"><span>到期前自动使用</span><input id="cards-auto" class="switch" type="checkbox"></label>
-              <p class="field-help">自动使用会兑换账号已有的赠送重置卡。优先使用最早到期的卡，兑换后查询实际额度；关闭网页后后台继续执行。</p>
+              <label class="switch-row"><span>到期前自动使用</span><input id="cards-auto" class="switch" type="checkbox" aria-describedby="cards-dependency" disabled></label>
+              </div>
+              <p id="cards-dependency" class="field-help">先开启详情查询，才能自动使用；关闭详情查询会同时关闭自动使用。</p>
+              <p class="info-note">自动使用会兑换账号已有的赠送重置卡，优先使用最早到期的一张。未知到期时间不自动兑换；关闭网页后后台继续执行。</p>
+              <details id="cards-advanced" class="scheduling-advanced"><summary>查询间隔与兑换条件</summary>
               <div class="settings-grid">
                 <div><label class="field-label" for="cards-poll">单账号查询间隔（秒）</label><input id="cards-poll" type="number" min="60" max="86400" required></div>
                 <div><label class="field-label" for="cards-expiry">提前关注到期卡（秒）</label><input id="cards-expiry" type="number" min="60" max="2592000" required></div>
                 <div><label class="field-label" for="cards-force">最晚尝试兑换距到期（秒）</label><input id="cards-force" type="number" min="1" max="2592000" required></div>
                 <div><label class="field-label" for="cards-used">通常兑换所需已用比例（%）</label><input id="cards-used" type="number" min="1" max="100" required></div>
               </div>
-            </fieldset>
-            <p id="scheduling-message" class="field-help" role="status">连接后读取设置，新增功能默认关闭。</p>
-            <div class="settings-actions"><button id="scheduling-save" class="button button-primary" type="submit" disabled>保存并应用</button><button id="scheduling-reload" class="button button-outline" type="button">重新读取并丢弃草稿</button></div>
-          </form>
+              <p class="field-help">例如：900 秒为 15 分钟，86400 秒为 1 天。最晚尝试兑换的提前量不能大于关注到期卡的时间范围。</p>
+              </details>
+            </section>
+          </fieldset>
+          <div class="card scheduling-actions">
+            <div><p id="scheduling-message" class="field-help" role="status">连接后读取设置，新增功能默认关闭。</p><p id="scheduling-validation" class="settings-validation" role="alert" hidden></p></div>
+            <div class="settings-actions"><button id="scheduling-save" class="button button-primary" type="submit" disabled>保存并应用全部设置</button><button id="scheduling-verify" class="button button-outline" type="button" hidden disabled>只读核实，保留草稿</button><button id="scheduling-reload" class="text-button" type="button" disabled>重新读取并丢弃草稿</button></div>
+          </div>
+        </form>
+        <section class="card detail-card reset-records" aria-labelledby="reset-records-title">
+          <div class="card-heading"><h2 id="reset-records-title">重置卡与兑换记录</h2><button id="reset-refresh" class="text-button" type="button" disabled>刷新记录</button></div>
+          <p class="field-help">展示已观测的账号及最近 100 条以内的兑换记录。刷新只读取后台记录，不查询上游、不兑换卡片。</p>
+          <div class="reset-toolbar">
+            <div class="reset-tabs" role="group" aria-label="记录类型"><button id="reset-tab-cards" type="button" aria-pressed="true">卡片概况</button><button id="reset-tab-attempts" type="button" aria-pressed="false">兑换记录</button></div>
+            <label class="sr-only" for="reset-search">搜索账号或卡片标识</label><input id="reset-search" type="search" placeholder="搜索账号或卡片标识" autocomplete="off">
+            <label class="reset-attention"><input id="reset-attention" type="checkbox">仅看需关注</label>
+          </div>
+          <div id="reset-cards-list" class="reset-record-list">尚未读取</div><div id="reset-attempts-list" class="reset-record-list" hidden>尚未读取</div>
+          <div class="reset-footer"><p id="reset-page-summary" class="field-help" role="status">连接后读取记录</p><div class="pagination"><button id="reset-previous" class="button button-outline" type="button" disabled>上一页</button><button id="reset-next" class="button button-outline" type="button" disabled>下一页</button></div></div>
         </section>
-        <section class="card detail-card"><h2>重置卡与兑换记录</h2><p class="field-help">账号额度查询可同步卡片数量，无需额外请求。卡片 ID 和到期时间由独立详情查询补充，需后台安装支持此协议的 Codex CLI；未知到期时间不自动兑换。</p><div id="reset-cards-list">尚未读取</div><h3>最近兑换</h3><div id="reset-attempts-list">尚无记录</div></section>
       </div>
     </section>
 

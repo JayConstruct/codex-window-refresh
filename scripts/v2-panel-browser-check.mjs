@@ -11,6 +11,7 @@ const base = '/cpa/v0/resource/plugins/codex-window-refresh/';
 const api = '/cpa/v0/management/codex-window-refresh/v2/';
 const fixtureKey = 'local-v2-browser-fixture';
 const autorefreshOnly = process.env.CWR_AUTOREFRESH_ONLY === '1';
+const schedulingOnly = process.env.CWR_SCHEDULING_ONLY === '1';
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], patches = [], reads = [], exceptions = [], pageErrors = [];
@@ -22,6 +23,7 @@ let authReadGate, authPatchGate, authFilesOverride;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
 let schedulingRevision = 0;
+let resetCardsFixture = null;
 let schedulingConfig = {enabled:false,prefer_reset:true,quota_max_age_seconds:300,session_ttl_seconds:1800,max_inflight:2,projects:[],cards:{enabled:false,auto_consume:false,poll_seconds:900,expiry_seconds:86400,force_before_seconds:1800,min_used_percent:80}};
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
 const generations = new Map();
@@ -288,7 +290,7 @@ try {
         json(response, 200, {...identity(), ...job}); return;
       }
       if (resource === 'scheduling') { json(response,200,{instance_id:identity().instance_id,revision:schedulingRevision,config:schedulingConfig}); return; }
-      if (resource === 'reset-cards') { json(response,200,{instance_id:identity().instance_id,accounts:[{account_id:'codex-01',credits:{availableCount:2,credits:null},observed_at:observed(),summary_observed_at:observed(),error_code:''}],attempts:[]}); return; }
+      if (resource === 'reset-cards') { json(response,200,{instance_id:identity().instance_id,...(resetCardsFixture || {accounts:[{account_id:'codex-01',credits:{availableCount:2,credits:null},observed_at:observed(),summary_observed_at:observed(),error_code:''}],attempts:[]})}); return; }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
       if (resource === 'model-settings') {
         if (modelReadGate) { modelReadGate.started = true; await modelReadGate.promise; }
@@ -428,6 +430,78 @@ try {
     await mkdir(output, {recursive: true});
     const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
     await writeFile(join(output, name), Buffer.from(capture.data, 'base64'));
+  }
+  async function runSchedulingChecks() {
+    const writeCount = posts.length, patchCount = patches.length;
+    await evaluate('document.querySelector("[data-page=scheduling]").click()');
+    await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Scheduling did not load');
+    await evaluate('document.getElementById("cards-force").value="90000";document.getElementById("scheduling-form").requestSubmit()');
+    assert.equal(await evaluate('!document.getElementById("scheduling-validation").hidden && document.getElementById("cards-advanced").open && document.activeElement.id==="cards-force"'), true, 'Invalid advanced settings were not revealed and focused');
+    assert.equal(posts.length, writeCount, 'Invalid configuration reached the backend');
+    await evaluate('document.getElementById("scheduling-reload").click()');
+    await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled && document.getElementById("cards-force").value==="1800"'), 'Draft discard did not finish');
+    await evaluate('document.getElementById("cards-enabled").click()');
+    assert.equal(await evaluate('document.getElementById("cards-auto").disabled'), false);
+    await evaluate('document.getElementById("cards-auto").click();document.getElementById("cards-enabled").click()');
+    assert.equal(await evaluate('document.getElementById("cards-auto").disabled && !document.getElementById("cards-auto").checked'), true);
+    await evaluate('document.getElementById("scheduling-reload").click()');
+    await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Switch draft discard did not finish');
+    resetCardsFixture = {accounts: Array.from({length: 12}, (_, index) => ({
+      account_id: index === 0 ? 'long-account-' + 'x'.repeat(230) : 'reset-account-' + index,
+      credits: {availableCount: 1, credits: [{id: 'credit-' + index, status: 'available', expiresAt: Math.floor(Date.now() / 1000) + 3600}]},
+      summary_observed_at: '2026-10-29T01:00:00Z', details_observed_at: '2026-10-28T01:00:00Z', error_code: ''
+    })), attempts: [{id: 'attempt-1', account_id: 'reset-account-1', credit_id: 'credit-1', phase: 'skipped', outcome: 'nothingToReset', updated_at: '2026-10-29T02:00:00Z', error_code: ''},
+      {id: 'attempt-2', account_id: 'reset-account-2', credit_id: '<img src=x onerror=alert(1)>', phase: 'unknown', outcome: '', updated_at: '2026-10-29T03:00:00Z', error_code: 'reset_timeout'}]};
+    await evaluate('document.getElementById("reset-refresh").click()');
+    await waitFor(() => evaluate('document.getElementById("reset-page-summary").textContent.includes("12 个账号")'), 'Reset fixture did not load');
+    await evaluate('globalThis.resetDetail=document.querySelector("#reset-cards-list details");resetDetail.open=true;globalThis.resetSummary=resetDetail.querySelector("summary");resetSummary.focus()');
+    resetCardsFixture.accounts[0].summary_observed_at = '2026-10-29T04:00:00Z';
+    await evaluate('document.getElementById("reset-refresh").click()'); await settleRefresh();
+    assert.equal(await evaluate('resetDetail.isConnected && resetDetail.open && document.activeElement===resetSummary'), true, 'Reset polling replaced expanded details');
+    for (const width of [1586, 768, 390, 320]) {
+      await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
+      const layout = await evaluate('(()=>{const f=document.getElementById("scheduling-fields"),t=document.getElementById("routing-projects");return {overflow:document.documentElement.scrollWidth>innerWidth,border:getComputedStyle(f).borderWidth,textarea:t.clientWidth,parent:t.parentElement.clientWidth}})()');
+      assert.equal(layout.overflow, false, 'Scheduling overflow at ' + width);
+      assert.equal(layout.border, '0px', 'Scheduling kept the browser fieldset border');
+      assert.ok(layout.textarea > layout.parent - 55, 'Project editor did not use the card width');
+      await evaluate('document.getElementById("cards-advanced").open=true;document.getElementById("routing-advanced").open=true');
+      assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'), true, 'Advanced settings overflow at ' + width);
+      await evaluate('document.getElementById("cards-advanced").open=false;document.getElementById("routing-advanced").open=false');
+      await evaluate('scrollTo(0,0)');
+      const metrics = await cdp('Page.getLayoutMetrics'), clip = {x: 0, y: 0, width, height: Math.ceil(metrics.cssContentSize.height), scale: 1};
+      const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true, clip});
+      await mkdir(output, {recursive: true}); await writeFile(join(output, 'scheduling-review-' + width + '.png'), Buffer.from(capture.data, 'base64'));
+    }
+    await evaluate('document.getElementById("reset-next").click()');
+    assert.equal(await evaluate('document.getElementById("reset-cards-list").children.length'), 2);
+    await evaluate('document.getElementById("reset-search").value="credit-11";document.getElementById("reset-search").dispatchEvent(new Event("input"))');
+    assert.equal(await evaluate('document.getElementById("reset-cards-list").children.length'), 1);
+    await evaluate('document.getElementById("reset-search").value="";document.getElementById("reset-search").dispatchEvent(new Event("input"));document.getElementById("reset-tab-attempts").click()');
+    assert.match(await evaluate('document.getElementById("reset-attempts-list").textContent'), /没有可重置的额度窗口/);
+    assert.match(await evaluate('document.getElementById("reset-attempts-list").textContent'), /后台保留原兑换标识及账号保护/);
+    assert.equal(await evaluate('document.querySelectorAll("#reset-attempts-list img,#reset-attempts-list script").length'), 0);
+    await evaluate('document.getElementById("reset-attention").click()');
+    assert.equal(await evaluate('document.getElementById("reset-attempts-list").children.length'), 1);
+    await evaluate('document.getElementById("display-mode").value="masked";document.getElementById("display-mode").dispatchEvent(new Event("change"))');
+    assert.equal(await evaluate('document.getElementById("reset-attempts-list").textContent.includes("reset-account-2")'), false);
+    await evaluate('document.getElementById("display-mode").value="original";document.getElementById("display-mode").dispatchEvent(new Event("change"));document.getElementById("reset-attention").click();document.getElementById("reset-tab-cards").click()');
+    resetCardsFixture = null;
+    await evaluate('document.getElementById("reset-refresh").click()'); await settleRefresh();
+    for (const width of [1586, 390]) {
+      await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
+      await evaluate('scrollTo(0,0)');
+      const metrics = await cdp('Page.getLayoutMetrics');
+      const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true, clip: {x: 0, y: 0, width, height: Math.ceil(metrics.cssContentSize.height), scale: 1}});
+      await writeFile(join(output, 'scheduling-optimized-' + width + '.png'), Buffer.from(capture.data, 'base64'));
+    }
+    if (schedulingOnly) {
+      await evaluate('document.getElementById("disconnect").click()');
+      assert.equal(await evaluate('["scheduling-fields","scheduling-save","scheduling-reload","scheduling-verify","reset-refresh"].every(id=>document.getElementById(id).disabled)'), true, 'Disconnected scheduling controls were enabled');
+    }
+    await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
+    assert.equal(posts.length, writeCount); assert.equal(patches.length, patchCount);
+    assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
+    console.log('Scheduling Chromium checks passed: validation/focus, switch dependency, readonly records/search/pagination, observation times, translated outcomes, masking, preserved details/focus, full-width editor and 320/390/768/1586 layouts. Screenshots: ' + output);
   }
   const readCountFor = resource => reads.filter(path => new URL(path, 'http://fixture').pathname.endsWith('/' + resource)).length;
   async function settleRefresh() {
@@ -658,6 +732,7 @@ try {
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
   await evaluate('document.fonts.ready.then(() => true)');
   checks: {
+  if (schedulingOnly) { await runSchedulingChecks(); break checks; }
   if (autorefreshOnly) {
     await evaluate('document.querySelector("[data-account-status-id=codex-01]").click()');
     await waitFor(() => evaluate('document.querySelector("[data-account-status-id=codex-01]").dataset.state==="confirmed"'), 'Explicit fixture-only setup PATCH did not reach confirmed');
@@ -1161,6 +1236,7 @@ try {
   assert.equal(schedulingConfig.subagent_affinity, false); assert.equal(schedulingConfig.rebind_on, 'any');
   assert.equal(await evaluate('document.getElementById("routing-subagent").checked'), false, 'Child affinity did not persist');
   assert.equal(await evaluate('document.getElementById("routing-rebind").value'), 'any', 'Rebind choice did not persist');
+  await runSchedulingChecks();
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   for (const width of [1586, 390]) {
     await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
@@ -1741,7 +1817,7 @@ try {
   if (server) await new Promise(resolve => server.close(resolve));
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
-if (!autorefreshOnly) {
+if (!autorefreshOnly && !schedulingOnly) {
   console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });

@@ -2,16 +2,16 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查询、可选自动查询和按需模型唤醒。插件 ID 为 `codex-window-refresh`。
 
-**v0.2.0-rc.23** 由插件统一管理主会话、子代理和分支粘性，增加子代理继承、失败重绑条件与空闲失效设置。已有绑定优先于项目偏好和额度排序，子代理重选不改写父绑定；宿主内部换号重试也按单次执行结果处理。后台与接入层均为 rc.23，升级须 `--restart`，数据库保持 schema 10。详见 [rc.23 发布说明](docs/releases/v0.2.0-rc.23.md)和[插件会话粘性](docs/account-scheduling.md#插件会话粘性)。
+**v0.2.0-rc.24** 优化“账号调度与重置卡”界面：分开设置卡、折叠高级参数，支持保留草稿的保存核实，并新增重置卡观测时间、中文兑换结果、搜索筛选和分页。后台为 rc.24，接入层沿用 rc.23，数据库保持 schema 10。从 rc.23 更新且接入层文件校验一致时可仅重启后台；首次安装或接入层变化须 `--restart`。详见 [rc.24 发布说明](docs/releases/v0.2.0-rc.24.md)和[面板说明](docs/backend-v2-panel.md#账号调度与重置卡)。
 
 服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
 
 ## 一键安装或更新
 
-当前 **v0.2.0-rc.23 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+当前 **v0.2.0-rc.24 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.23 --restart
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.24 --restart
 ```
 
 v2 提供额度查询、活动观测、模型配置、显式手动短句候选生成及 Codex 模型唤醒，自动查询和自动唤醒默认关闭，已有明确保存的规则保持不变。首次切换会停止 v1 功能，成功后清除 v1 数据、旧版本及临时恢复副本；后续更新保留 v2 数据。只有后台改变且接入层文件一致时只重启后台，接入层改变时仍须显式 `--restart`。下面的旧入口继续更新 v1，不会自动切换 v2。
@@ -22,7 +22,7 @@ v2 提供额度查询、活动观测、模型配置、显式手动短句候选�
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-可用 `--version v0.2.0-rc.23` 固定本次版本。**本次后台和接入层均为 rc.23；从任何早期版本升级均须显式 `--restart`**，以加载插件粘性管理及执行结果观测。数据库为 schema 10，从 rc.21/rc.22 升级无需迁移并保留已有规则、额度和发送防重记录；已有调度开关保持不变，粘性绑定在重启后重新建立。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
+可用 `--version v0.2.0-rc.24` 固定本次版本。**本次后台为 rc.24，接入层沿用 rc.23**。从 rc.23 更新时，安装器确认接入层文件完全一致后可省略 `--restart`；首次安装、从更早接入层升级或接入层文件变化仍须显式 `--restart`。数据库为 schema 10，从 rc.21/rc.22/rc.23 升级无需迁移并保留已有规则、额度和发送防重记录；读取页面不会改变已有开关。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
 
 rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总览与侧栏布局，默认自动更新。已接入持久化批量随机延迟、定期及五小时/周到期额度查询、网页设置与差异预览；手动单账号立即查询，查询均不发送模型请求。自动查询默认关闭，模型唤醒仍明确禁用。升级 rc.5 须添加 `--restart` 更新接入层；数据库迁移与降级限制见[发布说明](docs/releases/v0.2.0-rc.5.md)。
 

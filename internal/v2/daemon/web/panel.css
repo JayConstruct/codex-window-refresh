@@ -271,6 +271,54 @@ select { cursor: pointer; }
 .detail-card { padding: 22px; }
 .detail-card > .section-description { margin: 12px 0 20px; line-height: 1.8; }
 .detail-card .card-heading { justify-content: space-between; }
+.scheduling-layout { display: grid; gap: 18px; }
+.scheduling-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 18px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.scheduling-card { min-width: 0; }
+.scheduling-card .card-heading { flex-wrap: wrap; gap: 10px; }
+.scheduling-switches { display: grid; gap: 16px; padding-block: 4px 12px; }
+.scheduling-card input:not([type="checkbox"]), .scheduling-card select, .scheduling-card textarea { width: 100%; min-width: 0; }
+.scheduling-card textarea { display: block; min-height: 100px; resize: vertical; padding: 10px 12px; border: 1px solid #dbe2eb; border-radius: 7px; color: #25314a; background: #fff; font: inherit; line-height: 1.65; }
+.scheduling-card textarea:focus-visible { outline: 3px solid #57c7bc; outline-offset: 3px; }
+.scheduling-card textarea:disabled { color: var(--muted); background: #f5f7fa; }
+.scheduling-card textarea[aria-invalid="true"] { border-color: #cb625b; }
+.scheduling-card .field-help { line-height: 1.7; overflow-wrap: anywhere; }
+.scheduling-advanced { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.scheduling-advanced > summary { color: var(--teal-dark); cursor: pointer; font-weight: 500; }
+.scheduling-advanced > summary:focus-visible, .reset-credit-details > summary:focus-visible { outline: 3px solid #57c7bc; outline-offset: 3px; }
+.scheduling-actions { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 20px; margin-top: 18px; padding: 16px 22px; }
+.scheduling-actions .field-help, .scheduling-actions .settings-actions { margin-top: 0; }
+.scheduling-actions .settings-validation { margin-top: 10px; }
+.reset-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-block: 20px 16px; }
+.reset-toolbar input[type="search"] { flex: 1 1 220px; min-width: 0; }
+.reset-tabs { display: inline-flex; padding: 4px; gap: 4px; border-radius: 9px; background: #f0f5f7; }
+.reset-tabs button { min-height: 36px; padding: 7px 14px; border: 0; background: transparent; color: #607087; }
+.reset-tabs button[aria-pressed="true"] { background: #fff; color: var(--teal-dark); box-shadow: 0 1px 4px #273f5012; }
+.reset-attention { display: inline-flex; align-items: center; gap: 7px; color: #607087; font-size: 13px; }
+.reset-attention input { width: 16px; min-height: 16px; margin: 0; accent-color: var(--teal); }
+.reset-record-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }
+.reset-record { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 9px; background: #fcfefe; overflow-wrap: anywhere; }
+.reset-record-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.reset-record-heading strong { min-width: 0; font-weight: 550; }
+.reset-record-heading .status-badge { max-width: 100%; white-space: normal; }
+.reset-metadata { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; margin: 12px 0 0; font-size: 12px; }
+.reset-metadata dt { color: var(--muted); }
+.reset-metadata dd { margin: 0; color: #46546c; }
+.reset-warning { margin-top: 10px; color: #98620e; font-size: 12px; line-height: 1.7; }
+.reset-credit-details { margin-top: 12px; color: var(--teal-dark); font-size: 12px; }
+.reset-credit-details summary { cursor: pointer; }
+.reset-identifier { color: #46546c; }
+.reset-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; }
+@media (max-width: 1100px) {
+  .scheduling-settings, .reset-record-list { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 550px) {
+  .scheduling-actions { padding: 16px 18px; }
+  .scheduling-actions .settings-actions { width: 100%; }
+  .scheduling-actions .button { flex: 1 1 auto; white-space: normal; }
+  .scheduling-card .settings-grid { grid-template-columns: minmax(0, 1fr); }
+  .reset-toolbar input[type="search"] { flex-basis: 100%; }
+  .reset-record { padding: 13px; }
+}
 .field-label { display: block; margin: 20px 0 7px; color: #46546c; font-weight: 500; }
 .input-row { display: flex; gap: 10px; }
 .input-row input { flex: 1; min-width: 0; }

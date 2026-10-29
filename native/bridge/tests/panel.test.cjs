@@ -3329,3 +3329,171 @@ test('scheduling settings preserve drafts on polls, detect conflicts and save on
   await ui.get('refresh').onclick(); await flush();
   assert.equal(ui.get('routing-subagent').checked, false); assert.equal(ui.get('routing-rebind').value, 'any');
 });
+
+function schedulingFixture(overrides = {}) {
+  return {enabled: false, prefer_reset: true, quota_max_age_seconds: 300, session_ttl_seconds: 1800, max_inflight: 2,
+    subagent_affinity: true, rebind_on: 'quota', projects: [],
+    cards: {enabled: false, auto_consume: false, poll_seconds: 900, expiry_seconds: 86400, force_before_seconds: 1800, min_used_percent: 80}, ...overrides};
+}
+function schedulingPanel(handler = () => null, options = {}) {
+  let revision = 0, config = schedulingFixture();
+  return panel(async (url, request) => {
+    const response = await handler(url, request); if (response) return response;
+    if (url.endsWith('/scheduling')) {
+      if (request.method === 'POST') { const body = JSON.parse(request.body); assert.equal(body.revision, revision); config = body.config; revision++; return [200, {revision, config}]; }
+      return [200, {instance_id: 'a', revision, config}];
+    }
+    if (url.endsWith('/reset-cards')) return [200, {instance_id: 'a', accounts: [], attempts: []}];
+    return basic(url);
+  }, options);
+}
+async function openScheduling(ui) {
+  await ui.get('connect').onclick();
+  ui.nav.find(node => node.dataset.page === 'scheduling').listeners.get('click')(); await flush();
+}
+function editScheduling(ui, id, value) {
+  ui.get(id).value = value; ui.get('scheduling-form').listeners.get('input')();
+}
+const submitScheduling = ui => ui.get('scheduling-form').onsubmit({preventDefault() {}});
+
+test('scheduling cross-field validation preserves the draft and allows correction without a reload', async () => {
+  const ui = schedulingPanel(); await openScheduling(ui);
+  editScheduling(ui, 'cards-expiry', '60'); editScheduling(ui, 'cards-force', '1800');
+  await submitScheduling(ui);
+  assert.equal(mutations(ui).length, 0); assert.equal(ui.get('scheduling-validation').hidden, false);
+  assert.match(ui.get('scheduling-validation').textContent, /不能大于/);
+  assert.equal(ui.document.activeElement, ui.get('cards-force'));
+  editScheduling(ui, 'cards-force', '30'); await submitScheduling(ui);
+  assert.equal(mutations(ui).length, 1); assert.equal(ui.get('scheduling-validation').hidden, true);
+  assert.equal(ui.get('cards-expiry').value, '60'); assert.equal(ui.get('scheduling-save').disabled, false);
+});
+
+test('scheduling server validation failures keep save available and acknowledged saves need no second read', async () => {
+  let reject = true;
+  const ui = schedulingPanel((url, request) => {
+    if (url.endsWith('/scheduling') && request.method === 'POST' && reject) { reject = false; return [400, {error: 'invalid_scheduling_settings'}]; }
+  });
+  await openScheduling(ui); editScheduling(ui, 'routing-cap', '7'); await submitScheduling(ui);
+  assert.equal(ui.get('scheduling-save').disabled, false); assert.equal(ui.get('routing-cap').value, '7');
+  assert.match(ui.get('scheduling-message').textContent, /修正后可重新保存/);
+  editScheduling(ui, 'routing-cap', '8'); await submitScheduling(ui);
+  assert.equal(mutations(ui).length, 2); assert.equal(ui.get('routing-cap').value, '8');
+  assert.match(ui.get('scheduling-message').textContent, /全部设置已保存/);
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/scheduling') && !call.method).length, 1);
+});
+
+test('scheduling card switches prevent inactive automatic consumption and stop disables the editor', async () => {
+  const ui = schedulingPanel(); await openScheduling(ui);
+  assert.equal(ui.get('cards-auto').disabled, true);
+  ui.get('cards-enabled').checked = true; ui.get('cards-enabled').onchange();
+  assert.equal(ui.get('cards-auto').disabled, false);
+  ui.get('cards-auto').checked = true; ui.get('cards-enabled').checked = false; ui.get('cards-enabled').onchange();
+  assert.equal(ui.get('cards-auto').checked, false); assert.equal(ui.get('cards-auto').disabled, true);
+  await submitScheduling(ui);
+  const saved = JSON.parse(mutations(ui)[0].body).config;
+  assert.equal(saved.cards.enabled, false); assert.equal(saved.cards.auto_consume, false);
+  ui.get('disconnect').onclick();
+  for (const id of ['scheduling-fields', 'scheduling-save', 'scheduling-reload', 'scheduling-verify', 'reset-refresh', 'reset-next']) assert.equal(ui.get(id).disabled, true, id);
+  await submitScheduling(ui); assert.equal(mutations(ui).length, 1);
+});
+
+test('scheduling uncertain saves require explicit readonly verification and preserve subsequent edits', async () => {
+  let revision = 0, stored = schedulingFixture(), writes = 0;
+  const ui = schedulingPanel((url, request) => {
+    if (!url.endsWith('/scheduling')) return;
+    if (request.method === 'POST') {
+      const body = JSON.parse(request.body); assert.equal(body.revision, revision);
+      stored = body.config; revision++; writes++;
+      if (writes === 1) throw new Error('lost acknowledgement');
+      return [200, {revision, config: stored}];
+    }
+    // Responses may serialize config fields in a different order.
+    return [200, {instance_id: 'a', revision, config: Object.fromEntries(Object.entries(stored).reverse())}];
+  });
+  await openScheduling(ui); editScheduling(ui, 'routing-cap', '7'); await submitScheduling(ui);
+  assert.equal(ui.get('scheduling-save').disabled, true); assert.equal(ui.get('scheduling-verify').hidden, false);
+  await ui.get('refresh').onclick(); await flush();
+  await submitScheduling(ui); assert.equal(writes, 1);
+  editScheduling(ui, 'routing-cap', '8'); editScheduling(ui, 'cards-force', ''); ui.get('reset-search').focus();
+  await ui.get('scheduling-verify').onclick();
+  assert.equal(ui.get('routing-cap').value, '8'); assert.equal(ui.get('scheduling-save').disabled, false);
+  assert.equal(ui.get('cards-force').value, ''); assert.equal(ui.document.activeElement, ui.get('reset-search'));
+  assert.match(ui.get('scheduling-message').textContent, /草稿尚未保存/);
+  assert.equal(writes, 1); editScheduling(ui, 'cards-force', '1800'); await submitScheduling(ui); assert.equal(writes, 2); assert.equal(stored.max_inflight, 8);
+});
+
+test('scheduling late save responses cannot change a reconnected editor or clear verification', async () => {
+  let release, sending = false;
+  const ui = schedulingPanel((url, request) => {
+    if (url.endsWith('/scheduling') && request.method === 'POST') {
+      sending = true; return new Promise(resolve => { release = () => resolve([200, {revision: 1, config: JSON.parse(request.body).config}]); });
+    }
+  });
+  await openScheduling(ui); editScheduling(ui, 'routing-cap', '7');
+  const pending = submitScheduling(ui); await flush(); assert.equal(sending, true);
+  ui.get('disconnect').onclick(); ui.get('key').value = 'fixture-key'; await ui.get('connect').onclick();
+  editScheduling(ui, 'routing-cap', '8'); release(); await pending;
+  assert.equal(ui.get('routing-cap').value, '8'); assert.equal(ui.get('scheduling-save').disabled, true);
+  await ui.get('scheduling-verify').onclick();
+  assert.equal(ui.get('scheduling-save').disabled, false); assert.equal(ui.get('routing-cap').value, '8');
+  assert.equal(mutations(ui).length, 1);
+});
+
+test('scheduling rejects a write from a previous backend instance even when revisions match', async () => {
+  let instance = 'a', holdRead = false, release;
+  const config = schedulingFixture();
+  const ui = schedulingPanel((url, request) => {
+    if (url.endsWith('/overview')) return [200, {...overview(), instance_id: instance}];
+    if (url.endsWith('/scheduling') && !request.method) {
+      const response = [200, {instance_id: instance, revision: 0, config}];
+      return holdRead ? new Promise(resolve => { release = () => resolve(response); }) : response;
+    }
+  });
+  await openScheduling(ui); editScheduling(ui, 'routing-cap', '7');
+  instance = 'b'; holdRead = true; const refresh = ui.get('refresh').onclick(); await flush();
+  await submitScheduling(ui); assert.equal(mutations(ui).length, 0);
+  release(); await refresh; await flush(); assert.equal(ui.get('scheduling-save').disabled, true);
+  assert.equal(ui.get('routing-cap').value, '7');
+});
+
+test('reset records paginate, search, translate results and retain open details across changed observations', async () => {
+  const data = {instance_id: 'a', accounts: Array.from({length: 12}, (_, index) => ({account_id: 'reset-account-' + index,
+    credits: {availableCount: 1, credits: [{id: 'credit-' + index, status: 'available', expiresAt: 1900000000}]},
+    summary_observed_at: '2026-10-29T01:00:00Z', details_observed_at: '2026-10-28T01:00:00Z', error_code: ''})),
+    attempts: [{id: 'attempt-one', account_id: 'reset-account-0', credit_id: 'credit-0', updated_at: '2026-10-29T02:00:00Z', phase: 'skipped', outcome: 'nothingToReset', error_code: ''},
+      {id: 'attempt-two', account_id: 'reset-account-1', credit_id: '<img src=x onerror=alert(1)>', phase: 'unknown', outcome: '', error_code: 'reset_timeout'}]};
+  const ui = schedulingPanel(url => url.endsWith('/reset-cards') ? [200, structuredClone(data)] : null);
+  await openScheduling(ui);
+  assert.equal(ui.get('reset-cards-list').children.length, 10); assert.match(ui.get('reset-page-summary').textContent, /12 个账号.*1 \/ 2/);
+  const detail = descendants(ui.get('reset-cards-list')).find(node => node.className === 'reset-credit-details');
+  detail.open = true; detail.children[0].focus(); const focus = ui.document.activeElement;
+  data.accounts[0].summary_observed_at = '2026-10-29T03:00:00Z'; await ui.get('reset-refresh').onclick();
+  assert.equal(descendants(ui.get('reset-cards-list')).includes(detail), true); assert.equal(detail.open, true); assert.equal(ui.document.activeElement, focus);
+  assert.match(ui.get('reset-cards-list').textContent, /数量观测.*2026.*详情观测.*2026/);
+  ui.get('reset-next').onclick(); assert.equal(ui.get('reset-cards-list').children.length, 2);
+  ui.get('reset-search').value = 'credit-11'; ui.get('reset-search').oninput();
+  assert.equal(ui.get('reset-cards-list').children.length, 1); assert.match(ui.get('reset-cards-list').textContent, /reset-account-11/);
+  ui.get('reset-search').value = ''; ui.get('reset-search').oninput(); ui.get('reset-tab-attempts').onclick();
+  assert.equal(ui.get('reset-cards-list').hidden, true); assert.match(ui.get('reset-attempts-list').textContent, /没有可重置的额度窗口/);
+  assert.doesNotMatch(ui.get('reset-attempts-list').textContent, /nothingToReset/);
+  assert.match(ui.get('reset-attempts-list').textContent, /后台保留原兑换标识及账号保护/);
+  assert.equal(descendants(ui.get('reset-attempts-list')).some(node => node.tagName === 'img'), false);
+  ui.get('reset-attention').checked = true; ui.get('reset-attention').onchange();
+  assert.equal(ui.get('reset-attempts-list').children.length, 1); assert.match(ui.get('reset-attempts-list').textContent, /attempt-two/);
+  ui.get('display-mode').value = 'masked'; ui.get('display-mode').onchange();
+  assert.doesNotMatch(ui.get('reset-attempts-list').textContent, /reset-account-1/);
+  assert.equal(mutations(ui).length, 0);
+});
+
+test('reset quantity-only observations never supply a missing detail observation time', async () => {
+  const ui = schedulingPanel(url => url.endsWith('/reset-cards') ? [200, {instance_id: 'a', accounts: [
+    {account_id: 'empty', credits: {availableCount: 0, credits: []}, observed_at: '2026-10-29T01:00:00Z', summary_observed_at: '2026-10-29T01:00:00Z', details_observed_at: ''},
+    {account_id: 'summary', credits: {availableCount: 2, credits: null}, observed_at: '2026-10-29T01:00:00Z', summary_observed_at: '2026-10-29T01:00:00Z', details_observed_at: ''}
+  ], attempts: []}] : null);
+  await openScheduling(ui);
+  assert.equal(ui.get('reset-cards-list').children.length, 2);
+  for (const row of ui.get('reset-cards-list').children) assert.match(row.textContent, /数量观测.*2026.*详情观测—/);
+  ui.get('reset-attention').checked = true; ui.get('reset-attention').onchange();
+  assert.equal(ui.get('reset-cards-list').children.length, 1); assert.match(ui.get('reset-cards-list').textContent, /summary/);
+  assert.equal(mutations(ui).length, 0);
+});
