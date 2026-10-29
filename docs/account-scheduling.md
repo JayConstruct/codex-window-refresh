@@ -42,11 +42,13 @@ python3 scripts/cwr-codex.py --provider cpa --project project-a --directory /wor
 
 ## 官方赠送重置卡
 
-后台需要可执行的 Codex CLI，且必须支持官方文档中的 `account/rateLimits/read`、`rateLimitResetCredit/consume` 和外部 ChatGPT token 登录。可通过后台参数 `--codex-binary /absolute/path/to/codex` 指定。旧版、不支持该协议或未安装时展示诊断，不调用网页内部端点。
+rc.22 起，正常账号额度查询会保留上游 `/wham/usage` 中可选的 `rate_limit_reset_credits.available_count`，页面可直接显示卡片数量，不增加请求，也不要求安装 Codex CLI。缺失字段表示未知，不能推断为零。数量摘要不含卡片 ID 和到期时间；它们由独立详情查询补充。新数量与旧详情数量不一致时，不展示旧卡片列表；摘要更新不会刷新详情的观测时间。
+
+卡片详情查询和兑换需要可执行的 Codex CLI，且必须支持官方文档中的 `account/rateLimits/read`、`rateLimitResetCredit/consume` 和外部 ChatGPT token 登录。可通过后台参数 `--codex-binary /absolute/path/to/codex` 指定。旧版、不支持该协议或未安装时展示诊断，不调用网页内部端点。
 
 每次账号操作使用独立临时 CODEX_HOME、内存凭据存储和 stdio RPC，凭据仅在内存及匿名管道传输，不作为命令参数、日志或数据库内容。适配器不开模型会话。账号显式代理/direct 设置会被继承；账号没有代理覆盖时，重置卡适配器使用 `--reset-proxy`，未指定则继承后台进程代理环境。它使用 Codex 进程网络栈，**不会自动读取 CPA 全局代理**；需要代理的部署应为该后台单独配置。既有额度查询仍通过原有 CPA HTTP 桥继承宿主全局代理。
 
-面板分别开启“后台查询重置卡”和“到期前自动使用”。默认每账号十五分钟查询一次，接近已知到期时间时提前补读；所有卡片请求串行执行，大账号池实际轮询周期还受账号数和响应耗时影响。服务缺少到期时间或仅返回卡片数量时，保留未知状态，不猜测日期、不自动兑换。
+面板分别开启“后台查询重置卡详情”和“到期前自动使用”。默认每账号十五分钟查询一次，接近已知到期时间时提前补读；所有卡片请求串行执行，大账号池实际轮询周期还受账号数和响应耗时影响。服务缺少到期时间或仅返回卡片数量时，保留未知状态，不猜测日期、不自动兑换。
 
 默认关注一天内到期的卡，优先最早到期的一张；五小时或周窗口已用达到 80% 时可以兑换，最后三十分钟内则只要存在有用的已使用窗口就尝试。自然重置距离不足五分钟的窗口不作为兑换理由。执行前先查询额度、核实账号绑定、检查配置和其他后台发送占用。不能重置的窗口由官方返回 `nothingToReset`，不会创建模型请求来人为消耗额度。
 
@@ -55,3 +57,5 @@ python3 scripts/cwr-codex.py --provider cpa --project project-a --directory /wor
 管理 API：`GET/POST /v0/management/codex-window-refresh/v2/scheduling` 使用 revision 比较保存；`GET .../reset-cards` 读取卡片与最近兑换记录。它们通过 CPA 管理认证，读取设置和打开页面不会查询上游或兑换。
 
 接口依据：[CPA Scheduler](https://github.com/router-for-me/CLIProxyAPI/blob/90c447d3a8727d115aa7552ec93ce023736ed492/sdk/pluginapi/types.go#L520)、[Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)、[官方 App Server 账号协议](https://learn.chatgpt.com/docs/app-server#8-earned-rate-limit-resets-chatgpt)。本地验证使用模拟宿主和模拟协议进程，未操作真实重置卡。
+
+数量与详情接口核对：[官方客户端实现](https://github.com/openai/codex/blob/23934d31b15b1127c83535f84854e5009f7cd51d/codex-rs/backend-client/src/client/rate_limit_resets.rs)、[上游字段定义](https://github.com/openai/codex/blob/23934d31b15b1127c83535f84854e5009f7cd51d/codex-rs/backend-client/src/types.rs)。

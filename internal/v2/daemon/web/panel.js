@@ -2197,6 +2197,7 @@
       await accounts(true);
       if (current !== generation) return;
       if (wakeSettingsSupported()) await reloadWakeSettings();
+      if (activePage === 'scheduling') await Promise.all([loadScheduling(), loadResetCards()]);
       if (activePage === 'wake') await loadWakeJobs();
       if (activePage === 'history') await loadHistory();
       if (activePage === 'query' && settingsSupported() && !savedSettings) await reloadSettings();
@@ -2311,11 +2312,13 @@
     const cardRows = cards.map(a => {
       const deadlines = (a.credits?.credits || []).filter(c => c.status === 'available' && Number.isSafeInteger(c.expiresAt)).map(c => c.expiresAt);
       const expiry = deadlines.length ? new Date(Math.min(...deadlines) * 1000).toLocaleString() : '到期时间未知';
-      return element('p', 'field-help', a.account_id + '：' + (a.credits ? a.credits.availableCount + ' 张，最近到期 ' + expiry : '卡片信息未知') + (a.error_code ? ' · ' + message(a.error_code) : ''));
+      const count = a.credits?.availableCount;
+      const details = count === 0 ? '' : a.credits?.credits == null ? '，详情尚未读取' : '，最近到期 ' + expiry;
+      return element('p', 'field-help', a.account_id + '：' + (a.credits ? count + ' 张' + details : '卡片信息未知') + (a.error_code ? ' · ' + message(a.error_code) : ''));
     });
     const labels = {sending: '正在兑换', unknown: '结果未知，保留原兑换标识', verifying: '正在核实额度', completed: '已兑换并查询额度', skipped: '本次未兑换'};
     const attemptRows = attempts.map(a => element('p', 'field-help', a.account_id + ' · ' + (labels[a.phase] || a.phase) + (a.outcome ? ' · ' + a.outcome : '') + (a.error_code ? ' · ' + message(a.error_code) : '')));
-    $('reset-cards-list').replaceChildren(...(cardRows.length ? cardRows : [element('p', 'field-help', '尚无重置卡观测。开启查询后由后台读取。')]));
+    $('reset-cards-list').replaceChildren(...(cardRows.length ? cardRows : [element('p', 'field-help', '尚无重置卡观测。查询账号额度可同步卡片数量；开启重置卡查询后补充到期详情。')]));
     $('reset-attempts-list').replaceChildren(...(attemptRows.length ? attemptRows : [element('p', 'field-help', '尚无兑换记录。')]));
     applyDisplayPrivacy($('reset-cards-list')); applyDisplayPrivacy($('reset-attempts-list'));
   }

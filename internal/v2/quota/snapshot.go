@@ -9,6 +9,7 @@ import (
 
 	"codex-window-refresh/internal/core"
 	"codex-window-refresh/internal/cpa"
+	"codex-window-refresh/internal/v2/policy"
 )
 
 type Stamp struct {
@@ -24,6 +25,7 @@ type Snapshot struct {
 	Permission    *core.Permission     `json:"permission,omitempty"`
 	FiveHour      *core.WindowEvidence `json:"five_hour,omitempty"`
 	Weekly        *core.WindowEvidence `json:"weekly,omitempty"`
+	ResetCredits  *policy.ResetCredits `json:"reset_credits,omitempty"`
 	Fields        map[string]Stamp     `json:"fields,omitempty"`
 }
 
@@ -40,6 +42,18 @@ func Normalize(raw []byte, headers http.Header, binding, source string, at, star
 		return Snapshot{}, err
 	}
 	s := Snapshot{Source: source, Binding: binding, ObservedAt: at, ReadStartedAt: started, Permission: o.Permission, FiveHour: o.FiveHour, Weekly: o.Weekly}
+	// The official usage payload includes only an optional count. Detail IDs
+	// and expiration dates must still come from the dedicated account reader.
+	if source == "cpa_wham_usage" && headers == nil {
+		var usage struct {
+			Credits *struct {
+				Count *int `json:"available_count"`
+			} `json:"rate_limit_reset_credits"`
+		}
+		if json.Unmarshal(raw, &usage) == nil && usage.Credits != nil && usage.Credits.Count != nil && *usage.Credits.Count >= 0 && *usage.Credits.Count <= 100000 {
+			s.ResetCredits = &policy.ResetCredits{AvailableCount: *usage.Credits.Count}
+		}
+	}
 	for _, w := range []*core.WindowEvidence{s.FiveHour, s.Weekly} {
 		if w != nil {
 			w.Source = source
@@ -64,7 +78,7 @@ func Merge(oldRaw, newRaw []byte) ([]byte, bool, error) {
 	if current.Fields == nil {
 		current.Fields = map[string]Stamp{}
 	}
-	for name, present := range map[string]bool{"permission": current.Permission != nil, "five_hour": current.FiveHour != nil, "weekly": current.Weekly != nil} {
+	for name, present := range map[string]bool{"permission": current.Permission != nil, "five_hour": current.FiveHour != nil, "weekly": current.Weekly != nil, "reset_credits": current.ResetCredits != nil} {
 		if _, exists := current.Fields[name]; present && !exists && !current.ObservedAt.IsZero() {
 			stamp := Stamp{current.Source, current.ObservedAt, current.ReadStartedAt}
 			if stamp.ReadStartedAt.IsZero() {
@@ -95,6 +109,9 @@ func Merge(oldRaw, newRaw []byte) ([]byte, bool, error) {
 	}
 	if accept("weekly", incoming.Weekly != nil) {
 		current.Weekly = incoming.Weekly
+	}
+	if accept("reset_credits", incoming.ResetCredits != nil) {
+		current.ResetCredits = incoming.ResetCredits
 	}
 	if !changed {
 		return oldRaw, false, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -144,5 +145,56 @@ func TestResetDoesNotSpendCardsOnUnknownStaleOrSoonNaturallyResettingWindows(t *
 	q.FiveHour.Remaining.Value = 100
 	if resetWorthwhile(q, c, p, at) {
 		t.Fatal("spent card on unused window")
+	}
+}
+
+func TestResetViewsUseQuotaSummaryWithoutRefreshingDetailFreshness(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	at := time.Now().UTC()
+	a := schedulingFixture(t, s, at)
+	update := func(count int, stamp time.Time) {
+		t.Helper()
+		raw, err := quota.Normalize([]byte(fmt.Sprintf(`{"rate_limit":{"allowed":true},"rate_limit_reset_credits":{"available_count":%d}}`, count)), nil, a.Binding, "cpa_wham_usage", stamp, stamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := json.Marshal(raw)
+		if err = s.SaveResetQuota(ctx, a, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	update(2, at.Add(time.Second))
+	views, _, err := s.ResetViews(ctx)
+	if err != nil || len(views) != 1 || views[0].Credits.AvailableCount != 2 || views[0].Credits.Credits != nil {
+		t.Fatal(views, err)
+	}
+	expires := at.Add(time.Hour).Unix()
+	cards := &policy.ResetCredits{AvailableCount: 2, Credits: []policy.ResetCredit{{ID: "known-card", Status: "available", ResetType: "codexRateLimits", ExpiresAt: &expires}}}
+	if err = s.RecordResetCredits(ctx, a, cards, "", at.Add(2*time.Second), 900); err != nil {
+		t.Fatal(err)
+	}
+	update(2, at.Add(3*time.Second))
+	views, _, err = s.ResetViews(ctx)
+	if err != nil || len(views[0].Credits.Credits) != 1 || views[0].DetailsObservedAt != queryStamp(at.Add(2*time.Second)) {
+		t.Fatal("summary refreshed detail age", views, err)
+	}
+	update(1, at.Add(4*time.Second))
+	views, _, err = s.ResetViews(ctx)
+	if err != nil || views[0].Credits.AvailableCount != 1 || views[0].Credits.Credits != nil {
+		t.Fatal("count change kept stale detail", views, err)
+	}
+	update(0, at.Add(5*time.Second))
+	views, _, err = s.ResetViews(ctx)
+	if err != nil || views[0].Credits.AvailableCount != 0 || len(views[0].Credits.Credits) != 0 {
+		t.Fatal(views, err)
+	}
+	a.Binding = "replacement"
+	if err = s.SyncInventory(ctx, []Account{a}); err != nil {
+		t.Fatal(err)
+	}
+	views, _, err = s.ResetViews(ctx)
+	if err != nil || len(views) != 0 {
+		t.Fatal("replacement inherited count", views, err)
 	}
 }

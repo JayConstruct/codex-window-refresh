@@ -75,6 +75,7 @@ class NativeBridge(unittest.TestCase):
         self.quota_operations = {}
         self.quota_opened = 0
         self.quota_requests = []
+        self.quota_body = b'{"rate_limit":{"allowed":true}}'
         self.block_quota_http = False
         self.quota_lock = threading.Lock()
         self.quota_cancel_failures = 0
@@ -146,6 +147,46 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(self.call('scheduler.pick', request)['result'], {})
         snapshot['accounts'].reverse()
         self.assertFalse(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+
+    def test_scheduling_and_reset_routes_proxy_to_real_backend(self):
+        self.start_daemon()
+        status, settings = self.management('scheduling')
+        self.assertEqual(status, 200, settings)
+        self.assertFalse(settings['config']['enabled'])
+        self.assertEqual(self.management('reset-cards')[0], 200)
+        settings['config']['max_inflight'] = 3
+        status, saved = self.management('scheduling', 'POST', {'revision': settings['revision'], 'config': settings['config']})
+        self.assertEqual(status, 200, saved)
+        self.assertEqual(self.management('scheduling')[1]['config']['max_inflight'], 3)
+        self.assertEqual(self.management('scheduling', 'POST', {'revision': settings['revision'], 'config': settings['config']})[0], 409)
+        self.assertEqual(self.management('reset-cards', 'POST', {})[0], 404)
+        self.assertEqual(self.quota_requests, [])
+        self.assertEqual(self.models, 0)
+        self.stop_daemon()
+        self.start_daemon()
+        self.assertEqual(self.management('scheduling')[1]['config']['max_inflight'], 3)
+
+    def test_quota_query_exposes_reset_count_without_extra_calls(self):
+        self.allow_quota_http = True
+        self.quota_body = b'{"rate_limit":{"allowed":true},"rate_limit_reset_credits":{"available_count":2,"credits":[{"access_token":"not-for-storage"}]}}'
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        status, accepted = self.management('jobs', 'POST', {'kind': 'quota_query', 'account_id': 'a'}, 'usage-reset-count')
+        self.assertEqual(status, 202, accepted)
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, job = self.management('jobs', query={'job_id': [accepted['job_id']]})
+            if job['phase'] in ('completed', 'failed'): break
+            time.sleep(.02)
+        self.assertEqual(job['phase'], 'completed', job)
+        status, cards = self.management('reset-cards')
+        self.assertEqual(status, 200, cards)
+        account = next(a for a in cards['accounts'] if a['account_id']=='a')
+        self.assertEqual(account['credits'], {'availableCount': 2, 'credits': None})
+        self.assertEqual(account.get('details_observed_at', ''), '')
+        self.assertNotIn('not-for-storage', json.dumps(cards))
+        self.assertEqual(len(self.quota_requests), 1)
+        self.assertEqual(self.models, 0)
 
     def test_schema7_omits_unused_interceptor_request_bodies(self):
         registration = self.call('plugin.reconfigure', {'schema_version': 7})
@@ -529,7 +570,7 @@ class NativeBridge(unittest.TestCase):
                 if self.block_quota_http:
                     self.entered.set()
                     event.wait(10)
-                value = {'StatusCode': 200, 'Body': base64.b64encode(b'{"rate_limit":{"allowed":true}}').decode()}
+                value = {'StatusCode': 200, 'Body': base64.b64encode(self.quota_body).decode()}
             elif method == 'host.http.cancel':
                 with self.quota_lock:
                     self.quota_cancel_attempts += 1

@@ -3304,12 +3304,13 @@ test('scheduling settings preserve drafts on polls, detect conflicts and save on
       if (options.method === 'POST') { const request = JSON.parse(options.body); assert.equal(request.revision, revision); config = request.config; revision++; }
       return [200, {instance_id: 'a', revision, config}];
     }
-    if (url.endsWith('/reset-cards')) return [200, {instance_id: 'a', accounts: [], attempts: []}];
+    if (url.endsWith('/reset-cards')) return [200, {instance_id: 'a', accounts: [{account_id:'account-a',credits:{availableCount:2,credits:null},summary_observed_at:new Date().toISOString(),error_code:''}], attempts: []}];
     return basic(url);
   });
   await ui.get('connect').onclick();
   ui.nav.find(node => node.dataset.page === 'scheduling').listeners.get('click')(); await flush();
   assert.equal(ui.get('routing-cap').value, '2'); assert.equal(mutations(ui).length, 0);
+  assert.match(ui.get('reset-cards-list').textContent,/2 张，详情尚未读取/);
   ui.get('routing-cap').value = '7'; ui.get('scheduling-form').listeners.get('input')();
   revision++; config = {...config, max_inflight: 3};
   await ui.get('refresh').onclick(); await flush();

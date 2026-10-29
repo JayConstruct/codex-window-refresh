@@ -138,7 +138,7 @@ func (s *Store) RoutingSnapshot(ctx context.Context, at time.Time) (RoutingSnaps
 		}
 		var credits policy.ResetCredits
 		stamp, _ := time.Parse(time.RFC3339Nano, observed)
-		if settings.Config.Cards.Enabled && stamp.Add(time.Duration(settings.Config.Cards.PollSeconds)*time.Second).After(at) && json.Unmarshal([]byte(cards), &credits) == nil {
+		if settings.Config.Cards.Enabled && stamp.Add(time.Duration(settings.Config.Cards.PollSeconds)*time.Second).After(at) && json.Unmarshal([]byte(cards), &credits) == nil && (q.ResetCredits == nil || q.Fields["reset_credits"].ObservedAt.Before(stamp) || q.ResetCredits.AvailableCount > 0 && q.ResetCredits.AvailableCount == credits.AvailableCount) {
 			for _, c := range credits.Credits {
 				if c.Status == "available" && c.ResetType == "codexRateLimits" && c.ExpiresAt != nil && *c.ExpiresAt > at.Unix() && *c.ExpiresAt <= at.Unix()+int64(settings.Config.Cards.ExpirySeconds) && (a.CardExpiry == 0 || *c.ExpiresAt < a.CardExpiry) {
 					a.CardExpiry = *c.ExpiresAt
@@ -196,10 +196,12 @@ func routingEvidence(q quota.Snapshot, maxAge int, at time.Time) (time.Time, tim
 }
 
 type ResetView struct {
-	AccountID  string               `json:"account_id"`
-	Credits    *policy.ResetCredits `json:"credits"`
-	ObservedAt string               `json:"observed_at"`
-	ErrorCode  string               `json:"error_code"`
+	AccountID         string               `json:"account_id"`
+	Credits           *policy.ResetCredits `json:"credits"`
+	ObservedAt        string               `json:"observed_at"`
+	ErrorCode         string               `json:"error_code"`
+	SummaryObservedAt string               `json:"summary_observed_at,omitempty"`
+	DetailsObservedAt string               `json:"details_observed_at,omitempty"`
 }
 type ResetAttempt struct {
 	ID        string  `json:"id"`
@@ -215,20 +217,49 @@ type ResetAttempt struct {
 func (s *Store) ResetViews(ctx context.Context) ([]ResetView, []ResetAttempt, error) {
 	views := []ResetView{}
 	attempts := []ResetAttempt{}
-	rows, err := s.db.QueryContext(ctx, "SELECT c.account_id,c.credits,c.observed_at,c.error_code FROM reset_cards c JOIN account_bindings b ON b.account_id=c.account_id AND b.binding=c.binding ORDER BY c.account_id LIMIT 10000")
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,c.credits,COALESCE(c.observed_at,''),COALESCE(c.error_code,''),COALESCE(a.quota,''),b.binding FROM accounts a JOIN account_bindings b ON b.account_id=a.id LEFT JOIN reset_cards c ON c.account_id=a.id AND c.binding=b.binding WHERE a.status!='removed' ORDER BY a.id LIMIT 10000`)
 	if err != nil {
 		return nil, nil, err
 	}
 	for rows.Next() {
 		var v ResetView
 		var raw sql.NullString
-		if err = rows.Scan(&v.AccountID, &raw, &v.ObservedAt, &v.ErrorCode); err != nil {
+		var quotaRaw, binding string
+		if err = rows.Scan(&v.AccountID, &raw, &v.ObservedAt, &v.ErrorCode, &quotaRaw, &binding); err != nil {
 			break
 		}
 		if raw.Valid {
 			_ = json.Unmarshal([]byte(raw.String), &v.Credits)
 		}
-		views = append(views, v)
+		if v.Credits != nil && v.Credits.Credits != nil {
+			v.DetailsObservedAt = v.ObservedAt
+		}
+		var snapshot quota.Snapshot
+		if json.Unmarshal([]byte(quotaRaw), &snapshot) == nil && snapshot.Binding == binding && snapshot.ResetCredits != nil {
+			summaryAt := snapshot.Fields["reset_credits"].ObservedAt
+			if summaryAt.IsZero() {
+				summaryAt = snapshot.ObservedAt
+			}
+			if !summaryAt.IsZero() {
+				v.SummaryObservedAt = queryStamp(summaryAt)
+				detailAt, _ := time.Parse(time.RFC3339Nano, v.ObservedAt)
+				if v.Credits == nil || !summaryAt.Before(detailAt) {
+					count := snapshot.ResetCredits.AvailableCount
+					if v.Credits == nil || v.Credits.AvailableCount != count {
+						v.Credits = &policy.ResetCredits{AvailableCount: count}
+						v.DetailsObservedAt = ""
+					}
+					if count == 0 {
+						v.Credits.Credits = []policy.ResetCredit{}
+						v.DetailsObservedAt = ""
+					}
+					v.ObservedAt = queryStamp(summaryAt)
+				}
+			}
+		}
+		if v.Credits != nil || raw.Valid || v.ErrorCode != "" {
+			views = append(views, v)
+		}
 	}
 	if err == nil {
 		err = rows.Err()

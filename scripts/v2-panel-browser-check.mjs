@@ -21,6 +21,7 @@ let historyUnavailable = false;
 let authReadGate, authPatchGate, authFilesOverride;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
+const schedulingConfig = {enabled:false,prefer_reset:true,quota_max_age_seconds:300,session_ttl_seconds:1800,max_inflight:2,projects:[],cards:{enabled:false,auto_consume:false,poll_seconds:900,expiry_seconds:86400,force_before_seconds:1800,min_used_percent:80}};
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
 const generations = new Map();
 let wakeCapable = false, wakeRevision = 0, wakeConflictOnce = false;
@@ -277,6 +278,8 @@ try {
         if (job.reason === 'manual' && job.key) { job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++; job.response = responseRecord; }
         json(response, 200, {...identity(), ...job}); return;
       }
+      if (resource === 'scheduling') { json(response,200,{instance_id:identity().instance_id,revision:0,config:schedulingConfig}); return; }
+      if (resource === 'reset-cards') { json(response,200,{instance_id:identity().instance_id,accounts:[{account_id:'codex-01',credits:{availableCount:2,credits:null},observed_at:observed(),summary_observed_at:observed(),error_code:''}],attempts:[]}); return; }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
       if (resource === 'model-settings') {
         if (modelReadGate) { modelReadGate.started = true; await modelReadGate.promise; }
@@ -693,7 +696,7 @@ try {
   await evaluate('document.getElementById("sidebar-toggle").click()');
   assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'true');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 0, 'Overview fetched the generation directory before visiting models');
-  for (const page of ['accounts', 'query', 'wake', 'models', 'history', 'diagnostics', 'overview']) {
+  for (const page of ['accounts', 'query', 'wake', 'scheduling', 'models', 'history', 'diagnostics', 'overview']) {
     await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
     assert.equal(await evaluate(`document.querySelector('[data-view="${page}"]').hidden`), false, 'Navigation failed: ' + page);
   }
@@ -1120,6 +1123,11 @@ try {
     assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Wake editor overflow at ' + width);
     assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Wake navigation unlocked an unknown model action');
     await screenshot('wake-' + width + '.png');
+    await evaluate('document.querySelector("[data-page=scheduling]").click()');
+    await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Scheduling page did not load');
+    assert.equal(await evaluate('document.getElementById("reset-cards-list").textContent.includes("2 张，详情尚未读取")'), true, 'Quota reset summary was not shown');
+    assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'Scheduling layout overflow');
+    await screenshot('scheduling-' + width + '.png');
     if (width === 390) {
       await evaluate('document.getElementById("sidebar-toggle").click()');
       assert.equal(await evaluate('getComputedStyle(document.getElementById("primary-navigation")).display'), 'none', 'Mobile navigation did not collapse');

@@ -193,7 +193,7 @@
               <label class="field-label" for="routing-projects">项目首选账号</label><textarea id="routing-projects" rows="6" placeholder="project-a = account-1, account-2"></textarea>
               <p class="field-help">每行一个项目标识，等号后填写 CPA 完整账号 ID，多个账号用英文逗号分隔。使用配套 cwr-codex 启动器为目录设置项目标识。</p>
               <h3>官方赠送重置卡</h3>
-              <label class="switch-row"><span>后台查询重置卡</span><input id="cards-enabled" class="switch" type="checkbox"></label>
+              <label class="switch-row"><span>后台查询重置卡详情</span><input id="cards-enabled" class="switch" type="checkbox"></label>
               <label class="switch-row"><span>到期前自动使用</span><input id="cards-auto" class="switch" type="checkbox"></label>
               <p class="field-help">自动使用会兑换账号已有的赠送重置卡。优先使用最早到期的卡，兑换后查询实际额度；关闭网页后后台继续执行。</p>
               <div class="settings-grid">
@@ -207,7 +207,7 @@
             <div class="settings-actions"><button id="scheduling-save" class="button button-primary" type="submit" disabled>保存并应用</button><button id="scheduling-reload" class="button button-outline" type="button">重新读取并丢弃草稿</button></div>
           </form>
         </section>
-        <section class="card detail-card"><h2>重置卡与兑换记录</h2><p class="field-help">只展示已核实的卡片。未知到期时间的卡不自动兑换；需要后台安装支持此协议的 Codex CLI。</p><div id="reset-cards-list">尚未读取</div><h3>最近兑换</h3><div id="reset-attempts-list">尚无记录</div></section>
+        <section class="card detail-card"><h2>重置卡与兑换记录</h2><p class="field-help">账号额度查询可同步卡片数量，无需额外请求。卡片 ID 和到期时间由独立详情查询补充，需后台安装支持此协议的 Codex CLI；未知到期时间不自动兑换。</p><div id="reset-cards-list">尚未读取</div><h3>最近兑换</h3><div id="reset-attempts-list">尚无记录</div></section>
       </div>
     </section>
 

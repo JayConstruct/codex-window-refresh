@@ -3,9 +3,64 @@ package quota
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestUsageResetCountIsOptionalAllowlistedAndIndependentlyOrdered(t *testing.T) {
+	at := time.Now().UTC()
+	raw := `{"rate_limit":{"allowed":true},"rate_limit_reset_credits":{"available_count":2,"credits":[{"access_token":"private-must-not-persist"}]}}`
+	initial := normalized(t, raw, "cpa_wham_usage", at, at)
+	var q Snapshot
+	if json.Unmarshal(initial, &q) != nil || q.ResetCredits == nil || q.ResetCredits.AvailableCount != 2 || q.ResetCredits.Credits != nil || strings.Contains(string(initial), "private") {
+		t.Fatal(string(initial))
+	}
+	newer := normalized(t, `{"rate_limit":{"allowed":true},"rate_limit_reset_credits":{"available_count":0}}`, "cpa_wham_usage", at.Add(time.Second), at.Add(time.Second))
+	current, _, err := Merge(initial, newer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A query that started earlier cannot restore the older count.
+	slow := normalized(t, raw, "cpa_wham_usage", at.Add(2*time.Second), at)
+	current, _, err = Merge(current, slow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = json.Unmarshal(current, &q)
+	if q.ResetCredits.AvailableCount != 0 {
+		t.Fatal("late count overwrote newer observation")
+	}
+	for _, field := range []string{``, `,"rate_limit_reset_credits":null`, `,"rate_limit_reset_credits":{}`, `,"rate_limit_reset_credits":{"available_count":-1}`, `,"rate_limit_reset_credits":{"available_count":"2"}`} {
+		partial := normalized(t, `{"rate_limit":{"allowed":true}`+field+`}`, "cpa_wham_usage", at.Add(3*time.Second), at.Add(3*time.Second))
+		var p Snapshot
+		_ = json.Unmarshal(partial, &p)
+		if p.ResetCredits != nil {
+			t.Fatal("missing or invalid count guessed", string(partial))
+		}
+		current, _, err = Merge(current, partial)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = json.Unmarshal(current, &q)
+		if q.ResetCredits == nil || q.ResetCredits.AvailableCount != 0 {
+			t.Fatal("partial observation erased count")
+		}
+	}
+	q.Binding = "replacement"
+	q.ResetCredits = nil
+	q.Fields = nil
+	replacement, _ := json.Marshal(q)
+	result, _, err := Merge(current, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var changed Snapshot
+	_ = json.Unmarshal(result, &changed)
+	if changed.ResetCredits != nil {
+		t.Fatal("replacement inherited reset credits")
+	}
+}
 
 func normalized(t *testing.T, raw, source string, at, start time.Time) []byte {
 	t.Helper()
