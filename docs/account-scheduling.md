@@ -33,18 +33,11 @@ project-b = account-3
 python3 scripts/cwr-codex.py --provider cpa --project project-a --directory /work/project-a
 ```
 
-`--provider` 是用户填写的“允许启用项目调度的提供商 ID”，默认 `cpa`，它不选择或切换 Codex 的提供商。客户端需要 Python 3.11+；Python 3.10 可安装 `tomli` 以读取 TOML。启动器在每次启动时读取 `$CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`），只有配置中的 `model_provider` 与这个 ID 完全一致时，才读取项目目录映射并为该提供商添加 `X-CWR-Project` 请求头。例如：
+通过脚本启动时，启动器始终为本次 Codex 进程传入 `X-CWR-Project` 请求头设置；直接运行 `codex` 时，启动器不参与，也就不会额外添加项目头。启动器不读取或检测 Codex 配置及 profile，客户端使用 Python 3.10+ 即可，无需安装 `tomli`。
 
-```toml
-# ~/.codex/config.toml：放在文件顶层，保持原有 CPA 提供商定义和认证配置。
-model_provider = "cpa"
-```
+`--provider` 指定写入请求头的提供商 ID，默认 `cpa`，应填写 Codex 本次实际使用的提供商 ID；例如使用 `my_proxy` 时传入 `--provider my_proxy`。启动器将头部设置写入 `model_providers.<ID>.http_headers.X-CWR-Project` 启动参数，不替换 `model_provider`，不修改配置文件或服务器调度总开关。提供商 ID 及其 CPA 地址由用户配置，启动器不自动判断或切换。Codex 的 profile 和其他命令行参数照常透传。
 
-将 `model_provider` 改成其他提供商并重新启动后，同一条启动器命令会直接运行 Codex，不读取目录映射、不新增项目头，不会把提供商强制改回 CPA。该判断只影响本次客户端启动，不修改配置、目录映射或服务器调度总开关。提供商 ID 由用户保证指向 CPA，启动器不根据名称猜测或验证服务地址。
-
-通过 Codex 参数 `--profile`/`-p` 选择 profile 时，启动器按当前官方配置约定读取 `$CODEX_HOME/<profile>.config.toml` 中的提供商覆盖；通过 `-c`/`--config` 明确切到其他提供商、使用 `--oss` 或连接远程 app-server 时，本次跳过项目标识注入。命令行覆盖不能把配置文件中的其他提供商强行纳入项目调度。配置损坏、无法读取、缺少 TOML 解析器或旧版隐式 profile 无法确认时，同样不注入项目头，将原参数交给 Codex 处理；诊断不回显配置内容。
-
-启动器不保存密钥、不改写请求正文，也不向命令行添加 `model_provider` 覆盖。项目目录中的 `.codex/config.toml` 不用于提供商选择。配置优先级及独立 profile 文件依据：[OpenAI 官方配置说明](https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence)、[profile 与命令行覆盖](https://learn.chatgpt.com/docs/config-file/config-advanced)。
+这些是当前源码启动器的用法。已发布的 rc.25 安装包仍包含提供商检测逻辑，使用上述方式需替换为[当前源码中的启动器](../scripts/cwr-codex.py)，可与 rc.25 后台配合使用。启动器不保存密钥、不改写请求正文，请求头仅通过本次启动参数传入。
 
 自动按目录选择时，创建 `~/.config/cwr/projects.json`：
 
@@ -55,7 +48,7 @@ model_provider = "cpa"
 ]}
 ```
 
-然后在对应目录执行 `python3 /path/to/cwr-codex.py --provider cpa`。映射包含子目录，使用解析符号链接后的最长目录匹配；可以用 `--map` 指定另一份映射。Codex 参数放在 `--` 后，例如 `-- exec "检查测试结果"`。目录统一由启动器的 `--directory` 指定。
+然后在对应目录执行 `python3 /path/to/cwr-codex.py`，默认使用 `cpa` 提供商 ID。映射包含子目录，使用解析符号链接后的最长目录匹配；可以用 `--map` 指定另一份映射。没有匹配项目时会报错，可通过 `--project` 明确指定。Codex 参数放在 `--` 后，例如 `-- exec "检查测试结果"`。目录统一由启动器的 `--directory` 指定。需要普通启动时直接执行 `codex`。
 
 ## 额度分配
 

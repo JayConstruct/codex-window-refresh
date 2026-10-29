@@ -2,7 +2,9 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查询、可选自动查询和按需模型唤醒。插件 ID 为 `codex-window-refresh`。
 
-**v0.2.0-rc.25** 增加可视化项目目录与账号匹配：导入客户端目录清单，从 CPA 账号列表点选首选账号，保存后下载启动器使用的目录映射。启动器只在配置中的当前提供商与用户填写的 ID 匹配时添加项目标识，切换提供商后自动跳过，不强制切换配置。后台和接入层均为 rc.25，数据库保持 schema 10；升级须 `--restart`，客户端也需更新配套启动器。详见 [rc.25 发布说明](docs/releases/v0.2.0-rc.25.md)和[使用说明](docs/account-scheduling.md#项目与账号)。
+**v0.2.0-rc.25** 增加可视化项目目录与账号匹配：导入客户端目录清单，从 CPA 账号列表点选首选账号，保存后下载启动器使用的目录映射。后台和接入层均为 rc.25，数据库保持 schema 10；升级须 `--restart`，客户端也需更新配套启动器。详见 [rc.25 发布说明](docs/releases/v0.2.0-rc.25.md)和[使用说明](docs/account-scheduling.md#项目与账号)。
+
+当前源码的[客户端启动器](scripts/cwr-codex.py)已简化为通过脚本启动就传入项目请求头设置，直接运行 `codex` 则不额外添加。启动器不检测配置或 profile，使用 Python 3.10+，无需 TOML 依赖；`--provider` 填写本次使用的提供商 ID，默认 `cpa`。已发布的 rc.25 包仍使用旧检测逻辑，可单独替换脚本使用新方式。
 
 服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
 
@@ -22,7 +24,7 @@ v2 提供额度查询、活动观测、模型配置、显式手动短句候选�
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-可用 `--version v0.2.0-rc.25` 固定本次版本。**本次后台和接入层均为 rc.25，升级须显式 `--restart`**，以支持最多 256 KB 的项目目录调度设置。数据库为 schema 10，从 rc.21–rc.24 升级无需迁移，保留已有规则、额度和发送防重记录；读取页面不会改变已有开关。运行 Codex 的电脑还需更新包内 `cwr-codex.py`；客户端使用 Python 3.11+，旧版可安装 `tomli`。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
+可用 `--version v0.2.0-rc.25` 固定本次版本。**本次后台和接入层均为 rc.25，升级须显式 `--restart`**，以支持最多 256 KB 的项目目录调度设置。数据库为 schema 10，从 rc.21–rc.24 升级无需迁移，保留已有规则、额度和发送防重记录；读取页面不会改变已有开关。运行 Codex 的电脑还需更新 `cwr-codex.py`，当前源码启动器的用法与 rc.25 包的区别见上文。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
 
 rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总览与侧栏布局，默认自动更新。已接入持久化批量随机延迟、定期及五小时/周到期额度查询、网页设置与差异预览；手动单账号立即查询，查询均不发送模型请求。自动查询默认关闭，模型唤醒仍明确禁用。升级 rc.5 须添加 `--restart` 更新接入层；数据库迁移与降级限制见[发布说明](docs/releases/v0.2.0-rc.5.md)。
 

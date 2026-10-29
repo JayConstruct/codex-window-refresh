@@ -2,7 +2,7 @@
 
 适用于 Debian 12/13、amd64/arm64、CPA 原生 ABI 1，插件协商 RPC schema 6 或 7；支持 schema 8 的 CPA 仍可协商为 7。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。当前 **v0.2.0-rc.25 后台和接入层**提供网页、额度查询、持久任务、活动及正常业务额度观测、模型配置、短句候选生成、Codex 模型唤醒、项目账号调度、插件会话粘性和赠送重置卡管理。新安装的调度、重置卡查询及自动兑换默认关闭，已有明确保存的调度、查询和唤醒规则保留。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
 
-**本次后台和原生接入层均为 rc.25，升级须同时更新并显式 `--restart`。**项目目录与账号匹配支持客户端目录导入导出、账号点选、搜索筛选和分页；接入层将调度设置请求上限由 6 KB 提升至 256 KB。数据库保持 schema 10，从 rc.21–rc.24 升级无需迁移，原有规则及发送防重记录保留。运行 Codex 的电脑还需更新包内 `cwr-codex.py`；`--provider` 只表示启用条件，启动器跟随客户端配置，不强制选择提供商。客户端使用 Python 3.11+，Python 3.10 可安装 `tomli`。目录绑定及代理设置见[配置说明](account-scheduling.md)，完整变更见 [rc.25 发布说明](releases/v0.2.0-rc.25.md)。
+**本次后台和原生接入层均为 rc.25，升级须同时更新并显式 `--restart`。**项目目录与账号匹配支持客户端目录导入导出、账号点选、搜索筛选和分页；接入层将调度设置请求上限由 6 KB 提升至 256 KB。数据库保持 schema 10，从 rc.21–rc.24 升级无需迁移，原有规则及发送防重记录保留。运行 Codex 的电脑还需更新 `cwr-codex.py`。当前源码启动器使用 Python 3.10+，通过脚本启动就传入项目请求头设置，不检测配置文件；`--provider` 填写本次使用的提供商 ID，默认 `cpa`。已发布的 rc.25 包仍包含旧检测逻辑，需单独替换客户端脚本。目录绑定及代理设置见[配置说明](account-scheduling.md)，完整变更见 [rc.25 发布说明](releases/v0.2.0-rc.25.md)。
 
 以下为历史版本能力与迁移记录：rc.5 支持自动额度查询及随机延迟，不包含后续加入的模型唤醒、短句生成和自动模型规则；各包能力以对应发布说明为准。
 
@@ -59,7 +59,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-从 rc.24 或更早版本更新到 rc.25 必须使用 `--restart`，同时加载新版接入层。安装器在写入前检查重启要求。运行 Codex 的客户端也需替换配套启动器，以启用提供商匹配条件；更新后强制刷新网页。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.25`。
+从 rc.24 或更早版本更新到 rc.25 必须使用 `--restart`，同时加载新版接入层。安装器在写入前检查重启要求。运行 Codex 的客户端也需更新启动器；如需取消配置检测，使用当前源码脚本，单独替换脚本不要求重启后台。更新后强制刷新网页。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.25`。
 
 `latest` 会按数值比较全部已发布 V2 rc 版本，不取发布列表第一条，也不使用排除预发布的 GitHub `/releases/latest`。下载的独立入口会重新获取两份 Python 安装器，不复用下载目录中的旧副本；只有完整源码目录（含上级 `go.mod`）使用本地安装器，运行前须自行更新源码。离线安装继续使用下文的包内 Python 入口。
 
