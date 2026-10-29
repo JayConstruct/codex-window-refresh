@@ -6,9 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +24,9 @@ type Source interface {
 }
 type CPA struct {
 	Host Callback
-	// Transport and endpoint are private test seams. Production always uses the
-	// fixed quota endpoint and explicitly selected account proxy.
+	// Transport and endpoint are private test seams. Production uses a fixed
+	// quota endpoint and inherits host transport policy unless an account has
+	// explicitly selected a proxy or direct connection.
 	endpoint   string
 	transport  http.RoundTripper
 	mu         sync.Mutex
@@ -195,65 +194,6 @@ func (c *CPA) Identity(ctx context.Context, a store.Account) (store.Account, err
 	}
 	return a, nil
 }
-func (c *CPA) client(cred credential) (*http.Client, error) {
-	proxy := ""
-	for _, p := range []string{cred.Proxy, cred.ProxyCamel, cred.ProxyDash, cred.ProxyUpper} {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if strings.EqualFold(p, "none") || strings.EqualFold(p, "direct") {
-			p = "direct"
-		}
-		if proxy != "" && proxy != p {
-			return nil, errors.New("quota_proxy_invalid")
-		}
-		proxy = p
-	}
-	if proxy == "" {
-		proxy = "direct"
-	}
-	transport := c.transport
-	if transport == nil {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.transports == nil {
-			c.transports = map[string]*http.Transport{}
-		}
-		t := c.transports[proxy]
-		if t == nil {
-			t = http.DefaultTransport.(*http.Transport).Clone()
-			t.Proxy = nil
-			t.MaxIdleConns = 16
-			t.MaxIdleConnsPerHost = 4
-			t.IdleConnTimeout = 30 * time.Second
-			if proxy != "direct" {
-				u, err := url.Parse(proxy)
-				if err != nil || u.Hostname() == "" || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
-					return nil, errors.New("quota_proxy_invalid")
-				}
-				switch strings.ToLower(u.Scheme) {
-				case "http", "https", "socks5", "socks5h":
-				default:
-					return nil, errors.New("quota_proxy_invalid")
-				}
-				t.Proxy = http.ProxyURL(u)
-			}
-			// Bound transports including credential-bearing proxy keys. Active requests
-			// retain their transport; retiring only closes idle connections.
-			if len(c.transports) >= 16 {
-				for key, old := range c.transports {
-					old.CloseIdleConnections()
-					delete(c.transports, key)
-					break
-				}
-			}
-			c.transports[proxy] = t
-		}
-		transport = t
-	}
-	return &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
-}
 func (c *CPA) Query(ctx context.Context, a store.Account) (json.RawMessage, error) {
 	raw, _, err := c.QueryWithStatus(ctx, a)
 	return raw, err
@@ -285,28 +225,12 @@ func (c *CPA) query(ctx context.Context, a store.Account, observed **store.Accou
 	if !validQuotaToken(cred.Token) {
 		return nil, errors.New("quota_credential_missing")
 	}
-	endpoint := c.endpoint
-	if endpoint == "" {
-		endpoint = "https://chatgpt.com/backend-api/wham/usage"
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, errors.New("quota_request_invalid")
-	}
-	req.Header.Set("Authorization", "Bearer "+cred.Token)
-	req.Header.Set("Chatgpt-Account-Id", cred.Upstream)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex-window-refresh-v2")
-	client, err := c.client(cred)
+	started := time.Now().UTC()
+	resp, err := c.quotaHTTP(ctx, cred)
+	defer clear(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	started := time.Now().UTC()
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, errors.New("quota_transport_failed")
-	}
-	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		after, bindingErr := c.readBinding(ctx, a)
 		if bindingErr != nil || after.Upstream != cred.Upstream {
@@ -324,12 +248,7 @@ func (c *CPA) query(ctx context.Context, a store.Account, observed **store.Accou
 		}
 		return nil, errors.New("quota_upstream_http_failed")
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, (2<<20)+1))
-	defer clear(raw)
-	if err != nil {
-		return nil, errors.New("quota_body_failed")
-	}
-	if len(raw) > 2<<20 {
+	if len(resp.Body) > maxQuotaBody {
 		return nil, errors.New("quota_response_too_large")
 	}
 	// Revalidate after network work, including the actual upstream account ID.
@@ -343,7 +262,7 @@ func (c *CPA) query(ctx context.Context, a store.Account, observed **store.Accou
 	if at.Before(started) {
 		return nil, errors.New("quota_clock_changed")
 	}
-	observation, err := quota.Normalize(raw, nil, bindingID(a, cred.Upstream), "cpa_wham_usage", at, started)
+	observation, err := quota.Normalize(resp.Body, nil, bindingID(a, cred.Upstream), "cpa_wham_usage", at, started)
 	if err != nil {
 		return nil, errors.New("quota_response_unrecognized")
 	}

@@ -253,6 +253,7 @@ function panel(respond, options = {}) {
   }
   return {get, timers, calls, nav, panels, events, documentEvents, tick, storage, document: context.document, clock: context};
 }
+function isAuthFilesList(url) { return /\/auth-files(?:\?|$)/.test(url); }
 function basic(url) { return url.includes('/task-history?') ? [200, historyPage()] : url.endsWith('/overview') ? [200, overview()] : [200, accountPage()]; }
 function historyRecord(overrides = {}) {
   const record = {job_id: 'recorded-query', type: 'query', source: 'automatic', trigger: 'periodic', status: 'completed', account_id: 'recorded-account', model: '',
@@ -1679,7 +1680,7 @@ test('background model reads preserve editable drafts while a slow poll is pendi
 });
 test('CPA model catalog uses exact account identity and never saves or sends a model request', async () => {
   const account = {id: 'codex/account-01', provider: 'codex', auth_index: 'bound-index', disabled: false};
-  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [account]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: 'actual-model'}, {id: 'other-model'}, {id: 'actual-model'}]}] : modelResponse(url));
+  const ui = panel(url => isAuthFilesList(url) ? [200, {files: [account]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: 'actual-model'}, {id: 'other-model'}, {id: 'actual-model'}]}] : modelResponse(url));
   await openModels(ui);
   assert.equal(ui.calls.some(call => call.url.includes('/auth-files')), false);
   ui.get('model-catalog-account').value = account.id; ui.get('model-catalog-account').oninput();
@@ -1694,7 +1695,7 @@ test('CPA model catalog uses exact account identity and never saves or sends a m
 test('CPA model catalog rejects changed identity and malformed model names without disabling manual inputs', async () => {
   for (const malformed of [false, true]) {
     let reads = 0;
-    const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [{id: 'codex-01', provider: 'codex', auth_index: 'index-' + (malformed ? 1 : ++reads)}]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: malformed ? 'bad model' : 'valid-model'}]}] : modelResponse(url));
+    const ui = panel(url => isAuthFilesList(url) ? [200, {files: [{id: 'codex-01', provider: 'codex', auth_index: 'index-' + (malformed ? 1 : ++reads)}]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: malformed ? 'bad model' : 'valid-model'}]}] : modelResponse(url));
     await openModels(ui); ui.get('model-catalog-account').value = 'codex-01';
     await ui.get('model-catalog-refresh').onclick();
     assert.equal(ui.get('wake-model-options').children.length, 0);
@@ -1705,13 +1706,74 @@ test('CPA model catalog rejects changed identity and malformed model names witho
 });
 test('late model directory replies cannot populate a newly selected account', async () => {
   let release;
-  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [{id: 'old-account', provider: 'codex', auth_index: 'one'}]}] : url.includes('/auth-files/models?') ? new Promise(resolve => { release = () => resolve([200, {models: [{id: 'old-model'}]}]); }) : modelResponse(url));
+  const ui = panel(url => isAuthFilesList(url) ? [200, {files: [{id: 'old-account', provider: 'codex', auth_index: 'one'}]}] : url.includes('/auth-files/models?') ? new Promise(resolve => { release = () => resolve([200, {models: [{id: 'old-model'}]}]); }) : modelResponse(url));
   await openModels(ui); ui.get('model-catalog-account').value = 'old-account';
   const pending = ui.get('model-catalog-refresh').onclick(); await flush();
   ui.get('model-catalog-account').value = 'new-account'; ui.get('model-catalog-account').oninput();
   release(); await pending;
   assert.equal(ui.get('wake-model-options').children.length, 0);
   assert.equal(ui.get('model-catalog-refresh').disabled, false);
+});
+test('native account model directory uses one exact read and no management credential inventory', async () => {
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) { const data = modelOverview(); data.capabilities.account_models = true; return [200, data]; }
+    if (url.includes('/account-models?')) return [200, {instance_id: 'a', account_id: 'codex/account-01', provider: 'codex', models: ['native-model', 'native-model', 'other-model']}];
+    return modelResponse(url);
+  });
+  await openModels(ui); ui.get('model-catalog-account').value = 'codex/account-01';
+  await ui.get('model-catalog-refresh').onclick();
+  assert.deepEqual(ui.get('wake-model-options').children.map(node => node.value), ['native-model', 'other-model']);
+  assert.deepEqual(ui.calls.filter(call => call.url.includes('/account-models?')).map(call => call.url), ['/v0/management/codex-window-refresh/v2/account-models?account_id=codex%2Faccount-01']);
+  assert.equal(ui.calls.some(call => call.url.includes('/auth-files')), false);
+  assert.equal(mutations(ui).length, 0); assert.equal(ui.get('model-default').value, '');
+});
+test('native catalog falls back to the checked legacy directory only for explicit unsupported capability', async () => {
+  for (const failure of [[404, {error: 'not_found'}], [501, {error: 'model_catalog_unsupported'}]]) {
+    const ui = panel(url => {
+      if (url.endsWith('/overview')) { const data = modelOverview(); data.capabilities.account_models = true; return [200, data]; }
+      if (url.includes('/account-models?')) return failure;
+      if (isAuthFilesList(url)) return [200, {files: [{id: 'codex-01', provider: 'codex', auth_index: 'index-one'}]}];
+      if (url.includes('/auth-files/models?')) return [200, {models: [{id: 'legacy-model'}]}];
+      return modelResponse(url);
+    });
+    await openModels(ui); ui.get('model-catalog-account').value = 'codex-01';
+    await ui.get('model-catalog-refresh').onclick();
+    assert.deepEqual(ui.get('wake-model-options').children.map(node => node.value), ['legacy-model']);
+    assert.equal(ui.calls.filter(call => isAuthFilesList(call.url)).length, 2);
+    assert.equal(mutations(ui).length, 0);
+  }
+});
+test('native catalog rejects binding failures, unavailable hosts and mismatched replies without fallback', async () => {
+  for (const response of [[409, {error: 'model_catalog_changed'}], [503, {error: 'model_catalog_unavailable'}],
+    [200, {instance_id: 'stale', account_id: 'codex-01', provider: 'codex', models: ['model']}],
+    [200, {instance_id: 'a', account_id: 'other', provider: 'codex', models: ['model']}],
+    [200, {instance_id: 'a', account_id: 'codex-01', provider: 'antigravity', models: ['model']}],
+    [200, {instance_id: 'a', account_id: 'codex-01', provider: 'codex', models: ['bad model']}]]) {
+    const ui = panel(url => {
+      if (url.endsWith('/overview')) { const data = modelOverview(); data.capabilities.account_models = true; return [200, data]; }
+      if (url.includes('/account-models?')) return response;
+      return modelResponse(url);
+    });
+    await openModels(ui); ui.get('model-catalog-account').value = 'codex-01';
+    await ui.get('model-catalog-refresh').onclick();
+    assert.equal(ui.get('wake-model-options').children.length, 0);
+    assert.equal(ui.calls.some(call => call.url.includes('/auth-files')), false);
+    assert.equal(mutations(ui).length, 0);
+    assert.match(ui.get('model-catalog-status').textContent, /读取模型失败/);
+  }
+});
+test('late native model replies cannot populate a changed account', async () => {
+  let release;
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) { const data = modelOverview(); data.capabilities.account_models = true; return [200, data]; }
+    if (url.includes('/account-models?')) return new Promise(resolve => { release = () => resolve([200, {instance_id: 'a', account_id: 'old', provider: 'codex', models: ['old-model']}]); });
+    return modelResponse(url);
+  });
+  await openModels(ui); ui.get('model-catalog-account').value = 'old';
+  const reading = ui.get('model-catalog-refresh').onclick(); await flush();
+  ui.get('model-catalog-account').value = 'new'; ui.get('model-catalog-account').oninput(); release(); await reading;
+  assert.equal(ui.get('wake-model-options').children.length, 0);
+  assert.equal(mutations(ui).length, 0);
 });
 test('Codex style preset changes only prompt draft and never saves or generates automatically', async () => {
   const ui = panel(url => modelResponse(url)); await openModels(ui);
@@ -2017,7 +2079,7 @@ test('generation account directory loads only on model navigation and explicit r
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
 test('Antigravity model suggestions use its own CPA account and never populate Codex wake choices', async () => {
-  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [{id: 'antigravity-01', provider: 'antigravity', auth_index: 'antig-index'}]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: 'antigravity-only-model'}]}] : directoryResponse(url));
+  const ui = panel(url => isAuthFilesList(url) ? [200, {files: [{id: 'antigravity-01', provider: 'antigravity', auth_index: 'antig-index'}]}] : url.includes('/auth-files/models?') ? [200, {models: [{id: 'antigravity-only-model'}]}] : directoryResponse(url));
   await openModels(ui); ui.get('generation-account').value = 'antigravity-01'; ui.get('generation-account').oninput();
   await ui.get('generation-refresh-models').onclick();
   assert.deepEqual(ui.get('generation-model-options').children.map(node => node.value), ['antigravity-only-model']);
@@ -2727,7 +2789,7 @@ test('CPA status resolver permits disabled files but rejects ambiguous and non-i
 test('CPA account switches directly PATCH the unique filename/binding and confirm with GET without a dialog', async () => {
   let file = statusFile();
   const ui = panel((url, options) => {
-    if (url.endsWith('/auth-files')) return [200, {files: [file]}];
+    if (isAuthFilesList(url)) return [200, {files: [file]}];
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: JSON.parse(options.body).disabled}; return [200, {status: 'ok', disabled: file.disabled}]; }
     return basic(url);
   });
@@ -2739,7 +2801,7 @@ test('CPA account switches directly PATCH the unique filename/binding and confir
   assert.deepEqual(JSON.parse(writes[0].body), {name: file.name, auth_index: file.auth_index, disabled: true});
   assert.equal(writes[0].url, '/v0/management/auth-files/status'); assert.equal(writes[0].headers.Authorization, 'Bearer fixture-key');
   assert.equal(writes[0].credentials, 'omit'); assert.equal(writes[0].redirect, 'error');
-  assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, 3);
+  assert.equal(ui.calls.filter(call => isAuthFilesList(call.url)).length, 3);
   assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false');
   assert.equal(ui.get('accounts').children[0].children[1].textContent, '手动禁用');
   assert.equal(ui.get('account-status-dialog').open, undefined); assert.equal(ui.document.activeElement, button);
@@ -2752,7 +2814,7 @@ test('CPA direct writes lock from the first read through verification and ignore
   let file = statusFile(), releaseFirst, releasePatch, releaseRead, reads = 0;
   const ui = panel((url, options) => {
     if (url.endsWith('/auth-files/status')) return new Promise(resolve => { releasePatch = () => { file = {...file, disabled: true}; resolve([200, {status: 'ok'}]); }; });
-    if (url.endsWith('/auth-files')) {
+    if (isAuthFilesList(url)) {
       reads++;
       if (reads === 1) return new Promise(resolve => { releaseFirst = () => resolve([200, {files: [file]}]); });
       if (reads === 3) return new Promise(resolve => { releaseRead = () => resolve([200, {files: [file]}]); });
@@ -2770,7 +2832,7 @@ test('CPA direct writes lock from the first read through verification and ignore
 });
 
 test('a stale displayed status applies the clicked target without reversing a newer external change', async () => {
-  const ui = panel(url => url.endsWith('/auth-files') ? [200, {files: [statusFile({disabled: true})]}] : basic(url));
+  const ui = panel(url => isAuthFilesList(url) ? [200, {files: [statusFile({disabled: true})]}] : basic(url));
   await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false'); assert.equal(mutations(ui).length, 0);
 });
@@ -2780,7 +2842,7 @@ test('lost or 5xx PATCH results are never resent and GET-confirmed state is the 
     let file = statusFile(), failRead = true, patches = 0;
     const ui = panel((url, options) => {
       if (url.endsWith('/auth-files/status')) { patches++; file = {...file, disabled: true}; return lost ? Promise.reject(new Error('lost response')) : [500, {error: 'post-persist hook failed'}]; }
-      if (url.endsWith('/auth-files')) return patches && failRead ? [503, {error: 'storage_unavailable'}] : [200, {files: [file]}];
+      if (isAuthFilesList(url)) return patches && failRead ? [503, {error: 'storage_unavailable'}] : [200, {files: [file]}];
       return basic(url);
     });
     await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
@@ -2797,7 +2859,7 @@ test('CPA post-persist failure can be confirmed by GET without replaying the mut
   let file = statusFile();
   const ui = panel((url, options) => {
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [500, {error: 'hook failed'}]; }
-    return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
+    return isAuthFilesList(url) ? [200, {files: [file]}] : basic(url);
   });
   await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   assert.equal(statusSwitch(ui).dataset.state, 'confirmed'); assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
@@ -2808,7 +2870,7 @@ test('CPA status identity changes before and after PATCH fail closed without tou
     let reads = 0, restore = false;
     const file = statusFile(), replacement = {...file, id: 'replacement-account', auth_index: 'replacement-index', disabled: true};
     const ui = panel((url, options) => {
-      if (url.endsWith('/auth-files')) { reads++; return [200, {files: [restore ? {...file, disabled: true} : reads > (afterPatch ? 2 : 1) ? replacement : file]}]; }
+      if (isAuthFilesList(url)) { reads++; return [200, {files: [restore ? {...file, disabled: true} : reads > (afterPatch ? 2 : 1) ? replacement : file]}]; }
       if (url.endsWith('/auth-files/status')) return [200, {status: 'ok', disabled: true}];
       return basic(url);
     });
@@ -2833,7 +2895,7 @@ test('explicit refresh reconciles external CPA changes without stale daemon acco
   let file = statusFile();
   const ui = panel((url, options) => {
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
-    return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
+    return isAuthFilesList(url) ? [200, {files: [file]}] : basic(url);
   });
   await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   await ui.get('refresh').onclick(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false');
@@ -2846,7 +2908,7 @@ test('authentication loss during CPA PATCH preserves unknown intent across recon
   let patched = false;
   const ui = panel((url, options) => {
     if (url.endsWith('/auth-files/status')) { patched = true; return [401, {error: 'unauthorized'}]; }
-    return url.endsWith('/auth-files') ? [200, {files: [statusFile({disabled: patched})]}] : basic(url);
+    return isAuthFilesList(url) ? [200, {files: [statusFile({disabled: patched})]}] : basic(url);
   });
   await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
   assert.equal(ui.get('login-section').hidden, false); ui.get('key').value = 'reconnected-key'; await ui.get('connect').onclick();
@@ -2873,7 +2935,7 @@ test('aliases map true identity only in browser display and never change request
     if (url.endsWith('/overview')) { const data = overview(); data.dashboard.recent_jobs = [{...view(), job_id: 'running-job', account_id: id, phase: 'queued'}]; data.dashboard.recent_events = [{kind: 'model_wake', phase: 'skipped', account_id: id, hold_reason: 'window_already_active'}]; return [200, data]; }
     if (url.includes('/accounts?')) return [200, accountPage(1, [{id, status: 'available'}])];
     if (url.includes('/task-history?')) return [200, historyPage([record])];
-    if (url.endsWith('/auth-files')) return [200, {files: [file]}];
+    if (isAuthFilesList(url)) return [200, {files: [file]}];
     if (url.endsWith('/jobs') && options.method === 'POST') return [202, {...view(), job_id: 'private-query', phase: 'queued'}];
     return basic(url);
   });
@@ -2980,13 +3042,14 @@ test('automatic CPA confirmation reads follow later external changes instead of 
   let file = statusFile();
   const ui = panel(url => {
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
-    return url.endsWith('/auth-files') ? [200, {files: [file]}] : basic(url);
+    return isAuthFilesList(url) ? [200, {files: [file]}] : basic(url);
   });
   await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
-  const button = statusSwitch(ui), reads = ui.calls.filter(call => call.url.endsWith('/auth-files')).length;
+  const button = statusSwitch(ui), reads = ui.calls.filter(call => isAuthFilesList(call.url)).length;
   button.focus(); await ui.tick(5000);
   assert.equal(button.getAttribute('aria-checked'), 'false', 'stale daemon data rolled back the verified CPA disable');
-  assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, reads + 1);
+  assert.equal(ui.calls.filter(call => isAuthFilesList(call.url)).length, reads + 1);
+  assert.equal(ui.calls.filter(call => isAuthFilesList(call.url)).at(-1).url, '/v0/management/auth-files?auth_index=auth-index-01');
   file = {...file, disabled: false}; await ui.tick(5000);
   assert.equal(statusSwitch(ui), button); assert.equal(ui.document.activeElement, button);
   assert.equal(button.getAttribute('aria-checked'), 'true', 'external CPA enable is hidden by a stale local confirmation');
@@ -2999,14 +3062,14 @@ test('a failed automatic CPA confirmation read neither starves account reads nor
   let file = statusFile(), failing = false, revision = 1;
   const ui = panel(url => {
     if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
-    if (url.endsWith('/auth-files')) return failing ? [503, {error: 'storage_unavailable'}] : [200, {files: [file]}];
+    if (isAuthFilesList(url)) return failing ? [503, {error: 'storage_unavailable'}] : [200, {files: [file]}];
     if (url.endsWith('/overview')) return [200, overview(revision)];
     return [200, accountPage(revision, [{id: 'codex-01', status: 'available'}, {id: 'updated-' + revision, status: 'available'}])];
   });
   await ui.get('connect').onclick(); await statusSwitch(ui).onclick();
-  const reads = ui.calls.filter(call => call.url.endsWith('/auth-files')).length;
+  const reads = ui.calls.filter(call => isAuthFilesList(call.url)).length;
   failing = true; revision = 2; await ui.tick(5000);
-  assert.equal(ui.calls.filter(call => call.url.endsWith('/auth-files')).length, reads + 1);
+  assert.equal(ui.calls.filter(call => isAuthFilesList(call.url)).length, reads + 1);
   assert.match(ui.get('accounts').textContent, /updated-2/);
   assert.equal(ui.get('auto-status').dataset.state, 'online');
   failing = false; file = {...file, disabled: false}; await ui.tick(5000);
@@ -3017,7 +3080,7 @@ test('automatic refresh never retries or silently clears an unknown CPA mutation
   let patched = false;
   const ui = panel(url => {
     if (url.endsWith('/auth-files/status')) { patched = true; return [503, {error: 'storage_unavailable'}]; }
-    if (url.endsWith('/auth-files')) return patched ? [503, {error: 'storage_unavailable'}] : [200, {files: [statusFile()]}];
+    if (isAuthFilesList(url)) return patched ? [503, {error: 'storage_unavailable'}] : [200, {files: [statusFile()]}];
     return basic(url);
   });
   await ui.get('connect').onclick(); await statusSwitch(ui).onclick();

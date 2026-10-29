@@ -196,6 +196,39 @@ func TestAuthReadsStillRefreshChangedBridge(t *testing.T) {
 	}
 }
 
+func TestQuotaOperationsNeverReplayOnReplacementBridge(t *testing.T) {
+	for _, method := range []string{"host.http.operation_open", "host.http.do", "host.http.cancel"} {
+		t.Run(method, func(t *testing.T) {
+			uninitialized := &Client{Path: "/unused"}
+			if err := uninitialized.Call(context.Background(), method, struct{}{}, nil); err == nil || err.Error() != "bridge_unavailable" {
+				t.Fatalf("uninitialized operation: %v", err)
+			}
+			client, server := newBridgeTestClient(t, func(request bridgeTestRequest) any {
+				if request.Method == "bridge.hello" {
+					return bridgeHello("creating-instance", false)
+				}
+				if request.Instance != "creating-instance" || request.Method != method {
+					t.Errorf("operation escaped creating instance: %+v", request)
+				}
+				return bridgeError("bridge_instance_changed")
+			})
+			if _, err := client.Handshake(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Call(context.Background(), method, struct{}{}, nil); err == nil || err.Error() != "bridge_instance_changed" {
+				t.Fatalf("operation error: %v", err)
+			}
+			if !reflect.DeepEqual(server.calls(), []string{"bridge.hello", method}) {
+				t.Fatalf("operation replayed: %v", server.calls())
+			}
+			client.instance.Store("replacement-instance")
+			if err := client.CallForInstance(context.Background(), "creating-instance", method, struct{}{}, nil); err == nil || err.Error() != "bridge_instance_changed" {
+				t.Fatalf("original ownership was not preserved after handshake: %v", err)
+			}
+		})
+	}
+}
+
 func TestGenerationErrorSanitization(t *testing.T) {
 	for _, code := range []string{"generation_not_supported", "generation_request_invalid", "generation_delivery_unknown", "generation_candidates_invalid", "wake_not_supported", "wake_request_invalid", "wake_delivery_unknown", "account_binding_changed", "account_not_found", "account_identity_unavailable", "account_disabled", "private Authorization: secret"} {
 		t.Run(code, func(t *testing.T) {

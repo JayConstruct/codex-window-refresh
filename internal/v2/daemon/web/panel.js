@@ -337,6 +337,7 @@
   Object.assign(codes, {wake_account_not_found: '已同步的 Codex 账号清单中未找到此账号，请核对账号 ID 或提供方', wake_account_disabled: 'CPA 已禁用此账号，请核实账号状态', wake_host_unavailable: 'CPA 当前无法提供该账号，请稍后重试', wake_inventory_stale: 'CPA 账号状态尚未同步或已过期，请同步后重试', wake_account_ambiguous: '账号匹配不唯一', wake_binding_missing: '缺少可核实的凭据绑定，请同步 CPA 后重试', wake_binding_changed: '账号绑定已变更，请刷新后重试'});
   Object.assign(codes, {account_status_identity: '无法唯一核实独立认证文件，未修改 CPA；请检查账号目录与文件绑定', account_status_unknown: 'CPA 启停结果未知，不会重发；请显式只读核实', account_status_changed: '认证文件身份或状态已变化，未提交启停；请重新读取核实'});
   Object.assign(codes, {model_catalog_account_invalid: '账号身份、提供方或文件别名无法唯一核实，请刷新账号目录后重试', model_catalog_unavailable: 'CPA 未提供账号模型目录，可继续手动填写模型', model_catalog_changed: '账号目录或绑定已变化，请重新读取模型'});
+  codes.model_catalog_unsupported = '当前 CPA 未提供原生账号模型目录，可通过兼容接口读取或手动填写模型';
   codes.invalid_model_settings = '模型与提示词设置无效，请检查字段';
   codes.generation_accounts_unavailable = '生成账号目录暂不可用，请稍后刷新核实';
   codes.generation_prompt_unavailable = '当前后台不支持自定义生成提示词，请升级后台后再试';
@@ -707,7 +708,8 @@
     if (!confirmed.length) return;
     const current = generation, sequence = ++statusReadSequence;
     try {
-      const data = await api('/auth-files', {}, true);
+      const filter = confirmed.length === 1 && confirmed[0][1].before?.index ? '?auth_index=' + encodeURIComponent(confirmed[0][1].before.index) : '';
+      const data = await api('/auth-files' + filter, {}, true);
       if (current !== generation || sequence !== statusReadSequence) return;
       for (const [id, state] of confirmed) {
         if (statusOperations.get(id) !== state || state.phase !== 'confirmed') continue;
@@ -1414,18 +1416,35 @@
     const currentRequest = () => current === generation && sequence === state.sequence && instance === views.instance && resolveDisplayAccount($(target).value) === id && (kind === 'wake' || generationAccountState().provider === provider);
     state.loading = true; renderModelCatalogs(); setText(status, '正在读取并核对 CPA 本地模型目录…');
     try {
-      const before = resolveModelAccount(await api('/auth-files', {}, true), id, provider);
-      if (!currentRequest()) return;
-      const data = await api('/auth-files/models?name=' + encodeURIComponent(id), {}, true);
-      if (!currentRequest()) return;
-      if (!Array.isArray(data.models) || data.models.length > 2000) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
-      const models = [...new Set(data.models.map(model => {
+      let data, native = overviewData?.capabilities?.account_models === true;
+      if (native) {
+        try { data = await api('/account-models?account_id=' + encodeURIComponent(id)); }
+        catch (error) {
+          if (error.status === 404 || error.status === 501 && error.code === 'model_catalog_unsupported') native = false;
+          else throw error;
+        }
+        if (!currentRequest()) return;
+      }
+      let before;
+      if (!native) {
+        before = resolveModelAccount(await api('/auth-files', {}, true), id, provider);
+        if (!currentRequest()) return;
+        data = await api('/auth-files/models?name=' + encodeURIComponent(id), {}, true);
+        if (!currentRequest()) return;
+      } else if (data?.instance_id !== instance || data.account_id !== id || data.provider !== provider) {
+        throw Object.assign(new Error('model_catalog_changed'), {code: 'model_catalog_changed'});
+      }
+      if (!Array.isArray(data?.models) || data.models.length > (native ? 2048 : 2000)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      const models = [...new Set(data.models.map(value => {
+        const model = native ? {id: value} : value;
         if (typeof model?.id !== 'string' || !model.id || new TextEncoder().encode(model.id).length > 200 || /[\s\p{Cc}]/u.test(model.id)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
         return model.id;
       }))];
-      const after = resolveModelAccount(await api('/auth-files', {}, true), id, provider);
-      if (!currentRequest()) return;
-      if (before.index !== after.index) throw Object.assign(new Error('model_catalog_changed'), {code: 'model_catalog_changed'});
+      if (!native) {
+        const after = resolveModelAccount(await api('/auth-files', {}, true), id, provider);
+        if (!currentRequest()) return;
+        if (before.index !== after.index) throw Object.assign(new Error('model_catalog_changed'), {code: 'model_catalog_changed'});
+      }
       $(kind === 'wake' ? 'wake-model-options' : 'generation-model-options').replaceChildren(...models.map(id => { const option = element('option'); option.value = id; return option; }));
       setText(status, models.length ? '已读取 ' + models.length + ' 个 CPA 注册模型；请选择或手动填写，不自动保存，也不保证实时权限。' : '该账号暂无 CPA 注册模型，可手动填写已确认可用的模型；未试发请求。');
       feedback('catalog-feedback', $(status).textContent, 'success');

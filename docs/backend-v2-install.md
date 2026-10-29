@@ -1,6 +1,10 @@
 # v2 预发布安装与更新
 
-适用于 Debian 12/13、amd64/arm64、CPA ABI 1/schema 6。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。v2 提供网页、额度查询、持久任务、活动及正常业务额度观测。已发布 rc.5 支持自动额度查询及随机延迟，不包含模型唤醒、短句生成和自动模型规则；各包能力以对应发布说明为准。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
+适用于 Debian 12/13、amd64/arm64、CPA 原生 ABI 1，插件协商 RPC schema 6 或 7；支持 schema 8 的 CPA 仍可协商为 7。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。当前 **v0.2.0-rc.20 后台和接入层**提供网页、额度查询、持久任务、活动及正常业务额度观测、模型配置、短句候选生成和 Codex 模型唤醒，自动查询及自动唤醒默认关闭，已有明确保存的规则保留。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
+
+**升级到 rc.20 须同时更新后台及接入层，并显式 `--restart` 重启 CPA。**本版增加宿主额度 HTTP 与账号模型目录路由，数据库保持 schema 9，不新增迁移。无账号代理时继承 CPA 全局代理；账号显式 direct/none 和专用代理仍分别生效。原生模型目录需要宿主支持 `host.auth.models`，旧宿主明确不支持时使用兼容读取；目录读取不会试发模型请求。详见 [rc.20 发布说明](releases/v0.2.0-rc.20.md)与 [API 优化说明](cpa-api-optimization.md)。
+
+以下为历史版本能力与迁移记录：rc.5 支持自动额度查询及随机延迟，不包含后续加入的模型唤醒、短句生成和自动模型规则；各包能力以对应发布说明为准。
 
 rc.6 新增可折叠侧栏、总览查询开关直接保存、模型与提示词持久配置及手动短句候选生成；生成需要显式选择账号和模型并确认消耗额度，不随安装验收、配置保存或额度查询自动执行。自动唤醒仍未实现。数据库迁移到 schema 5，并依赖新版接入层注册模型配置/生成管理路由和有界模型流接口，部署时须同时替换两部分并显式 `--restart`。
 
@@ -14,7 +18,7 @@ rc.10 保留候选、账号及历史控件的焦点和详情展开状态，修�
 
 首次升级 rc.8 时先保持自动唤醒及五小时、周、每日规则关闭，核对实际模型、时区与允许时段，再显式手动唤醒一个测试账号。手动操作会先只读查额度和活动保护，可能跳过或阻塞，不保证一定发送；若发送则可能消耗模型额度。模型完成与窗口核实分开显示，结果未知不得换新键重复发送。确认行为后再按需保存开启自动规则。自动规则默认关闭并不覆盖旧版中用户已经明确保存的设置。
 
-升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、迁移和验证范围见 [rc.18 发布说明](releases/v0.2.0-rc.18.md)。
+升级前须另存一致备份，范围包括查询任务、模型配置、候选任务和唤醒发送防重记录；停服务或使用 SQLite 在线备份，不单独复制活动 WAL 数据库主文件。升级不能清空未知发送记录来恢复可发送状态。安装包、兼容性和验证范围见 [rc.20 发布说明](releases/v0.2.0-rc.20.md)。
 
 旧后台不能直接打开迁移后的新库，回退必须停服务并恢复升级前一致的数据库备份，不能仅替换旧二进制。安装器激活失败时会使用临时一致备份恢复，但成功后会清理该副本；需要日后手动降级时，升级前须另行保存停机或 SQLite 在线一致备份。
 
@@ -24,13 +28,13 @@ rc.12 在额度查询完成时同步已核实的宿主账号状态，并提供�
 
 ## 首次切换
 
-当前 rc.18 修复容量满足后旧唤醒任务长期显示排队或执行中，支持容量缺口恢复后的同周期重新调度；一并提供账号启停拨动开关和“手动禁用”状态，主页面操作不再弹出确认窗，自动唤醒额度提示只在首次确认时显示；保留 rc.16 的自动读取与显示稳定改进。**后台为 rc.18，接入层沿用 rc.14；首次切换或从 rc.13 及更早版本更新须显式 `--restart`，重启 CPA 注册统一任务记录路由。**数据库仍为 schema 9，从 rc.13/rc.14/rc.15/rc.16/rc.17 升级不增加迁移。更早版本升级仍须遵循下面的一致备份和降级限制，详见 [rc.18 发布说明](releases/v0.2.0-rc.18.md)。
+当前后台和接入层均为 **v0.2.0-rc.20**。首次切换及从任意早期版本升级均须显式 `--restart`，重启 CPA 加载新接入层并注册账号模型目录路由。数据库仍为 schema 9，从 rc.13–rc.19 升级不增加迁移，保留现有 v2 数据和发送防重记录。更早版本仍须遵循下面的一致备份和降级限制，详见 [rc.20 发布说明](releases/v0.2.0-rc.20.md)。
 
 rc.13 新增快捷唤醒与持久响应记录，数据库升级至 schema 9，首次启动自动迁移并保留现有任务及防重状态。升级前另存停机或 SQLite 在线一致备份；不能把旧后台直接换回迁移后的新库。原生接入层仍为 rc.8，详见 [rc.13 发布说明](releases/v0.2.0-rc.13.md)。
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.20 --restart
 ```
 
 root 会话可省略 sudo。首次下载需要已有 curl。脚本安装缺少的运行依赖，识别当前 CPA 的配置、进程、用户及 systemd 服务；无法唯一确认时用参数明确指定，例如：
@@ -45,7 +49,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.18` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.20` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -55,11 +59,11 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-本次从 rc.14/rc.15/rc.16/rc.17 更新到 rc.18 时，只有安装器确认接入层文件一致才可省略 `--restart`，仅重启后台。从 rc.13 及更早版本更新或接入层文件变化时，确认可重启 CPA 后须使用 `--restart`，安装器仍在写入前检查。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.18`。
+从 rc.19 或任意更早版本更新到 rc.20，必须使用 `--restart` 同时加载新版接入层；安装器仍在写入前检查重启要求。不能沿用早期仅重启后台的更新方式。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.20`。
 
 `latest` 会按数值比较全部已发布 V2 rc 版本，不取发布列表第一条，也不使用排除预发布的 GitHub `/releases/latest`。下载的独立入口会重新获取两份 Python 安装器，不复用下载目录中的旧副本；只有完整源码目录（含上级 `go.mod`）使用本地安装器，运行前须自行更新源码。离线安装继续使用下文的包内 Python 入口。
 
-**后台和接入层独立记录版本**。本次后台为 rc.18，接入层为 rc.14；接入层 rc.14 已提供统一任务记录路由，历史 rc.8 接入层不能替代它。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
+**后台和接入层独立记录版本**。本次两者均为 rc.20；早期接入层缺少本版宿主额度 HTTP 和账号模型目录能力，不能替代 rc.20 接入层。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
 
 普通 v1 的 `install.sh` 不自动选择 v2 包；检测到已有 v2 安装记录时拒绝覆盖。不能通过旧脚本把正在运行的 v2 改回 v1。
 
@@ -83,7 +87,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.18 --package /path/codex-window-refresh-v2_v0.2.0-rc.18_linux_amd64.tar.gz \
+  --version v0.2.0-rc.20 --package /path/codex-window-refresh-v2_v0.2.0-rc.20_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 

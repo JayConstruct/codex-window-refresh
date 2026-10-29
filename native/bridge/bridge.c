@@ -1,6 +1,6 @@
-/* CPA ABI 1 / schema 6 bridge. No rules, credentials on disk, or Go runtime.
- * Host callbacks permit local auth reads and explicitly pinned manual streams.
- * The independent daemon performs HTTP and owns all durable business state. */
+/* CPA ABI 1 / schema 6-7 bridge. No rules, credentials on disk, or Go runtime.
+ * Host callbacks permit local auth reads, bounded quota HTTP and pinned streams.
+ * The independent daemon owns all durable business state. */
 #define _GNU_SOURCE
 #include "json_api.h"
 #include "events.h"
@@ -57,13 +57,19 @@ static pthread_mutex_t queue_mu=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t available=PTHREAD_COND_INITIALIZER,drained=PTHREAD_COND_INITIALIZER;
 static pthread_t accept_thread,workers[WORKERS];
 static int listener=-1,owner_lock=-1,stopping=1,running=0,live=0,queued[QUEUE],qhead=0,qsize=0,created=0,initialized=0;
-static int host_active;
+static int host_active,control_active;
+static unsigned negotiated_schema;
 static pthread_cond_t streams_changed=PTHREAD_COND_INITIALIZER;
 static struct {
     char id[257];
     int used,reading,closing,closed;
     time_t touched,retry_at;
 } streams[HOST_CALLS];
+static struct {
+    char id[257];
+    int used,executing,dispatched,cancelling,cancelled;
+    time_t expires,retry_at;
+} operations[HOST_CALLS];
 static char bridge_path[sizeof(((struct sockaddr_un*)0)->sun_path)],daemon_path[sizeof(bridge_path)],instance[65];
 static char process_identity[128];
 static int identify_process(void) {
@@ -216,9 +222,101 @@ static J *host_callback(const char*method,J*payload) {
     if(result.ptr)host.free_buffer(result.ptr,result.len);
     J*success=field(response,"ok");
     if(!success||json_object_get_type(success)!=1||!json_object_get_int(success)) {
+        int unsupported=!strcmp(method,"host.auth.models")&&equals(field(field(response,"error"),"message"),"unsupported host callback host.auth.models");
         json_object_put(response);
-        return error("host_callback_failed");
+        return error(unsupported?"model_catalog_unsupported":"host_callback_failed");
     }
+    return response;
+}
+/* These handles are local to this bridge instance. Reserve a separate control
+ * callback lane so eight blocked HTTP requests can still be cancelled. */
+static int quota_payload(J*payload) {
+    if(!equals(field(payload,"method"),"GET")||!equals(field(payload,"url"),"https://chatgpt.com/backend-api/wham/usage")||json_object_object_length(payload)!=4)return 0;
+    J*headers=field(payload,"headers");
+    if(!headers||json_object_get_type(headers)!=4||json_object_object_length(headers)!=4)return 0;
+    const char*names[]={"Authorization","Chatgpt-Account-Id","Accept","User-Agent"};
+    for(size_t i=0;i<4;i++) {
+        J*values=field(headers,names[i]);
+        if(!values||json_object_get_type(values)!=5||json_object_array_length(values)!=1)return 0;
+        J*value=json_object_array_get_idx(values,0);
+        if(!bounded_text(value,i==0?65543:i==1?256:64))return 0;
+        const char*text=string(value);
+        if(i==0) {
+            if(strncmp(text,"Bearer ",7)||!text[7])return 0;
+            for(const unsigned char*p=(const unsigned char*)text+7;*p;p++)if(*p<33||*p>126)return 0;
+        }
+        if((i==2&&strcmp(text,"application/json"))||(i==3&&strcmp(text,"codex-window-refresh-v2")))return 0;
+    }
+    return 1;
+}
+static J *quota_rpc(const char*method,J*payload,int budget) {
+    int opening=!strcmp(method,"host.http.operation_open"),cancel=!strcmp(method,"host.http.cancel");
+    if(!opening&&!cancel&&strcmp(method,"host.http.do"))return error("method_not_allowed");
+    if(opening?json_object_object_length(payload)!=0:!bounded_text(field(payload,"operation_id"),256))return error("invalid_payload");
+    if(cancel&&json_object_object_length(payload)!=1)return error("invalid_payload");
+    if(!opening&&!cancel&&!quota_payload(payload))return error("invalid_payload");
+    pthread_mutex_lock(&queue_mu);
+    if(stopping||host_active>=HOST_CALLS+(cancel?1:0)||(cancel&&control_active)) {
+        int stopped=stopping;
+        pthread_mutex_unlock(&queue_mu);
+        return error(stopped?"bridge_stopping":"bridge_busy");
+    }
+    int slot=-1;
+    for(int i=0;i<HOST_CALLS;i++)if(opening?!operations[i].used:(operations[i].used&&!strcmp(operations[i].id,string(field(payload,"operation_id"))))) {
+        slot=i;
+        break;
+    }
+    if(slot<0||(!opening&&(operations[slot].cancelled||(!cancel&&operations[slot].dispatched)))) {
+        pthread_mutex_unlock(&queue_mu);
+        return error(opening?"bridge_busy":"quota_operation_unavailable");
+    }
+    if(!opening&&operations[slot].cancelling) {
+        pthread_mutex_unlock(&queue_mu);
+        return error("bridge_busy");
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC,&now);
+    // Round the absolute deadline up, including the fractional current second.
+    // Rounding just the budget can otherwise cancel up to a second early.
+    time_t expires=now.tv_sec+(now.tv_nsec+(int64_t)budget*1000000+999999999)/1000000000;
+    if(opening) {
+        operations[slot].used=1;
+        operations[slot].expires=expires;
+    }
+    else if(cancel)operations[slot].cancelling=1;
+    else {
+        operations[slot].executing=1;
+        operations[slot].dispatched=1;
+        operations[slot].expires=expires;
+    }
+    host_active++;
+    if(cancel)control_active++;
+    pthread_mutex_unlock(&queue_mu);
+    J*response=host_callback(method,payload);
+    pthread_mutex_lock(&queue_mu);
+    host_active--;
+    if(cancel)control_active--;
+    if(opening) {
+        J*id=field(field(response,"result"),"operation_id");
+        if(bounded_text(id,256))strcpy(operations[slot].id,string(id));
+        else {
+            memset(&operations[slot],0,sizeof(operations[slot]));
+            json_object_put(response);
+            response=error("host_callback_failed");
+        }
+    }
+    else if(cancel) {
+        operations[slot].cancelling=0;
+        if(json_object_get_int(field(response,"ok")))operations[slot].cancelled=1;
+        else {
+            clock_gettime(CLOCK_MONOTONIC,&now);
+            operations[slot].retry_at=now.tv_sec+1;
+        }
+    }
+    else operations[slot].executing=0;
+    if(operations[slot].cancelled&&!operations[slot].executing)memset(&operations[slot],0,sizeof(operations[slot]));
+    pthread_cond_broadcast(&streams_changed);
+    pthread_mutex_unlock(&queue_mu);
     return response;
 }
 static void *stream_reaper(void*arg) {
@@ -228,6 +326,41 @@ static void *stream_reaper(void*arg) {
         int slot=-1,pending=0;
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC,&now);
+        for(int i=0;i<HOST_CALLS;i++) {
+            if(!operations[i].used)continue;
+            pending=1;
+            if(operations[i].id[0]&&!operations[i].cancelled&&!operations[i].cancelling&&now.tv_sec>=operations[i].retry_at&&(stopping||operations[i].retry_at||now.tv_sec>=operations[i].expires)&&host_active<HOST_CALLS+1&&!control_active) {
+                slot=i;
+                break;
+            }
+        }
+        if(slot>=0) {
+            char id[257];
+            strcpy(id,operations[slot].id);
+            operations[slot].cancelling=1;
+            host_active++;
+            control_active++;
+            pthread_mutex_unlock(&queue_mu);
+            J*payload=json_object_new_object();
+            json_object_object_add(payload,"operation_id",json_object_new_string(id));
+            J*response=host_callback("host.http.cancel",payload);
+            int released=json_object_get_int(field(response,"ok"));
+            json_object_put(response);
+            json_object_put(payload);
+            pthread_mutex_lock(&queue_mu);
+            host_active--;
+            control_active--;
+            operations[slot].cancelling=0;
+            if(released) {
+                operations[slot].cancelled=1;
+                if(!operations[slot].executing)memset(&operations[slot],0,sizeof(operations[slot]));
+            }
+            else {
+                clock_gettime(CLOCK_MONOTONIC,&now);
+                operations[slot].retry_at=now.tv_sec+1;
+            }
+            continue;
+        }
         for(int index=0;index<HOST_CALLS;index++) {
             if(!streams[index].used)continue;
             pending=1;
@@ -289,7 +422,10 @@ static J *rpc(J*req) {
         json_object_object_add(j,"prompt_generation_providers",providers);
         json_object_object_add(j,"version",json_object_new_string(CWR_VERSION));
         json_object_object_add(j,"max_host_calls",json_object_new_int(HOST_CALLS));
+        json_object_object_add(j,"quota_host_http_supported",json_object_new_boolean(1));
         pthread_mutex_lock(&queue_mu);
+        json_object_object_add(j,"rpc_schema",json_object_new_int((int)negotiated_schema));
+        json_object_object_add(j,"request_body_omitted",json_object_new_boolean(negotiated_schema>=7));
         json_object_object_add(j,"active_host_calls",json_object_new_int(host_active));
         pthread_mutex_unlock(&queue_mu);
         json_object_object_add(j,"events_supported",json_object_new_boolean(1));
@@ -305,17 +441,20 @@ static J *rpc(J*req) {
     if(!strcmp(method,"bridge.bindings.replace"))return cwr_bindings_replace(field(req,"payload"));
     int execute=!strcmp(method,"host.model.execute_stream"),read_stream=!strcmp(method,"host.model.stream_read"),close_stream=!strcmp(method,"host.model.stream_close");
     int model=execute||read_stream||close_stream;
-    if(!model&&strcmp(method,"host.auth.list")&&strcmp(method,"host.auth.get")&&strcmp(method,"host.auth.get_runtime"))return error("method_not_allowed");
+    int http=!strcmp(method,"host.http.operation_open")||!strcmp(method,"host.http.do")||!strcmp(method,"host.http.cancel");
+    if(!model&&!http&&strcmp(method,"host.auth.list")&&strcmp(method,"host.auth.get")&&strcmp(method,"host.auth.get_runtime")&&strcmp(method,"host.auth.models"))return error("method_not_allowed");
     J*payload=field(req,"payload");
     if(!payload||json_object_get_type(payload)!=4)return error("invalid_payload");
     if(execute&&!model_payload(payload))return error("invalid_payload");
     if((read_stream||close_stream)&&!bounded_text(field(payload,"stream_id"),256))return error("invalid_payload");
-    if(!model&&strcmp(method,"host.auth.list")) {
+    if(!model&&!http&&strcmp(method,"host.auth.list")) {
         const char*index=string(field(payload,"auth_index"));
         if(!index||!index[0]||strlen(index)>256)return error("invalid_payload");
+        if(!strcmp(method,"host.auth.models")&&json_object_object_length(payload)!=1)return error("invalid_payload");
     }
     int budget=json_object_get_int(field(req,"remaining_timeout_ms"));
     if(budget<1||budget>300000)return error("invalid_deadline");
+    if(http)return quota_rpc(method,payload,budget);
     pthread_mutex_lock(&queue_mu);
     int stopped=stopping;
     int busy=host_active>=HOST_CALLS;
@@ -684,7 +823,7 @@ static J *proxy(J*req) {
     char endpoint[128];
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
-        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"task-history");
+        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"task-history")||!strcmp(tail,"account-models");
         int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs");
         if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
@@ -705,7 +844,7 @@ static J *proxy(J*req) {
     snprintf(target,sizeof(target),"http://localhost%s",endpoint);
     J*query=field(req,"Query");
     const char*allowed[]= {
-        "job_id","after","limit","revision","search","status","type","source","trigger","from","to","page","today_from","today_to"
+        "job_id","after","limit","revision","search","status","type","source","trigger","from","to","page","today_from","today_to","account_id"
     };
     for(size_t index=0;index<sizeof(allowed)/sizeof(allowed[0]);index++) {
         J*v=field(query,allowed[index]);
@@ -780,6 +919,9 @@ static J *proxy(J*req) {
     return http_error(400,"invalid_management_request");
 }
 static J *registration(unsigned schema) {
+    pthread_mutex_lock(&queue_mu);
+    negotiated_schema=schema;
+    pthread_mutex_unlock(&queue_mu);
     J*r=json_object_new_object(),*metadata=json_object_new_object(),*cap=json_object_new_object();
     json_object_object_add(r,"schema_version",json_object_new_int((int)schema));
     json_object_object_add(metadata,"Name",json_object_new_string("codex-window-refresh"));
@@ -804,9 +946,9 @@ static J *registration(unsigned schema) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history","account-models"
     };
-    for(int i=0;i<17;i++) {
+    for(int i=0;i<18;i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);

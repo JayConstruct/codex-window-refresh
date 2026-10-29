@@ -72,7 +72,7 @@ func (s *Store) AccountPageFiltered(ctx context.Context, after string, limit int
 	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM accounts WHERE "+filter+" AND id<=?", search, after).Scan(&page.Offset); err != nil {
 		return page, err
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT id,auth_index,status,"+accountDisplayStatusSQL+",updated_at,COALESCE(quota,''),COALESCE(observed_at,'') FROM accounts WHERE "+filter+" AND id>? ORDER BY id LIMIT ?", search, after, limit+1)
+	rows, err := tx.QueryContext(ctx, "SELECT id,auth_index,status,"+accountDisplayStatusSQL+","+accountStatusObservedAtSQL+",COALESCE(quota,''),COALESCE(observed_at,'') FROM accounts WHERE "+filter+" AND id>? ORDER BY id LIMIT ?", search, after, limit+1)
 	if err != nil {
 		return page, err
 	}

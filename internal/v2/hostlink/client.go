@@ -40,6 +40,9 @@ type Hello struct {
 	PromptGeneration    bool     `json:"prompt_generation_supported"`
 	GenerationProviders []string `json:"prompt_generation_providers"`
 	WakeSupported       bool     `json:"wake_supported"`
+	RPCSchema           int      `json:"rpc_schema"`
+	RequestBodyOmitted  bool     `json:"request_body_omitted"`
+	QuotaHostHTTP       bool     `json:"quota_host_http_supported"`
 }
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -119,6 +122,7 @@ func (c *Client) exchangeFor(ctx context.Context, method string, request, respon
 	if !e.OK {
 		switch e.Error.Code {
 		case "bridge_busy", "model_budget_busy", "bridge_instance_changed", "method_not_allowed", "host_callback_failed", "bridge_stopping", "invalid_event_cursor",
+			"model_catalog_unsupported", "quota_operation_unavailable",
 			"generation_not_supported", "generation_request_invalid", "generation_delivery_unknown", "generation_candidates_invalid",
 			"wake_not_supported", "wake_request_invalid", "wake_delivery_unknown",
 			"account_binding_changed", "account_not_found", "account_identity_unavailable", "account_disabled":
@@ -209,6 +213,20 @@ func (c *Client) Instance() string {
 	instance, _ := c.instance.Load().(string)
 	return instance
 }
+
+// CallForInstance keeps operation ownership stable while background inventory
+// handshakes learn about a replacement bridge. It never retries or repins.
+func (c *Client) CallForInstance(ctx context.Context, instance, method string, request, response any) error {
+	if instance == "" {
+		return errors.New("bridge_unavailable")
+	}
+	switch method {
+	case "host.http.operation_open", "host.http.do", "host.http.cancel":
+		return c.exchangeFor(ctx, method, request, response, instance)
+	default:
+		return errors.New("method_not_allowed")
+	}
+}
 func (c *Client) SupportsWake() bool {
 	instance := c.Instance()
 	wake, _ := c.wake.Load().(string)
@@ -227,7 +245,15 @@ func (c *Client) SupportedGenerationProviders() []string {
 }
 func (c *Client) Call(ctx context.Context, method string, request, response any) error {
 	switch method {
-	case "host.auth.list", "host.auth.get_runtime", "host.auth.get":
+	case "host.auth.list", "host.auth.get_runtime", "host.auth.get", "host.auth.models":
+	case "host.http.operation_open", "host.http.do", "host.http.cancel":
+		instance := c.Instance()
+		if instance == "" {
+			return errors.New("bridge_unavailable")
+		}
+		// Operation IDs belong to their creating bridge. Never handshake or
+		// replay an HTTP operation onto a replacement instance.
+		return c.exchangeFor(ctx, method, request, response, instance)
 	case "host.model.execute_stream", "host.model.stream_read", "host.model.stream_close":
 		instance, _ := c.instance.Load().(string)
 		capability, _ := c.generation.Load().(generationCapability)

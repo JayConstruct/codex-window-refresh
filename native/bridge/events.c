@@ -519,6 +519,14 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
         if(lifecycle)lost();
         return;
     }
+    // Payload chunks never carry fresh quota evidence. Check the phase before
+    // decoding metadata and allocating request/account strings on every token.
+    if(stream) {
+        J*index=decode(root[3]);
+        int init=index&&json_object_get_type(index)==3&&json_object_get_int64(index)==-1;
+        json_object_put(index);
+        if(!init)return;
+    }
     if(root[1].data&&!(root[1].size==4&&!memcmp(root[1].data,"null",4))&&!select_fields(root[1],meta_names,meta,4)) {
         if(lifecycle)lost();
         return;
@@ -556,12 +564,6 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
         goto done;
     }
     if(excluded)goto done;
-    if(stream) {
-        J*index=decode(root[3]);
-        int init=index&&json_object_get_type(index)==3&&json_object_get_int64(index)==-1;
-        json_object_put(index);
-        if(!init)goto done;
-    }
     J*provider=decode(root[4]),*auth=decode(root[5]),*eventtype=decode(root[6]);
     const char*provider_name=text(provider),*auth_id=text(auth),*type=text(eventtype);
     J*evidence=NULL;

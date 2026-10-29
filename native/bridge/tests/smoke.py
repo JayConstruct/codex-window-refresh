@@ -71,6 +71,18 @@ class NativeBridge(unittest.TestCase):
         self.block_model_close = False
         self.model_close_error = False
         self.antigravity_accounts = False
+        self.allow_quota_http = False
+        self.quota_operations = {}
+        self.quota_opened = 0
+        self.quota_requests = []
+        self.block_quota_http = False
+        self.quota_lock = threading.Lock()
+        self.quota_cancel_failures = 0
+        self.quota_cancel_attempts = 0
+        self.quota_cancel_entered = threading.Event()
+        self.quota_cancel_release = threading.Event()
+        self.quota_cancel_release.set()
+        self.catalog_error = None
         self.entered = threading.Event()
         self.release = threading.Event()
         self.release.set()
@@ -126,6 +138,188 @@ class NativeBridge(unittest.TestCase):
                 all(isinstance(metadata.get(key), str) and metadata[key].strip()
                     for key in ('Name', 'Version', 'Author', 'GitHubRepository')) and
                 result.get('capabilities', {}).get('management_api') is True)
+
+    @staticmethod
+    def quota_request(operation):
+        return {'operation_id': operation, 'method': 'GET',
+                'url': 'https://chatgpt.com/backend-api/wham/usage',
+                'headers': {'Authorization': ['Bearer fixture-token'],
+                            'Chatgpt-Account-Id': ['fixture-upstream'],
+                            'Accept': ['application/json'], 'User-Agent': ['codex-window-refresh-v2']}}
+
+    def test_quota_http_is_fixed_endpoint_owned_and_one_shot(self):
+        self.allow_quota_http = True
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        operation = self.rpc('host.http.operation_open', {}, instance)['result']['operation_id']
+        request = self.quota_request(operation)
+        for change in ({'url': 'https://example.invalid/'}, {'method': 'POST'},
+                       {'body': 'e30='}, {'operation_id': 'foreign-operation'},
+                       {'headers': {**request['headers'], 'X-Management-Key': ['private']}}):
+            self.assertFalse(self.rpc('host.http.do', {**request, **change}, instance)['ok'])
+        self.assertEqual(self.quota_requests, [])
+        result = self.rpc('host.http.do', request, instance)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(json.loads(base64.b64decode(result['result']['Body'])), {'rate_limit': {'allowed': True}})
+        self.assertFalse(self.rpc('host.http.do', request, instance)['ok'])
+        self.assertTrue(self.rpc('host.http.cancel', {'operation_id': operation}, instance)['ok'])
+        self.assertEqual(len(self.quota_requests), 1)
+
+    def test_quota_http_cancel_survives_all_eight_blocked_requests(self):
+        self.allow_quota_http = self.block_quota_http = True
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        operations = [self.rpc('host.http.operation_open', {}, instance)['result']['operation_id'] for _ in range(8)]
+        results = []
+        threads = [threading.Thread(target=lambda operation=operation: results.append(
+            self.rpc('host.http.do', self.quota_request(operation), instance))) for operation in operations]
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic()+3
+        while len(self.quota_requests) < 8 and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(len(self.quota_requests), 8)
+        self.assertEqual(self.rpc('host.auth.list', {}, instance)['error']['code'], 'bridge_busy')
+        for operation in operations:
+            self.assertTrue(self.rpc('host.http.cancel', {'operation_id': operation}, instance)['ok'])
+        for thread in threads:
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(len(results), 8)
+        self.assertTrue(all(result['ok'] for result in results), results)
+
+    def test_quota_http_expiry_and_quiesce_release_abandoned_handles(self):
+        self.allow_quota_http = True
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.rpc('host.http.operation_open', {}, instance, timeout_ms=1)
+        deadline = time.monotonic()+3
+        while self.quota_operations and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertFalse(self.quota_operations)
+        operation = self.rpc('host.http.operation_open', {}, instance)['result']['operation_id']
+        self.block_quota_http = True
+        result = []
+        thread = threading.Thread(target=lambda: result.append(self.rpc('host.http.do', self.quota_request(operation), instance)))
+        thread.start()
+        self.assertTrue(self.entered.wait(3))
+        self.assertTrue(self.call('plugin.quiesce', {})['ok'])
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(self.quota_operations)
+        self.assertTrue(result[0]['ok'], result)
+
+    def test_quota_http_failed_reaper_cancel_keeps_ownership_until_retry(self):
+        self.allow_quota_http = True
+        self.quota_cancel_failures = 1
+        self.quota_cancel_release.clear()
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        operation = self.rpc('host.http.operation_open', {}, instance, timeout_ms=1)['result']['operation_id']
+        self.assertTrue(self.quota_cancel_entered.wait(3), 'reaper did not attempt expired operation cleanup')
+        try:
+            for method, payload in (('host.http.cancel', {'operation_id': operation}),
+                                    ('host.http.do', self.quota_request(operation))):
+                reply = self.rpc(method, payload, instance)
+                self.assertEqual(reply['error']['code'], 'bridge_busy', reply)
+            with self.quota_lock:
+                self.assertIn(operation, self.quota_operations)
+            # In-progress cancellation still occupies its slot. A failed host
+            # callback must not make that slot available to an unrelated open.
+            others = [self.rpc('host.http.operation_open', {}, instance)['result']['operation_id'] for _ in range(7)]
+            self.assertEqual(self.rpc('host.http.operation_open', {}, instance)['error']['code'], 'bridge_busy')
+            self.assertEqual(self.quota_requests, [], 'cleanup race dispatched HTTP')
+        finally:
+            self.quota_cancel_release.set()
+        deadline = time.monotonic()+4
+        while time.monotonic() < deadline:
+            with self.quota_lock:
+                pending = operation in self.quota_operations
+            if not pending:
+                break
+            time.sleep(.01)
+        self.assertFalse(pending, 'failed cancellation was not retried')
+        self.assertGreaterEqual(self.quota_cancel_attempts, 2)
+        # The fixture removes the host handle before its native callback returns;
+        # allow the native reaper to finish its matching ownership transition.
+        replacement = None
+        while time.monotonic() < deadline:
+            reply = self.rpc('host.http.operation_open', {}, instance)
+            if reply['ok']:
+                replacement = reply['result']['operation_id']
+                break
+            self.assertEqual(reply['error']['code'], 'bridge_busy', reply)
+            time.sleep(.01)
+        self.assertIsNotNone(replacement, 'released slot remained occupied')
+        self.assertEqual(self.rpc('host.http.cancel', {'operation_id': operation}, instance)['error']['code'], 'quota_operation_unavailable')
+        for handle in others+[replacement]:
+            self.assertTrue(self.rpc('host.http.cancel', {'operation_id': handle}, instance)['ok'])
+
+    def test_quota_http_reaper_does_not_truncate_the_monotonic_deadline(self):
+        self.allow_quota_http = True
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        # Open near a monotonic second boundary. Dropping the fractional part
+        # when adding a 1000 ms budget would expire this handle in ~200 ms.
+        time.sleep((.8-time.monotonic() % 1) % 1)
+        started = time.monotonic()
+        operation = self.rpc('host.http.operation_open', {}, instance, timeout_ms=1000)['result']['operation_id']
+        time.sleep(max(0, started+.4-time.monotonic()))
+        # Wake the reaper after the incorrectly truncated deadline, rather than
+        # depending on the phase of its normal one-second timer.
+        self.assertTrue(self.rpc('host.auth.list', {}, instance)['ok'])
+        checked = time.monotonic()
+        self.assertLess(checked-started, 1, 'fixture scheduling exceeded the operation budget')
+        until = min(started+.65, checked+.15)
+        while time.monotonic() < until:
+            with self.quota_lock:
+                self.assertIn(operation, self.quota_operations, 'reaper cancelled before the full monotonic deadline')
+            time.sleep(.01)
+        self.assertTrue(self.rpc('host.http.cancel', {'operation_id': operation}, instance)['ok'])
+
+    def test_daemon_quota_query_uses_owned_host_http_without_model_calls(self):
+        self.allow_quota_http = True
+        self.start_daemon()
+        status, accepted = self.management('jobs', 'POST', {'kind': 'quota_query', 'account_id': 'a'}, 'host-quota-query')
+        self.assertEqual(status, 202)
+        deadline = time.monotonic()+5
+        job = None
+        while time.monotonic() < deadline:
+            status, job = self.management('jobs', query={'job_id': [accepted['job_id']]})
+            self.assertEqual(status, 200)
+            if job['phase'] in ('completed', 'failed', 'cancelled'):
+                break
+            time.sleep(.02)
+        self.assertEqual(job['phase'], 'completed', job)
+        self.assertEqual(len(job['items']), 1, job)
+        self.assertEqual((job['items'][0]['account_id'], job['items'][0]['phase'], job['items'][0].get('error_code', '')),
+                         ('a', 'completed', ''), job)
+        self.assertEqual(len(self.quota_requests), 1)
+        self.assertEqual(self.quota_requests[0]['headers']['Authorization'], ['Bearer fixture-quota-token'])
+        self.assertEqual(self.quota_requests[0]['headers']['Chatgpt-Account-Id'], ['fixture-upstream'])
+        with self.quota_lock:
+            self.assertFalse(self.quota_operations, 'query completed before its HTTP handle was released')
+        status, page = self.management('accounts')
+        self.assertEqual(status, 200)
+        account = next(account for account in page['accounts'] if account['id'] == 'a')
+        self.assertEqual((account['quota']['permission'], account['quota']['source']), ('allowed', 'cpa_wham_usage'))
+        status, replay = self.management('jobs', 'POST', {'kind': 'quota_query', 'account_id': 'a'}, 'host-quota-query')
+        self.assertEqual((status, replay['job_id']), (202, accepted['job_id']))
+        self.assertEqual(len(self.quota_requests), 1, 'read-only task replay queried upstream again')
+        self.assertEqual(self.models, 0)
+
+    def test_account_models_are_scoped_and_unsupported_is_precise(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.assertFalse(self.rpc('host.auth.models', {}, instance)['ok'])
+        self.assertFalse(self.rpc('host.auth.models', {'auth_index': 'a', 'extra': True}, instance)['ok'])
+        result = self.rpc('host.auth.models', {'auth_index': 'a'}, instance)
+        self.assertEqual(result['result']['credentials'][0]['models'], ['fixture-model'])
+        self.catalog_error = 'unsupported host callback host.auth.models'
+        self.assertEqual(self.rpc('host.auth.models', {'auth_index': 'a'}, instance)['error']['code'], 'model_catalog_unsupported')
+        self.catalog_error = 'private token text'
+        failure = self.rpc('host.auth.models', {'auth_index': 'a'}, instance)
+        self.assertEqual(failure['error']['code'], 'host_callback_failed')
+        self.assertNotIn('private token', json.dumps(failure))
+        self.catalog_error = None
+        self.start_daemon()
+        status, catalog = self.management('account-models', query={'account_id': ['a']})
+        self.assertEqual(status, 200, catalog)
+        self.assertEqual(catalog['models'], ['fixture-model'])
 
     def assert_host_registration(self, registration):
         self.assertTrue(self.host_accepts_registration(registration), registration)
@@ -215,6 +409,8 @@ class NativeBridge(unittest.TestCase):
     def cleanup(self):
         self.release.set()
         self.model_close_error = False
+        self.quota_cancel_failures = 0
+        self.quota_cancel_release.set()
         if self.process:
             self.process.terminate()
             self.process.communicate(timeout=10)
@@ -222,6 +418,7 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(self.calls, self.frees, 'host-owned buffer leak')
         self.assertEqual(self.models, self.expected_models, 'unexpected model execute side effect')
         self.assertFalse(self.model_streams, 'unreleased fixture model streams')
+        self.assertFalse(self.quota_operations, 'unreleased fixture HTTP operations')
         # All native threads must be joined before dlclose. This is a C library,
         # without RTLD_NODELETE or a retained Go runtime.
         import _ctypes
@@ -274,6 +471,50 @@ class NativeBridge(unittest.TestCase):
                     value = {}
             else:
                 return 1
+        elif method.startswith('host.http.'):
+            self.assertTrue(self.allow_quota_http, 'HTTP callback without fixture opt-in')
+            if method == 'host.http.operation_open':
+                self.quota_opened += 1
+                operation = f'fixture-http-{self.quota_opened}'
+                with self.quota_lock:
+                    self.quota_operations[operation] = threading.Event()
+                value = {'operation_id': operation}
+            elif method == 'host.http.do':
+                with self.quota_lock:
+                    event = self.quota_operations[req['operation_id']]
+                    self.quota_requests.append(req)
+                if self.block_quota_http:
+                    self.entered.set()
+                    event.wait(10)
+                value = {'StatusCode': 200, 'Body': base64.b64encode(b'{"rate_limit":{"allowed":true}}').decode()}
+            elif method == 'host.http.cancel':
+                with self.quota_lock:
+                    self.quota_cancel_attempts += 1
+                    failed = self.quota_cancel_failures > 0
+                    if failed:
+                        self.quota_cancel_failures -= 1
+                if failed:
+                    self.quota_cancel_entered.set()
+                    self.quota_cancel_release.wait(10)
+                    success = False
+                    value = {'error': 'fixture-quota-cancel-failed'}
+                else:
+                    with self.quota_lock:
+                        event = self.quota_operations.pop(req['operation_id'], None)
+                    if event:
+                        event.set()
+                    value = {}
+            else:
+                return 1
+        elif method == 'host.auth.models':
+            if self.catalog_error:
+                raw = json.dumps({'ok': False, 'error': {'code': 'host_callback_failed', 'message': self.catalog_error}}).encode()
+                result.contents.ptr = self.libc.malloc(len(raw))
+                result.contents.len = len(raw)
+                C.memmove(result.contents.ptr, raw, len(raw))
+                return 0
+            value = {'credentials': [{'id': req['auth_index'], 'auth_index': req['auth_index'],
+                                     'provider': 'codex', 'models': ['fixture-model']}]}
         elif method == 'host.auth.list':
             value = {'files': [{'id': name, 'auth_index': name, 'provider': 'codex'} for name in ('a', 'b')]}
             if self.antigravity_accounts:
@@ -288,6 +529,8 @@ class NativeBridge(unittest.TestCase):
                                   'email': 'fixture@example.invalid', 'project_id': 'fixture-project'}}
         elif method == 'host.auth.get':
             value = {'auth_index': req['auth_index'], 'json': {'type': 'codex', 'account_id': 'fixture-upstream'}}
+            if self.allow_quota_http:
+                value['json']['access_token'] = 'fixture-quota-token'
             if self.antigravity_accounts and req['auth_index'] == 'antig-index':
                 value = {'auth_index': 'antig-index', 'json': {'type': 'antigravity', 'email': 'fixture@example.invalid',
                          'project_id': 'fixture-project', 'access_token': 'private-fixture-token', 'refresh_token': 'private-fixture-refresh'}}
@@ -309,9 +552,9 @@ class NativeBridge(unittest.TestCase):
         finally:
             self.api.free(result.ptr, result.len)
 
-    def rpc(self, method, payload=None, instance=''):
+    def rpc(self, method, payload=None, instance='', timeout_ms=15000):
         request = json.dumps({'protocol_version': 1, 'request_id': 'fixture', 'bridge_instance_id': instance,
-                              'remaining_timeout_ms': 15000, 'method': method, 'payload': payload or {}}).encode()
+                              'remaining_timeout_ms': timeout_ms, 'method': method, 'payload': payload or {}}).encode()
         with socket.socket(socket.AF_UNIX) as conn:
             conn.settimeout(15)
             conn.connect(str(self.runtime / 'bridge.sock'))
