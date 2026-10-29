@@ -6,7 +6,7 @@ rc.23 增加下述插件会话粘性接管。数据库保持 schema 10，旧调�
 
 ## 项目与账号
 
-rc.26 起默认使用客户端自动目录标识，无需维护 `projects.json`。Linux/macOS 在运行 Codex 的电脑安装或更新客户端（Python 3.10+、curl，无需 sudo）：
+rc.26 起支持客户端自动目录标识，无需维护 `projects.json`。rc.27 客户端默认使用已记住的 ID 或 `cliproxyapi`，提供商启动报错时可输入实际 ID 并保存；已有 rc.26 服务端可以继续使用。Linux/macOS 在运行 Codex 的电脑安装或更新客户端（Python 3.10+、curl，无需 sudo）：
 
 ```sh
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh
@@ -14,7 +14,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 
 默认安装到 `~/.local/bin`，提供 `cwr-codex` 命令及兼容原路径的 `cwr-codex.py`。未加入 PATH 时可运行 `~/.local/bin/cwr-codex`；自定义目录使用 `bash /tmp/cwr-client-install.sh --bin-dir /absolute/path`。重新下载并运行同一安装命令即可更新，安装器下载配套标签版本并校验 SHA-256，下载或校验失败不会覆盖旧脚本。已有 Codex 配置、目录映射和 shell 配置保留。离线安装可在完整解压的发行包中运行 `bash install-client.sh`，无需 curl。
 
-1. 在运行 Codex 的电脑进入项目目录，执行 `cwr-codex`，再发送一次正常请求。脚本不检测 Codex 配置，`--provider` 默认 `cpa`；其他提供商 ID 需显式填写。
+1. 在运行 Codex 的电脑进入项目目录，执行 `cwr-codex`，再发送一次正常请求。新版脚本不读取 Codex 配置，默认使用已记住的提供商 ID，没有记忆时使用 `cliproxyapi`。若 Codex 报该提供商定义缺失或名称为空，则提示输入实际 ID，保存到客户端设置后自动重试；下次直接运行即可。
 2. 在面板“账号调度与重置卡”找到“客户端最近出现的项目”。客户端上报目录名和 `dir-` 开头的稳定标识；点击“匹配账号”，可填写便于辨认的项目名称，再从 CPA 账号清单选择首选账号。
 3. 开启业务账号调度并“保存并应用全部设置”。账号偏好保存在服务端，后续新会话按该项目选择账号，客户端无需重新下载文件。已有会话绑定继续沿用原账号。
 
@@ -48,14 +48,16 @@ project-b = account-3
 客户端使用仓库或安装包内的 Python 启动器：
 
 ```sh
-python3 scripts/cwr-codex.py --provider cpa --project project-a --directory /work/project-a
+python3 scripts/cwr-codex.py --project project-a --directory /work/project-a
 ```
 
 通过脚本启动时，启动器始终为本次 Codex 进程传入 `X-CWR-Project` 请求头设置；直接运行 `codex` 时，启动器不参与，也就不会额外添加项目头。启动器不读取或检测 Codex 配置及 profile，客户端使用 Python 3.10+ 即可，无需安装 `tomli`。
 
-`--provider` 指定写入请求头的提供商 ID，默认 `cpa`，应填写 Codex 本次实际使用的提供商 ID；例如使用 `my_proxy` 时传入 `--provider my_proxy`。启动器将头部设置写入 `model_providers.<ID>.http_headers.X-CWR-Project` 启动参数，不替换 `model_provider`，不修改配置文件或服务器调度总开关。提供商 ID 及其 CPA 地址由用户配置，启动器不自动判断或切换。Codex 的 profile 和其他命令行参数照常透传。
+新版默认使用 `cliproxyapi`，交互输入的 ID 保存到 `$XDG_CONFIG_HOME/cwr/client.json`（未指定 XDG_CONFIG_HOME 时为 `~/.config/cwr/client.json`）。脚本只捕获当前提供商对应的 `provider name must not be empty` 启动错误；回车、Ctrl+C 或输入结束可取消，HTTP、认证或其他错误照常退出。非交互运行时不等待输入，会提示通过 `--provider` 指定 ID。客户端安装或更新保留这个记忆文件。
 
-这些是 [rc.26 启动器](../scripts/cwr-codex.py)的用法。rc.25 安装包仍包含提供商检测逻辑。当前脚本的显式 `--project` 和原有目录映射可配合旧后台使用，自动发现则需要上述三端同时升级。启动器不保存密钥、不改写请求正文，请求头仅通过本次启动参数传入。
+`--provider` 可单次覆盖已记住的 ID，例如 `--provider my_proxy`；成功启动不会把单次覆盖写成默认值。启动器将头部设置写入 `model_providers.<ID>.http_headers.X-CWR-Project` 启动参数，不替换 `model_provider`，不修改 Codex 配置文件或服务器调度总开关。提供商 ID 及其 CPA 地址由用户配置，启动器不自动判断或切换。Codex 的 profile 和其他命令行参数照常透传。
+
+这些是 [rc.27 启动器](../scripts/cwr-codex.py)的用法。rc.25 安装包仍包含提供商检测逻辑。当前脚本的显式 `--project` 和原有目录映射可配合旧后台使用，自动发现需要后台和接入层至少为 rc.26。rc.27 的提供商交互修复可单独更新客户端。启动器不保存密钥、不改写请求正文，请求头仅通过本次启动参数传入。
 
 需要沿用自定义项目标识或将多个目录合并到同一项目时，可选创建 `~/.config/cwr/projects.json`：
 
@@ -66,7 +68,7 @@ python3 scripts/cwr-codex.py --provider cpa --project project-a --directory /wor
 ]}
 ```
 
-然后在对应目录执行 `python3 /path/to/cwr-codex.py`，默认使用 `cpa` 提供商 ID。手动 `--project` 优先，其次是现有目录映射的最长路径匹配，最后自动生成目录标识；默认映射文件不存在时直接使用自动标识，不创建文件。`--map` 可指定另一份映射，显式指定的文件不存在、内容损坏或映射重复时会报错。希望已有目录改用自动标识时，移除对应映射即可。Codex 参数放在 `--` 后，例如 `-- exec "检查测试结果"`。目录统一由启动器的 `--directory` 指定。需要普通启动时直接执行 `codex`。
+然后在对应目录执行 `python3 /path/to/cwr-codex.py`，新版会使用已记住的提供商 ID 或默认 `cliproxyapi`。手动 `--project` 优先，其次是现有目录映射的最长路径匹配，最后自动生成目录标识；默认映射文件不存在时直接使用自动标识，不创建文件。`--map` 可指定另一份映射，显式指定的文件不存在、内容损坏或映射重复时会报错。希望已有目录改用自动标识时，移除对应映射即可。Codex 参数放在 `--` 后，例如 `-- exec "检查测试结果"`。目录统一由启动器的 `--directory` 指定。需要普通启动时直接执行 `codex`。
 
 ## 额度分配
 

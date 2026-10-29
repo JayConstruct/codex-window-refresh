@@ -2,16 +2,16 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查询、可选自动查询和按需模型唤醒。插件 ID 为 `codex-window-refresh`。
 
-**v0.2.0-rc.26** 支持客户端目录自动发现：通过 `cwr-codex` 发送请求后，服务端面板列出目录名与稳定标识，可直接选择首选账号，无需同步 `projects.json`。客户端提供一键安装和更新，不检测 Codex 配置；`--provider` 默认 `cpa`。后台和接入层均为 rc.26，升级须 `--restart`，数据库升至 schema 11 并保留已有数据。详见 [rc.26 发布说明](docs/releases/v0.2.0-rc.26.md)和[使用说明](docs/account-scheduling.md#项目与账号)。
+**v0.2.0-rc.27** 修复客户端提供商启动错误：直接运行 `cwr-codex` 默认使用已记住的 ID 或 `cliproxyapi`；提供商定义缺失或名称为空时，提示输入实际 ID，保存到客户端自己的 `~/.config/cwr/client.json` 后重试，下次直接运行即可。`--provider` 仍可单次覆盖，不读取或修改 Codex 配置。已有 rc.26 服务端只需更新客户端即可获得修复。配套后台为 rc.27，原生接入层保持 rc.26，数据库保持 schema 11。详见 [rc.27 发布说明](docs/releases/v0.2.0-rc.27.md)和[使用说明](docs/account-scheduling.md#项目与账号)。
 
 服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
 
 ## 一键安装或更新
 
-当前 **v0.2.0-rc.26 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+当前 **v0.2.0-rc.27 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.26 --restart
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.27 --restart
 ```
 
 v2 提供额度查询、活动观测、模型配置、显式手动短句候选生成及 Codex 模型唤醒，自动查询和自动唤醒默认关闭，已有明确保存的规则保持不变。首次切换会停止 v1 功能，成功后清除 v1 数据、旧版本及临时恢复副本；后续更新保留 v2 数据。只有后台改变且接入层文件一致时只重启后台，接入层改变时仍须显式 `--restart`。下面的旧入口继续更新 v1，不会自动切换 v2。
@@ -22,7 +22,7 @@ v2 提供额度查询、活动观测、模型配置、显式手动短句候选�
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-可用 `--version v0.2.0-rc.26` 固定本次版本。**本次后台和接入层均为 rc.26，升级须显式 `--restart`**，以接收客户端自动目录标识。数据库从 schema 10 升至 11，保留已有规则、额度和发送防重记录；schema 11 不能直接交给 rc.25 或更早后台。运行 Codex 的电脑也需更新客户端。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
+可用 `--version v0.2.0-rc.27` 固定本次版本。**后台为 rc.27，接入层保持 rc.26**；从 rc.26 更新后台时，安装器确认接入层文件完全一致后可仅重启后台。从 rc.25 或更早版本升级须显式 `--restart`，并迁移到 schema 11，保留已有规则、额度和发送防重记录；schema 11 不能直接交给 rc.25 或更早后台。仅修复客户端启动无需更新服务端，重新运行下方客户端安装命令即可。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
 
 **客户端安装或更新（Linux/macOS，无需 sudo）**：
 

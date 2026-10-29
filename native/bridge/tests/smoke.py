@@ -181,8 +181,8 @@ class NativeBridge(unittest.TestCase):
                           '--codex', str(fake), '--directory', str(repo)], env={**os.environ, 'HOME': str(self.root)}, text=True))
         headers = {}
         for value in argv:
-            if value.startswith('model_providers.cpa.http_headers.'):
-                key, _, encoded = value.removeprefix('model_providers.cpa.http_headers.').partition('=')
+            if value.startswith('model_providers.cliproxyapi.http_headers.'):
+                key, _, encoded = value.removeprefix('model_providers.cliproxyapi.http_headers.').partition('=')
                 headers[key] = [json.loads(encoded)]
         project = headers['X-CWR-Project'][0]
         self.assertRegex(project, '^dir-[a-f0-9]{64}$')

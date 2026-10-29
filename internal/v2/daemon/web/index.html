@@ -235,7 +235,7 @@
                 </section>
               </div>
               <details id="routing-text-editor" class="scheduling-advanced"><summary>按文本编辑项目偏好</summary><label class="field-label" for="routing-projects">项目首选账号</label><textarea id="routing-projects" rows="3" placeholder="project-a = account-1, account-2"></textarea><p class="field-help">每行“项目标识 = 账号 ID, 账号 ID”。同名项目保留目录；删除或重命名项目会移除对应目录映射。</p></details>
-              <details class="scheduling-advanced"><summary>安装客户端并启动</summary><p class="field-help">Linux/macOS 使用以下命令安装或更新（Python 3.10+、curl，无需 sudo），默认安装到 ~/.local/bin。进入项目目录运行 cwr-codex；未加入 PATH 时可用 ~/.local/bin/cwr-codex。客户端自动从 Git 项目根目录生成标识，无 Git 时使用启动目录，无需 projects.json。--provider 填写实际使用的提供商 ID，默认 cpa。直接运行 codex 不额外添加项目头，启动器不检测配置或切换提供商。已有手动 --project 及目录映射仍优先生效。</p><pre class="routing-command">curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh &amp;&amp; bash /tmp/cwr-client-install.sh
+              <details class="scheduling-advanced"><summary>安装客户端并启动</summary><p class="field-help">Linux/macOS 使用以下命令安装或更新（Python 3.10+、curl，无需 sudo），默认安装到 ~/.local/bin。进入项目目录运行 cwr-codex；未加入 PATH 时可用 ~/.local/bin/cwr-codex。新版默认使用已记住的提供商 ID 或 cliproxyapi；提供商启动报错时可输入实际 ID 并记住，下次无需再填，--provider 仍可单次覆盖。客户端自动从 Git 项目根目录生成标识，无 Git 时使用启动目录，无需 projects.json。直接运行 codex 不额外添加项目头，启动器不读取 Codex 配置或切换提供商。已有手动 --project 及目录映射仍优先生效。</p><pre class="routing-command">curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh &amp;&amp; bash /tmp/cwr-client-install.sh
 cwr-codex</pre></details>
             </section>
           </fieldset>

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLIENT_VERSION=v0.2.0-rc.26
-CLIENT_SHA256=f7ebc0c26121e0747ed112dca61c27ae5b31909e6118893e02876b298ed30cde
+CLIENT_VERSION=v0.2.0-rc.27
+CLIENT_SHA256=0608a3f1dd4c827fd6fb2e1ffb613877db0ab19716a72c9b94938fe5815ba37b
 version=$CLIENT_VERSION
 bin_dir=${HOME:-}/.local/bin
 while [[ $# -gt 0 ]]; do
@@ -15,6 +15,7 @@ while [[ $# -gt 0 ]]; do
         "安装或更新本安装器配套的客户端 $CLIENT_VERSION，默认目录为 ~/.local/bin。" \
         '需要 Python 3.10+ 和 curl，支持 Linux/macOS，无需 sudo。' \
         '提供 cwr-codex 命令及 cwr-codex.py；不修改 Codex 配置、目录映射或 shell 配置。' \
+        '直接运行默认使用 cliproxyapi；提供商报错时可输入 ID 并记住，下次无需再填。' \
         '再次下载并运行安装器即可更新；可在已解压的发行包目录中离线安装。'
       exit 0 ;;
     *) printf '未知参数：%s\n' "$1" >&2; exit 1 ;;

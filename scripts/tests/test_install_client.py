@@ -42,7 +42,8 @@ bash "$1" "${@:2}"
     def test_install_update_and_executable_command_preserve_configuration_and_maps(self):
         config = self.root / ".codex" / "config.toml"
         mapping = self.root / ".config" / "cwr" / "projects.json"
-        for file in (config, mapping):
+        preference = self.root / ".config" / "cwr" / "client.json"
+        for file in (config, mapping, preference):
             file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text("preserve me", encoding="utf-8")
         self.destination.mkdir()
@@ -59,7 +60,7 @@ bash "$1" "${@:2}"
             self.assertEqual(executed.returncode, 0, executed.stderr)
             self.assertIn("--provider", executed.stdout)
             self.assertFalse(list(self.destination.glob(".cwr-*")))
-            for file in (config, mapping):
+            for file in (config, mapping, preference):
                 self.assertEqual(file.read_text(encoding="utf-8"), "preserve me")
         request = self.operations.read_text(encoding="utf-8")
         self.assertIn("/" + (ROOT / "release/v2-version.txt").read_text().strip() + "/scripts/cwr-codex.py", request)
