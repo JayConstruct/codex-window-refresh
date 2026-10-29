@@ -2267,6 +2267,7 @@
   function schedulingDraft() {
     const c = JSON.parse(JSON.stringify(schedulingSaved.config));
     c.enabled = $('routing-enabled').checked; c.prefer_reset = $('routing-reset').checked;
+    c.subagent_affinity = $('routing-subagent').checked; c.rebind_on = $('routing-rebind').value;
     for (const [key, id] of Object.entries(schedulingNumbers)) c[key] = Number($(id).value);
     c.cards.enabled = $('cards-enabled').checked; c.cards.auto_consume = $('cards-auto').checked;
     for (const [key, id] of Object.entries(cardNumbers)) c.cards[key] = Number($(id).value);
@@ -2295,6 +2296,7 @@
     if (changed) {
       const c = data.config;
       $('routing-enabled').checked = c.enabled; $('routing-reset').checked = c.prefer_reset;
+      $('routing-subagent').checked = c.subagent_affinity !== false; $('routing-rebind').value = c.rebind_on || 'quota';
       for (const [key, id] of Object.entries(schedulingNumbers)) $(id).value = c[key];
       $('cards-enabled').checked = c.cards.enabled; $('cards-auto').checked = c.cards.auto_consume;
       for (const [key, id] of Object.entries(cardNumbers)) $(id).value = c.cards[key];

@@ -7,6 +7,7 @@ is separately covered by executor/source_test.go with an injected transport.
 import base64
 import ctypes as C
 import contextlib
+import concurrent.futures
 import hashlib
 import http.server
 import http.client
@@ -109,23 +110,25 @@ class NativeBridge(unittest.TestCase):
     def routing_snapshot(projects=None, cap=8):
         now = int(time.time())
         return {'config': {'enabled': True, 'prefer_reset': True, 'max_inflight': cap,
-                           'session_ttl_seconds': 1800, 'projects': projects or []},
+                           'session_ttl_seconds': 1800, 'subagent_affinity': True, 'rebind_on': 'quota', 'projects': projects or []},
+                'identities': [{'id':'a','binding':'binding-a','status':'available'}, {'id':'b','binding':'binding-b','status':'available'}],
                 'accounts': [{'id': 'a', 'valid_until': now + 300, 'reset_at': now + 60, 'card_expiry': 0},
                              {'id': 'b', 'valid_until': now + 300, 'reset_at': now + 3600, 'card_expiry': 0}]}
 
     @staticmethod
-    def routing_request(project='', session='', scope='caller'):
-        return {'Candidates': [{'ID': 'a', 'Provider': 'codex'}, {'ID': 'b', 'Provider': 'codex'}],
+    def routing_request(project='', session='', scope='caller', parent='', model='fixture-model'):
+        return {'Model':model, 'Candidates': [{'ID': 'a', 'Provider': 'codex'}, {'ID': 'b', 'Provider': 'codex'}],
                 'Options': {'Headers': {'X-Cwr-Project': [project]},
-                            'Metadata': {'session_id': session, 'caller_scope': scope}}}
+                            'Metadata': {'canonical_session_id': session, 'caller_scope': scope,'parent_session_id':parent,'selection_id':os.urandom(16).hex()}}}
 
     def test_scheduler_project_preference_cap_and_completion(self):
         instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
         self.assertEqual(self.call('scheduler.pick', self.routing_request())['result'], {})
         snapshot = self.routing_snapshot([{'project': 'work', 'accounts': ['b']}], cap=1)
         self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
-        self.assertEqual(self.call('scheduler.pick', self.routing_request('work'))['result']['AuthID'], 'b')
-        self.call('request.intercept_after', {'RequestID': 'work-request', 'Metadata': {'selected_auth_id': 'b'}})
+        request=self.routing_request('work')
+        self.assertEqual(self.call('scheduler.pick', request)['result']['AuthID'], 'b')
+        self.call('request.intercept_after', {'RequestID': 'work-request', 'Metadata': {**request['Options']['Metadata'],'selected_auth_id': 'b'}})
         self.assertEqual(self.call('scheduler.pick', self.routing_request('work'))['result']['AuthID'], 'a')
         self.assertTrue(self.call('scheduler.pick', self.routing_request('work'))['result']['Reject'])
         self.call('request.complete', {'RequestID': 'work-request', 'Metadata': {}})
@@ -140,11 +143,13 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(self.call('scheduler.pick', request)['result']['AuthID'], 'a')
         snapshot['accounts'][1]['reset_at'] = int(time.time()) + 5
         self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+        request['Options']['Metadata']['selection_id']=os.urandom(16).hex()
         self.assertEqual(self.call('scheduler.pick', request)['result']['AuthID'], 'a')
         self.assertEqual(self.call('scheduler.pick', self.routing_request(session='shared-session', scope='other'))['result']['AuthID'], 'b')
         for a in snapshot['accounts']: a['valid_until'] = 1
         self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
-        self.assertEqual(self.call('scheduler.pick', request)['result'], {})
+        request['Options']['Metadata']['selection_id']=os.urandom(16).hex()
+        self.assertEqual(self.call('scheduler.pick', request)['result']['AuthID'], 'a')
         snapshot['accounts'].reverse()
         self.assertFalse(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
 
@@ -187,6 +192,249 @@ class NativeBridge(unittest.TestCase):
         self.assertNotIn('not-for-storage', json.dumps(cards))
         self.assertEqual(len(self.quota_requests), 1)
         self.assertEqual(self.models, 0)
+
+    def sticky_snapshot(self, snapshot):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+
+    def sticky_pick(self, session, parent='', model='fixture-model', scope='caller', project='', candidates=None, headers=None):
+        request = self.routing_request(project=project, session=session, scope=scope, parent=parent, model=model)
+        if candidates is not None: request['Candidates'] = candidates
+        if headers is not None: request['Options']['Headers'].update(headers)
+        decision = self.call('scheduler.pick', request)['result']
+        return request, decision
+
+    def sticky_started(self, request, decision, request_id):
+        metadata = {**request['Options']['Metadata'], 'selected_auth_id': decision['AuthID']}
+        self.call('request.intercept_after', {'RequestID': request_id, 'Metadata': metadata})
+        return metadata
+
+    def sticky_completed(self, request_id, metadata, outcome='succeeded', status=200):
+        self.call('request.complete', {'RequestID': request_id, 'Metadata': metadata, 'Outcome': outcome, 'StatusCode': status, 'Error':'private-error-not-retained'})
+
+    def test_sticky_existing_binding_precedes_project_reset_and_recovered_priority(self):
+        snapshot = self.routing_snapshot([{'project':'work','accounts':['a']}])
+        self.sticky_snapshot(snapshot)
+        request, choice = self.sticky_pick('main', project='work')
+        self.assertEqual(choice['AuthID'], 'a')
+        metadata = self.sticky_started(request, choice, 'initial')
+        self.sticky_completed('initial', metadata)
+        snapshot['config']['projects']=[{'project':'work','accounts':['b']}]
+        snapshot['accounts'][1]['reset_at']=int(time.time())+1
+        self.sticky_snapshot(snapshot)
+        candidates=[{'ID':'a','Provider':'codex','Priority':0},{'ID':'b','Provider':'codex','Priority':10}]
+        self.assertEqual(self.sticky_pick('main', project='work', candidates=candidates)[1]['AuthID'],'a')
+        self.assertEqual(self.sticky_pick('new', project='work', candidates=candidates)[1]['AuthID'],'b')
+        for account in snapshot['accounts']: account['valid_until']=1
+        self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main', project='work', candidates=candidates)[1]['AuthID'],'a')
+
+    def test_sticky_children_forks_and_nested_children_inherit_and_fail_independently(self):
+        snapshot=self.routing_snapshot(cap=32)
+        self.sticky_snapshot(snapshot)
+        request, choice=self.sticky_pick('parent')
+        metadata=self.sticky_started(request,choice,'parent-run');self.sticky_completed('parent-run',metadata)
+        snapshot['accounts'][1]['reset_at']=int(time.time())+1
+        self.sticky_snapshot(snapshot)
+        request,child=self.sticky_pick('child',parent='parent')
+        self.assertEqual(child['AuthID'],'a')
+        child_meta=self.sticky_started(request,child,'child-run')
+        self.assertEqual(self.sticky_pick('nested',parent='child')[1]['AuthID'],'a')
+        self.assertEqual(self.sticky_pick('fork',parent='parent')[1]['AuthID'],'a')
+        self.sticky_completed('child-run',child_meta,'failed',429)
+        self.assertEqual(self.sticky_pick('child',parent='parent')[1]['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('parent')[1]['AuthID'],'a')
+        self.assertEqual(self.sticky_pick('nested',parent='child')[1]['AuthID'],'a')
+        self.assertEqual(self.sticky_pick('fork',parent='parent')[1]['AuthID'],'a')
+
+    def test_sticky_subagent_setting_and_scope_project_model_isolation(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('parent')[1]['AuthID'],'a')
+        snapshot['accounts'][1]['reset_at']=int(time.time())+1
+        snapshot['config']['subagent_affinity']=False
+        self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('child',parent='parent')[1]['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('parent',scope='other')[1]['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('parent',project='other')[1]['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('parent',model='other')[1]['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('parent')[1]['AuthID'],'a')
+        snapshot['config']['subagent_affinity']=True;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('new-child',parent='parent')[1]['AuthID'],'a')
+        # A supported different child model can inherit an unambiguous ancestor.
+        self.assertEqual(self.sticky_pick('cross-model-child',parent='parent',model='third')[1]['AuthID'],'b')
+        # Parent has conflicting per-model bindings: cross-model inheritance is declined.
+        self.assertEqual(self.sticky_pick('parent',model='other')[1]['AuthID'],'b')
+
+    def test_sticky_busy_rejects_without_switching_and_reservation_is_idempotent(self):
+        snapshot=self.routing_snapshot(cap=1);self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('session')
+        self.assertEqual(choice['AuthID'],'a')
+        self.assertEqual(self.call('scheduler.pick',request)['result']['AuthID'],'a')
+        metadata=self.sticky_started(request,choice,'one')
+        self.assertEqual(self.sticky_pick('session')[1].get('RejectCode'),'scheduler_busy')
+        self.assertEqual(self.sticky_pick('child',parent='session')[1].get('RejectCode'),'scheduler_busy')
+        self.sticky_completed('one',metadata)
+        self.assertEqual(self.sticky_pick('session')[1]['AuthID'],'a')
+
+    def test_sticky_transient_failover_preserves_binding_until_config_allows_rebind(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main');metadata=self.sticky_started(request,choice,'main')
+        self.sticky_completed('main',metadata,'failed',503)
+        snapshot['accounts'][1]['reset_at']=int(time.time())+1;self.sticky_snapshot(snapshot)
+        only_b=[{'ID':'b','Provider':'codex'}]
+        request,choice=self.sticky_pick('main',candidates=only_b)
+        self.assertEqual(choice['AuthID'],'b')
+        metadata=self.sticky_started(request,choice,'failover');self.sticky_completed('failover',metadata)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        snapshot['config']['rebind_on']='any';self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main');metadata=self.sticky_started(request,choice,'any-failure')
+        self.sticky_completed('any-failure',metadata,'failed',503)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'b')
+
+    def test_sticky_cancellation_and_caller_errors_do_not_invalidate_binding(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        for outcome,status in [('canceled',499),('failed',400),('failed',404),('failed',422),('rejected',403)]:
+            request,choice=self.sticky_pick('main');metadata=self.sticky_started(request,choice,'request-'+str(status))
+            self.assertEqual(choice['AuthID'],'a')
+            self.sticky_completed('request-'+str(status),metadata,outcome,status)
+        snapshot['accounts'][1]['reset_at']=int(time.time())+1;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+
+    def test_sticky_replacement_disable_and_exhaustion_invalidate_old_binding(self):
+        for reason in ['replacement','disabled','quota']:
+            self.call('plugin.quiesce',{})
+            self.assertTrue(self.call('plugin.register',{'schema_version':6})['ok'])
+            snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+            self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+            snapshot['accounts'][1]['reset_at']=int(time.time())+1
+            if reason=='replacement': snapshot['identities'][0]['binding']='changed-account'
+            if reason=='disabled': snapshot['identities'][0]['status']='disabled'
+            if reason=='quota': snapshot['exhausted']=['a']
+            self.sticky_snapshot(snapshot)
+            self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'b')
+
+    def test_sticky_old_completion_cannot_invalidate_new_binding(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main');old=self.sticky_started(request,choice,'old')
+        snapshot['exhausted']=['a'];self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main');new=self.sticky_started(request,choice,'new')
+        self.assertEqual(choice['AuthID'],'b')
+        snapshot['exhausted']=[];self.sticky_snapshot(snapshot)
+        self.sticky_completed('old',old,'failed',429)
+        self.sticky_completed('new',new)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'b')
+
+    def test_sticky_parallel_first_turns_and_shared_binding_failure(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            picks=list(pool.map(lambda _:self.sticky_pick('parallel'),range(16)))
+        self.assertEqual({pick['AuthID'] for _,pick in picks},{'a'})
+        # Several requests share one binding generation. A failure of that
+        # account still invalidates it, even if another turn was selected later.
+        request,choice=picks[0];metadata=self.sticky_started(request,choice,'early')
+        self.sticky_completed('early',metadata,'failed',401)
+        snapshot['accounts'][1]['reset_at']=int(time.time())+30;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('parallel')[1]['AuthID'],'b')
+
+    def test_sticky_duplicate_reservation_does_not_survive_identity_replacement(self):
+        snapshot=self.routing_snapshot(cap=1);self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main')
+        self.assertEqual(choice['AuthID'],'a')
+        snapshot['identities'][0]['binding']='replacement'
+        snapshot['accounts'][1]['reset_at']=int(time.time())+30;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.call('scheduler.pick',request)['result']['AuthID'],'b')
+
+    def sticky_usage(self, metadata, failed=False, status=200):
+        result=self.call('usage.handle',{'RequestID':'different-upstream-request-id','SelectionID':metadata['selection_id'],
+            'AuthID':metadata['selected_auth_id'],'Provider':'codex','Generate':True,'Failed':failed,
+            'APIKey':'private-client-key-never-retained','Failure':{'StatusCode':status,'Body':'private-error-never-retained'},'Detail':{'InputTokens':123}})
+        self.assertEqual(result,{'ok':True,'result':{}})
+
+    def test_sticky_usage_failure_survives_host_retry_and_successful_final_completion(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main');first=self.sticky_started(request,choice,'retried')
+        request,choice=self.sticky_pick('main',candidates=[{'ID':'b','Provider':'codex'}])
+        second=self.sticky_started(request,choice,'retried')
+        self.sticky_completed('retried',second)
+        # The final HTTP outcome was successful on b. CPA's delayed per-attempt
+        # usage still carries the earlier 429 and its original selection ID.
+        self.sticky_usage(first,True,429)
+        snapshot['accounts'][1]['reset_at']=int(time.time())+3600;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'b')
+
+    def test_sticky_usage_releases_attempt_capacity_and_cancellation_preserves_binding(self):
+        snapshot=self.routing_snapshot(cap=1);snapshot['config']['rebind_on']='any';self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main');metadata=self.sticky_started(request,choice,'attempt')
+        self.sticky_started(request,choice,'attempt') # Same attempt callback is idempotent.
+        self.sticky_usage(metadata,True,0)
+        self.sticky_completed('attempt',metadata,'canceled',0)
+        snapshot['accounts'][1]['reset_at']=int(time.time())+30;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+
+    def test_sticky_late_usage_failure_does_not_clear_newer_binding(self):
+        snapshot=self.routing_snapshot(cap=32);snapshot['config']['rebind_on']='any';self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('main');first=self.sticky_started(request,choice,'retried')
+        request,choice=self.sticky_pick('main',candidates=[{'ID':'b','Provider':'codex'}]);second=self.sticky_started(request,choice,'retried')
+        self.sticky_usage(first,True,401)
+        self.sticky_completed('retried',second)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'b')
+
+    def test_sticky_reset_hold_rejects_and_missing_identity_never_shares_binding(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        snapshot['blocked']=['a'];self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['RejectCode'],'scheduler_busy')
+        snapshot['blocked']=[];snapshot['accounts'][1]['reset_at']=int(time.time())+30;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        self.assertEqual(self.sticky_pick('main',scope='')[1]['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('main',scope='')[1]['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+
+    def test_sticky_stale_routing_snapshot_keeps_affinity_and_disabled_restores_host(self):
+        snapshot=self.routing_snapshot();self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        time.sleep(10.1)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        # Expired routing evidence gives no urgency priority. Host availability
+        # and live reservations still allow a new conversation to use b.
+        self.assertEqual(self.sticky_pick('new')[1]['AuthID'],'b')
+        snapshot['config']['enabled']=False;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1],{})
+        snapshot['config']['enabled']=True;snapshot['accounts'][1]['reset_at']=int(time.time())+30
+        self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'b')
+
+    def test_sticky_canonical_metadata_wins_over_headers_and_pin_never_rebinds(self):
+        snapshot=self.routing_snapshot(cap=32);self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('canonical',headers={'session_id':['weaker']})[1]['AuthID'],'a')
+        snapshot['accounts'][1]['reset_at']=int(time.time())+1;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('canonical',headers={'Session_ID':['different']})[1]['AuthID'],'a')
+        request=self.routing_request(session='canonical')
+        request['Candidates']=[{'ID':'b','Provider':'codex'}]
+        request['Options']['Metadata']['pinned_auth_id']='b'
+        snapshot['config']['rebind_on']='any';self.sticky_snapshot(snapshot)
+        choice=self.call('scheduler.pick',request)['result']
+        self.assertEqual(choice['AuthID'],'b')
+        self.assertEqual(self.sticky_pick('canonical')[1]['AuthID'],'a')
+        request=self.routing_request(session='')
+        request['Options']['Headers']={'sEsSiOn_Id':['header-session']}
+        self.assertEqual(self.call('scheduler.pick',request)['result']['AuthID'],'b')
+
+    def test_sticky_sliding_ttl_and_restart_reset_local_bindings(self):
+        snapshot=self.routing_snapshot(cap=32);snapshot['config']['session_ttl_seconds']=3
+        self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        time.sleep(1.1)
+        snapshot['accounts'][1]['reset_at']=int(time.time())+30;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        time.sleep(2.1)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
+        time.sleep(3.1)
+        self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'b')
+        self.call('plugin.quiesce',{});self.call('plugin.register',{'schema_version':6})
+        snapshot['accounts'][1]['reset_at']=int(time.time())+3600;self.sticky_snapshot(snapshot)
+        self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
 
     def test_schema7_omits_unused_interceptor_request_bodies(self):
         registration = self.call('plugin.reconfigure', {'schema_version': 7})
@@ -407,6 +655,8 @@ class NativeBridge(unittest.TestCase):
 
     def assert_host_registration(self, registration):
         self.assertTrue(self.host_accepts_registration(registration), registration)
+        self.assertTrue(registration['result']['capabilities']['scheduler_across_priorities'])
+        self.assertTrue(registration['result']['capabilities']['usage_plugin'])
         routes = self.call('management.register', {})
         self.assertTrue(routes['ok'], routes)
         menus = [r for r in routes['result']['Resources'] if r.get('Menu')]

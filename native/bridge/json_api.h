@@ -26,6 +26,14 @@ extern const char *json_object_get_string(J *);
 extern int json_object_get_string_len(const J *);
 extern int json_object_get_type(const J *);
 extern int json_object_get_int(const J *);
+/* Public iterator ABI, json-c 0.16 json_object_iterator.h. */
+struct json_object_iterator { const void *opaque_; };
+extern struct json_object_iterator json_object_iter_begin(J *);
+extern struct json_object_iterator json_object_iter_end(const J *);
+extern int json_object_iter_equal(const struct json_object_iterator *,const struct json_object_iterator *);
+extern void json_object_iter_next(struct json_object_iterator *);
+extern const char *json_object_iter_peek_name(const struct json_object_iterator *);
+extern J *json_object_iter_peek_value(const struct json_object_iterator *);
 extern int64_t json_object_get_int64(const J *);
 extern const char *json_object_to_json_string_ext(J *,int);
 extern struct json_tokener *json_tokener_new_ex(int);

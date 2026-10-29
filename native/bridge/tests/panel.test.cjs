@@ -3310,6 +3310,7 @@ test('scheduling settings preserve drafts on polls, detect conflicts and save on
   await ui.get('connect').onclick();
   ui.nav.find(node => node.dataset.page === 'scheduling').listeners.get('click')(); await flush();
   assert.equal(ui.get('routing-cap').value, '2'); assert.equal(mutations(ui).length, 0);
+  assert.equal(ui.get('routing-subagent').checked, true); assert.equal(ui.get('routing-rebind').value, 'quota');
   assert.match(ui.get('reset-cards-list').textContent,/2 张，详情尚未读取/);
   ui.get('routing-cap').value = '7'; ui.get('scheduling-form').listeners.get('input')();
   revision++; config = {...config, max_inflight: 3};
@@ -3318,9 +3319,13 @@ test('scheduling settings preserve drafts on polls, detect conflicts and save on
   await ui.get('scheduling-reload').onclick();
   assert.equal(ui.get('routing-cap').value, '3');
   ui.get('routing-enabled').checked = true; ui.get('routing-projects').value = 'work = account-a, account-b';
+  ui.get('routing-subagent').checked = false; ui.get('routing-rebind').value = 'any';
   ui.get('scheduling-form').listeners.get('input')();
   await ui.get('scheduling-form').onsubmit({preventDefault() {}});
   assert.equal(mutations(ui).length, 1); assert.equal(config.enabled, true);
   assert.deepEqual(config.projects, [{project: 'work', accounts: ['account-a', 'account-b']}]);
   assert.equal(config.cards.auto_consume, false);
+  assert.equal(config.subagent_affinity, false); assert.equal(config.rebind_on, 'any');
+  await ui.get('refresh').onclick(); await flush();
+  assert.equal(ui.get('routing-subagent').checked, false); assert.equal(ui.get('routing-rebind').value, 'any');
 });

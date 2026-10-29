@@ -78,9 +78,17 @@ type RoutingAccount struct {
 	CardExpiry int64  `json:"card_expiry"`
 }
 type RoutingSnapshot struct {
-	Config   policy.SchedulingConfig `json:"config"`
-	Accounts []RoutingAccount        `json:"accounts"`
-	Blocked  []string                `json:"blocked"`
+	Config     policy.SchedulingConfig `json:"config"`
+	Accounts   []RoutingAccount        `json:"accounts"`
+	Blocked    []string                `json:"blocked"`
+	Identities []RoutingIdentity       `json:"identities"`
+	Exhausted  []string                `json:"exhausted"`
+}
+
+type RoutingIdentity struct {
+	ID      string `json:"id"`
+	Binding string `json:"binding"`
+	Status  string `json:"status"`
 }
 
 func (s *Store) RoutingSnapshot(ctx context.Context, at time.Time) (RoutingSnapshot, error) {
@@ -93,7 +101,31 @@ func (s *Store) RoutingSnapshot(ctx context.Context, at time.Time) (RoutingSnaps
 	if err != nil {
 		return RoutingSnapshot{}, err
 	}
-	result := RoutingSnapshot{Config: settings.Config, Accounts: []RoutingAccount{}}
+	result := RoutingSnapshot{Config: settings.Config, Accounts: []RoutingAccount{}, Identities: []RoutingIdentity{}}
+	// Identity validity is independent of quota freshness. An expired quota
+	// snapshot removes optimization priority, never an otherwise usable binding.
+	identities, err := tx.QueryContext(ctx, `SELECT a.id,b.binding,a.status,COALESCE(a.quota,'') FROM accounts a JOIN account_bindings b ON b.account_id=a.id WHERE a.status!='removed' AND b.binding!='' ORDER BY a.id LIMIT 10000`)
+	if err != nil {
+		return result, err
+	}
+	for identities.Next() {
+		var id RoutingIdentity
+		var raw string
+		if err = identities.Scan(&id.ID, &id.Binding, &id.Status, &raw); err != nil {
+			identities.Close()
+			return result, err
+		}
+		result.Identities = append(result.Identities, id)
+		var q quota.Snapshot
+		if json.Unmarshal([]byte(raw), &q) == nil && q.Binding == id.Binding && routingExhausted(q, settings.Config.QuotaMaxAgeSeconds, at) {
+			result.Exhausted = append(result.Exhausted, id.ID)
+		}
+	}
+	err = identities.Err()
+	identities.Close()
+	if err != nil {
+		return result, err
+	}
 	holds, err := tx.QueryContext(ctx, "SELECT DISTINCT account_id FROM reset_attempts WHERE phase IN ('sending','unknown','verifying') AND EXISTS(SELECT 1 FROM account_bindings b WHERE b.account_id=reset_attempts.account_id AND b.binding=reset_attempts.binding) ORDER BY account_id LIMIT 10000")
 	if err != nil {
 		return result, err
@@ -148,6 +180,25 @@ func (s *Store) RoutingSnapshot(ctx context.Context, at time.Time) (RoutingSnaps
 		result.Accounts = append(result.Accounts, a)
 	}
 	return result, rows.Err()
+}
+
+func routingExhausted(q quota.Snapshot, maxAge int, at time.Time) bool {
+	fresh := func(name string) bool {
+		stamp := q.Fields[name].ObservedAt
+		if stamp.IsZero() {
+			stamp = q.ObservedAt
+		}
+		return !stamp.IsZero() && !stamp.After(at.Add(time.Second)) && stamp.Add(time.Duration(maxAge)*time.Second).After(at)
+	}
+	if fresh("permission") && q.Permission != nil && *q.Permission == core.PermissionBlocked {
+		return true
+	}
+	for name, w := range map[string]*core.WindowEvidence{"five_hour": q.FiveHour, "weekly": q.Weekly} {
+		if fresh(name) && w != nil && w.State == core.WindowActive && w.ResetAt.After(at) && w.Remaining != nil && w.Remaining.Unit == "percent" && w.Remaining.Value == 0 {
+			return true
+		}
+	}
+	return false
 }
 func routingEvidence(q quota.Snapshot, maxAge int, at time.Time) (time.Time, time.Time) {
 	if q.Permission == nil || *q.Permission != core.PermissionAllowed {

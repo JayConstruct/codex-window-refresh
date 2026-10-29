@@ -497,26 +497,38 @@ static J *websocket_quota(Slice payload,const char*event_type,int *is_headers) {
     return result;
 }
 void cwr_observe_hook(const char *method,const void *payload,size_t size) {
+    if(!strcmp(method,"usage.handle")) {
+        const char *names[]={"SelectionID","AuthID","Provider","Failed","Failure","Generate"};
+        Slice fields[6]={{0}},failure[1]={{0}};
+        if(!payload||!size||!select_fields((Slice){payload,size},names,fields,6))return;
+        const char *failure_names[]={"StatusCode"};
+        if(fields[4].data&&!select_fields(fields[4],failure_names,failure,1))return;
+        J *selection=decode(fields[0]),*account=decode(fields[1]),*provider=decode(fields[2]),*failed=decode(fields[3]),*status=decode(failure[0]),*generate=decode(fields[5]);
+        const char *name=text(provider);
+        if(name&&!strcmp(name,"codex")&&(!generate||json_object_get_type(generate)!=1||json_object_get_int(generate)))cwr_scheduler_usage(text(selection),text(account),json_object_get_int(failed),json_object_get_int(status));
+        json_object_put(selection);json_object_put(account);json_object_put(provider);json_object_put(failed);json_object_put(status);json_object_put(generate);
+        return;
+    }
     int before=!strcmp(method,"request.intercept_before"),selection=!strcmp(method,"request.intercept_after"),completion=!strcmp(method,"request.complete");
     int lifecycle=before||selection||completion,stream=!strcmp(method,"response.intercept_stream_chunk"),ws=!strcmp(method,"websocket.response_event");
     const char*root_names[]= {
-        "RequestID","Metadata","ResponseHeaders","ChunkIndex","Provider","AuthID","EventType","Payload"
+        "RequestID","Metadata","ResponseHeaders","ChunkIndex","Provider","AuthID","EventType","Payload","Outcome","StatusCode"
     };
     const char*meta_names[]= {
-        "caller_scope","selected_auth_id","source","generate"
+        "caller_scope","selected_auth_id","source","generate","selection_id"
     };
-    Slice root[8]= {
+    Slice root[10]= {
         {
             0
         }
-    },meta[4]= {
+    },meta[5]= {
         {
             0
         }
     };
     if(!payload||!size||!select_fields((Slice) {
         payload,size
-    },root_names,root,8)) {
+    },root_names,root,10)) {
         if(lifecycle)lost();
         return;
     }
@@ -528,7 +540,7 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
         json_object_put(index);
         if(!init)return;
     }
-    if(root[1].data&&!(root[1].size==4&&!memcmp(root[1].data,"null",4))&&!select_fields(root[1],meta_names,meta,4)) {
+    if(root[1].data&&!(root[1].size==4&&!memcmp(root[1].data,"null",4))&&!select_fields(root[1],meta_names,meta,5)) {
         if(lifecycle)lost();
         return;
     }
@@ -541,7 +553,11 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
     }
     unsigned slot=request_slot(request);
     if(lifecycle) {
-        if(!excluded&&(selection||completion))cwr_scheduler_observe(request,selected,completion);
+        if(!excluded&&(selection||completion)) {
+            J *selection_id=decode(meta[4]),*outcome=completion?decode(root[8]):NULL,*status=completion?decode(root[9]):NULL;
+            cwr_scheduler_observe(request,selected,text(selection_id),completion,text(outcome),json_object_get_int(status));
+            json_object_put(selection_id);json_object_put(outcome);json_object_put(status);
+        }
         pthread_mutex_lock(&mu);
         ResponseBinding*r=&responses[slot];
         if(before||selection) {

@@ -21,7 +21,8 @@ let historyUnavailable = false;
 let authReadGate, authPatchGate, authFilesOverride;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
-const schedulingConfig = {enabled:false,prefer_reset:true,quota_max_age_seconds:300,session_ttl_seconds:1800,max_inflight:2,projects:[],cards:{enabled:false,auto_consume:false,poll_seconds:900,expiry_seconds:86400,force_before_seconds:1800,min_used_percent:80}};
+let schedulingRevision = 0;
+let schedulingConfig = {enabled:false,prefer_reset:true,quota_max_age_seconds:300,session_ttl_seconds:1800,max_inflight:2,projects:[],cards:{enabled:false,auto_consume:false,poll_seconds:900,expiry_seconds:86400,force_before_seconds:1800,min_used_percent:80}};
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
 const generations = new Map();
 let wakeCapable = false, wakeRevision = 0, wakeConflictOnce = false;
@@ -191,6 +192,14 @@ try {
       if (request.method === 'POST') {
         let body = ''; for await (const chunk of request) body += chunk;
         posts.push({resource, body, headers: request.headers});
+        if (resource === 'scheduling') {
+          const data = JSON.parse(body);
+          assert.equal(data.revision, schedulingRevision);
+          assert.equal(typeof data.config.subagent_affinity, 'boolean');
+          assert.ok(['quota', 'any'].includes(data.config.rebind_on));
+          schedulingConfig = data.config; schedulingRevision++; revision++;
+          json(response, 200, {instance_id: identity().instance_id, revision: schedulingRevision, config: schedulingConfig}); return;
+        }
         if (resource === 'wake-settings') {
           const data = JSON.parse(body); assert.deepEqual(Object.keys(data).sort(), ['config', 'revision']);
           assert.deepEqual(Object.keys(data.config).sort(), Object.keys(wakeConfig).sort());
@@ -278,7 +287,7 @@ try {
         if (job.reason === 'manual' && job.key) { job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++; job.response = responseRecord; }
         json(response, 200, {...identity(), ...job}); return;
       }
-      if (resource === 'scheduling') { json(response,200,{instance_id:identity().instance_id,revision:0,config:schedulingConfig}); return; }
+      if (resource === 'scheduling') { json(response,200,{instance_id:identity().instance_id,revision:schedulingRevision,config:schedulingConfig}); return; }
       if (resource === 'reset-cards') { json(response,200,{instance_id:identity().instance_id,accounts:[{account_id:'codex-01',credits:{availableCount:2,credits:null},observed_at:observed(),summary_observed_at:observed(),error_code:''}],attempts:[]}); return; }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
       if (resource === 'model-settings') {
@@ -1126,6 +1135,8 @@ try {
     await evaluate('document.querySelector("[data-page=scheduling]").click()');
     await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Scheduling page did not load');
     assert.equal(await evaluate('document.getElementById("reset-cards-list").textContent.includes("2 张，详情尚未读取")'), true, 'Quota reset summary was not shown');
+    assert.equal(await evaluate('document.getElementById("routing-subagent").checked'), true, 'Old settings did not default to child affinity');
+    assert.equal(await evaluate('document.getElementById("routing-rebind").value'), 'quota', 'Old settings did not preserve temporary failover');
     assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'Scheduling layout overflow');
     await screenshot('scheduling-' + width + '.png');
     if (width === 390) {
@@ -1138,6 +1149,18 @@ try {
     }
     await evaluate('document.querySelector("[data-page=overview]").click()');
   }
+  await evaluate(`(() => {
+    document.querySelector('[data-page=scheduling]').click();
+    document.getElementById('routing-subagent').checked = false;
+    document.getElementById('routing-rebind').value = 'any';
+    document.getElementById('scheduling-form').dispatchEvent(new Event('input', {bubbles:true}));
+    document.getElementById('scheduling-form').requestSubmit();
+  })()`);
+  await waitFor(() => schedulingRevision === 1, 'Sticky settings did not save');
+  await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Sticky settings did not reload');
+  assert.equal(schedulingConfig.subagent_affinity, false); assert.equal(schedulingConfig.rebind_on, 'any');
+  assert.equal(await evaluate('document.getElementById("routing-subagent").checked'), false, 'Child affinity did not persist');
+  assert.equal(await evaluate('document.getElementById("routing-rebind").value'), 'any', 'Rebind choice did not persist');
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   for (const width of [1586, 390]) {
     await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
@@ -1692,8 +1715,9 @@ try {
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Unexpected model wake writes');
   assert.equal(patches.length, 5, 'Unexpected auth-file status PATCH count');
   assert.equal(patches.every(patch => patch.path === '/cpa/v0/management/auth-files/status' && patch.body.name === 'real+primary.codex.json' && patch.body.auth_index === 'fixture-index-0'), true, 'Status PATCH escaped the exact auth file binding');
-  assert.equal(posts.length, 20, 'Unexpected total API write count');
-  assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations', 'wake-settings', 'wake-jobs'].includes(post.resource)), true, 'Unexpected API write');
+  assert.equal(posts.filter(post => post.resource === 'scheduling').length, 1, 'Unexpected scheduling writes');
+  assert.equal(posts.length, 21, 'Unexpected total API write count');
+  assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations', 'wake-settings', 'wake-jobs', 'scheduling'].includes(post.resource)), true, 'Unexpected API write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
   console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, direct wake without a modal, exactly one wake POST, five direct filename/index-bound CPA PATCHes with GET verification and unknown protection, global alias/mask preferences scoped to CPA base with stable request IDs and polling focus, precise wake explanations, informational legacy/current skips, persisted task history and real trigger menus, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard fallback, mobile detail focus/scroll, unavailable-history recovery, fixture-only page traffic and screenshots.');
   console.log('Local fixture screenshots: ' + output);
@@ -1718,7 +1742,7 @@ try {
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
 if (!autorefreshOnly) {
-  console.log('Original V2 fixture verified 20 POSTs and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
+  console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
   assert.equal(result.code, 0, 'Isolated automatic-refresh Chromium fixture failed: ' + JSON.stringify(result));

@@ -180,7 +180,7 @@
     <section data-view="scheduling" aria-label="账号调度与重置卡" hidden>
       <div class="detail-grid">
         <section class="card detail-card"><h2>业务账号调度</h2>
-          <p class="section-description">按项目选择首选账号，优先使用临近重置的剩余额度。首选不可用时允许回退，同一会话尽量保持账号。</p>
+          <p class="section-description">按项目选择首选账号，优先使用临近重置的剩余额度。已有会话优先保持账号，项目偏好与重置时间仅用于首次分配和失效后的重选。</p>
           <form id="scheduling-form">
             <fieldset id="scheduling-fields" disabled><legend class="sr-only">调度与重置卡规则</legend>
               <label class="switch-row"><span>启用业务账号调度</span><input id="routing-enabled" class="switch" type="checkbox"></label>
@@ -188,8 +188,13 @@
               <div class="settings-grid">
                 <div><label class="field-label" for="routing-cap">单账号并发上限</label><input id="routing-cap" type="number" min="1" max="128" required></div>
                 <div><label class="field-label" for="routing-age">额度最长有效时间（秒）</label><input id="routing-age" type="number" min="5" max="3600" required></div>
-                <div><label class="field-label" for="routing-session">会话绑定时间（秒）</label><input id="routing-session" type="number" min="1" max="86400" required></div>
+                <div><label class="field-label" for="routing-session">会话空闲失效时间（秒）</label><input id="routing-session" type="number" min="1" max="86400" required></div>
               </div>
+              <h3>插件会话粘性</h3>
+              <label class="switch-row"><span>子代理继承父会话账号</span><input id="routing-subagent" class="switch" type="checkbox"></label>
+              <label class="field-label" for="routing-rebind">失败后的重绑定条件</label>
+              <select id="routing-rebind"><option value="quota">额度耗尽或认证失效时重绑定</option><option value="any">额度、认证或临时上游故障时重绑定</option></select>
+              <p class="field-help">插件调度开启后统一管理主会话、子代理和分支绑定。临时故障默认只为本次请求回退，保留原绑定；子代理失败不修改父会话。绑定账号并发满时返回繁忙。绑定仅保存在接入层内存，CPA 重启后重新分配。</p>
               <label class="field-label" for="routing-projects">项目首选账号</label><textarea id="routing-projects" rows="6" placeholder="project-a = account-1, account-2"></textarea>
               <p class="field-help">每行一个项目标识，等号后填写 CPA 完整账号 ID，多个账号用英文逗号分隔。使用配套 cwr-codex 启动器为目录设置项目标识。</p>
               <h3>官方赠送重置卡</h3>

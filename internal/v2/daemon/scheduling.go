@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -204,16 +205,23 @@ func (s *Service) scheduling(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 256<<10)
 		var request struct {
-			Revision *uint64                  `json:"revision"`
-			Config   *policy.SchedulingConfig `json:"config"`
+			Revision *uint64         `json:"revision"`
+			Config   json.RawMessage `json:"config"`
 		}
 		d := json.NewDecoder(r.Body)
 		d.DisallowUnknownFields()
-		if d.Decode(&request) != nil || d.Decode(new(any)) != io.EOF || request.Revision == nil || request.Config == nil {
+		if d.Decode(&request) != nil || d.Decode(new(any)) != io.EOF || request.Revision == nil || len(request.Config) == 0 || bytes.Equal(bytes.TrimSpace(request.Config), []byte("null")) {
 			apiError(w, 400, "invalid_scheduling_settings")
 			return
 		}
-		settings, err := s.Store.SaveScheduling(r.Context(), *request.Revision, *request.Config)
+		config := policy.DefaultScheduling()
+		configDecoder := json.NewDecoder(bytes.NewReader(request.Config))
+		configDecoder.DisallowUnknownFields()
+		if configDecoder.Decode(&config) != nil || configDecoder.Decode(new(any)) != io.EOF {
+			apiError(w, 400, "invalid_scheduling_settings")
+			return
+		}
+		settings, err := s.Store.SaveScheduling(r.Context(), *request.Revision, config)
 		if err != nil {
 			status := 503
 			code := "storage_unavailable"

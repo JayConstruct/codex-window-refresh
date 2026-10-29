@@ -52,7 +52,7 @@ func TestSchedulingDefaultAndQuotaBindingFreshness(t *testing.T) {
 		t.Fatal("lost configuration CAS", err)
 	}
 	snapshot, err = s.RoutingSnapshot(ctx, at.Add(6*time.Minute))
-	if err != nil || len(snapshot.Accounts) != 0 {
+	if err != nil || len(snapshot.Accounts) != 0 || len(snapshot.Identities) != 1 || snapshot.Identities[0].Binding != a.Binding || len(snapshot.Exhausted) != 0 {
 		t.Fatal("stale evidence selected", snapshot, err)
 	}
 	a.Binding = "replacement"
@@ -60,8 +60,65 @@ func TestSchedulingDefaultAndQuotaBindingFreshness(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot, err = s.RoutingSnapshot(ctx, at)
-	if err != nil || len(snapshot.Accounts) != 0 {
+	if err != nil || len(snapshot.Accounts) != 0 || len(snapshot.Identities) != 1 || snapshot.Identities[0].Binding != "replacement" {
 		t.Fatal("replacement inherited old quota", snapshot, err)
+	}
+}
+
+func TestSchedulingReadsOldSettingsAndPersistsExplicitStickyOptions(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	raw, _ := json.Marshal(policy.DefaultScheduling())
+	var old map[string]any
+	json.Unmarshal(raw, &old)
+	delete(old, "subagent_affinity")
+	delete(old, "rebind_on")
+	raw, _ = json.Marshal(old)
+	if _, err := s.db.ExecContext(ctx, "INSERT INTO scheduling_settings VALUES(1,7,?)", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := s.SchedulingSettings(ctx)
+	if err != nil || settings.Revision != 7 || !settings.Config.SubagentAffinity || settings.Config.RebindOn != "quota" {
+		t.Fatal(settings, err)
+	}
+	settings.Config.SubagentAffinity, settings.Config.RebindOn = false, "any"
+	if _, err = s.SaveScheduling(ctx, 7, settings.Config); err != nil {
+		t.Fatal(err)
+	}
+	settings, err = s.SchedulingSettings(ctx)
+	if err != nil || settings.Revision != 8 || settings.Config.SubagentAffinity || settings.Config.RebindOn != "any" {
+		t.Fatal(settings, err)
+	}
+}
+
+func TestRoutingExhaustionNeedsFreshMatchingEvidence(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	at := time.Now().UTC()
+	a := schedulingFixture(t, s, at)
+	raw, err := quota.Normalize([]byte(`{"rate_limit":{"allowed":false,"primary_window":{"used_percent":100,"reset_at":`+fmt.Sprint(at.Add(time.Hour).Unix())+`}}}`), nil, a.Binding, "cpa_wham_usage", at.Add(time.Second), at.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(raw)
+	if err = s.SaveResetQuota(ctx, a, data); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := s.RoutingSnapshot(ctx, at.Add(2*time.Second))
+	if err != nil || len(snapshot.Exhausted) != 1 || snapshot.Exhausted[0] != "a" || len(snapshot.Identities) != 1 {
+		t.Fatal(snapshot, err)
+	}
+	snapshot, err = s.RoutingSnapshot(ctx, at.Add(6*time.Minute))
+	if err != nil || len(snapshot.Exhausted) != 0 || len(snapshot.Identities) != 1 {
+		t.Fatal("stale exhaustion invalidated affinity", snapshot, err)
+	}
+	a.Binding = "replacement"
+	if err = s.SyncInventory(ctx, []Account{a}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = s.RoutingSnapshot(ctx, at)
+	if err != nil || len(snapshot.Exhausted) != 0 {
+		t.Fatal("replacement inherited exhaustion", snapshot, err)
 	}
 }
 func TestResetOwnershipSurvivesRestartAndReusesRedemptionKey(t *testing.T) {

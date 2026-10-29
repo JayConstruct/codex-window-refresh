@@ -127,3 +127,36 @@ func TestSchedulingAPIHasDefaultsCASAndReadOnlyViews(t *testing.T) {
 		t.Fatal("settings or views performed upstream work")
 	}
 }
+
+func TestSchedulingAPIDefaultsOldClientsAndValidatesStickySettings(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	s, err := New(st, &dashboardSource{}, Options{QueryConcurrency: 1, QueryTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string, want int) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v2/scheduling", strings.NewReader(body)))
+		if w.Code != want {
+			t.Fatalf("got %d: %s", w.Code, w.Body.String())
+		}
+	}
+	post(`{"revision":0,"config":{"enabled":true}}`, 200)
+	settings, err := st.SchedulingSettings(context.Background())
+	if err != nil || !settings.Config.SubagentAffinity || settings.Config.RebindOn != "quota" {
+		t.Fatal(settings, err)
+	}
+	for _, config := range []string{`null`, `[]`, `{"rebind_on":"invalid"}`, `{"subagent_affinity":"false"}`, `{"unknown_field":true}`} {
+		post(`{"revision":1,"config":`+config+`}`, 400)
+	}
+	post(`{"revision":1,"config":{"enabled":true,"subagent_affinity":false,"rebind_on":"any"}}`, 200)
+	settings, err = st.SchedulingSettings(context.Background())
+	if err != nil || settings.Config.SubagentAffinity || settings.Config.RebindOn != "any" {
+		t.Fatal(settings, err)
+	}
+}

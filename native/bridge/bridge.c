@@ -934,6 +934,8 @@ static J *registration(unsigned schema) {
     json_object_object_add(metadata,"ConfigFields",json_object_new_array());
     json_object_object_add(r,"metadata",metadata);
     json_object_object_add(cap,"scheduler",json_object_new_boolean(1));
+    json_object_object_add(cap,"scheduler_across_priorities",json_object_new_boolean(1));
+    json_object_object_add(cap,"usage_plugin",json_object_new_boolean(1));
     json_object_object_add(cap,"management_api",json_object_new_boolean(1));
     json_object_object_add(cap,"request_interceptor",json_object_new_boolean(1));
     if(schema>=7) {
@@ -978,7 +980,7 @@ static int plugin_call(char*method,uint8_t*payload,size_t size,Buffer*out) {
     out->ptr=NULL;
     out->len=0;
     if(!method||!method[0]||strnlen(method,257)>256||(size&&!payload))return 1;
-    int hook=!strcmp(method,"request.intercept_before")||!strcmp(method,"request.intercept_after")||!strcmp(method,"request.complete")||!strcmp(method,"response.intercept_after")||!strcmp(method,"response.intercept_stream_chunk")||!strcmp(method,"websocket.response_event");
+    int hook=!strcmp(method,"request.intercept_before")||!strcmp(method,"request.intercept_after")||!strcmp(method,"request.complete")||!strcmp(method,"response.intercept_after")||!strcmp(method,"response.intercept_stream_chunk")||!strcmp(method,"websocket.response_event")||!strcmp(method,"usage.handle");
     if(!strcmp(method,"scheduler.pick")) {
         pthread_rwlock_rdlock(&gate);
         J*request=size<=FRAME_LIMIT?parse(payload,size):NULL;
