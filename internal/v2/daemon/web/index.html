@@ -189,8 +189,7 @@
               <label class="switch-row"><span>优先使用临近重置的账号</span><input id="routing-reset" class="switch" type="checkbox"></label>
               <label class="switch-row"><span>子代理继承父会话账号</span><input id="routing-subagent" class="switch" type="checkbox"></label>
               </div>
-              <label class="field-label" for="routing-projects">项目首选账号</label><textarea id="routing-projects" rows="3" placeholder="project-a = account-1, account-2" aria-describedby="routing-projects-help"></textarea>
-              <p id="routing-projects-help" class="field-help">每行一个项目，等号后填写完整账号 ID，多个账号用英文逗号分隔。使用配套 cwr-codex 启动器为目录设置项目标识。</p>
+              <p class="field-help">在下方“项目目录与账号匹配”中维护项目、客户端目录和首选账号。匹配是新会话的软偏好，首选账号不可用时可回退。</p>
               <details id="routing-advanced" class="scheduling-advanced"><summary>并发、额度与会话设置</summary>
               <div class="settings-grid">
                 <div><label class="field-label" for="routing-cap">单账号并发上限</label><input id="routing-cap" type="number" min="1" max="128" required></div>
@@ -220,6 +219,22 @@
               </div>
               <p class="field-help">例如：900 秒为 15 分钟，86400 秒为 1 天。最晚尝试兑换的提前量不能大于关注到期卡的时间范围。</p>
               </details>
+            </section>
+            <section class="card detail-card routing-matcher" aria-labelledby="routing-matcher-title">
+              <div class="card-heading"><h2 id="routing-matcher-title">项目目录与账号匹配</h2><button id="routing-project-add" class="button button-primary" type="button">新增项目</button></div>
+              <p class="field-help">目录属于运行 Codex 的电脑。同一项目可填写多个目录，子目录按最长路径匹配；账号列表来自 CPA 已同步的 Codex 账号。</p>
+              <div class="routing-map-tools"><button id="routing-map-import" class="button button-outline" type="button">导入目录清单</button><input id="routing-map-file" type="file" accept=".json,application/json" hidden><button id="routing-map-export" class="button button-outline" type="button">下载目录映射</button><span id="routing-map-message" class="field-help" role="status">可导入现有 projects.json，匹配完成后保存设置。</span></div>
+              <div class="routing-match-grid">
+                <div class="routing-project-pane"><h3>项目与客户端目录</h3><div id="routing-project-list" class="routing-project-list"></div></div>
+                <section class="routing-account-pane" aria-labelledby="routing-account-title">
+                  <div class="routing-account-heading"><h3 id="routing-account-title" tabindex="-1">选择项目后匹配账号</h3><button id="routing-accounts-refresh" class="text-button" type="button">刷新账号</button></div>
+                  <div class="routing-account-filters"><label class="sr-only" for="routing-account-search">搜索账号 ID 或完整别称</label><input id="routing-account-search" type="search" placeholder="搜索账号 ID 或完整别称" autocomplete="off"><label class="sr-only" for="routing-account-status">账号状态</label><select id="routing-account-status"><option value="all">全部状态</option><option value="available">正常</option><option value="disabled">手动禁用</option><option value="unavailable">暂不可用</option><option value="attention">异常与待确认</option></select></div>
+                  <p id="routing-accounts-message" class="field-help" role="status">连接后只读加载账号，不查询上游额度。</p><div id="routing-account-list" class="routing-account-list"></div>
+                  <div class="reset-footer"><p id="routing-account-page" class="field-help" role="status">尚未读取</p><div class="pagination"><button id="routing-account-previous" class="button button-outline" type="button" disabled>上一页</button><button id="routing-account-next" class="button button-outline" type="button" disabled>下一页</button></div></div>
+                </section>
+              </div>
+              <details id="routing-text-editor" class="scheduling-advanced"><summary>按文本编辑项目偏好</summary><label class="field-label" for="routing-projects">项目首选账号</label><textarea id="routing-projects" rows="3" placeholder="project-a = account-1, account-2"></textarea><p class="field-help">每行“项目标识 = 账号 ID, 账号 ID”。同名项目保留目录；删除或重命名项目会移除对应目录映射。</p></details>
+              <details class="scheduling-advanced"><summary>在客户端使用目录映射</summary><p class="field-help">将下载的 projects.json 放到运行 Codex 的电脑的 ~/.config/cwr/projects.json，再在项目目录运行配套启动器（Python 3.11+，旧版需 tomli）。--provider 填写允许调度的提供商 ID，默认 cpa；仅客户端配置中的当前提供商匹配时添加项目标识，切到其他提供商并重新启动后自动跳过。启动器不切换提供商；新增匹配须先保存后台设置，客户端再使用新映射。</p><pre class="routing-command">python3 /path/to/cwr-codex.py --provider cpa</pre></details>
             </section>
           </fieldset>
           <div class="card scheduling-actions">

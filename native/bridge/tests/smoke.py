@@ -160,9 +160,16 @@ class NativeBridge(unittest.TestCase):
         self.assertFalse(settings['config']['enabled'])
         self.assertEqual(self.management('reset-cards')[0], 200)
         settings['config']['max_inflight'] = 3
+        settings['config']['projects'] = [
+            {'project': f'project-{index}', 'accounts': [f'account-{index}'],
+             'directories': [f'/client-{index}/' + 'long-directory-' * 20 + f'/repo-{entry}' for entry in range(16)]}
+            for index in range(2)
+        ]
+        self.assertGreater(len(json.dumps(settings['config'])), 6144)
         status, saved = self.management('scheduling', 'POST', {'revision': settings['revision'], 'config': settings['config']})
         self.assertEqual(status, 200, saved)
         self.assertEqual(self.management('scheduling')[1]['config']['max_inflight'], 3)
+        self.assertEqual(self.management('scheduling')[1]['config']['projects'], settings['config']['projects'])
         self.assertEqual(self.management('scheduling', 'POST', {'revision': settings['revision'], 'config': settings['config']})[0], 409)
         self.assertEqual(self.management('reset-cards', 'POST', {})[0], 404)
         self.assertEqual(self.quota_requests, [])

@@ -12,6 +12,7 @@ const api = '/cpa/v0/management/codex-window-refresh/v2/';
 const fixtureKey = 'local-v2-browser-fixture';
 const autorefreshOnly = process.env.CWR_AUTOREFRESH_ONLY === '1';
 const schedulingOnly = process.env.CWR_SCHEDULING_ONLY === '1';
+const projectsOnly = process.env.CWR_PROJECTS_ONLY === '1';
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], patches = [], reads = [], exceptions = [], pageErrors = [];
@@ -326,7 +327,7 @@ try {
         const filtered = (snapshot?.accounts || accounts).filter(account => account.id.toLowerCase().includes(search) && (status === 'all' || status === accountDisplayStatus(account) || status === 'attention' && !['available', 'disabled'].includes(accountDisplayStatus(account))));
         const page = filtered.filter(account => account.id > (url.searchParams.get('after') || '')).slice(0, Number(url.searchParams.get('limit') || 6));
         const last = page.at(-1)?.id, next = filtered.some(account => account.id > last) ? last : '';
-        json(response, 200, {...(snapshot?.identity || identity()), accounts_revision: snapshot?.revision ?? accountsRevision, accounts: page, next_after: next, total: 24, filter_total: filtered.length}); return;
+        json(response, 200, {...(snapshot?.identity || identity()), accounts_revision: snapshot?.revision ?? accountsRevision, accounts: page, next_after: next, total: 24, filter_total: filtered.length, offset: filtered.filter(account=>account.id <= (url.searchParams.get('after') || '')).length}); return;
       }
       json(response, 404, {error: 'not_found'});
     } catch (error) { exceptions.push(String(error)); json(response, 500, {error: 'fixture_failed'}); }
@@ -460,10 +461,12 @@ try {
     assert.equal(await evaluate('resetDetail.isConnected && resetDetail.open && document.activeElement===resetSummary'), true, 'Reset polling replaced expanded details');
     for (const width of [1586, 768, 390, 320]) {
       await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
+      await evaluate('document.getElementById("routing-text-editor").open=true');
       const layout = await evaluate('(()=>{const f=document.getElementById("scheduling-fields"),t=document.getElementById("routing-projects");return {overflow:document.documentElement.scrollWidth>innerWidth,border:getComputedStyle(f).borderWidth,textarea:t.clientWidth,parent:t.parentElement.clientWidth}})()');
       assert.equal(layout.overflow, false, 'Scheduling overflow at ' + width);
       assert.equal(layout.border, '0px', 'Scheduling kept the browser fieldset border');
       assert.ok(layout.textarea > layout.parent - 55, 'Project editor did not use the card width');
+      await evaluate('document.getElementById("routing-text-editor").open=false');
       await evaluate('document.getElementById("cards-advanced").open=true;document.getElementById("routing-advanced").open=true');
       assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'), true, 'Advanced settings overflow at ' + width);
       await evaluate('document.getElementById("cards-advanced").open=false;document.getElementById("routing-advanced").open=false');
@@ -502,6 +505,62 @@ try {
     assert.equal(posts.length, writeCount); assert.equal(patches.length, patchCount);
     assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
     console.log('Scheduling Chromium checks passed: validation/focus, switch dependency, readonly records/search/pagination, observation times, translated outcomes, masking, preserved details/focus, full-width editor and 320/390/768/1586 layouts. Screenshots: ' + output);
+  }
+  async function runProjectMatchingChecks() {
+    await evaluate('document.querySelector("[data-page=scheduling]").click()');
+    await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled && document.querySelectorAll("#routing-account-list .routing-account").length===12'), 'Project account list did not load');
+    const mapFile = join(output, 'import-projects.json');
+    await mkdir(output, {recursive:true});
+    await writeFile(mapFile, JSON.stringify({projects:[
+      {directory:'/work/project-a',project:'project-a'},
+      {directory:'C:\\Work\\ProjectA',project:'project-a'},
+      {directory:'/work/project-b',project:'project-b'}
+    ]}));
+    await cdp('DOM.enable');
+    const doc = await cdp('DOM.getDocument'), file = await cdp('DOM.querySelector',{nodeId:doc.root.nodeId,selector:'#routing-map-file'});
+    await cdp('DOM.setFileInputFiles',{nodeId:file.nodeId,files:[mapFile]});
+    await waitFor(()=>evaluate('document.querySelectorAll("#routing-project-list .routing-project").length===2'),'Directory map import did not produce project rows');
+    assert.equal(posts.length,0,'Directory import automatically saved');
+    await evaluate('document.querySelector("#routing-account-list .routing-account button").click()');
+    await evaluate('document.querySelectorAll("#routing-project-list .routing-project")[1].querySelector("button").click()');
+    await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[1].querySelector("button").click()');
+    assert.equal(await evaluate('document.querySelectorAll("#routing-project-list .routing-account-chip").length'),2);
+    assert.equal(await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[4].querySelector("button").disabled'),true,'Disabled account could be added');
+    await evaluate('document.querySelectorAll("#routing-project-list .routing-project")[0].querySelector("button").click();globalThis.directoryEditor=document.querySelector("#routing-project-list textarea");directoryEditor.value+="\\n";directoryEditor.dispatchEvent(new Event("input",{bubbles:true}));directoryEditor.focus();directoryEditor.setSelectionRange(directoryEditor.value.length,directoryEditor.value.length)');
+    await evaluate('document.getElementById("routing-accounts-refresh").click()'); await settleRefresh();
+    const directoryState = await evaluate('({connected:directoryEditor.isConnected,value:directoryEditor.value,focus:document.activeElement===directoryEditor,active:document.activeElement.id})');
+    assert.equal(directoryState.connected && directoryState.value.endsWith('\n') && directoryState.focus,true,'Account refresh lost directory input/newline/focus: '+JSON.stringify(directoryState));
+    await evaluate('document.getElementById("routing-account-next").click()');
+    await waitFor(()=>evaluate('document.getElementById("routing-account-list").textContent.includes("codex-13")'),'Matching list next page did not load');
+    await evaluate('document.getElementById("routing-account-previous").click()');
+    await waitFor(()=>evaluate('document.getElementById("routing-account-list").textContent.includes("codex-01")'),'Matching list previous page did not load');
+    await evaluate('document.getElementById("routing-account-search").value="codex-09";document.getElementById("routing-account-search").dispatchEvent(new Event("input"))');
+    await waitFor(()=>evaluate('document.querySelectorAll("#routing-account-list .routing-account").length===1 && document.getElementById("routing-account-list").textContent.includes("codex-09")'),'Matching account search did not apply');
+    await evaluate('document.getElementById("routing-account-search").value="";document.getElementById("routing-account-search").dispatchEvent(new Event("input"))');
+    await waitFor(()=>evaluate('document.querySelectorAll("#routing-account-list .routing-account").length===12'),'Account search clear did not reload');
+    await evaluate('document.getElementById("scheduling-form").requestSubmit()');
+    await waitFor(()=>schedulingRevision===1,'Project map did not save');
+    await waitFor(()=>evaluate('!document.getElementById("scheduling-fields").disabled'),'Project save did not acknowledge');
+    assert.deepEqual(schedulingConfig.projects,[{project:'project-a',accounts:['codex-01'],directories:['/work/project-a','C:\\Work\\ProjectA']},{project:'project-b',accounts:['codex-02'],directories:['/work/project-b']}]);
+    await cdp('Browser.setDownloadBehavior',{behavior:'allow',downloadPath:output});
+    await evaluate('document.getElementById("routing-map-export").click()');
+    let downloaded;
+    await waitFor(async()=>{try{downloaded=JSON.parse(await readFile(join(output,'projects.json'),'utf8'));return true;}catch{return false;}},'Directory mapping did not download');
+    assert.deepEqual(downloaded.projects,[{directory:'/work/project-a',project:'project-a'},{directory:'C:\\Work\\ProjectA',project:'project-a'},{directory:'/work/project-b',project:'project-b'}]);
+    await evaluate('document.getElementById("display-mode").value="masked";document.getElementById("display-mode").dispatchEvent(new Event("change"))');
+    assert.equal(await evaluate('document.getElementById("routing-account-list").textContent.includes("codex-01") || document.querySelector("#routing-project-list .routing-selected-accounts").textContent.includes("codex-01")'),false,'Matching account privacy failed');
+    await evaluate('document.getElementById("display-mode").value="original";document.getElementById("display-mode").dispatchEvent(new Event("change"))');
+    for(const width of [1586,768,390,320]) {
+      await cdp('Emulation.setDeviceMetricsOverride',{width,height:992,deviceScaleFactor:1,mobile:width<600});
+      assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true,'Project matching overflow at '+width);
+      await evaluate('scrollTo(0,0)');
+      const metrics=await cdp('Page.getLayoutMetrics');
+      const capture=await cdp('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:{x:0,y:0,width,height:Math.ceil(metrics.cssContentSize.height),scale:1}});
+      await writeFile(join(output,'project-matching-'+width+'.png'),Buffer.from(capture.data,'base64'));
+    }
+    assert.equal(posts.length,1); assert.equal(posts[0].resource,'scheduling'); assert.equal(patches.length,0);
+    assert.equal(exceptions.length,0,JSON.stringify(exceptions)); assert.equal(pageErrors.length,0,JSON.stringify(pageErrors));
+    console.log('Project matching Chromium checks passed: client map import/export, account selection, saved roundtrip, disabled accounts, independent pagination/search, privacy, multiline caret/focus and 320/390/768/1586 layouts. Screenshots: '+output);
   }
   const readCountFor = resource => reads.filter(path => new URL(path, 'http://fixture').pathname.endsWith('/' + resource)).length;
   async function settleRefresh() {
@@ -732,6 +791,7 @@ try {
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
   await evaluate('document.fonts.ready.then(() => true)');
   checks: {
+  if (projectsOnly) { await runProjectMatchingChecks(); break checks; }
   if (schedulingOnly) { await runSchedulingChecks(); break checks; }
   if (autorefreshOnly) {
     await evaluate('document.querySelector("[data-account-status-id=codex-01]").click()');
@@ -1817,10 +1877,14 @@ try {
   if (server) await new Promise(resolve => server.close(resolve));
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
-if (!autorefreshOnly && !schedulingOnly) {
+if (!autorefreshOnly && !schedulingOnly && !projectsOnly) {
   console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
   assert.equal(result.code, 0, 'Isolated automatic-refresh Chromium fixture failed: ' + JSON.stringify(result));
-  console.log('V2 full and isolated automatic-refresh Chromium fixtures both passed.');
+  console.log('V2 full and isolated automatic-refresh Chromium fixtures passed; starting isolated project-matching fixture.');
+  const projectChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_PROJECTS_ONLY: '1', CWR_AUTOREFRESH_ONLY: '0', CWR_SCHEDULING_ONLY: '0', CWR_SCREENSHOT_DIR: join(output, 'project-matching')}, stdio: 'inherit'});
+  const projectResult = await new Promise((resolve, reject) => { projectChild.once('error', reject); projectChild.once('exit', (code, signal) => resolve({code, signal})); });
+  assert.equal(projectResult.code, 0, 'Isolated project-matching Chromium fixture failed: ' + JSON.stringify(projectResult));
+  console.log('V2 full, automatic-refresh and project-matching Chromium fixtures all passed.');
 }

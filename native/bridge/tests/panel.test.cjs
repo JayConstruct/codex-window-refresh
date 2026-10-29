@@ -3497,3 +3497,136 @@ test('reset quantity-only observations never supply a missing detail observation
   assert.equal(ui.get('reset-cards-list').children.length, 1); assert.match(ui.get('reset-cards-list').textContent, /summary/);
   assert.equal(mutations(ui).length, 0);
 });
+
+test('client directory imports validate portable absolute paths and ambiguous maps', () => {
+  const {projectDirectoryKey, readProjectDirectoryMap} = require('../../../internal/v2/daemon/web/panel.js');
+  assert.equal(projectDirectoryKey('/work/repo/../repo/'), '/work/repo');
+  assert.equal(projectDirectoryKey('C:\\Work\\Repo'), 'c:/work/repo');
+  assert.equal(projectDirectoryKey('\\\\Server\\Share\\Repo'), 'unc:/server/share/repo');
+  assert.equal(projectDirectoryKey('C:relative'), ''); assert.equal(projectDirectoryKey('/work/\nrepo'), '');
+  const data = {projects: [{directory: '/client/repo', project: 'repo'}, {directory: '/client/repo/nested', project: 'nested'}]};
+  assert.deepEqual(readProjectDirectoryMap(JSON.stringify(data)), data.projects);
+  assert.throws(() => readProjectDirectoryMap(JSON.stringify({projects: [{directory: '/client/repo', project: 'a'}, {directory: '/client/./repo/', project: 'b'}]})), /重复目录/);
+  assert.throws(() => readProjectDirectoryMap(JSON.stringify({projects: [{directory: '/client/repo', project: 'bad label'}]})), /有效项目标识/);
+});
+
+async function importProjectMap(ui, projects) {
+  const text = JSON.stringify({projects}); ui.get('routing-map-file').files = [{size: Buffer.byteLength(text), text: async () => text}];
+  await ui.get('routing-map-file').onchange();
+}
+function routingButtons(ui) { return descendants(ui.get('routing-account-list')).filter(node => node.tagName === 'button'); }
+
+test('project directory imports and account matching save together without upstream or implicit writes', async () => {
+  const ui = schedulingPanel(); await openScheduling(ui);
+  await importProjectMap(ui, [{directory: '/client/repo', project: 'repo'}, {directory: 'C:\\Work\\Repo', project: 'repo'}]);
+  assert.equal(mutations(ui).length, 0); assert.equal(ui.get('routing-project-list').children.length, 1);
+  assert.match(ui.get('routing-map-message').textContent, /原有首选账号保留/);
+  const add = routingButtons(ui).find(node => node.textContent === '加入首选'); assert.ok(add); add.onclick();
+  assert.match(ui.get('routing-projects').value, /repo = codex-01/);
+  await submitScheduling(ui);
+  assert.equal(mutations(ui).length, 1);
+  const saved = JSON.parse(mutations(ui)[0].body).config;
+  assert.deepEqual(saved.projects, [{project: 'repo', accounts: ['codex-01'], directories: ['/client/repo', 'C:\\Work\\Repo']}]);
+  assert.equal(ui.get('routing-map-export').disabled, false);
+  editScheduling(ui, 'routing-projects', 'repo = codex-01, manually-added'); await submitScheduling(ui);
+  const edited = JSON.parse(mutations(ui)[1].body).config;
+  assert.deepEqual(edited.projects[0].directories, ['/client/repo', 'C:\\Work\\Repo']);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').every(call => call.url.endsWith('/scheduling')), true);
+});
+
+test('project map conflicts and late file reads cannot overwrite an edited draft', async () => {
+  const ui = schedulingPanel(); await openScheduling(ui);
+  await importProjectMap(ui, [{directory: '/client/repo', project: 'repo'}]);
+  await importProjectMap(ui, [{directory: '/client/other', project: 'other'}, {directory: '/client/repo/.', project: 'conflict'}]);
+  assert.match(ui.get('routing-map-message').textContent, /已属于其他项目/);
+  assert.equal(ui.get('routing-project-list').children.length, 1); assert.doesNotMatch(ui.get('routing-projects').value, /other/);
+  let release; ui.get('routing-map-file').files = [{size: 1, text: () => new Promise(resolve => { release = resolve; })}];
+  const pending = ui.get('routing-map-file').onchange();
+  editScheduling(ui, 'routing-cap', '7'); release(JSON.stringify({projects: [{directory: '/client/late', project: 'late'}]})); await pending;
+  assert.match(ui.get('routing-map-message').textContent, /本次导入未应用/); assert.doesNotMatch(ui.get('routing-projects').value, /late/);
+  assert.equal(ui.get('routing-cap').value, '7'); assert.equal(mutations(ui).length, 0);
+});
+
+test('saved directory downloads use the launcher map format and cannot export unsaved preferences', async () => {
+  const ui = schedulingPanel(); await openScheduling(ui);
+  await importProjectMap(ui, [{directory: '/client/repo', project: 'repo'}]);
+  assert.equal(ui.get('routing-map-export').disabled, true);
+  routingButtons(ui).find(node => node.textContent === '加入首选').onclick(); await submitScheduling(ui);
+  let downloaded;
+  ui.clock.Blob = Blob; ui.clock.URL = class extends URL { static createObjectURL(blob) { downloaded = blob; return 'blob:fixture'; } static revokeObjectURL() {} };
+  const create = ui.document.createElement;
+  ui.document.createElement = tag => { const node = create(tag); if (tag === 'a') { node.click = () => {}; node.remove = () => node.parentNode.removeChild(node); } return node; };
+  ui.get('routing-map-export').onclick();
+  assert.deepEqual(JSON.parse(await downloaded.text()), {projects: [{directory: '/client/repo', project: 'repo'}]});
+  assert.equal(mutations(ui).length, 1);
+});
+
+test('account matching pages are independent of the main account table and reject late search responses', async () => {
+  let release, block = false;
+  const ui = schedulingPanel(url => {
+    const parsed = new URL(url, origin);
+    if (parsed.pathname.endsWith('/accounts') && parsed.searchParams.get('limit') === '12') {
+      const search = parsed.searchParams.get('search'), after = parsed.searchParams.get('after');
+      const data = {...accountPage(1, [{id: search || (after ? 'account-two' : 'account-one'), status: 'available'}]), total: 2, filter_total: 2, offset: after ? 1 : 0, next_after: after || search ? '' : 'account-one'};
+      if (block && search === 'early') return new Promise(resolve => { release = () => resolve([200, data]); });
+      return [200, data];
+    }
+  });
+  await openScheduling(ui); const main = ui.get('accounts').textContent;
+  assert.match(ui.get('routing-account-list').textContent, /account-one/);
+  await ui.get('routing-account-next').onclick(); assert.match(ui.get('routing-account-list').textContent, /account-two/);
+  await ui.get('routing-account-previous').onclick(); assert.match(ui.get('routing-account-list').textContent, /account-one/);
+  block = true; ui.get('routing-account-search').value = 'early'; ui.get('routing-account-search').oninput();
+  const pending = ui.tick(200); await flush();
+  ui.get('routing-account-search').value = 'latest'; ui.get('routing-account-search').oninput(); await ui.tick(200);
+  await flush(); release(); await pending; await flush(); assert.match(ui.get('routing-account-list').textContent, /latest/); assert.doesNotMatch(ui.get('routing-account-list').textContent, /early/);
+  assert.equal(ui.get('accounts').textContent, main); assert.equal(mutations(ui).length, 0);
+});
+
+test('account matching preserves directory input newlines and blocks adding disabled accounts', async () => {
+  const ui = schedulingPanel(url => new URL(url, origin).searchParams.get('limit') === '12' ? [200, accountPage(1, [{id: 'disabled-account', status: 'disabled'}, {id: 'enabled-account', status: 'available'}])] : null);
+  await openScheduling(ui); await importProjectMap(ui, [{directory: '/client/repo', project: 'repo'}]);
+  await ui.get('routing-accounts-refresh').onclick();
+  const name = descendants(ui.get('routing-project-list')).find(node => node.tagName === 'input');
+  name.value = 'renamed'; name.oninput(); ui.get('scheduling-form').listeners.get('input')();
+  assert.match(ui.get('routing-projects').value, /^renamed =/);
+  const directory = descendants(ui.get('routing-project-list')).find(node => node.tagName === 'textarea');
+  directory.value = '/client/repo\n'; directory.oninput(); ui.get('scheduling-form').listeners.get('input')();
+  const current = descendants(ui.get('routing-project-list')).find(node => node.tagName === 'textarea');
+  assert.equal(current, directory); assert.equal(current.value, '/client/repo\n');
+  const buttons = routingButtons(ui); assert.equal(buttons[0].disabled, true); assert.equal(buttons[1].disabled, false);
+  ui.get('display-mode').value = 'masked'; ui.get('display-mode').onchange();
+  assert.doesNotMatch(ui.get('routing-account-list').textContent, /disabled-account|enabled-account/);
+  ui.get('disconnect').onclick(); buttons[1].onclick(); assert.equal(mutations(ui).length, 0);
+});
+
+test('project matching validation identifies the project and field that need correction', async () => {
+  const ui = schedulingPanel(); await openScheduling(ui);
+  await importProjectMap(ui, [{directory: '/client/repo', project: 'repo'}]);
+  await submitScheduling(ui);
+  assert.equal(mutations(ui).length, 0); assert.match(ui.get('scheduling-validation').textContent, /repo.*至少一个首选账号/);
+  assert.equal(ui.document.activeElement, ui.get('routing-account-title'));
+  routingButtons(ui).find(node => node.textContent === '加入首选').onclick();
+  ui.get('routing-project-add').onclick();
+  const cards = ui.get('routing-project-list').children, second = cards[1];
+  const name = descendants(second).find(node => node.tagName === 'input'), directory = descendants(second).find(node => node.tagName === 'textarea');
+  name.value = 'second'; name.oninput(); ui.get('scheduling-form').listeners.get('input')();
+  directory.value = '/client/repo/.'; directory.oninput(); ui.get('scheduling-form').listeners.get('input')();
+  routingButtons(ui).find(node => node.textContent === '加入首选').onclick(); await submitScheduling(ui);
+  assert.equal(mutations(ui).length, 0); assert.match(ui.get('scheduling-validation').textContent, /重复映射/);
+  assert.match(ui.document.activeElement.id, /^routing-project-directories-/);
+});
+
+test('only the latest chosen directory file may apply even when the older file finishes first', async () => {
+  const ui = schedulingPanel(); await openScheduling(ui);
+  let first, latest;
+  ui.get('routing-map-file').files = [{size: 1, text: () => new Promise(resolve => { first = resolve; })}];
+  const older = ui.get('routing-map-file').onchange();
+  ui.get('routing-map-file').files = [{size: 1, text: () => new Promise(resolve => { latest = resolve; })}];
+  const newer = ui.get('routing-map-file').onchange();
+  first(JSON.stringify({projects: [{directory: '/client/older', project: 'older'}]})); await older;
+  assert.doesNotMatch(ui.get('routing-projects').value, /older/);
+  latest(JSON.stringify({projects: [{directory: '/client/latest', project: 'latest'}]})); await newer;
+  assert.match(ui.get('routing-projects').value, /latest/); assert.doesNotMatch(ui.get('routing-projects').value, /older/);
+  assert.equal(mutations(ui).length, 0);
+});

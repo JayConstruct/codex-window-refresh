@@ -288,6 +288,35 @@ select { cursor: pointer; }
 .scheduling-actions { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px 20px; margin-top: 18px; padding: 16px 22px; }
 .scheduling-actions .field-help, .scheduling-actions .settings-actions { margin-top: 0; }
 .scheduling-actions .settings-validation { margin-top: 10px; }
+.routing-matcher { grid-column: 1 / -1; min-width: 0; }
+.routing-matcher .card-heading, .routing-account-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; }
+.routing-map-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-block: 18px; }
+.routing-map-tools .field-help { flex: 1 1 260px; margin: 0; line-height: 1.7; }
+.routing-match-grid { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 1.35fr); align-items: start; gap: 22px; }
+.routing-project-pane, .routing-account-pane { min-width: 0; }
+.routing-project-list { display: grid; gap: 12px; margin-top: 14px; max-height: 650px; overflow-y: auto; padding: 3px; }
+.routing-project { min-width: 0; border: 1px solid var(--border); border-radius: 9px; padding: 14px; overflow-wrap: anywhere; }
+.routing-project[data-selected="true"] { border-color: #70c8bc; background: #f5fcfa; box-shadow: inset 3px 0 #009f90; }
+.routing-project-heading { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.routing-project .field-label { margin-top: 12px; font-size: 12px; }
+.routing-matcher input:not([type="checkbox"]), .routing-matcher select, .routing-matcher textarea { width: 100%; min-width: 0; }
+.routing-matcher textarea { display: block; resize: vertical; padding: 9px 11px; border: 1px solid #dbe2eb; border-radius: 7px; background: #fff; color: #25314a; font: inherit; line-height: 1.6; }
+.routing-matcher textarea:focus-visible { outline: 3px solid #57c7bc; outline-offset: 3px; }
+.routing-matcher [aria-invalid="true"] { border-color: #cb625b; }
+.routing-selected-accounts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.routing-account-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 5px 8px; border: 1px solid #c9e7df; border-radius: 6px; background: #fff; color: #287369; font-size: 12px; overflow-wrap: anywhere; text-align: left; }
+.routing-account-chip span { min-width: 0; }
+.routing-account-filters { display: flex; gap: 10px; margin-top: 14px; }
+.routing-account-filters input { flex: 1; }
+.routing-account-filters select { width: 130px; }
+.routing-account-list { display: grid; gap: 9px; margin-top: 12px; max-height: 560px; overflow-y: auto; padding: 3px; }
+.routing-account { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; overflow-wrap: anywhere; }
+.routing-account[data-selected="true"] { background: #f0faf7; border-color: #a4d9ca; }
+.routing-account-heading strong { min-width: 0; overflow-wrap: anywhere; }
+.routing-account .field-help { line-height: 1.7; overflow-wrap: anywhere; }
+.routing-command { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border-radius: 7px; background: #f3f7f8; font-size: 12px; }
+@media (max-width: 1100px) { .routing-match-grid { grid-template-columns: minmax(0, 1fr); } .routing-project-list { max-height: 420px; } }
+@media (max-width: 550px) { .routing-matcher .card-heading > .button { width: 100%; } .routing-account-filters { flex-wrap: wrap; } .routing-account-filters select { width: 100%; } .routing-map-tools .button { flex: 1; white-space: normal; } }
 .reset-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-block: 20px 16px; }
 .reset-toolbar input[type="search"] { flex: 1 1 220px; min-width: 0; }
 .reset-tabs { display: inline-flex; padding: 4px; gap: 4px; border-radius: 9px; background: #f0f5f7; }

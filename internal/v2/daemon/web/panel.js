@@ -490,7 +490,33 @@
     }
     return data;
   }
-  if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText, historyTimeRange, historyQuery, historyStatus, historyDuration, validateQueryJob, validateTaskHistoryPage};
+  function projectDirectoryKey(value) {
+    if (typeof value !== 'string' || !value || value !== value.trim() || new TextEncoder().encode(value).length > 4096 || /[\p{Cc}]/u.test(value)) return '';
+    const clean = path => {
+      const result = [];
+      for (const part of path.split('/')) { if (!part || part === '.') continue; if (part === '..') result.pop(); else result.push(part); }
+      return '/' + result.join('/');
+    };
+    if (value.startsWith('/')) return clean(value);
+    const windows = value.replaceAll('\\', '/');
+    if (/^[A-Za-z]:\//.test(windows)) return (windows.slice(0, 2) + clean(windows.slice(2))).toLowerCase();
+    const parts = windows.replace(/^\/+|\/+$/g, '').split('/');
+    if (value.startsWith('\\\\') && parts.length >= 2 && parts.slice(0, 2).every(part => part && part !== '.' && part !== '..')) return ('unc:/' + parts[0] + '/' + parts[1] + clean(parts.slice(2).join('/')).replace(/\/$/, '')).toLowerCase();
+    return '';
+  }
+  function readProjectDirectoryMap(text) {
+    if (new TextEncoder().encode(text).length > 256 * 1024) throw new Error('目录清单不能超过 256 KB。');
+    let data; try { data = JSON.parse(text); } catch { throw new Error('请选择有效的 projects.json 文件。'); }
+    if (!data || !Array.isArray(data.projects) || data.projects.length > 2048) throw new Error('目录清单须包含 projects 数组，最多 2048 条映射。');
+    const directories = new Set();
+    return data.projects.map(item => {
+      const key = projectDirectoryKey(item?.directory);
+      if (!key || typeof item?.project !== 'string' || !/^[A-Za-z0-9._:-]{1,128}$/.test(item.project)) throw new Error('每条映射须包含绝对目录和有效项目标识。项目标识支持字母、数字及 . _ : -。');
+      if (directories.has(key)) throw new Error('目录清单存在重复目录，请先合并。');
+      directories.add(key); return {directory: item.directory, project: item.project};
+    });
+  }
+  if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText, historyTimeRange, historyQuery, historyStatus, historyDuration, validateQueryJob, validateTaskHistoryPage, projectDirectoryKey, readProjectDirectoryMap};
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {wakeDefaults, wakeConfigDraft, validateWakeDraft});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
@@ -531,6 +557,9 @@
   let quickWakeAccount = '', quickWakeLoading = false, quickWakeSequence = 0;
   let schedulingSaved = null, schedulingDirty = false, schedulingBusy = false, schedulingLoading = false, schedulingConflict = false, schedulingNeedsVerification = false;
   let schedulingRead = 0, schedulingPending = null, schedulingError = '', schedulingNotice = '';
+  let routingProjects = [], routingProjectSerial = 0, routingSelectedProject = null, routingProjectText = '', routingEditSequence = 0, routingImportSequence = 0;
+  let routingAccounts = null, routingAccountsLoading = false, routingAccountsBlocking = false, routingAccountsSequence = 0, routingAccountsCursor = '', routingAccountsPrevious = [], routingAccountsError = '', routingAccountTimer;
+  const routingKnownAccounts = new Map(), routingInvalidFields = new Set();
   let resetData = null, resetRendered = '', resetRead = 0, resetTab = 'cards', resetPage = 1;
   let historyData = null, historyLoading = false, historyPolling = false, historyError = '', historyTimer, historySequence = 0, historyDetailSequence = 0;
   let historySelected = null, historyJob = null, historyDetailLoading = false, historyDetailPolling = false, historyDetailError = '';
@@ -762,7 +791,7 @@
       }
       for (const name of Object.keys(current.dataset)) if (!Object.hasOwn(next.dataset, name)) delete current.dataset[name];
       for (const [name, value] of Object.entries(next.dataset)) if (current.dataset[name] !== value) current.dataset[name] = value;
-      current.onclick = next.onclick; current.onchange = next.onchange;
+      current.onclick = next.onclick; current.onchange = next.onchange; current.oninput = next.oninput;
       if (next.childNodes.length) updateChildren(current, Array.from(next.childNodes), true);
       else if (current.textContent !== next.textContent) current.textContent = next.textContent;
       return current;
@@ -1605,6 +1634,7 @@
     if (wakeSubmitting && wakeIntent) wakeUnconfirmed = true;
     if (schedulingBusy) { schedulingNeedsVerification = true; schedulingDirty = true; }
     schedulingRead++; resetRead++; schedulingBusy = false; schedulingLoading = false;
+    routingAccountsSequence++; routingAccountsLoading = false; routingAccountsBlocking = false; routingAccounts = null; routingKnownAccounts.clear(); clearTimeout(routingAccountTimer);
     wakeConsentRequested = false;
     wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false;
     $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false; $('wake-manual-consent').checked = false;
@@ -2151,7 +2181,7 @@
           read(() => accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing));
         }
         read(pollJobs);
-        if (activePage === 'scheduling') { read(() => loadScheduling()); read(() => loadResetCards()); }
+        if (activePage === 'scheduling') { read(() => loadScheduling()); read(() => loadResetCards()); if (!routingAccountsLoading) read(() => loadRoutingAccounts(false, true)); }
         if (activePage === 'history') {
           if (!historyPolling) read(() => loadHistory(true));
           if (historySelected && !historyDetailPolling) read(() => readHistoryDetail(true));
@@ -2203,7 +2233,7 @@
       await accounts(true);
       if (current !== generation) return;
       if (wakeSettingsSupported()) await reloadWakeSettings();
-      if (activePage === 'scheduling') await Promise.all([loadScheduling(), loadResetCards()]);
+      if (activePage === 'scheduling') await Promise.all([loadScheduling(), loadResetCards(), loadRoutingAccounts()]);
       if (activePage === 'wake') await loadWakeJobs();
       if (activePage === 'history') await loadHistory();
       if (activePage === 'query' && settingsSupported() && !savedSettings) await reloadSettings();
@@ -2269,6 +2299,179 @@
 
   const schedulingNumbers = {quota_max_age_seconds: 'routing-age', session_ttl_seconds: 'routing-session', max_inflight: 'routing-cap'};
   const cardNumbers = {poll_seconds: 'cards-poll', expiry_seconds: 'cards-expiry', force_before_seconds: 'cards-force', min_used_percent: 'cards-used'};
+  function routingEditable() { return connected && schedulingSaved?.instance_id === views.instance && !schedulingBusy && !schedulingLoading; }
+  function syncRoutingProjectText() {
+    routingProjectText = routingProjects.map(row => row.project + ' = ' + row.accounts.join(', ')).join('\n');
+    $('routing-projects').value = routingProjectText;
+  }
+  function readRoutingProjectText() {
+    const text = $('routing-projects').value;
+    if (text === routingProjectText) return;
+    const previous = new Map(routingProjects.map(row => [row.project, row]));
+    routingProjects = text.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+      const at = line.indexOf('='), project = (at > 0 ? line.slice(0, at) : line).trim(), old = previous.get(project);
+      return {key: old?.key || ++routingProjectSerial, project, directories: [...(old?.directories || [])], accounts: at > 0 ? line.slice(at + 1).split(',').map(id => id.trim()) : []};
+    });
+    if (!routingProjects.some(row => row.key === routingSelectedProject)) routingSelectedProject = routingProjects[0]?.key ?? null;
+    routingProjectText = text;
+  }
+  function routingProjectChanged() {
+    syncRoutingProjectText(); routingEditSequence++; schedulingDirty = true; schedulingError = ''; schedulingNotice = '';
+    clearSchedulingValidation(); renderScheduling();
+  }
+  function renderRoutingProjects() {
+    const rows = routingProjects.map(row => {
+      const card = element('article', 'routing-project'); card.dataset.renderKey = 'project:' + row.key; card.dataset.selected = String(row.key === routingSelectedProject);
+      const heading = element('div', 'routing-project-heading'), choose = element('button', 'text-button', row.key === routingSelectedProject ? '正在匹配账号' : '匹配账号');
+      choose.type = 'button'; choose.setAttribute('aria-pressed', row.key === routingSelectedProject);
+      choose.onclick = () => {
+        routingSelectedProject = row.key; renderScheduling();
+        if (context.matchMedia?.('(max-width: 1100px)').matches) { $('routing-account-title').scrollIntoView({block: 'start'}); $('routing-account-title').focus({preventScroll: true}); }
+      };
+      const remove = element('button', 'text-button', '删除项目'); remove.type = 'button';
+      remove.onclick = () => {
+        if (!routingEditable()) return;
+        routingProjects = routingProjects.filter(item => item.key !== row.key);
+        if (routingSelectedProject === row.key) routingSelectedProject = routingProjects[0]?.key ?? null;
+        routingProjectChanged();
+      };
+      heading.append(choose, remove); card.append(heading);
+      const nameID = 'routing-project-name-' + row.key, nameLabel = element('label', 'field-label', '项目标识'), name = element('input');
+      nameLabel.setAttribute('for', nameID); name.id = nameID; name.type = 'text'; name.value = row.project; name.autocomplete = 'off'; name.placeholder = '例如 project-a';
+      if (routingInvalidFields.has(nameID)) name.setAttribute('aria-invalid', 'true');
+      name.oninput = function () { row.project = this.value; syncRoutingProjectText(); };
+      const directoryID = 'routing-project-directories-' + row.key, directoryLabel = element('label', 'field-label', '客户端目录（每行一个，可留空）'), directory = element('textarea');
+      directoryLabel.setAttribute('for', directoryID); directory.id = directoryID; directory.rows = 2; directory.value = row.directoryText ?? row.directories.join('\n'); directory.placeholder = '/work/project-a 或 C:\\work\\project-a';
+      if (routingInvalidFields.has(directoryID)) directory.setAttribute('aria-invalid', 'true');
+      directory.oninput = function () { row.directoryText = this.value; row.directories = this.value.split('\n').map(value => value.trim()).filter(Boolean); syncRoutingProjectText(); };
+      card.append(nameLabel, name, directoryLabel, directory, element('p', 'field-help', '首选账号 ' + row.accounts.length + ' 个 · ' + (row.directories.length ? row.directories.length + ' 个目录' : '尚未绑定客户端目录')));
+      const selected = element('div', 'routing-selected-accounts');
+      for (const id of row.accounts) {
+        const chip = element('button', 'routing-account-chip'); chip.type = 'button'; chip.dataset.renderKey = 'account:' + id;
+        const account = routingKnownAccounts.get(id);
+        chip.append(element('span', '', id + (account ? ' · ' + accountStatus(account).label : ' · 待核实')), document.createTextNode(' ×'));
+        chip.setAttribute('aria-label', '从项目中移除首选账号 ' + id);
+        chip.onclick = () => { if (routingEditable()) { row.accounts = row.accounts.filter(value => value !== id); routingProjectChanged(); } };
+        selected.append(chip);
+      }
+      if (!row.accounts.length) selected.append(element('p', 'field-help', '请点击“匹配账号”，在右侧清单中加入首选账号。'));
+      card.append(selected); return card;
+    });
+    updateChildren($('routing-project-list'), rows.length ? rows : [element('p', 'field-help', '尚无项目。新增项目，或导入客户端已有的 projects.json，再为项目选择账号。')]);
+    $('routing-project-add').disabled = !routingEditable() || routingProjects.length >= 128;
+    $('routing-map-import').disabled = !routingEditable();
+    $('routing-map-export').disabled = !routingEditable() || schedulingDirty || schedulingConflict || schedulingNeedsVerification || !routingProjects.some(row => row.directories.length);
+  }
+  function renderRoutingAccounts() {
+    const project = routingProjects.find(row => row.key === routingSelectedProject), current = connected && routingAccounts?.instance_id === views.instance;
+    setText('routing-account-title', project ? '为“' + (project.project || '未命名项目') + '”选择账号' : '选择项目后匹配账号');
+    $('routing-accounts-refresh').disabled = !connected || routingAccountsLoading;
+    $('routing-account-previous').disabled = !current || routingAccountsBlocking || !routingAccountsPrevious.length;
+    $('routing-account-next').disabled = !current || routingAccountsBlocking || !routingAccounts.next_after;
+    const info = !connected ? '网页未连接，账号清单待核实。' : routingAccountsError || (routingAccountsBlocking ? '正在读取 CPA 已同步的账号清单…' : current ? '仅查看已有额度观测，不查询上游。加入后先保存设置；同一账号可被多个项目首选。' : '正在等待当前后台的账号清单。');
+    setText('routing-accounts-message', info);
+    const accounts = current ? routingAccounts.accounts : [];
+    setText('routing-account-page', current ? '共 ' + (routingAccounts.filter_total ?? routingAccounts.total ?? accounts.length) + ' 个账号 · 当前 ' + ((routingAccounts.offset || 0) + (accounts.length ? 1 : 0)) + '–' + ((routingAccounts.offset || 0) + accounts.length) : '尚未读取');
+    const rows = accounts.map(account => {
+      const chosen = project?.accounts.includes(account.id), node = element('article', 'routing-account'), heading = element('div', 'routing-account-heading');
+      node.dataset.renderKey = 'account:' + account.id; node.dataset.selected = String(!!chosen);
+      const button = element('button', chosen ? 'button button-outline' : 'button button-primary', chosen ? '移除首选' : '加入首选'); button.type = 'button';
+      button.disabled = !project || !routingEditable() || routingAccountsBlocking || !chosen && account.status !== 'available';
+      button.onclick = () => {
+        if (!project || !routingEditable() || routingAccounts?.instance_id !== views.instance || !chosen && account.status !== 'available') return;
+        project.accounts = chosen ? project.accounts.filter(id => id !== account.id) : [...project.accounts, account.id];
+        routingProjectChanged();
+      };
+      heading.append(element('strong', '', account.id), button); node.append(heading);
+      const five = windowView(account.quota, 'five_hour'), weekly = windowView(account.quota, 'weekly');
+      node.append(element('p', 'field-help', accountStatus(account).label + ' · 5 小时剩余 ' + (five.percent === null ? '未知' : five.percent + '%') + ' · 周剩余 ' + (weekly.percent === null ? '未知' : weekly.percent + '%')));
+      node.append(element('p', 'field-help', '额度观测：' + historyDate(account.quota?.observed_at || account.observed_at, true)));
+      const others = routingProjects.filter(row => row.key !== project?.key && row.accounts.includes(account.id)).map(row => row.project || '未命名项目');
+      if (others.length) node.append(element('p', 'field-help', '其他首选项目：' + others.join('、')));
+      return node;
+    });
+    updateChildren($('routing-account-list'), rows.length ? rows : [element('p', 'field-help', current ? '没有匹配的账号，请调整搜索或状态。' : '连接后读取 Codex 账号清单。')]);
+  }
+  async function loadRoutingAccounts(reset = false, background = false, move = '') {
+    if (!connected || background && routingAccountsLoading) return;
+    const current = generation, instance = views.instance, sequence = ++routingAccountsSequence;
+    if (routingAccounts?.instance_id !== instance) { reset = true; routingKnownAccounts.clear(); }
+    let after = reset ? '' : move === 'next' ? routingAccounts?.next_after || '' : move === 'previous' ? routingAccountsPrevious.at(-1) || '' : routingAccountsCursor;
+    const search = resolveDisplayAccount($('routing-account-search').value), status = $('routing-account-status').value || 'all';
+    if (new TextEncoder().encode(search).length > 256 || /[\p{Cc}]/u.test(search)) { routingAccountsError = '搜索账号最多 256 字节，不含控制字符。'; renderRoutingAccounts(); return; }
+    let path = '/accounts?limit=12&status=' + encodeURIComponent(status);
+    if (search) path += '&search=' + encodeURIComponent(search);
+    if (after) path += '&after=' + encodeURIComponent(after) + '&revision=' + routingAccounts.accounts_revision;
+    routingAccountsLoading = true; routingAccountsBlocking = !background; routingAccountsError = ''; renderRoutingAccounts();
+    try {
+      const data = await api(path);
+      if (current !== generation || sequence !== routingAccountsSequence || instance !== views.instance || data.instance_id !== instance) return;
+      if (!Array.isArray(data.accounts) || !Number.isSafeInteger(data.accounts_revision) || data.accounts.some(account => typeof account.id !== 'string' || typeof account.status !== 'string')) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      if (reset) routingAccountsPrevious = [];
+      else if (move === 'next') routingAccountsPrevious.push(routingAccountsCursor);
+      else if (move === 'previous') routingAccountsPrevious.pop();
+      if (routingAccounts?.accounts_revision !== data.accounts_revision) routingKnownAccounts.clear();
+      routingAccountsCursor = after; routingAccounts = data;
+      for (const account of data.accounts) { routingKnownAccounts.delete(account.id); routingKnownAccounts.set(account.id, account); }
+      while (routingKnownAccounts.size > 10000) routingKnownAccounts.delete(routingKnownAccounts.keys().next().value);
+    } catch (error) {
+      if (current !== generation || sequence !== routingAccountsSequence) return;
+      if (error.code === 'view_changed' && after) return loadRoutingAccounts(true, background);
+      routingAccountsError = '读取账号失败：' + message(error.code); throw error;
+    } finally { if (current === generation && sequence === routingAccountsSequence) { routingAccountsLoading = false; routingAccountsBlocking = false; renderRoutingProjects(); renderRoutingAccounts(); } }
+  }
+  function importRoutingDirectories(text) {
+    const records = readProjectDirectoryMap(text), projects = routingProjects.map(row => ({...row, accounts: [...row.accounts], directories: [...row.directories]}));
+    for (const record of records) {
+      const key = projectDirectoryKey(record.directory), owner = projects.find(row => row.directories.some(directory => projectDirectoryKey(directory) === key));
+      if (owner && owner.project !== record.project) throw new Error('目录已属于其他项目：' + record.directory);
+      let project = projects.find(row => row.project === record.project);
+      if (!project) { project = {key: ++routingProjectSerial, project: record.project, accounts: [], directories: []}; projects.push(project); }
+      if (!owner) project.directories.push(record.directory);
+      if (project.directories.length > 16 || projects.length > 128) throw new Error('最多 128 个项目，每个项目最多 16 个目录。');
+    }
+    routingProjects = projects;
+    if (!routingProjects.some(row => row.key === routingSelectedProject)) routingSelectedProject = routingProjects[0]?.key ?? null;
+    routingProjectChanged(); setText('routing-map-message', '已导入 ' + records.length + ' 条目录映射，原有首选账号保留。请补齐账号并保存设置，再下载映射到客户端。');
+  }
+  $('routing-project-add').onclick = () => {
+    if (!routingEditable() || routingProjects.length >= 128) return;
+    const row = {key: ++routingProjectSerial, project: '', directories: [], accounts: []};
+    routingProjects.push(row); routingSelectedProject = row.key; routingProjectChanged();
+    $('routing-project-name-' + row.key).focus();
+  };
+  $('routing-accounts-refresh').onclick = () => loadRoutingAccounts().catch(report);
+  $('routing-account-next').onclick = () => { if (!$('routing-account-next').disabled) return loadRoutingAccounts(false, false, 'next').catch(report); };
+  $('routing-account-previous').onclick = () => { if (!$('routing-account-previous').disabled) return loadRoutingAccounts(false, false, 'previous').catch(report); };
+  function filterRoutingAccounts() {
+    clearTimeout(routingAccountTimer); routingAccountsSequence++; routingAccountsLoading = false; routingAccountsBlocking = false;
+    const current = generation;
+    routingAccountTimer = setTimeout(() => { if (connected && current === generation) void loadRoutingAccounts(true).catch(report); }, 200);
+  }
+  $('routing-account-search').oninput = filterRoutingAccounts; $('routing-account-status').onchange = filterRoutingAccounts;
+  $('routing-map-import').onclick = () => { if (routingEditable()) $('routing-map-file').click(); };
+  $('routing-map-file').onchange = async () => {
+    const file = $('routing-map-file').files?.[0]; if (!file || !routingEditable()) return;
+    const current = generation, sequence = routingEditSequence, read = ++routingImportSequence;
+    setText('routing-map-message', '正在读取客户端目录清单…');
+    try {
+      if (file.size > 256 * 1024) throw new Error('目录清单不能超过 256 KB。');
+      const text = await file.text();
+      if (read !== routingImportSequence) return;
+      if (current !== generation || sequence !== routingEditSequence || !routingEditable()) { setText('routing-map-message', '编辑或连接已变化，本次导入未应用，请重新导入。'); return; }
+      importRoutingDirectories(text);
+    } catch (error) { if (current === generation && read === routingImportSequence) setText('routing-map-message', error.message); }
+    finally { if (current === generation && read === routingImportSequence) $('routing-map-file').value = ''; }
+  };
+  $('routing-map-export').onclick = () => {
+    if ($('routing-map-export').disabled) return;
+    const projects = routingProjects.flatMap(row => row.directories.map(directory => ({directory, project: row.project})));
+    const blob = new Blob([JSON.stringify({projects}, null, 2) + '\n'], {type: 'application/json'});
+    const url = context.URL.createObjectURL(blob), link = element('a'); link.href = url; link.download = 'projects.json';
+    document.documentElement.append(link); link.click(); link.remove();
+    setTimeout(() => context.URL.revokeObjectURL(url), 1000);
+    setText('routing-map-message', '已下载已保存的目录映射。请放到客户端 ~/.config/cwr/projects.json，再使用 cwr-codex 启动器。');
+  };
   function renderScheduling() {
     const current = connected && schedulingSaved?.instance_id === views.instance;
     $('scheduling-fields').disabled = !current || schedulingBusy || schedulingLoading;
@@ -2293,16 +2496,24 @@
       : schedulingError || (schedulingDirty ? '草稿尚未保存，两组设置将一起应用。' :
         (schedulingSaved.routing_error ? '调度快照尚未同步到 CPA，请检查接入层版本与连接。' : schedulingSaved.reset_error ? '最近一次重置卡操作未完成，请查看下方记录。' : schedulingNotice || '已读取后台设置。保存后应用，关闭页面不停止后台。'));
     setText('scheduling-message', text);
+    renderRoutingProjects(); renderRoutingAccounts();
   }
   function clearSchedulingValidation() {
     $('scheduling-validation').hidden = true;
+    for (const id of routingInvalidFields) $(id)?.removeAttribute('aria-invalid');
+    routingInvalidFields.clear();
     for (const id of [...Object.values(schedulingNumbers), ...Object.values(cardNumbers), 'routing-projects']) $(id).removeAttribute('aria-invalid');
   }
   function schedulingInvalid(id, text) {
+    if (id.startsWith('routing-project-') || id === 'routing-account-title') routingInvalidFields.add(id);
     $(id).setAttribute('aria-invalid', 'true');
     const details = $(id).closest?.('details'); if (details) details.open = true;
     $(id).focus();
     throw new Error(text);
+  }
+  function routingProjectInvalid(row, field, text) {
+    routingSelectedProject = row.key; renderRoutingProjects(); renderRoutingAccounts();
+    schedulingInvalid(field === 'accounts' ? 'routing-account-title' : 'routing-project-' + field + '-' + row.key, text);
   }
   function schedulingDraft() {
     const c = JSON.parse(JSON.stringify(schedulingSaved.config));
@@ -2322,16 +2533,28 @@
     c.cards.force_before_seconds = number('cards-force', '最晚尝试兑换的提前量（秒）', 1, 2592000);
     c.cards.min_used_percent = number('cards-used', '兑换所需已用比例（%）', 1, 100);
     if (c.cards.force_before_seconds > c.cards.expiry_seconds) schedulingInvalid('cards-force', '最晚尝试兑换的提前量不能大于关注到期卡的时间范围。');
-    const projects = new Set(), validLabel = value => value && new TextEncoder().encode(value).length <= 256 && !/[\p{Cc}"\\]/u.test(value);
-    c.projects = $('routing-projects').value.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
-      const at = line.indexOf('=');
-      const project = at > 0 ? line.slice(0, at).trim() : '', accounts = at > 0 ? line.slice(at + 1).split(',').map(id => id.trim()) : [];
-      if (!validLabel(project) || !accounts.length || accounts.some(id => !validLabel(id))) schedulingInvalid('routing-projects', '每行请填写“项目标识 = 账号 ID, 账号 ID”，标识和账号不可为空、超过 256 字节或包含控制字符、引号、反斜线。');
-      if (projects.has(project) || new Set(accounts).size !== accounts.length) schedulingInvalid('routing-projects', '项目标识不能重复，同一项目的账号也不能重复。');
-      if (accounts.length > 1000) schedulingInvalid('routing-projects', '每个项目最多填写 1000 个账号。');
-      projects.add(project); return {project, accounts};
+    readRoutingProjectText();
+    const projects = new Set(), directories = new Set(), validLabel = value => value && new TextEncoder().encode(value).length <= 256 && !/[\p{Cc}"\\]/u.test(value);
+    c.projects = routingProjects.map(row => {
+      const project = row.project.trim(), accounts = row.accounts;
+      if (!validLabel(project)) routingProjectInvalid(row, 'name', '请填写项目标识，最多 256 字节，不含控制字符、引号或反斜线。');
+      if (projects.has(project)) routingProjectInvalid(row, 'name', '项目标识“' + project + '”重复，请为各项目使用独立标识。');
+      if (!accounts.length) routingProjectInvalid(row, 'accounts', '请为项目“' + project + '”选择至少一个首选账号。');
+      if (accounts.some(id => !validLabel(id))) schedulingInvalid('routing-projects', '项目“' + project + '”的账号 ID 无效。请检查文本编辑中的账号，不可为空、超过 256 字节或包含控制字符、引号、反斜线。');
+      if (new Set(accounts).size !== accounts.length) routingProjectInvalid(row, 'accounts', '项目“' + project + '”的账号重复，请移除重复项。');
+      if (accounts.length > 1000) routingProjectInvalid(row, 'accounts', '每个项目最多填写 1000 个账号。');
+      if (row.directories.length > 16) routingProjectInvalid(row, 'directories', '每个项目最多填写 16 个客户端目录。');
+      if (row.directories.length && !/^[A-Za-z0-9._:-]{1,128}$/.test(project)) routingProjectInvalid(row, 'name', '使用目录映射的项目标识只支持 1–128 个字母、数字及 . _ : -。');
+      for (const directory of row.directories) {
+        const key = projectDirectoryKey(directory);
+        if (!key) routingProjectInvalid(row, 'directories', '请为项目“' + project + '”填写有效的客户端绝对目录，不含控制字符，最多 4096 字节。');
+        if (directories.has(key)) routingProjectInvalid(row, 'directories', '客户端目录存在重复映射：' + directory);
+        directories.add(key);
+      }
+      projects.add(project); return {project, accounts: [...accounts], ...(row.directories.length ? {directories: [...row.directories]} : {})};
     });
     if (c.projects.length > 128) schedulingInvalid('routing-projects', '最多填写 128 个项目。');
+    if (new TextEncoder().encode(JSON.stringify({revision: schedulingSaved.revision, config: c})).length > 256 * 1024) schedulingInvalid('routing-projects', '调度设置超过 256 KB，请减少项目目录或账号条目。');
     return c;
   }
   function fillScheduling(c) {
@@ -2340,7 +2563,10 @@
     for (const [key, id] of Object.entries(schedulingNumbers)) $(id).value = c[key];
     $('cards-enabled').checked = c.cards.enabled; $('cards-auto').checked = c.cards.auto_consume;
     for (const [key, id] of Object.entries(cardNumbers)) $(id).value = c.cards[key];
-    $('routing-projects').value = c.projects.map(p => p.project + ' = ' + p.accounts.join(', ')).join('\n');
+    const previous = new Map(routingProjects.map(row => [row.project, row.key]));
+    routingProjects = c.projects.map(p => ({key: previous.get(p.project) || ++routingProjectSerial, project: p.project, accounts: [...p.accounts], directories: [...(p.directories || [])]}));
+    if (!routingProjects.some(row => row.key === routingSelectedProject)) routingSelectedProject = routingProjects[0]?.key ?? null;
+    syncRoutingProjectText(); routingEditSequence++;
     clearSchedulingValidation();
   }
   function schedulingConfigEqual(a, b) {
@@ -2353,7 +2579,8 @@
   function schedulingInputSignature() {
     return JSON.stringify([
       ...[...Object.values(schedulingNumbers), ...Object.values(cardNumbers), 'routing-projects', 'routing-rebind'].map(id => $(id).value),
-      ...['routing-enabled', 'routing-reset', 'routing-subagent', 'cards-enabled', 'cards-auto'].map(id => $(id).checked)
+      ...['routing-enabled', 'routing-reset', 'routing-subagent', 'cards-enabled', 'cards-auto'].map(id => $(id).checked),
+      routingProjects.map(row => [row.project, row.accounts, row.directories])
     ]);
   }
   async function loadScheduling(discard = false, verify = false) {
@@ -2464,6 +2691,7 @@
     updateChildren(list, rows.length ? rows : [element('p', 'field-help', empty)]);
   }
   $('scheduling-form').addEventListener('input', () => {
+    readRoutingProjectText(); routingEditSequence++;
     schedulingDirty = true; schedulingError = ''; schedulingNotice = ''; clearSchedulingValidation(); renderScheduling();
   });
   $('cards-enabled').onchange = () => {
@@ -2515,7 +2743,7 @@
     setText('page-title', pages[name][0]); setText('page-description', pages[name][1]); setText('breadcrumb', pages[name][0]);
     document.title = '窗口助手 · ' + pages[name][0];
     if (connected) { renderTasks(); renderDiagnostics(); }
-    if (name === 'scheduling' && connected) { void loadScheduling().catch(report); void loadResetCards().catch(report); }
+    if (name === 'scheduling' && connected) { void loadScheduling().catch(report); void loadResetCards().catch(report); void loadRoutingAccounts().catch(report); }
     if (name === 'query' && loadSettings && connected && settingsSupported() && (!savedSettings || savedSettings.instance_id !== views.instance)) void reloadSettings();
     if (name === 'models' && loadSettings && connected) { ensureGenerationAccounts(); void reloadModelSettings(); void pollGeneration(); }
     if (name === 'wake' && loadSettings && connected) { ensureWakeSettings(); void loadWakeJobs(); }
@@ -2532,6 +2760,7 @@
   $('display-mode').onchange = () => {
     if (!['original', 'masked', 'alias'].includes($('display-mode').value)) return;
     displayPreference.mode = $('display-mode').value; persistDisplayPreference(); applyDisplayPrivacy(document.documentElement);
+    renderRoutingProjects(); renderRoutingAccounts();
     renderResetCards();
     renderGeneration();
   };

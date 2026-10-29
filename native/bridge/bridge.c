@@ -865,7 +865,8 @@ static J *proxy(J*req) {
     unsigned char*request_body=NULL;
     const char*body=string(field(req,"Body"));
     if(body) {
-        request_body=unbase64(body,&body_size,!strcmp(endpoint,"/api/v2/model-settings")?(128u<<10):6144);
+        size_t body_limit=!strcmp(endpoint,"/api/v2/scheduling")?(256u<<10):!strcmp(endpoint,"/api/v2/model-settings")?(128u<<10):6144;
+        request_body=unbase64(body,&body_size,body_limit);
         if(!request_body)goto invalid;
     }
     struct curl_slist*headers=NULL;

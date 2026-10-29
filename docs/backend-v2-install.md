@@ -1,8 +1,8 @@
 # v2 预发布安装与更新
 
-适用于 Debian 12/13、amd64/arm64、CPA 原生 ABI 1，插件协商 RPC schema 6 或 7；支持 schema 8 的 CPA 仍可协商为 7。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。当前 **v0.2.0-rc.24 后台及 v0.2.0-rc.23 接入层**提供网页、额度查询、持久任务、活动及正常业务额度观测、模型配置、短句候选生成、Codex 模型唤醒、项目账号调度、插件会话粘性和赠送重置卡管理。新安装的调度、重置卡查询及自动兑换默认关闭，已有明确保存的调度、查询和唤醒规则保留。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
+适用于 Debian 12/13、amd64/arm64、CPA 原生 ABI 1，插件协商 RPC schema 6 或 7；支持 schema 8 的 CPA 仍可协商为 7。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。当前 **v0.2.0-rc.25 后台和接入层**提供网页、额度查询、持久任务、活动及正常业务额度观测、模型配置、短句候选生成、Codex 模型唤醒、项目账号调度、插件会话粘性和赠送重置卡管理。新安装的调度、重置卡查询及自动兑换默认关闭，已有明确保存的调度、查询和唤醒规则保留。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
 
-**本次后台为 rc.24，原生接入层沿用 rc.23。**从 rc.23 更新且安装器确认接入层文件完全一致时，可省略 `--restart`，仅更新并重启后台；首次安装、旧接入层或接入层文件变化仍须显式 `--restart`。本版优化账号调度与重置卡设置、草稿核实及记录浏览，数据库保持 schema 10，从 rc.21/rc.22/rc.23 升级无需迁移。插件继续统一管理主会话、子代理和分支粘性，以 CPA v8.0.47 的宿主契约为基线；仅重启后台不清空原生桥中的有效绑定。目录绑定使用配套 `cwr-codex.py`。重置卡详情与兑换需要支持官方账号协议的 Codex CLI；其代理继承后台进程环境或 `--reset-proxy`，不同于既有额度查询的 CPA 全局代理继承。详见 [rc.24 发布说明](releases/v0.2.0-rc.24.md)与[配置说明](account-scheduling.md)。
+**本次后台和原生接入层均为 rc.25，升级须同时更新并显式 `--restart`。**项目目录与账号匹配支持客户端目录导入导出、账号点选、搜索筛选和分页；接入层将调度设置请求上限由 6 KB 提升至 256 KB。数据库保持 schema 10，从 rc.21–rc.24 升级无需迁移，原有规则及发送防重记录保留。运行 Codex 的电脑还需更新包内 `cwr-codex.py`；`--provider` 只表示启用条件，启动器跟随客户端配置，不强制选择提供商。客户端使用 Python 3.11+，Python 3.10 可安装 `tomli`。目录绑定及代理设置见[配置说明](account-scheduling.md)，完整变更见 [rc.25 发布说明](releases/v0.2.0-rc.25.md)。
 
 以下为历史版本能力与迁移记录：rc.5 支持自动额度查询及随机延迟，不包含后续加入的模型唤醒、短句生成和自动模型规则；各包能力以对应发布说明为准。
 
@@ -28,13 +28,13 @@ rc.12 在额度查询完成时同步已核实的宿主账号状态，并提供�
 
 ## 首次切换
 
-当前后台为 **v0.2.0-rc.24**，接入层为 **v0.2.0-rc.23**。首次切换及接入层文件变化须显式 `--restart`，重启 CPA 加载接入层。数据库为 schema 10，保留现有 v2 数据和发送防重记录；须遵循下面的一致备份和降级限制，详见 [rc.24 发布说明](releases/v0.2.0-rc.24.md)。
+当前后台和接入层均为 **v0.2.0-rc.25**。首次切换及从早期版本升级须显式 `--restart`，重启 CPA 加载支持较大调度设置的接入层。数据库为 schema 10，保留现有 v2 数据和发送防重记录；须遵循下面的一致备份和降级限制，详见 [rc.25 发布说明](releases/v0.2.0-rc.25.md)。
 
 rc.13 新增快捷唤醒与持久响应记录，数据库升级至 schema 9，首次启动自动迁移并保留现有任务及防重状态。升级前另存停机或 SQLite 在线一致备份；不能把旧后台直接换回迁移后的新库。原生接入层仍为 rc.8，详见 [rc.13 发布说明](releases/v0.2.0-rc.13.md)。
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.24 --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.25 --restart
 ```
 
 root 会话可省略 sudo。首次下载需要已有 curl。脚本安装缺少的运行依赖，识别当前 CPA 的配置、进程、用户及 systemd 服务；无法唯一确认时用参数明确指定，例如：
@@ -49,7 +49,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.24` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.25` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -59,11 +59,11 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxya
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-上述命令适用于首次切换及旧版本更新。从 rc.23 更新且接入层文件完全一致时，可省略 `--restart` 以仅重启后台；从 rc.22 或更早接入层升级、或接入层文件变化时仍必须使用 `--restart`。安装器在写入前检查重启要求。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.24`。
+从 rc.24 或更早版本更新到 rc.25 必须使用 `--restart`，同时加载新版接入层。安装器在写入前检查重启要求。运行 Codex 的客户端也需替换配套启动器，以启用提供商匹配条件；更新后强制刷新网页。保留原部署所需的 `--cpa-dir`、用户服务等参数。若原命令固定了旧 `--version`，请替换为 `latest`，或指定本次 `v0.2.0-rc.25`。
 
 `latest` 会按数值比较全部已发布 V2 rc 版本，不取发布列表第一条，也不使用排除预发布的 GitHub `/releases/latest`。下载的独立入口会重新获取两份 Python 安装器，不复用下载目录中的旧副本；只有完整源码目录（含上级 `go.mod`）使用本地安装器，运行前须自行更新源码。离线安装继续使用下文的包内 Python 入口。
 
-**后台和接入层独立记录版本**。本次后台为 rc.24，接入层沿用 rc.23；早期接入层缺少粘性管理和执行结果观测能力，不能替代 rc.23 接入层。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
+**后台和接入层独立记录版本**。本次两者均为 rc.25；早期接入层无法转发超过 6 KB 的调度设置，不能完整支持较大的项目目录清单。安装器会输出目标后台版本、目标接入层版本，成功后显示实际后台及接入层版本；也可在 V2 网页的诊断页查看后台版本。若安装器报告接入层变化、网络错误或验证失败，则尚未完成更新，不能仅凭下载成功判断。
 
 普通 v1 的 `install.sh` 不自动选择 v2 包；检测到已有 v2 安装记录时拒绝覆盖。不能通过旧脚本把正在运行的 v2 改回 v1。
 
@@ -87,7 +87,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.24 --package /path/codex-window-refresh-v2_v0.2.0-rc.24_linux_amd64.tar.gz \
+  --version v0.2.0-rc.25 --package /path/codex-window-refresh-v2_v0.2.0-rc.25_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 

@@ -102,6 +102,12 @@ func (s *Store) RoutingSnapshot(ctx context.Context, at time.Time) (RoutingSnaps
 		return RoutingSnapshot{}, err
 	}
 	result := RoutingSnapshot{Config: settings.Config, Accounts: []RoutingAccount{}, Identities: []RoutingIdentity{}}
+	// Client directory labels are management metadata. The bridge routes by the
+	// project header and does not need a copy of clients' filesystem paths.
+	result.Config.Projects = append([]policy.ProjectPreference{}, settings.Config.Projects...)
+	for i := range result.Config.Projects {
+		result.Config.Projects[i].Directories = nil
+	}
 	// Identity validity is independent of quota freshness. An expired quota
 	// snapshot removes optimization priority, never an otherwise usable binding.
 	identities, err := tx.QueryContext(ctx, `SELECT a.id,b.binding,a.status,COALESCE(a.quota,'') FROM accounts a JOIN account_bindings b ON b.account_id=a.id WHERE a.status!='removed' AND b.binding!='' ORDER BY a.id LIMIT 10000`)

@@ -6,12 +6,24 @@ rc.23 增加下述插件会话粘性接管。数据库保持 schema 10，旧调�
 
 ## 项目与账号
 
-在面板“账号调度与重置卡”填写项目首选账号，每行例如：
+在面板“账号调度与重置卡”的“项目目录与账号匹配”中维护目录和账号：
+
+1. 新增项目并填写项目标识、运行 Codex 的电脑上的绝对目录；同一项目可填写多个目录。也可导入客户端已有的 `projects.json`，同名项目的首选账号会保留，目录冲突时整个导入不应用。
+2. 点击项目的“匹配账号”，在 CPA 已同步的 Codex 账号清单中点选首选账号。支持账号 ID 或完整本地别称搜索、状态筛选和独立分页；显示已有的五小时、周额度及观测时间，查看和刷新清单不查询上游、不发送模型。
+3. 保存全部设置，再点击“下载目录映射”。将文件放到客户端的 `~/.config/cwr/projects.json`，通过下述启动器运行 Codex，目录才会转换为调度请求中的项目标识。
+
+目录清单来自手动登记或导入客户端文件，后台不读取客户端文件系统。每个项目最多 16 个目录、1000 个首选账号，总计最多 128 个项目，完整设置不超过 256 KB。同一目录不能重复分配，嵌套目录允许；启动器在客户端解析符号链接并使用最长路径匹配。混合平台清单中的其他操作系统绝对路径会被启动器跳过。
+
+目录作为可选的管理元数据与项目偏好一起按 revision 保存，旧配置无需修改，不增加数据库迁移。发布给接入层的调度快照只包含项目标识与首选账号，不包含客户端目录。rc.25 起，完整支持大于 6 KB 的调度设置需要同时更新到 rc.25 原生接入层，并显式重启 CPA。
+
+高级文本编辑仍支持项目首选账号，每行例如：
 
 ```text
 project-a = account-1, account-2
 project-b = account-3
 ```
+
+文本编辑时，同名项目保留已登记目录；删除或重命名项目会移除对应的目录映射。目录与项目账号只在保存后应用，未保存、配置冲突或保存结果待核实时不能下载新映射。
 
 这些是首次分配时的软偏好：首选账号不可用或达到并发上限时，可以回退其他可用候选。项目标识不授予账号访问权限。CPA 原有模型支持、禁用、冷却和显式指定账号继续生效；新会话优先最高可用优先级，已有绑定可以继续使用较低优先级账号。插件声明 `scheduler_across_priorities` 以接收这些候选。已有其他选号插件时，应避免同时启用多个选号插件，宿主只选择一个活动 Scheduler。
 
@@ -21,7 +33,18 @@ project-b = account-3
 python3 scripts/cwr-codex.py --provider cpa --project project-a --directory /work/project-a
 ```
 
-`--provider` 必须是用户级 Codex 配置中已经存在、指向 CPA 的 provider ID。启动器通过命令行设置该 provider 和 `X-CWR-Project` 请求头，不保存密钥，也不修改 Codex 配置文件。当前 Codex 忽略项目 `.codex/config.toml` 中的 provider 配置，不能通过各目录的 provider 配置实现切换。
+`--provider` 是用户填写的“允许启用项目调度的提供商 ID”，默认 `cpa`，它不选择或切换 Codex 的提供商。客户端需要 Python 3.11+；Python 3.10 可安装 `tomli` 以读取 TOML。启动器在每次启动时读取 `$CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`），只有配置中的 `model_provider` 与这个 ID 完全一致时，才读取项目目录映射并为该提供商添加 `X-CWR-Project` 请求头。例如：
+
+```toml
+# ~/.codex/config.toml：放在文件顶层，保持原有 CPA 提供商定义和认证配置。
+model_provider = "cpa"
+```
+
+将 `model_provider` 改成其他提供商并重新启动后，同一条启动器命令会直接运行 Codex，不读取目录映射、不新增项目头，不会把提供商强制改回 CPA。该判断只影响本次客户端启动，不修改配置、目录映射或服务器调度总开关。提供商 ID 由用户保证指向 CPA，启动器不根据名称猜测或验证服务地址。
+
+通过 Codex 参数 `--profile`/`-p` 选择 profile 时，启动器按当前官方配置约定读取 `$CODEX_HOME/<profile>.config.toml` 中的提供商覆盖；通过 `-c`/`--config` 明确切到其他提供商、使用 `--oss` 或连接远程 app-server 时，本次跳过项目标识注入。命令行覆盖不能把配置文件中的其他提供商强行纳入项目调度。配置损坏、无法读取、缺少 TOML 解析器或旧版隐式 profile 无法确认时，同样不注入项目头，将原参数交给 Codex 处理；诊断不回显配置内容。
+
+启动器不保存密钥、不改写请求正文，也不向命令行添加 `model_provider` 覆盖。项目目录中的 `.codex/config.toml` 不用于提供商选择。配置优先级及独立 profile 文件依据：[OpenAI 官方配置说明](https://learn.chatgpt.com/docs/config-file/config-basic#configuration-precedence)、[profile 与命令行覆盖](https://learn.chatgpt.com/docs/config-file/config-advanced)。
 
 自动按目录选择时，创建 `~/.config/cwr/projects.json`：
 

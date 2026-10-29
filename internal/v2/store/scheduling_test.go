@@ -255,3 +255,28 @@ func TestResetViewsUseQuotaSummaryWithoutRefreshingDetailFreshness(t *testing.T)
 		t.Fatal("replacement inherited count", views, err)
 	}
 }
+
+func TestClientDirectoriesPersistButAreNotPublishedToTheScheduler(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	config := policy.DefaultScheduling()
+	config.Projects = []policy.ProjectPreference{{Project: "client-repo", Accounts: []string{"a"}, Directories: []string{"/client-only/repo", "C:\\Work\\Repo"}}}
+	saved, err := s.SaveScheduling(ctx, 0, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := s.RoutingSnapshot(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Config.Projects) != 1 || len(snapshot.Config.Projects[0].Directories) != 0 || snapshot.Config.Projects[0].Accounts[0] != "a" {
+		t.Fatal("client paths reached scheduler or routing preference changed", snapshot.Config)
+	}
+	reread, err := s.SchedulingSettings(ctx)
+	if err != nil || reread.Revision != saved.Revision || len(reread.Config.Projects[0].Directories) != 2 || reread.Config.Projects[0].Directories[0] != "/client-only/repo" {
+		t.Fatal("scheduler snapshot mutated persisted management metadata", reread, err)
+	}
+	if _, err = s.SaveScheduling(ctx, 0, config); !errors.Is(err, ErrSettingsConflict) {
+		t.Fatal("directory settings bypassed revision check", err)
+	}
+}
