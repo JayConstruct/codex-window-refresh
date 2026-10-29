@@ -2,6 +2,7 @@
  * socket or host callback is used here. CPA supplies canonical session IDs. */
 #define _POSIX_C_SOURCE 200809L
 #include "scheduler.h"
+#include "events.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -36,6 +37,7 @@ static uint64_t generation;
 static Affinity sessions[SLOTS];
 static Execution active[SLOTS],pending[SLOTS],history[SLOTS];
 static unsigned history_cursor;
+static struct {char project[69];time_t seen;} observed_projects[1024];
 
 static J *get(J *object,const char *name) {
     J *value=NULL;
@@ -166,6 +168,7 @@ void cwr_scheduler_clear(void) {
     pthread_mutex_lock(&lock);json_object_put(snapshot);snapshot=NULL;deadline=0;
     memset(sessions,0,sizeof(sessions));memset(active,0,sizeof(active));memset(pending,0,sizeof(pending));
     memset(history,0,sizeof(history));
+    memset(observed_projects,0,sizeof(observed_projects));
     pthread_mutex_unlock(&lock);
 }
 J *cwr_scheduler_replace(J *input) {
@@ -342,23 +345,37 @@ static int choose_new(J *candidates,J *preference,const Affinity *own,time_t now
     }
     return best;
 }
+static void observe_project(const char *scope,const char *project,const char *name,time_t at) {
+    if(!scope||!project||strlen(project)!=68||strncmp(project,"dir-",4))return;
+    unsigned hash=2166136261u;
+    for(const unsigned char *p=(const unsigned char *)project+4;*p;p++) {
+        if(!(*p>='0'&&*p<='9')&&!(*p>='a'&&*p<='f'))return;
+        hash=(hash^*p)*16777619u;
+    }
+    unsigned slot=hash%1024;
+    if(!strcmp(observed_projects[slot].project,project)&&at<observed_projects[slot].seen+60)return;
+    strcpy(observed_projects[slot].project,project);observed_projects[slot].seen=at;
+    cwr_project_observed(project,name);
+}
 J *cwr_scheduler_pick(J *request) {
     J *result=json_object_new_object();pthread_mutex_lock(&lock);time_t now=monotonic(),wall=time(NULL);
-    if(!snapshot)goto done;
-    J *config=get(snapshot,"config");if(!json_object_get_int(get(config,"enabled")))goto done;
+    J *config=get(snapshot,"config");int enabled=json_object_get_int(get(config,"enabled"));
     J *candidates=either(request,"Candidates","candidates"),*options=either(request,"Options","options");
     J *metadata=either(options,"Metadata","metadata"),*headers=either(options,"Headers","headers");
     if(!candidates||json_object_get_type(candidates)!=5||!length(candidates)||length(candidates)>MAX_ACCOUNTS)goto done;
     if(text(get(metadata,"source"))&&!strcmp(text(get(metadata,"source")),"plugin_host_model_callback"))goto done;
+    if(json_object_get_type(get(metadata,"generate"))==1&&!json_object_get_int(get(metadata,"generate")))goto done;
     for(size_t i=0;i<length(candidates);i++) {
         const char *provider=text(either(json_object_array_get_idx(candidates,i),"Provider","provider"));
         if(!provider||strcmp(provider,"codex"))goto done;
-        if(!text(either(json_object_array_get_idx(candidates,i),"ID","id"))){reject(result,"scheduler_unavailable");goto done;}
+        if(!text(either(json_object_array_get_idx(candidates,i),"ID","id"))){if(enabled)reject(result,"scheduler_unavailable");goto done;}
     }
+    const char *scope=text(get(metadata,"caller_scope")),*project=header(headers,"X-CWR-Project");
+    observe_project(scope,project,header(headers,"X-CWR-Project-Name"),now);
+    if(!enabled)goto done;
     /* A daemon outage stops quota optimization, not business routing. Keep
      * ownership of affinity and use the host's current available candidates. */
     SessionKey key={0};char parent[LABEL]={0};
-    const char *scope=text(get(metadata,"caller_scope")),*project=header(headers,"X-CWR-Project");
     const char *model=text(get(metadata,"requested_model"));if(!model)model=text(either(request,"Model","model"));
     if(scope)strcpy(key.scope,scope);
     if(project)strcpy(key.project,project);

@@ -2,18 +2,16 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查询、可选自动查询和按需模型唤醒。插件 ID 为 `codex-window-refresh`。
 
-**v0.2.0-rc.25** 增加可视化项目目录与账号匹配：导入客户端目录清单，从 CPA 账号列表点选首选账号，保存后下载启动器使用的目录映射。后台和接入层均为 rc.25，数据库保持 schema 10；升级须 `--restart`，客户端也需更新配套启动器。详见 [rc.25 发布说明](docs/releases/v0.2.0-rc.25.md)和[使用说明](docs/account-scheduling.md#项目与账号)。
-
-当前源码的[客户端启动器](scripts/cwr-codex.py)已简化为通过脚本启动就传入项目请求头设置，直接运行 `codex` 则不额外添加。启动器不检测配置或 profile，使用 Python 3.10+，无需 TOML 依赖；`--provider` 填写本次使用的提供商 ID，默认 `cpa`。已发布的 rc.25 包仍使用旧检测逻辑，可单独替换脚本使用新方式。
+**v0.2.0-rc.26** 支持客户端目录自动发现：通过 `cwr-codex` 发送请求后，服务端面板列出目录名与稳定标识，可直接选择首选账号，无需同步 `projects.json`。客户端提供一键安装和更新，不检测 Codex 配置；`--provider` 默认 `cpa`。后台和接入层均为 rc.26，升级须 `--restart`，数据库升至 schema 11 并保留已有数据。详见 [rc.26 发布说明](docs/releases/v0.2.0-rc.26.md)和[使用说明](docs/account-scheduling.md#项目与账号)。
 
 服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
 
 ## 一键安装或更新
 
-当前 **v0.2.0-rc.25 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+当前 **v0.2.0-rc.26 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.25 --restart
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.26 --restart
 ```
 
 v2 提供额度查询、活动观测、模型配置、显式手动短句候选生成及 Codex 模型唤醒，自动查询和自动唤醒默认关闭，已有明确保存的规则保持不变。首次切换会停止 v1 功能，成功后清除 v1 数据、旧版本及临时恢复副本；后续更新保留 v2 数据。只有后台改变且接入层文件一致时只重启后台，接入层改变时仍须显式 `--restart`。下面的旧入口继续更新 v1，不会自动切换 v2。
@@ -24,7 +22,15 @@ v2 提供额度查询、活动观测、模型配置、显式手动短句候选�
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-可用 `--version v0.2.0-rc.25` 固定本次版本。**本次后台和接入层均为 rc.25，升级须显式 `--restart`**，以支持最多 256 KB 的项目目录调度设置。数据库为 schema 10，从 rc.21–rc.24 升级无需迁移，保留已有规则、额度和发送防重记录；读取页面不会改变已有开关。运行 Codex 的电脑还需更新 `cwr-codex.py`，当前源码启动器的用法与 rc.25 包的区别见上文。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
+可用 `--version v0.2.0-rc.26` 固定本次版本。**本次后台和接入层均为 rc.26，升级须显式 `--restart`**，以接收客户端自动目录标识。数据库从 schema 10 升至 11，保留已有规则、额度和发送防重记录；schema 11 不能直接交给 rc.25 或更早后台。运行 Codex 的电脑也需更新客户端。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
+
+**客户端安装或更新（Linux/macOS，无需 sudo）**：
+
+```sh
+curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh
+```
+
+需要 Python 3.10+ 和 curl。默认安装到 `~/.local/bin`，进入项目目录运行 `cwr-codex`；若目录尚未在 PATH 中，可运行 `~/.local/bin/cwr-codex`。安装器校验配套版本脚本的 SHA-256，下载失败保留旧安装。首次请求后，在服务端“客户端最近出现的项目”选择账号并保存。直接执行 `codex` 不额外添加项目头，已有目录映射仍优先生效。
 
 rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总览与侧栏布局，默认自动更新。已接入持久化批量随机延迟、定期及五小时/周到期额度查询、网页设置与差异预览；手动单账号立即查询，查询均不发送模型请求。自动查询默认关闭，模型唤醒仍明确禁用。升级 rc.5 须添加 `--restart` 更新接入层；数据库迁移与降级限制见[发布说明](docs/releases/v0.2.0-rc.5.md)。
 

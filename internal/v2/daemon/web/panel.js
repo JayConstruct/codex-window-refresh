@@ -558,6 +558,7 @@
   let schedulingSaved = null, schedulingDirty = false, schedulingBusy = false, schedulingLoading = false, schedulingConflict = false, schedulingNeedsVerification = false;
   let schedulingRead = 0, schedulingPending = null, schedulingError = '', schedulingNotice = '';
   let routingProjects = [], routingProjectSerial = 0, routingSelectedProject = null, routingProjectText = '', routingEditSequence = 0, routingImportSequence = 0;
+  let routingObserved = [], routingObservedPage = 1;
   let routingAccounts = null, routingAccountsLoading = false, routingAccountsBlocking = false, routingAccountsSequence = 0, routingAccountsCursor = '', routingAccountsPrevious = [], routingAccountsError = '', routingAccountTimer;
   const routingKnownAccounts = new Map(), routingInvalidFields = new Set();
   let resetData = null, resetRendered = '', resetRead = 0, resetTab = 'cards', resetPage = 1;
@@ -1635,6 +1636,7 @@
     if (schedulingBusy) { schedulingNeedsVerification = true; schedulingDirty = true; }
     schedulingRead++; resetRead++; schedulingBusy = false; schedulingLoading = false;
     routingAccountsSequence++; routingAccountsLoading = false; routingAccountsBlocking = false; routingAccounts = null; routingKnownAccounts.clear(); clearTimeout(routingAccountTimer);
+    routingObserved = []; routingObservedPage = 1;
     wakeConsentRequested = false;
     wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false;
     $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false; $('wake-manual-consent').checked = false;
@@ -2310,7 +2312,7 @@
     const previous = new Map(routingProjects.map(row => [row.project, row]));
     routingProjects = text.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
       const at = line.indexOf('='), project = (at > 0 ? line.slice(0, at) : line).trim(), old = previous.get(project);
-      return {key: old?.key || ++routingProjectSerial, project, directories: [...(old?.directories || [])], accounts: at > 0 ? line.slice(at + 1).split(',').map(id => id.trim()) : []};
+      return {key: old?.key || ++routingProjectSerial, project, name: old?.name || '', directories: [...(old?.directories || [])], accounts: at > 0 ? line.slice(at + 1).split(',').map(id => id.trim()) : []};
     });
     if (!routingProjects.some(row => row.key === routingSelectedProject)) routingSelectedProject = routingProjects[0]?.key ?? null;
     routingProjectText = text;
@@ -2320,8 +2322,9 @@
     clearSchedulingValidation(); renderScheduling();
   }
   function renderRoutingProjects() {
+    renderObservedProjects();
     const rows = routingProjects.map(row => {
-      const card = element('article', 'routing-project'); card.dataset.renderKey = 'project:' + row.key; card.dataset.selected = String(row.key === routingSelectedProject);
+      const card = element('article', 'routing-project'); card.id = 'routing-project-row-' + row.key; card.dataset.renderKey = 'project:' + row.key; card.dataset.selected = String(row.key === routingSelectedProject);
       const heading = element('div', 'routing-project-heading'), choose = element('button', 'text-button', row.key === routingSelectedProject ? '正在匹配账号' : '匹配账号');
       choose.type = 'button'; choose.setAttribute('aria-pressed', row.key === routingSelectedProject);
       choose.onclick = () => {
@@ -2340,11 +2343,15 @@
       nameLabel.setAttribute('for', nameID); name.id = nameID; name.type = 'text'; name.value = row.project; name.autocomplete = 'off'; name.placeholder = '例如 project-a';
       if (routingInvalidFields.has(nameID)) name.setAttribute('aria-invalid', 'true');
       name.oninput = function () { row.project = this.value; syncRoutingProjectText(); };
+      const aliasID = 'routing-project-alias-' + row.key, aliasLabel = element('label', 'field-label', '项目名称（可选）'), alias = element('input');
+      aliasLabel.setAttribute('for', aliasID); alias.id = aliasID; alias.type = 'text'; alias.value = row.name || ''; alias.placeholder = '例如 商城后台';
+      if (routingInvalidFields.has(aliasID)) alias.setAttribute('aria-invalid', 'true');
+      alias.oninput = function () { row.name = this.value; };
       const directoryID = 'routing-project-directories-' + row.key, directoryLabel = element('label', 'field-label', '客户端目录（每行一个，可留空）'), directory = element('textarea');
       directoryLabel.setAttribute('for', directoryID); directory.id = directoryID; directory.rows = 2; directory.value = row.directoryText ?? row.directories.join('\n'); directory.placeholder = '/work/project-a 或 C:\\work\\project-a';
       if (routingInvalidFields.has(directoryID)) directory.setAttribute('aria-invalid', 'true');
       directory.oninput = function () { row.directoryText = this.value; row.directories = this.value.split('\n').map(value => value.trim()).filter(Boolean); syncRoutingProjectText(); };
-      card.append(nameLabel, name, directoryLabel, directory, element('p', 'field-help', '首选账号 ' + row.accounts.length + ' 个 · ' + (row.directories.length ? row.directories.length + ' 个目录' : '尚未绑定客户端目录')));
+      card.append(nameLabel, name, aliasLabel, alias, directoryLabel, directory, element('p', 'field-help', '首选账号 ' + row.accounts.length + ' 个 · ' + (row.directories.length ? row.directories.length + ' 个目录' : /^dir-[a-f0-9]{64}$/.test(row.project) ? '客户端自动目录标识' : '尚未绑定客户端目录')));
       const selected = element('div', 'routing-selected-accounts');
       for (const id of row.accounts) {
         const chip = element('button', 'routing-account-chip'); chip.type = 'button'; chip.dataset.renderKey = 'account:' + id;
@@ -2362,9 +2369,41 @@
     $('routing-map-import').disabled = !routingEditable();
     $('routing-map-export').disabled = !routingEditable() || schedulingDirty || schedulingConflict || schedulingNeedsVerification || !routingProjects.some(row => row.directories.length);
   }
+  function renderObservedProjects() {
+    const search = $('routing-observed-search').value.trim().toLowerCase();
+    const filtered = routingObserved.filter(item => [item.name, item.project].some(value => value.toLowerCase().includes(search)));
+    const pages = Math.max(1, Math.ceil(filtered.length / 10)); routingObservedPage = Math.min(routingObservedPage, pages);
+    const rows = filtered.slice((routingObservedPage - 1) * 10, routingObservedPage * 10).map(item => {
+      const row = element('article', 'routing-project'); row.dataset.renderKey = 'observed:' + item.project;
+      const configured = routingProjects.find(project => project.project === item.project), heading = element('div', 'routing-project-heading');
+      const choose = element('button', 'button button-outline', configured ? '调整首选账号' : '匹配账号'); choose.type = 'button';
+      choose.disabled = !routingEditable() || !configured && routingProjects.length >= 128;
+      choose.onclick = () => {
+        if (!routingEditable()) return;
+        let project = routingProjects.find(value => value.project === item.project);
+        if (!project) {
+          if (routingProjects.length >= 128) return;
+          project = {key: ++routingProjectSerial, project: item.project, name: item.name, directories: [], accounts: []};
+          routingProjects.push(project); routingSelectedProject = project.key; routingProjectChanged();
+        } else { routingSelectedProject = project.key; renderScheduling(); }
+        $('routing-project-row-' + project.key).scrollIntoView?.({block: 'nearest'});
+        $('routing-account-title').scrollIntoView?.({block: 'nearest'});
+      };
+      heading.append(element('strong', '', configured?.name || item.name || '未命名目录'), choose);
+      row.append(heading, element('code', '', item.project), element('p', 'field-help', '最近出现：' + historyDate(item.last_seen, true) + (configured ? schedulingDirty ? ' · 已加入项目草稿' : ' · 已保存首选账号' : ' · 待配置首选账号')));
+      return row;
+    });
+    updateChildren($('routing-observed-list'), rows.length ? rows : [element('p', 'field-help', routingObserved.length ? '没有匹配的项目。' : '尚未观测到目录标识。请使用新版启动器发送一次 Codex 请求。')]);
+    setText('routing-observed-page', '共 ' + filtered.length + ' 个项目 · 第 ' + routingObservedPage + '/' + pages + ' 页');
+    $('routing-observed-previous').disabled = routingObservedPage <= 1;
+    $('routing-observed-next').disabled = routingObservedPage >= pages;
+  }
+  $('routing-observed-search').oninput = () => { routingObservedPage = 1; renderObservedProjects(); };
+  $('routing-observed-previous').onclick = () => { if (routingObservedPage > 1) { routingObservedPage--; renderObservedProjects(); } };
+  $('routing-observed-next').onclick = () => { routingObservedPage++; renderObservedProjects(); };
   function renderRoutingAccounts() {
     const project = routingProjects.find(row => row.key === routingSelectedProject), current = connected && routingAccounts?.instance_id === views.instance;
-    setText('routing-account-title', project ? '为“' + (project.project || '未命名项目') + '”选择账号' : '选择项目后匹配账号');
+    setText('routing-account-title', project ? '为“' + (project.name || project.project || '未命名项目') + '”选择账号' : '选择项目后匹配账号');
     $('routing-accounts-refresh').disabled = !connected || routingAccountsLoading;
     $('routing-account-previous').disabled = !current || routingAccountsBlocking || !routingAccountsPrevious.length;
     $('routing-account-next').disabled = !current || routingAccountsBlocking || !routingAccounts.next_after;
@@ -2537,6 +2576,8 @@
     const projects = new Set(), directories = new Set(), validLabel = value => value && new TextEncoder().encode(value).length <= 256 && !/[\p{Cc}"\\]/u.test(value);
     c.projects = routingProjects.map(row => {
       const project = row.project.trim(), accounts = row.accounts;
+      const name = (row.name || '').trim();
+      if (new TextEncoder().encode(name).length > 256 || /[\p{Cc}]/u.test(name)) routingProjectInvalid(row, 'alias', '项目名称最多 256 字节，不含控制字符。');
       if (!validLabel(project)) routingProjectInvalid(row, 'name', '请填写项目标识，最多 256 字节，不含控制字符、引号或反斜线。');
       if (projects.has(project)) routingProjectInvalid(row, 'name', '项目标识“' + project + '”重复，请为各项目使用独立标识。');
       if (!accounts.length) routingProjectInvalid(row, 'accounts', '请为项目“' + project + '”选择至少一个首选账号。');
@@ -2551,7 +2592,7 @@
         if (directories.has(key)) routingProjectInvalid(row, 'directories', '客户端目录存在重复映射：' + directory);
         directories.add(key);
       }
-      projects.add(project); return {project, accounts: [...accounts], ...(row.directories.length ? {directories: [...row.directories]} : {})};
+      projects.add(project); return {project, accounts: [...accounts], ...(name ? {name} : {}), ...(row.directories.length ? {directories: [...row.directories]} : {})};
     });
     if (c.projects.length > 128) schedulingInvalid('routing-projects', '最多填写 128 个项目。');
     if (new TextEncoder().encode(JSON.stringify({revision: schedulingSaved.revision, config: c})).length > 256 * 1024) schedulingInvalid('routing-projects', '调度设置超过 256 KB，请减少项目目录或账号条目。');
@@ -2564,7 +2605,7 @@
     $('cards-enabled').checked = c.cards.enabled; $('cards-auto').checked = c.cards.auto_consume;
     for (const [key, id] of Object.entries(cardNumbers)) $(id).value = c.cards[key];
     const previous = new Map(routingProjects.map(row => [row.project, row.key]));
-    routingProjects = c.projects.map(p => ({key: previous.get(p.project) || ++routingProjectSerial, project: p.project, accounts: [...p.accounts], directories: [...(p.directories || [])]}));
+    routingProjects = c.projects.map(p => ({key: previous.get(p.project) || ++routingProjectSerial, project: p.project, name: p.name || '', accounts: [...p.accounts], directories: [...(p.directories || [])]}));
     if (!routingProjects.some(row => row.key === routingSelectedProject)) routingSelectedProject = routingProjects[0]?.key ?? null;
     syncRoutingProjectText(); routingEditSequence++;
     clearSchedulingValidation();
@@ -2580,7 +2621,7 @@
     return JSON.stringify([
       ...[...Object.values(schedulingNumbers), ...Object.values(cardNumbers), 'routing-projects', 'routing-rebind'].map(id => $(id).value),
       ...['routing-enabled', 'routing-reset', 'routing-subagent', 'cards-enabled', 'cards-auto'].map(id => $(id).checked),
-      routingProjects.map(row => [row.project, row.accounts, row.directories])
+      routingProjects.map(row => [row.project, row.name || '', row.accounts, row.directories])
     ]);
   }
   async function loadScheduling(discard = false, verify = false) {
@@ -2593,6 +2634,9 @@
       if (data.instance_id !== views.instance) return;
       if (!Number.isSafeInteger(data.revision) || data.revision < 0 || !data.config?.cards || !Array.isArray(data.config.projects)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
       if (schedulingSaved?.instance_id === data.instance_id && data.revision < schedulingSaved.revision) return;
+      const observed = data.observed_projects || [];
+      if (!Array.isArray(observed) || observed.length > 1024 || observed.some(item => !item || !/^dir-[a-f0-9]{64}$/.test(item.project) || typeof item.name !== 'string' || new TextEncoder().encode(item.name).length > 256 || /[\p{Cc}]/u.test(item.name) || typeof item.last_seen !== 'string' || !Number.isFinite(Date.parse(item.last_seen)))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      routingObserved = observed;
       const sameBasis = schedulingSaved?.instance_id === data.instance_id && schedulingSaved.revision === data.revision;
       if (!discard && schedulingDirty) {
         if (verify && schedulingSaved?.instance_id === data.instance_id && schedulingPending && schedulingConfigEqual(data.config, schedulingPending.config)) {

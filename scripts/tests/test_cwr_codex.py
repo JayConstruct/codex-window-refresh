@@ -29,6 +29,47 @@ class LauncherFixture(unittest.TestCase):
 
 
 class DirectoryRouting(LauncherFixture):
+    def test_automatic_identity_uses_nearest_git_root_and_canonical_paths(self):
+        repo = self.root / "项目 商城"
+        nested = repo / "src" / "api"
+        nested.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        root, project = launcher.directory_project(nested)
+        self.assertEqual(root, repo)
+        self.assertRegex(project, r"^dir-[a-f0-9]{64}$")
+        self.assertEqual(launcher.directory_project(repo)[1], project)
+        alias = self.root / "alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        self.assertEqual(launcher.directory_project(alias)[1], project)
+        other = self.root / "other"
+        other.mkdir()
+        self.assertNotEqual(launcher.directory_project(other)[1], project)
+        (nested / ".git").write_text("gitdir: /external/worktree", encoding="utf-8")
+        self.assertEqual(launcher.directory_project(nested)[0], nested)
+
+    def test_missing_default_map_uses_hash_and_encoded_name_without_full_path(self):
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            command = launcher.command(self.args(project=None, map=None))
+        project = launcher.directory_project(self.root)[1]
+        self.assertIn('model_providers.cpa.http_headers.X-CWR-Project="' + project + '"', command)
+        name_header = next(item for item in command if ".X-CWR-Project-Name=" in item)
+        self.assertNotIn(str(self.root.parent), name_header)
+        repo = self.root / "中文 空格"
+        repo.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}):
+            command = launcher.command(self.args(directory=str(repo), project=None, map=None))
+        self.assertIn('model_providers.cpa.http_headers.X-CWR-Project-Name="%E4%B8%AD%E6%96%87%20%E7%A9%BA%E6%A0%BC"', command)
+
+    def test_unmatched_legacy_map_falls_back_but_explicit_project_wins(self):
+        mapping = self.root / "projects.json"
+        mapping.write_text('{"projects":[]}', encoding="utf-8")
+        command = launcher.command(self.args(project=None, map=str(mapping)))
+        self.assertTrue(any('.X-CWR-Project="dir-' in item for item in command))
+        command = launcher.command(self.args(project="explicit", map=str(mapping)))
+        self.assertIn('model_providers.cpa.http_headers.X-CWR-Project="explicit"', command)
+        self.assertFalse(any('.X-CWR-Project-Name=' in item for item in command))
+
     def test_longest_canonical_directory_match_and_safe_exec_arguments(self):
         nested = self.root / "nested"
         nested.mkdir()

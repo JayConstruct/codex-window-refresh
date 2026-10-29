@@ -29,6 +29,10 @@ def check():
     notes = (ROOT / f"docs/releases/{version}.md").read_text()
     if not notes.startswith(f"# {version} ") or len(notes.splitlines()) < 3:
         raise ValueError("missing v2 release notes")
+    client_installer = (ROOT / "scripts/install-client.sh").read_text()
+    client_hash = hashlib.sha256((ROOT / "scripts/cwr-codex.py").read_bytes()).hexdigest()
+    if f"CLIENT_VERSION={version}\n" not in client_installer or f"CLIENT_SHA256={client_hash}\n" not in client_installer:
+        raise ValueError("client installer version/checksum does not match release")
     return version
 
 
@@ -59,7 +63,7 @@ def main():
                 platform="linux", architecture=arch, host_abi=1, rpc_schema=6,
                 protocol_version=1, minimum_glibc_symbols=glibc,
                 go_version=packaging.command("go", "version"), model_execution=True,
-                wake=True, wake_providers=["codex"], scheduling=True, earned_reset_cards=True, database_schema=10,
+                wake=True, wake_providers=["codex"], scheduling=True, earned_reset_cards=True, database_schema=11,
                 prompt_generation=True, model_settings=True,
                 prompt_generation_providers=["codex", "antigravity"],
                 editable_generation_prompt=True,
@@ -72,6 +76,7 @@ def main():
     for name, source in {"install-v2.py": "scripts/install-v2.py", "install.py": "scripts/install.py",
                          "INSTALL.md": "docs/backend-v2-install.md", "PROTOTYPE.md": "docs/backend-v2-prototype.md",
                          "ACCOUNT-SCHEDULING.md": "docs/account-scheduling.md", "cwr-codex.py": "scripts/cwr-codex.py",
+                         "install-client.sh": "scripts/install-client.sh",
                          "NOTICE": "native/bridge/NOTICE", "LICENSE.upstream": "third_party/cliproxyapi-reference/LICENSE"}.items():
         members[name] = ((ROOT / source).read_bytes(), 0o644)
     output = pathlib.Path(args.output).resolve()

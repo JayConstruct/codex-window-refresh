@@ -13,6 +13,7 @@ var ErrScheduling = errors.New("invalid_scheduling_settings")
 
 type ProjectPreference struct {
 	Project     string   `json:"project"`
+	Name        string   `json:"name,omitempty"`
 	Accounts    []string `json:"accounts"`
 	Directories []string `json:"directories,omitempty"`
 }
@@ -44,6 +45,11 @@ func RoutingLabel(s string) bool {
 }
 
 var launcherProject = regexp.MustCompile("^[A-Za-z0-9._:-]{1,128}$")
+var DirectoryProject = regexp.MustCompile("^dir-[a-f0-9]{64}$")
+
+func ProjectName(s string) bool {
+	return len(s) <= 256 && utf8.ValidString(s) && s == strings.TrimSpace(s) && strings.IndexFunc(s, unicode.IsControl) < 0
+}
 
 // ProjectDirectoryKey compares client paths without reading the server filesystem.
 // The launcher resolves symlinks on the client when matching the working directory.
@@ -77,7 +83,7 @@ func (c SchedulingConfig) Validate() error {
 	seen := map[string]bool{}
 	directories := map[string]bool{}
 	for _, p := range c.Projects {
-		if !RoutingLabel(p.Project) || seen[p.Project] || len(p.Accounts) == 0 || len(p.Accounts) > 1000 || len(p.Directories) > 16 || len(p.Directories) > 0 && !launcherProject.MatchString(p.Project) {
+		if !RoutingLabel(p.Project) || !ProjectName(p.Name) || seen[p.Project] || len(p.Accounts) == 0 || len(p.Accounts) > 1000 || len(p.Directories) > 16 || len(p.Directories) > 0 && !launcherProject.MatchString(p.Project) {
 			return ErrScheduling
 		}
 		seen[p.Project] = true

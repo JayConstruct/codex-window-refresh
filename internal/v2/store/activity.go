@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"codex-window-refresh/internal/v2/events"
+	"codex-window-refresh/internal/v2/policy"
 )
 
 const MaxTrackedRequests = 4096
@@ -116,6 +117,10 @@ func validateBatch(b events.Batch) error {
 		}
 		switch e.Kind {
 		case "started", "account_selected", "completed":
+		case "project_observed":
+			if !policy.DirectoryProject.MatchString(e.Project) || len(e.ProjectName) > 256 {
+				return errors.New("invalid_project_event")
+			}
 		case "quota_observed":
 			if !ValidID(e.AccountID) || !ValidID(e.AuthIndex) || !ValidID(e.Binding) || (e.Source != "cpa_response_headers" && e.Source != "cpa_websocket_quota") || len(e.Quota) > 2048 || len(e.Headers) > 10 {
 				return errors.New("invalid_quota_event")
@@ -198,7 +203,9 @@ func (s *Store) ApplyEvents(ctx context.Context, b events.Batch) (uint64, error)
 			if e.Sequence != c.Sequence+1 {
 				return errors.New("noncontiguous_event_batch")
 			}
-			if e.Kind == "quota_observed" {
+			if e.Kind == "project_observed" {
+				err = applyProject(ctx, tx, e)
+			} else if e.Kind == "quota_observed" {
 				err = applyQuota(ctx, tx, e)
 			} else {
 				err = applyActivity(tx, ctx, b.Instance, e, &c)

@@ -984,7 +984,7 @@ static int plugin_call(char*method,uint8_t*payload,size_t size,Buffer*out) {
     int hook=!strcmp(method,"request.intercept_before")||!strcmp(method,"request.intercept_after")||!strcmp(method,"request.complete")||!strcmp(method,"response.intercept_after")||!strcmp(method,"response.intercept_stream_chunk")||!strcmp(method,"websocket.response_event")||!strcmp(method,"usage.handle");
     if(!strcmp(method,"scheduler.pick")) {
         pthread_rwlock_rdlock(&gate);
-        J*request=size<=FRAME_LIMIT?parse(payload,size):NULL;
+        J*request=running&&!stopping&&size<=FRAME_LIMIT?parse(payload,size):NULL;
         J*reply=cwr_scheduler_pick(request);int status=write_buffer(out,reply);json_object_put(reply);json_object_put(request);pthread_rwlock_unlock(&gate);return status;
     }
     if(hook) {

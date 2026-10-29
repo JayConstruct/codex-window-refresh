@@ -244,7 +244,12 @@ func (s *Service) scheduling(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 503, "storage_unavailable")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"instance_id": s.instance, "revision": settings.Revision, "config": settings.Config, "routing_error": s.routingError.Load(), "reset_error": s.resetError.Load()})
+	projects, err := s.Store.ObservedProjects(r.Context())
+	if err != nil {
+		apiError(w, 503, "storage_unavailable")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"instance_id": s.instance, "revision": settings.Revision, "config": settings.Config, "observed_projects": projects, "routing_error": s.routingError.Load(), "reset_error": s.resetError.Load()})
 }
 func (s *Service) resetCards(w http.ResponseWriter, r *http.Request) {
 	cards, attempts, err := s.Store.ResetViews(r.Context())

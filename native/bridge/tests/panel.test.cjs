@@ -3630,3 +3630,37 @@ test('only the latest chosen directory file may apply even when the older file f
   assert.match(ui.get('routing-projects').value, /latest/); assert.doesNotMatch(ui.get('routing-projects').value, /older/);
   assert.equal(mutations(ui).length, 0);
 });
+
+
+test('observed directory projects create named account preferences without client maps and keep drafts during discovery', async () => {
+  let revision = 0, config = schedulingFixture();
+  let observed = Array.from({length: 12}, (_, index) => ({project: 'dir-' + index.toString(16).padStart(64, '0'), name: 'repo-' + index, first_seen: '2026-10-30T01:00:00Z', last_seen: '2026-10-30T02:00:00Z'}));
+  const ui = schedulingPanel((url, request) => {
+    if (!url.endsWith('/scheduling')) return;
+    if (request.method === 'POST') { const body = JSON.parse(request.body); assert.equal(body.revision, revision); config = body.config; revision++; }
+    return [200, {instance_id: 'a', revision, config, observed_projects: observed}];
+  });
+  await openScheduling(ui);
+  assert.equal(ui.get('routing-observed-list').children.length, 10);
+  ui.get('routing-observed-next').onclick(); assert.equal(ui.get('routing-observed-list').children.length, 2);
+  ui.get('routing-observed-search').value = 'repo-0'; ui.get('routing-observed-search').oninput();
+  assert.equal(ui.get('routing-observed-list').children.length, 1);
+  descendants(ui.get('routing-observed-list')).find(node => node.tagName === 'button').onclick();
+  assert.equal(mutations(ui).length, 0);
+  routingButtons(ui).find(node => node.textContent === '加入首选').onclick();
+  const alias = descendants(ui.get('routing-project-list')).find(node => node.id?.startsWith('routing-project-alias-'));
+  alias.value = '商城后台'; alias.oninput(); ui.get('scheduling-form').listeners.get('input')();
+  observed = [...observed, {project:'dir-' + 'f'.repeat(64),name:'new repo',last_seen:'2026-10-30T03:00:00Z'}];
+  await ui.get('refresh').onclick(); await flush();
+  assert.equal(descendants(ui.get('routing-project-list')).find(node => node.id === alias.id).value, '商城后台');
+  assert.equal(ui.get('scheduling-save').disabled, false);
+  await submitScheduling(ui);
+  assert.equal(mutations(ui).length, 1);
+  assert.deepEqual(config.projects, [{project:observed[0].project,accounts:['codex-01'],name:'商城后台'}]);
+  assert.equal(ui.get('routing-map-export').disabled, true);
+  descendants(ui.get('routing-observed-list')).find(node => node.tagName === 'button').onclick();
+  assert.equal(ui.get('routing-project-list').children.length, 1);
+  assert.match(ui.get('routing-account-title').textContent, /商城后台/);
+  ui.get('disconnect').onclick();
+  assert.doesNotMatch(ui.get('routing-observed-list').textContent, /repo-0/);
+});

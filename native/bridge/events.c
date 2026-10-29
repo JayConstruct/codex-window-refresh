@@ -318,6 +318,15 @@ static void enqueue(J*event) {
     else loss_epoch++;
     pthread_mutex_unlock(&mu);
 }
+/* Called only with bounded, validated directory IDs from the scheduler. */
+void cwr_project_observed(const char *project,const char *name) {
+    J *event=json_object_new_object();
+    json_object_object_add(event,"kind",json_object_new_string("project_observed"));
+    json_object_object_add(event,"request_id",json_object_new_string(project));
+    json_object_object_add(event,"project",json_object_new_string(project));
+    if(name)json_object_object_add(event,"project_name",json_object_new_string(name));
+    enqueue(event);json_object_put(event);
+}
 static const char*header_names[]= {
     "x-codex-allowed","x-codex-limit-reached", "x-codex-primary-used-percent","x-codex-primary-window-minutes","x-codex-primary-reset-at","x-codex-primary-reset-after-seconds", "x-codex-secondary-used-percent","x-codex-secondary-window-minutes","x-codex-secondary-reset-at","x-codex-secondary-reset-after-seconds"
 };

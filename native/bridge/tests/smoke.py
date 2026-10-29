@@ -135,6 +135,88 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(self.call('scheduler.pick', self.routing_request('work'))['result']['AuthID'], 'b')
         self.assertEqual(self.models, 0)
 
+    def test_directory_discovery_is_bounded_throttled_and_does_not_enable_scheduling(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        snapshot = self.routing_snapshot()
+        snapshot['config']['enabled'] = False
+        project = 'dir-' + 'a' * 64
+        request = self.routing_request(project)
+        request['Options']['Headers']['X-CWR-Project-Name'] = ['%E4%B8%AD%E6%96%87%20repo']
+        request['Options']['Headers']['Authorization'] = ['Bearer never-record']
+        self.assertEqual(self.call('scheduler.pick', request)['result'], {})
+        self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+        for _ in range(3):
+            self.assertEqual(self.call('scheduler.pick', request)['result'], {})
+        batch = self.rpc('bridge.events.pull', {'after': 0}, instance)['result']
+        self.assertEqual(len(batch['events']), 1)
+        self.assertEqual(batch['events'][0]['kind'], 'project_observed')
+        self.assertEqual(batch['events'][0]['project'], project)
+        self.assertEqual(batch['events'][0]['project_name'], '%E4%B8%AD%E6%96%87%20repo')
+        self.assertNotIn('never-record', json.dumps(batch))
+        for change in ['missing-scope', 'duplicate-header', 'foreign-provider', 'internal', 'probe', 'invalid-id', 'missing-candidate-id']:
+            bad = self.routing_request('dir-' + 'b' * 64)
+            if change == 'missing-scope': bad['Options']['Metadata']['caller_scope'] = ''
+            if change == 'duplicate-header': bad['Options']['Headers']['x-cwr-project'] = ['dir-' + 'c' * 64]
+            if change == 'foreign-provider': bad['Candidates'][0]['Provider'] = 'antigravity'
+            if change == 'internal': bad['Options']['Metadata']['source'] = 'plugin_host_model_callback'
+            if change == 'probe': bad['Options']['Metadata']['generate'] = False
+            if change == 'missing-candidate-id': del bad['Candidates'][0]['ID']
+            if change == 'invalid-id': bad['Options']['Headers']['X-Cwr-Project'] = ['dir-' + 'Z' * 64]
+            self.assertEqual(self.call('scheduler.pick', bad)['result'], {})
+        self.assertEqual(self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['latest_sequence'], 1)
+        snapshot['config']['enabled'] = True
+        snapshot['config']['projects'] = [{'project': project, 'accounts': ['b']}]
+        self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+        self.assertEqual(self.call('scheduler.pick', request)['result']['AuthID'], 'b')
+
+    def test_directory_launcher_discovery_and_server_preferences_survive_restart(self):
+        repo = self.root / '客户端 项目'
+        repo.mkdir()
+        (repo / '.git').mkdir()
+        (repo / '.git' / 'HEAD').write_text('ref: refs/heads/main\n')
+        fake = self.root / 'fake-codex'
+        fake.write_text('#!' + sys.executable + '\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
+        fake.chmod(0o755)
+        argv = json.loads(subprocess.check_output([sys.executable, str(ROOT / 'scripts/cwr-codex.py'),
+                          '--codex', str(fake), '--directory', str(repo)], env={**os.environ, 'HOME': str(self.root)}, text=True))
+        headers = {}
+        for value in argv:
+            if value.startswith('model_providers.cpa.http_headers.'):
+                key, _, encoded = value.removeprefix('model_providers.cpa.http_headers.').partition('=')
+                headers[key] = [json.loads(encoded)]
+        project = headers['X-CWR-Project'][0]
+        self.assertRegex(project, '^dir-[a-f0-9]{64}$')
+        self.start_daemon()
+        self.wait_activity(0)
+        request = self.routing_request(project)
+        request['Options']['Headers'] = headers
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            self.assertEqual(self.call('scheduler.pick', request)['result'], {})
+            status, settings = self.management('scheduling')
+            if status == 200 and settings.get('observed_projects'): break
+            time.sleep(.05)
+        self.assertEqual(settings['observed_projects'][0]['project'], project)
+        self.assertEqual(settings['observed_projects'][0]['name'], '客户端 项目')
+        self.assertEqual(settings['revision'], 0)
+        settings['config']['enabled'] = True
+        settings['config']['projects'] = [{'project': project, 'name': '业务项目', 'accounts': ['b']}]
+        status, saved = self.management('scheduling', 'POST', {'revision': settings['revision'], 'config': settings['config']})
+        self.assertEqual(status, 200, saved)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            choice = self.call('scheduler.pick', request)['result']
+            if choice.get('AuthID') == 'b': break
+            time.sleep(.05)
+        self.assertEqual(choice.get('AuthID'), 'b', choice)
+        self.stop_daemon()
+        self.start_daemon()
+        status, restored = self.management('scheduling')
+        self.assertEqual(status, 200)
+        self.assertEqual(restored['observed_projects'][0]['project'], project)
+        self.assertEqual(restored['config']['projects'], settings['config']['projects'])
+        self.assertEqual(self.models, 0)
+
     def test_scheduler_affinity_is_caller_scoped_and_evidence_expires(self):
         instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
         snapshot = self.routing_snapshot()

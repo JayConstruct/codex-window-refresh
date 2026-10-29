@@ -24,6 +24,7 @@ let authReadGate, authPatchGate, authFilesOverride;
 let revision = 1, accountsRevision = 1, settingsRevision = 1, settingsConflictOnce = false, unauthorized = false, browser, server, socket;
 let modelRevision = 0, modelConflictOnce = false;
 let schedulingRevision = 0;
+let observedProjects = [];
 let resetCardsFixture = null;
 let schedulingConfig = {enabled:false,prefer_reset:true,quota_max_age_seconds:300,session_ttl_seconds:1800,max_inflight:2,projects:[],cards:{enabled:false,auto_consume:false,poll_seconds:900,expiry_seconds:86400,force_before_seconds:1800,min_used_percent:80}};
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
@@ -290,7 +291,7 @@ try {
         if (job.reason === 'manual' && job.key) { job.phase = 'unknown'; job.hold_reason = 'verification_pending'; job.updated_at = observed(); revision++; job.response = responseRecord; }
         json(response, 200, {...identity(), ...job}); return;
       }
-      if (resource === 'scheduling') { json(response,200,{instance_id:identity().instance_id,revision:schedulingRevision,config:schedulingConfig}); return; }
+      if (resource === 'scheduling') { json(response,200,{instance_id:identity().instance_id,revision:schedulingRevision,config:schedulingConfig,observed_projects:observedProjects}); return; }
       if (resource === 'reset-cards') { json(response,200,{instance_id:identity().instance_id,...(resetCardsFixture || {accounts:[{account_id:'codex-01',credits:{availableCount:2,credits:null},observed_at:observed(),summary_observed_at:observed(),error_code:''}],attempts:[]})}); return; }
       if (resource === 'generation-accounts') { json(response, 200, {instance_id: identity().instance_id, accounts: generationAccounts}); return; }
       if (resource === 'model-settings') {
@@ -550,6 +551,22 @@ try {
     await evaluate('document.getElementById("display-mode").value="masked";document.getElementById("display-mode").dispatchEvent(new Event("change"))');
     assert.equal(await evaluate('document.getElementById("routing-account-list").textContent.includes("codex-01") || document.querySelector("#routing-project-list .routing-selected-accounts").textContent.includes("codex-01")'),false,'Matching account privacy failed');
     await evaluate('document.getElementById("display-mode").value="original";document.getElementById("display-mode").dispatchEvent(new Event("change"))');
+    observedProjects = Array.from({length:12}, (_,index) => ({project:'dir-'+index.toString(16).padStart(64,'0'),name:index===0?'商城后台':'client-repo-'+index,first_seen:observed(),last_seen:observed()}));
+    await evaluate('document.getElementById("refresh").click()');
+    await waitFor(()=>evaluate('document.querySelectorAll("#routing-observed-list article").length===10'),'Observed directory projects did not appear');
+    assert.equal(posts.length,1,'Discovering projects changed settings');
+    await evaluate('document.getElementById("routing-observed-next").click()');
+    assert.equal(await evaluate('document.querySelectorAll("#routing-observed-list article").length'),2);
+    await evaluate('document.getElementById("routing-observed-previous").click();document.querySelector("#routing-observed-list button").click()');
+    await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[2].querySelector("button").click()');
+    const alias = await evaluate('document.querySelectorAll("#routing-project-list input[id^=routing-project-alias-]")[2].id');
+    await evaluate('document.getElementById('+JSON.stringify(alias)+').value="商城业务";document.getElementById('+JSON.stringify(alias)+').dispatchEvent(new Event("input",{bubbles:true}))');
+    await evaluate('document.getElementById("refresh").click()'); await settleRefresh();
+    assert.equal(await evaluate('document.getElementById('+JSON.stringify(alias)+').value'),'商城业务','Discovery refresh lost project alias draft');
+    await evaluate('document.getElementById("scheduling-form").requestSubmit()');
+    await waitFor(()=>schedulingRevision===2,'Observed project preference did not save');
+    await waitFor(()=>evaluate('!document.getElementById("scheduling-fields").disabled'),'Observed project preference save was not acknowledged');
+    assert.deepEqual(schedulingConfig.projects[2],{project:observedProjects[0].project,accounts:['codex-03'],name:'商城业务'});
     for(const width of [1586,768,390,320]) {
       await cdp('Emulation.setDeviceMetricsOverride',{width,height:992,deviceScaleFactor:1,mobile:width<600});
       assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'),true,'Project matching overflow at '+width);
@@ -558,9 +575,9 @@ try {
       const capture=await cdp('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip:{x:0,y:0,width,height:Math.ceil(metrics.cssContentSize.height),scale:1}});
       await writeFile(join(output,'project-matching-'+width+'.png'),Buffer.from(capture.data,'base64'));
     }
-    assert.equal(posts.length,1); assert.equal(posts[0].resource,'scheduling'); assert.equal(patches.length,0);
+    assert.equal(posts.length,2); assert.ok(posts.every(post=>post.resource==='scheduling')); assert.equal(patches.length,0);
     assert.equal(exceptions.length,0,JSON.stringify(exceptions)); assert.equal(pageErrors.length,0,JSON.stringify(pageErrors));
-    console.log('Project matching Chromium checks passed: client map import/export, account selection, saved roundtrip, disabled accounts, independent pagination/search, privacy, multiline caret/focus and 320/390/768/1586 layouts. Screenshots: '+output);
+    console.log('Project matching Chromium checks passed: automatic directory discovery, project aliases and server preferences without client maps; legacy map import/export, account selection, saved roundtrip, pagination/search, privacy, focus and 320/390/768/1586 layouts. Screenshots: '+output);
   }
   const readCountFor = resource => reads.filter(path => new URL(path, 'http://fixture').pathname.endsWith('/' + resource)).length;
   async function settleRefresh() {

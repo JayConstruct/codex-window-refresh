@@ -27,7 +27,7 @@ func TestVersionFiveMigrationPreservesGenerationSnapshotsAndKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := strings.Replace(schema, "SELECT 10 WHERE NOT EXISTS", "SELECT 5 WHERE NOT EXISTS", 1)
+	old := strings.Replace(schema, "SELECT 11 WHERE NOT EXISTS", "SELECT 5 WHERE NOT EXISTS", 1)
 	old = strings.Replace(old, "provider TEXT NOT NULL DEFAULT 'codex', ", "", 1)
 	old = strings.Replace(old, "prompt TEXT NOT NULL DEFAULT '', ", "", 1)
 	if _, err = database.Exec(old); err != nil {
@@ -74,7 +74,7 @@ func TestVersionFiveMigrationPreservesGenerationSnapshotsAndKeys(t *testing.T) {
 		t.Fatal(claimed, err)
 	}
 	var version, columns int
-	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 10 {
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 11 {
 		t.Fatal(version, err)
 	}
 	if err = storage.db.QueryRow("SELECT count(*) FROM pragma_table_info('prompt_generations') WHERE name='provider'").Scan(&columns); err != nil || columns != 1 {
@@ -97,7 +97,7 @@ func TestVersionSixMigrationKeepsProviderAndLegacyGenerationHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := strings.Replace(schema, "SELECT 10 WHERE NOT EXISTS", "SELECT 6 WHERE NOT EXISTS", 1)
+	old := strings.Replace(schema, "SELECT 11 WHERE NOT EXISTS", "SELECT 6 WHERE NOT EXISTS", 1)
 	old = strings.Replace(old, "prompt TEXT NOT NULL DEFAULT '', ", "", 1)
 	if _, err = database.Exec(old); err != nil {
 		t.Fatal(err)
@@ -153,7 +153,7 @@ func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := strings.Split(schema, "CREATE INDEX IF NOT EXISTS jobs_retention")[0]
-	old = strings.Replace(old, "SELECT 10 WHERE NOT EXISTS", "SELECT 1 WHERE NOT EXISTS", 1)
+	old = strings.Replace(old, "SELECT 11 WHERE NOT EXISTS", "SELECT 1 WHERE NOT EXISTS", 1)
 	if _, err = db.Exec(old); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestVersionOneMigratesWithoutLosingJobOrIdempotency(t *testing.T) {
 		t.Fatal(id, existing, err)
 	}
 	var version int
-	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 10 {
+	if err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 11 {
 		t.Fatal(version, err)
 	}
 }
@@ -192,7 +192,7 @@ func TestVersionTwoMigrationKeepsQuotaAndAddsBindingState(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := strings.Split(schema, "CREATE TABLE IF NOT EXISTS account_bindings")[0]
-	old = strings.Replace(old, "SELECT 10 WHERE NOT EXISTS", "SELECT 2 WHERE NOT EXISTS", 1)
+	old = strings.Replace(old, "SELECT 11 WHERE NOT EXISTS", "SELECT 2 WHERE NOT EXISTS", 1)
 	if _, err = db.Exec(old); err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestVersionFourMigrationPreservesQueryConfigurationAndSchedule(t *testing.T
 	}
 	defer storage.Close()
 	var version int
-	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 10 {
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 11 {
 		t.Fatal(version, err)
 	}
 	models, err := storage.ModelSettings(ctx)

@@ -107,6 +107,7 @@ func (s *Store) RoutingSnapshot(ctx context.Context, at time.Time) (RoutingSnaps
 	result.Config.Projects = append([]policy.ProjectPreference{}, settings.Config.Projects...)
 	for i := range result.Config.Projects {
 		result.Config.Projects[i].Directories = nil
+		result.Config.Projects[i].Name = ""
 	}
 	// Identity validity is independent of quota freshness. An expired quota
 	// snapshot removes optimization priority, never an otherwise usable binding.

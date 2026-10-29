@@ -1,6 +1,11 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 10 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 11 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+CREATE TABLE IF NOT EXISTS routing_projects(
+ project TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
+ first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS routing_projects_seen ON routing_projects(last_seen);
 CREATE TABLE IF NOT EXISTS accounts(
  id TEXT PRIMARY KEY, auth_index TEXT NOT NULL, status TEXT NOT NULL,
  quota TEXT, observed_at TEXT, updated_at TEXT NOT NULL
@@ -29,6 +34,8 @@ CREATE TABLE IF NOT EXISTS view_state(
  accounts_revision INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO view_state VALUES(1,0,0);
+CREATE TRIGGER IF NOT EXISTS routing_projects_insert AFTER INSERT ON routing_projects BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS routing_projects_update AFTER UPDATE ON routing_projects BEGIN UPDATE view_state SET revision=revision+1; END;
 CREATE TABLE IF NOT EXISTS event_state(
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), bridge_instance TEXT NOT NULL DEFAULT '',
  host_process TEXT NOT NULL DEFAULT '', sequence INTEGER NOT NULL DEFAULT 0,
