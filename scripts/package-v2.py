@@ -59,7 +59,7 @@ def main():
                 platform="linux", architecture=arch, host_abi=1, rpc_schema=6,
                 protocol_version=1, minimum_glibc_symbols=glibc,
                 go_version=packaging.command("go", "version"), model_execution=True,
-                wake=True, wake_providers=["codex"],
+                wake=True, wake_providers=["codex"], scheduling=True, earned_reset_cards=True, database_schema=10,
                 prompt_generation=True, model_settings=True,
                 prompt_generation_providers=["codex", "antigravity"],
                 editable_generation_prompt=True,
@@ -71,6 +71,7 @@ def main():
     }
     for name, source in {"install-v2.py": "scripts/install-v2.py", "install.py": "scripts/install.py",
                          "INSTALL.md": "docs/backend-v2-install.md", "PROTOTYPE.md": "docs/backend-v2-prototype.md",
+                         "ACCOUNT-SCHEDULING.md": "docs/account-scheduling.md", "cwr-codex.py": "scripts/cwr-codex.py",
                          "NOTICE": "native/bridge/NOTICE", "LICENSE.upstream": "third_party/cliproxyapi-reference/LICENSE"}.items():
         members[name] = ((ROOT / source).read_bytes(), 0o644)
     output = pathlib.Path(args.output).resolve()

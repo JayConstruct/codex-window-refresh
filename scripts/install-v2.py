@@ -31,7 +31,7 @@ spec.loader.exec_module(common)
 require, InstallError = common.require, common.InstallError
 PREFIX = "codex-window-refresh-v2"
 FILES = {"codex-window-refresh-v2-bridge.so", "window-refreshd", "BUILD-INFO.json",
-         "install.py", "install-v2.py", "INSTALL.md", "PROTOTYPE.md", "NOTICE", "LICENSE.upstream"}
+         "install.py", "install-v2.py", "INSTALL.md", "PROTOTYPE.md", "NOTICE", "LICENSE.upstream", "ACCOUNT-SCHEDULING.md", "cwr-codex.py"}
 
 
 def latest(arch):
@@ -394,6 +394,9 @@ def install(args, plan, arch):
                     source.backup(dest)
                 os.chmod(backup / "backend.sqlite", 0o600)
             transaction.write(binary, (unpacked / "window-refreshd").read_bytes(), 0o755)
+            for extra in ("cwr-codex.py", "ACCOUNT-SCHEDULING.md"):
+                if (unpacked / extra).is_file():
+                    transaction.write(release_dir / extra, (unpacked / extra).read_bytes(), 0o644)
             if changed_bridge:
                 # CPA can retain native mappings even after quiesce: the CPA
                 # process is stopped before replacing any versioned library.

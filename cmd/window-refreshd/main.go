@@ -28,7 +28,7 @@ func main() {
 	}
 }
 func run() error {
-	var data, runtime string
+	var data, runtime, codexBinary, resetProxy string
 	var concurrency, terminalJobs int
 	var timeout, historyAge time.Duration
 	flag.StringVar(&data, "data-dir", "", "absolute private persistent data directory")
@@ -37,6 +37,8 @@ func run() error {
 	flag.DurationVar(&timeout, "query-timeout", 15*time.Second, "per account quota query deadline")
 	flag.DurationVar(&historyAge, "history-retention", 7*24*time.Hour, "terminal job history age (1h..8760h)")
 	flag.IntVar(&terminalJobs, "terminal-jobs", 10000, "maximum retained terminal jobs (1..50000)")
+	flag.StringVar(&codexBinary, "codex-binary", "codex", "Codex CLI binary for earned reset cards (no model execution)")
+	flag.StringVar(&resetProxy, "reset-proxy", "", "default reset account transport proxy; inherits process proxy when empty")
 	flag.Parse()
 	st, err := store.Open(data)
 	if err != nil {
@@ -44,7 +46,7 @@ func run() error {
 	}
 	defer st.Close()
 	link := &hostlink.Client{Path: filepath.Join(runtime, "bridge.sock")}
-	source := &executor.CPA{Host: link}
+	source := &executor.CPA{Host: link, CodexBinary: codexBinary, ResetProxy: resetProxy}
 	defer source.Close()
 	consumer := &ingest.Consumer{Store: st, Link: link, Inventory: source}
 	service, err := daemon.New(st, source, daemon.Options{QueryConcurrency: concurrency, QueryTimeout: timeout, Retention: store.Retention{HistoryAge: historyAge, TerminalJobs: terminalJobs}, RequestInventorySync: consumer.RequestInventorySync})

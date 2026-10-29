@@ -2,6 +2,7 @@
  * never decoded, duplicated, or retained. Hooks perform no socket or disk I/O. */
 #define _GNU_SOURCE
 #include "events.h"
+#include "scheduler.h"
 #include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -540,6 +541,7 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
     }
     unsigned slot=request_slot(request);
     if(lifecycle) {
+        if(!excluded&&(selection||completion))cwr_scheduler_observe(request,selected,completion);
         pthread_mutex_lock(&mu);
         ResponseBinding*r=&responses[slot];
         if(before||selection) {

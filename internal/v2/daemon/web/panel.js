@@ -8,6 +8,7 @@
     accounts: ['账号额度', '查看五小时与周额度，按账号查询最新结果'],
     query: ['额度查询', '管理查询规则与随机延迟，不发送模型请求'],
     wake: ['模型唤醒', '配置后台唤醒规则、手动执行并核实任务结果'],
+    scheduling: ['账号调度与重置卡', '管理项目账号偏好、额度分配和赠送卡到期兑换'],
     models: ['模型与提示词', '管理唤醒模型、提示词与短句池'],
     history: ['任务记录', '统一查看手动与自动任务，追踪执行进度与响应结果'],
     diagnostics: ['诊断与设置', '检查 CPA 连接、查询能力与后台异常']
@@ -38,6 +39,7 @@
     settings_conflict: '后台设置已变化，请重新加载并丢弃草稿后再编辑',
     invalid_query_settings: '查询设置无效，请检查字段', settings_unconfirmed: '保存结果尚未确认，请重新加载设置核实，不要直接重复提交'
   };
+  Object.assign(codes, {invalid_scheduling_settings: '调度设置无效，请检查字段范围与项目账号', reset_codex_unavailable: '后台未找到支持重置卡协议的 Codex CLI', reset_runtime_unavailable: '无法启动重置卡适配器', reset_protocol_invalid: '重置卡协议响应无效', reset_transport_failed: '重置卡连接中断', reset_account_rpc_failed: '官方账号接口拒绝操作或协议版本不支持', reset_timeout: '重置卡操作超时', reset_verification_incomplete: '正在等待两种额度窗口的完整可用证据', reset_operation_failed: '重置卡操作未完成'});
   codes.secure_random_unavailable = '浏览器无法生成安全的任务标识，请更换浏览器或使用 HTTPS';
   function requestID(crypto) {
     if (typeof crypto?.randomUUID === 'function') {
@@ -2143,6 +2145,7 @@
           read(() => accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing));
         }
         read(pollJobs);
+        if (activePage === 'scheduling') { read(() => loadScheduling()); read(() => loadResetCards()); }
         if (activePage === 'history') {
           if (!historyPolling) read(() => loadHistory(true));
           if (historySelected && !historyDetailPolling) read(() => readHistoryDetail(true));
@@ -2256,6 +2259,77 @@
     } catch (error) { if (current === generation || error.code === 'unauthorized') report(error); }
     finally { if (current === generation) { syncing = false; controls(); } }
   }
+
+  let schedulingSaved = null, schedulingDirty = false, schedulingBusy = false, schedulingConflict = false, resetRendered = '', schedulingRead = 0, resetRead = 0;
+  const schedulingNumbers = {quota_max_age_seconds: 'routing-age', session_ttl_seconds: 'routing-session', max_inflight: 'routing-cap'};
+  const cardNumbers = {poll_seconds: 'cards-poll', expiry_seconds: 'cards-expiry', force_before_seconds: 'cards-force', min_used_percent: 'cards-used'};
+  function schedulingDraft() {
+    const c = JSON.parse(JSON.stringify(schedulingSaved.config));
+    c.enabled = $('routing-enabled').checked; c.prefer_reset = $('routing-reset').checked;
+    for (const [key, id] of Object.entries(schedulingNumbers)) c[key] = Number($(id).value);
+    c.cards.enabled = $('cards-enabled').checked; c.cards.auto_consume = $('cards-auto').checked;
+    for (const [key, id] of Object.entries(cardNumbers)) c.cards[key] = Number($(id).value);
+    c.projects = $('routing-projects').value.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+      const at = line.indexOf('='); if (at < 1) throw new Error('每行请填写“项目标识 = 账号 ID, 账号 ID”。');
+      return {project: line.slice(0, at).trim(), accounts: line.slice(at + 1).split(',').map(id => id.trim()).filter(Boolean)};
+    });
+    return c;
+  }
+  async function loadScheduling(discard = false) {
+    if (!connected || schedulingBusy) return;
+    const read = ++schedulingRead;
+    const data = await api('/scheduling');
+    if (read !== schedulingRead || schedulingBusy) return;
+    if (schedulingSaved && schedulingSaved.instance_id === data.instance_id && data.revision < schedulingSaved.revision) return;
+    if (data.instance_id !== views.instance || !Number.isSafeInteger(data.revision) || !data.config) return;
+    if (!discard && schedulingDirty) {
+      if (!schedulingSaved || data.revision !== schedulingSaved.revision || data.instance_id !== schedulingSaved.instance_id) {
+        schedulingConflict = true; $('scheduling-save').disabled = true;
+        setText('scheduling-message', '后台配置已变化，草稿保留；请重新读取后再保存。');
+      }
+      return;
+    }
+    const changed = discard || !schedulingSaved || schedulingSaved.revision !== data.revision || schedulingSaved.instance_id !== data.instance_id;
+    schedulingSaved = data;
+    if (changed) {
+      const c = data.config;
+      $('routing-enabled').checked = c.enabled; $('routing-reset').checked = c.prefer_reset;
+      for (const [key, id] of Object.entries(schedulingNumbers)) $(id).value = c[key];
+      $('cards-enabled').checked = c.cards.enabled; $('cards-auto').checked = c.cards.auto_consume;
+      for (const [key, id] of Object.entries(cardNumbers)) $(id).value = c.cards[key];
+      $('routing-projects').value = c.projects.map(p => p.project + ' = ' + p.accounts.join(', ')).join('\n');
+      schedulingDirty = false; schedulingConflict = false;
+    }
+    $('scheduling-fields').disabled = false; $('scheduling-save').disabled = false;
+    setText('scheduling-message', data.routing_error ? '调度快照尚未同步到 CPA，请检查接入层版本与连接。' : data.reset_error ? '最近一次重置卡操作未完成，请查看右侧记录。' : '已读取后台设置。保存后应用，关闭页面不停止后台。');
+  }
+  async function loadResetCards() {
+    if (!connected) return;
+    const read = ++resetRead; const data = await api('/reset-cards'); if (read !== resetRead) return; if (data.instance_id !== views.instance) return;
+    const signature = JSON.stringify(data); if (signature === resetRendered) return; resetRendered = signature;
+    const cards = data.accounts || [], attempts = data.attempts || [];
+    const cardRows = cards.map(a => {
+      const deadlines = (a.credits?.credits || []).filter(c => c.status === 'available' && Number.isSafeInteger(c.expiresAt)).map(c => c.expiresAt);
+      const expiry = deadlines.length ? new Date(Math.min(...deadlines) * 1000).toLocaleString() : '到期时间未知';
+      return element('p', 'field-help', a.account_id + '：' + (a.credits ? a.credits.availableCount + ' 张，最近到期 ' + expiry : '卡片信息未知') + (a.error_code ? ' · ' + message(a.error_code) : ''));
+    });
+    const labels = {sending: '正在兑换', unknown: '结果未知，保留原兑换标识', verifying: '正在核实额度', completed: '已兑换并查询额度', skipped: '本次未兑换'};
+    const attemptRows = attempts.map(a => element('p', 'field-help', a.account_id + ' · ' + (labels[a.phase] || a.phase) + (a.outcome ? ' · ' + a.outcome : '') + (a.error_code ? ' · ' + message(a.error_code) : '')));
+    $('reset-cards-list').replaceChildren(...(cardRows.length ? cardRows : [element('p', 'field-help', '尚无重置卡观测。开启查询后由后台读取。')]));
+    $('reset-attempts-list').replaceChildren(...(attemptRows.length ? attemptRows : [element('p', 'field-help', '尚无兑换记录。')]));
+    applyDisplayPrivacy($('reset-cards-list')); applyDisplayPrivacy($('reset-attempts-list'));
+  }
+  $('scheduling-form').addEventListener('input', () => { schedulingDirty = true; setText('scheduling-message', '草稿尚未保存。'); });
+  $('scheduling-form').onsubmit = async event => {
+    event.preventDefault(); if (!connected || !schedulingSaved || schedulingBusy || schedulingConflict) return;
+    let config; try { config = schedulingDraft(); } catch (error) { setText('scheduling-message', error.message); return; }
+    schedulingBusy = true; ++schedulingRead; $('scheduling-save').disabled = true; $('scheduling-fields').disabled = true;
+    try { await api('/scheduling', {method: 'POST', body: JSON.stringify({revision: schedulingSaved.revision, config})}); schedulingDirty = false; schedulingBusy = false; await loadScheduling(true); }
+    catch (error) { schedulingConflict = true; setText('scheduling-message', '保存未确认，草稿保留。请重新读取核实后再保存。'); report(error); }
+    finally { schedulingBusy = false; $('scheduling-fields').disabled = !connected; $('scheduling-save').disabled = schedulingConflict || !connected; }
+  };
+  $('scheduling-reload').onclick = () => loadScheduling(true).catch(report);
+
   function navigate(name, loadSettings = true) {
     if (!Object.hasOwn(pages, name)) return;
     activePage = name;
@@ -2269,6 +2343,7 @@
     setText('page-title', pages[name][0]); setText('page-description', pages[name][1]); setText('breadcrumb', pages[name][0]);
     document.title = '窗口助手 · ' + pages[name][0];
     if (connected) { renderTasks(); renderDiagnostics(); }
+    if (name === 'scheduling' && connected) { void loadScheduling().catch(report); void loadResetCards().catch(report); }
     if (name === 'query' && loadSettings && connected && settingsSupported() && (!savedSettings || savedSettings.instance_id !== views.instance)) void reloadSettings();
     if (name === 'models' && loadSettings && connected) { ensureGenerationAccounts(); void reloadModelSettings(); void pollGeneration(); }
     if (name === 'wake' && loadSettings && connected) { ensureWakeSettings(); void loadWakeJobs(); }

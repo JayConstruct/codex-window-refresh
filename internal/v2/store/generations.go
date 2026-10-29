@@ -48,7 +48,7 @@ func (request GenerationRequest) Validate() error {
 
 func generationAccount(ctx context.Context, tx *sql.Tx, id string) (Account, error) {
 	var account Account
-	err := tx.QueryRowContext(ctx, `SELECT a.id,a.auth_index,a.status,b.binding FROM accounts a JOIN account_bindings b ON b.account_id=a.id WHERE a.id=? AND a.status='available' AND a.auth_index!='' AND b.binding!='' AND NOT EXISTS(SELECT 1 FROM accounts other WHERE other.id!=a.id AND other.auth_index=a.auth_index AND other.status!='removed') AND EXISTS(SELECT 1 FROM inventory_state WHERE singleton=1 AND status='ready' AND last_success_at>=?)`, id, time.Now().UTC().Add(-90*time.Second).Format("2006-01-02T15:04:05.000000000Z")).Scan(&account.ID, &account.AuthIndex, &account.Status, &account.Binding)
+	err := tx.QueryRowContext(ctx, `SELECT a.id,a.auth_index,a.status,b.binding FROM accounts a JOIN account_bindings b ON b.account_id=a.id WHERE a.id=? AND a.status='available' AND a.auth_index!='' AND b.binding!='' AND NOT EXISTS(SELECT 1 FROM accounts other WHERE other.id!=a.id AND other.auth_index=a.auth_index AND other.status!='removed') AND NOT EXISTS(SELECT 1 FROM reset_attempts r WHERE r.account_id=a.id AND r.binding=b.binding AND r.phase IN ('sending','unknown','verifying')) AND EXISTS(SELECT 1 FROM inventory_state WHERE singleton=1 AND status='ready' AND last_success_at>=?)`, id, time.Now().UTC().Add(-90*time.Second).Format("2006-01-02T15:04:05.000000000Z")).Scan(&account.ID, &account.AuthIndex, &account.Status, &account.Binding)
 	if errors.Is(err, sql.ErrNoRows) {
 		return account, ErrGenerationAccount
 	}

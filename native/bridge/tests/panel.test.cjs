@@ -212,7 +212,7 @@ function panel(respond, options = {}) {
     button.dataset.historyStatus = status; count.dataset.historyCount = status || 'all';
     button.append(count); get('history-tabs').append(button);
   }
-  const nav = ['overview', 'accounts', 'query', 'wake', 'models', 'history', 'diagnostics'].map(name => { const node = new Element('button'); node.dataset.page = name; return node; });
+  const nav = ['overview', 'accounts', 'query', 'wake', 'scheduling', 'models', 'history', 'diagnostics'].map(name => { const node = new Element('button'); node.dataset.page = name; return node; });
   const panels = nav.map(node => { const panel = new Element(); panel.dataset.view = node.dataset.page; return panel; });
   root.append(...nav, ...panels);
   const walk = node => [node, ...node.children.flatMap(walk)];
@@ -3293,4 +3293,33 @@ test('returning from the back-forward cache cannot reuse a saved CPA key after e
   ui.events.get('pageshow')({persisted: true}); ui.events.get('focus')(); ui.events.get('online')(); await flush();
   assert.equal(ui.calls.length, calls); assert.equal(refreshTimers(ui).length, 0);
   assert.equal(ui.get('login-section').hidden, false); assert.equal(mutations(ui).length, 0);
+});
+
+test('scheduling settings preserve drafts on polls, detect conflicts and save only their own revision', async () => {
+  let revision = 0;
+  let config = {enabled: false, prefer_reset: true, quota_max_age_seconds: 300, session_ttl_seconds: 1800, max_inflight: 2, projects: [],
+    cards: {enabled: false, auto_consume: false, poll_seconds: 900, expiry_seconds: 86400, force_before_seconds: 1800, min_used_percent: 80}};
+  const ui = panel((url, options) => {
+    if (url.endsWith('/scheduling')) {
+      if (options.method === 'POST') { const request = JSON.parse(options.body); assert.equal(request.revision, revision); config = request.config; revision++; }
+      return [200, {instance_id: 'a', revision, config}];
+    }
+    if (url.endsWith('/reset-cards')) return [200, {instance_id: 'a', accounts: [], attempts: []}];
+    return basic(url);
+  });
+  await ui.get('connect').onclick();
+  ui.nav.find(node => node.dataset.page === 'scheduling').listeners.get('click')(); await flush();
+  assert.equal(ui.get('routing-cap').value, '2'); assert.equal(mutations(ui).length, 0);
+  ui.get('routing-cap').value = '7'; ui.get('scheduling-form').listeners.get('input')();
+  revision++; config = {...config, max_inflight: 3};
+  await ui.get('refresh').onclick(); await flush();
+  assert.equal(ui.get('routing-cap').value, '7'); assert.equal(ui.get('scheduling-save').disabled, true);
+  await ui.get('scheduling-reload').onclick();
+  assert.equal(ui.get('routing-cap').value, '3');
+  ui.get('routing-enabled').checked = true; ui.get('routing-projects').value = 'work = account-a, account-b';
+  ui.get('scheduling-form').listeners.get('input')();
+  await ui.get('scheduling-form').onsubmit({preventDefault() {}});
+  assert.equal(mutations(ui).length, 1); assert.equal(config.enabled, true);
+  assert.deepEqual(config.projects, [{project: 'work', accounts: ['account-a', 'account-b']}]);
+  assert.equal(config.cards.auto_consume, false);
 });

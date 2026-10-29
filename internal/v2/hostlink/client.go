@@ -245,6 +245,14 @@ func (c *Client) SupportedGenerationProviders() []string {
 }
 func (c *Client) Call(ctx context.Context, method string, request, response any) error {
 	switch method {
+	case "host.routing.reset_cooldown":
+		instance := c.Instance()
+		if instance == "" {
+			return errors.New("bridge_unavailable")
+		}
+		return c.exchangeFor(ctx, method, request, response, instance)
+	case "bridge.scheduler.replace":
+		return c.exchange(ctx, method, request, response)
 	case "host.auth.list", "host.auth.get_runtime", "host.auth.get", "host.auth.models":
 	case "host.http.operation_open", "host.http.do", "host.http.cancel":
 		instance := c.Instance()

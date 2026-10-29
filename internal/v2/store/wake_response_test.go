@@ -80,7 +80,7 @@ func TestWakeResponseMigrationFromEightPreservesJobsAndRecordsInterruptedSend(t 
 	}
 	defer storage.Close()
 	var version int
-	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 9 {
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 10 {
 		t.Fatal(version, err)
 	}
 	if err = storage.RecoverWakes(ctx); err != nil {

@@ -39,7 +39,7 @@ release-check:
 v2-build:
 	mkdir -p bin
 	CGO_ENABLED=1 go build -buildvcs=false -o bin/window-refreshd ./cmd/window-refreshd
-	cc -std=c11 -Wall -Wextra -Werror -fPIC -fvisibility=hidden -shared -o bin/codex-window-refresh-v2-bridge.so native/bridge/bridge.c native/bridge/events.c -pthread -lcurl -l:libjson-c.so.5
+	cc -std=c11 -Wall -Wextra -Werror -fPIC -fvisibility=hidden -shared -o bin/codex-window-refresh-v2-bridge.so native/bridge/bridge.c native/bridge/events.c native/bridge/scheduler.c -pthread -lcurl -l:libjson-c.so.5
 
 v2-smoke: v2-build
 	python3 native/bridge/tests/smoke.py

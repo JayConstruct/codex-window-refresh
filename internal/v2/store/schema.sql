@@ -1,6 +1,6 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 9 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 10 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
 CREATE TABLE IF NOT EXISTS accounts(
  id TEXT PRIMARY KEY, auth_index TEXT NOT NULL, status TEXT NOT NULL,
  quota TEXT, observed_at TEXT, updated_at TEXT NOT NULL
@@ -179,3 +179,11 @@ CREATE TRIGGER IF NOT EXISTS inventory_update AFTER UPDATE ON inventory_state
 END;
 INSERT OR IGNORE INTO job_receipts SELECT idempotency_key,request_hash,id,unixepoch(created_at)+2592000 FROM jobs
 WHERE NOT EXISTS(SELECT 1 FROM query_plans p WHERE p.job_id=jobs.id AND p.automatic=1);
+
+CREATE TABLE IF NOT EXISTS scheduling_settings(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision INTEGER NOT NULL,config TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS reset_cards(account_id TEXT PRIMARY KEY,binding TEXT NOT NULL,credits TEXT,observed_at TEXT NOT NULL DEFAULT '',next_at TEXT NOT NULL DEFAULT '',error_code TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS reset_attempts(id TEXT PRIMARY KEY,account_id TEXT NOT NULL,auth_index TEXT NOT NULL,binding TEXT NOT NULL,credit_id TEXT NOT NULL,phase TEXT NOT NULL,outcome TEXT NOT NULL DEFAULT '',error_code TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,next_at TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS reset_account_live ON reset_attempts(account_id,binding) WHERE phase IN ('sending','unknown','verifying');
+CREATE INDEX IF NOT EXISTS reset_attempts_ready ON reset_attempts(phase,next_at);
+CREATE TRIGGER IF NOT EXISTS scheduling_insert AFTER INSERT ON scheduling_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+CREATE TRIGGER IF NOT EXISTS scheduling_update AFTER UPDATE ON scheduling_settings BEGIN UPDATE view_state SET revision=revision+1; END;

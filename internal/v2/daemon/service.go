@@ -47,6 +47,8 @@ type Service struct {
 	wakeWork           chan struct{}
 	wakeWorkerError    atomic.Bool
 	wakeSchedulerError atomic.Bool
+	routingError       atomic.Bool
+	resetError         atomic.Bool
 	expanderError      atomic.Value
 	maintenanceError   atomic.Bool
 	schedulerError     atomic.Value
@@ -95,6 +97,9 @@ func wait(ctx context.Context, d time.Duration) bool {
 }
 func (s *Service) Run(ctx context.Context) {
 	var workers sync.WaitGroup
+	workers.Add(2)
+	go func() { defer workers.Done(); s.publishRouting(ctx) }()
+	go func() { defer workers.Done(); s.manageResetCards(ctx) }()
 	workers.Add(1)
 	go func() { defer workers.Done(); s.maintenance(ctx) }()
 	workers.Add(1)
@@ -294,6 +299,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch r.Method + " " + r.URL.Path {
+	case "GET /api/v2/scheduling", "POST /api/v2/scheduling":
+		s.scheduling(w, r)
+	case "GET /api/v2/reset-cards":
+		s.resetCards(w, r)
 	case "GET /api/v2/overview":
 		view, err := s.Store.Overview(r.Context())
 		if err != nil {

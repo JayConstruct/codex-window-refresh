@@ -23,7 +23,9 @@ type Source interface {
 	Query(context.Context, store.Account) (json.RawMessage, error)
 }
 type CPA struct {
-	Host Callback
+	Host        Callback
+	CodexBinary string
+	ResetProxy  string
 	// Transport and endpoint are private test seams. Production uses a fixed
 	// quota endpoint and inherits host transport policy unless an account has
 	// explicitly selected a proxy or direct connection.

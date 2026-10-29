@@ -2,16 +2,16 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查询、可选自动查询和按需模型唤醒。插件 ID 为 `codex-window-refresh`。
 
-**v0.2.0-rc.20** 包含 [CPA API 优化](docs/cpa-api-optimization.md)：V2 查询继承全局代理、原生按账号模型目录、减少无变化同步写入和面板全量读取。后台与接入层均为 rc.20，升级须显式 `--restart`；详见 [rc.20 发布说明](docs/releases/v0.2.0-rc.20.md)。
+**v0.2.0-rc.21** 新增[项目账号调度与官方赠送重置卡](docs/account-scheduling.md)：目录启动器、项目首选账号组、临近重置优先、会话绑定与并发保护，以及可选的到期前自动兑换。面板新增“账号调度与重置卡”，新功能默认关闭；后台与接入层均为 rc.21，数据库升级至 schema 10。详见 [rc.21 发布说明](docs/releases/v0.2.0-rc.21.md)。
 
 服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
 
 ## 一键安装或更新
 
-当前 **v0.2.0-rc.20 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+当前 **v0.2.0-rc.21 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.20 --restart
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.21 --restart
 ```
 
 v2 提供额度查询、活动观测、模型配置、显式手动短句候选生成及 Codex 模型唤醒，自动查询和自动唤醒默认关闭，已有明确保存的规则保持不变。首次切换会停止 v1 功能，成功后清除 v1 数据、旧版本及临时恢复副本；后续更新保留 v2 数据。只有后台改变且接入层文件一致时只重启后台，接入层改变时仍须显式 `--restart`。下面的旧入口继续更新 v1，不会自动切换 v2。
@@ -22,7 +22,7 @@ v2 提供额度查询、活动观测、模型配置、显式手动短句候选�
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
 ```
 
-可用 `--version v0.2.0-rc.20` 固定本次版本。**本次后台和接入层均为 rc.20；从任何早期版本升级均须显式 `--restart`**，以加载新的额度 HTTP 回调和账号模型目录路由，不能只替换后台。数据库保持 schema 9，已有规则、额度和发送防重记录保留；升级前须另存一致备份，更早版本升级仍受既有迁移和降级限制。
+可用 `--version v0.2.0-rc.21` 固定本次版本。**本次后台和接入层均为 rc.21；从任何早期版本升级均须显式 `--restart`**，以加载调度扩展和新增管理路由。数据库升级至 schema 10，保留已有规则、额度和发送防重记录；升级前须另存一致备份，不能用旧后台直接打开新数据库。重置卡功能另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
 
 rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总览与侧栏布局，默认自动更新。已接入持久化批量随机延迟、定期及五小时/周到期额度查询、网页设置与差异预览；手动单账号立即查询，查询均不发送模型请求。自动查询默认关闭，模型唤醒仍明确禁用。升级 rc.5 须添加 `--restart` 更新接入层；数据库迁移与降级限制见[发布说明](docs/releases/v0.2.0-rc.5.md)。
 

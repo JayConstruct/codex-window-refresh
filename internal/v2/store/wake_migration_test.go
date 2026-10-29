@@ -59,7 +59,7 @@ func TestWakeVersionSevenMigrationPreservesGenerationAndSettingsWithWakeOff(t *t
 		t.Fatal(err)
 	}
 	var version int
-	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 9 {
+	if err = storage.db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 10 {
 		t.Fatalf("migrated schema=%d err=%v", version, err)
 	}
 	wakes, err := storage.WakeSettings(ctx)

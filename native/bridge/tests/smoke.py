@@ -104,6 +104,49 @@ class NativeBridge(unittest.TestCase):
         self.assertTrue(registration['ok'], registration)
         self.assert_host_registration(registration)
 
+    @staticmethod
+    def routing_snapshot(projects=None, cap=8):
+        now = int(time.time())
+        return {'config': {'enabled': True, 'prefer_reset': True, 'max_inflight': cap,
+                           'session_ttl_seconds': 1800, 'projects': projects or []},
+                'accounts': [{'id': 'a', 'valid_until': now + 300, 'reset_at': now + 60, 'card_expiry': 0},
+                             {'id': 'b', 'valid_until': now + 300, 'reset_at': now + 3600, 'card_expiry': 0}]}
+
+    @staticmethod
+    def routing_request(project='', session='', scope='caller'):
+        return {'Candidates': [{'ID': 'a', 'Provider': 'codex'}, {'ID': 'b', 'Provider': 'codex'}],
+                'Options': {'Headers': {'X-Cwr-Project': [project]},
+                            'Metadata': {'session_id': session, 'caller_scope': scope}}}
+
+    def test_scheduler_project_preference_cap_and_completion(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.assertEqual(self.call('scheduler.pick', self.routing_request())['result'], {})
+        snapshot = self.routing_snapshot([{'project': 'work', 'accounts': ['b']}], cap=1)
+        self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+        self.assertEqual(self.call('scheduler.pick', self.routing_request('work'))['result']['AuthID'], 'b')
+        self.call('request.intercept_after', {'RequestID': 'work-request', 'Metadata': {'selected_auth_id': 'b'}})
+        self.assertEqual(self.call('scheduler.pick', self.routing_request('work'))['result']['AuthID'], 'a')
+        self.assertTrue(self.call('scheduler.pick', self.routing_request('work'))['result']['Reject'])
+        self.call('request.complete', {'RequestID': 'work-request', 'Metadata': {}})
+        self.assertEqual(self.call('scheduler.pick', self.routing_request('work'))['result']['AuthID'], 'b')
+        self.assertEqual(self.models, 0)
+
+    def test_scheduler_affinity_is_caller_scoped_and_evidence_expires(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        snapshot = self.routing_snapshot()
+        self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+        request = self.routing_request(session='shared-session')
+        self.assertEqual(self.call('scheduler.pick', request)['result']['AuthID'], 'a')
+        snapshot['accounts'][1]['reset_at'] = int(time.time()) + 5
+        self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+        self.assertEqual(self.call('scheduler.pick', request)['result']['AuthID'], 'a')
+        self.assertEqual(self.call('scheduler.pick', self.routing_request(session='shared-session', scope='other'))['result']['AuthID'], 'b')
+        for a in snapshot['accounts']: a['valid_until'] = 1
+        self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+        self.assertEqual(self.call('scheduler.pick', request)['result'], {})
+        snapshot['accounts'].reverse()
+        self.assertFalse(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
+
     def test_schema7_omits_unused_interceptor_request_bodies(self):
         registration = self.call('plugin.reconfigure', {'schema_version': 7})
         self.assertTrue(registration['ok'], registration)

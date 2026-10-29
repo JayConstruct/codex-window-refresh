@@ -1,8 +1,8 @@
 # v2 预发布安装与更新
 
-适用于 Debian 12/13、amd64/arm64、CPA 原生 ABI 1，插件协商 RPC schema 6 或 7；支持 schema 8 的 CPA 仍可协商为 7。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。当前 **v0.2.0-rc.20 后台和接入层**提供网页、额度查询、持久任务、活动及正常业务额度观测、模型配置、短句候选生成和 Codex 模型唤醒，自动查询及自动唤醒默认关闭，已有明确保存的规则保留。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
+适用于 Debian 12/13、amd64/arm64、CPA 原生 ABI 1，插件协商 RPC schema 6 或 7；支持 schema 8 的 CPA 仍可协商为 7。CPA 与后台使用相同 UID，通过私有 Unix socket 通信。当前 **v0.2.0-rc.21 后台和接入层**提供网页、额度查询、持久任务、活动及正常业务额度观测、模型配置、短句候选生成、Codex 模型唤醒、项目账号调度和赠送重置卡管理。新增调度、重置卡查询及自动兑换默认关闭，已有明确保存的查询和唤醒规则保留。选择 v2 会停止 v1 功能，部署成功后清除 v1 策略、状态、环境文件、旧版本与备份；后续更新保留 v2 数据。
 
-**升级到 rc.20 须同时更新后台及接入层，并显式 `--restart` 重启 CPA。**本版增加宿主额度 HTTP 与账号模型目录路由，数据库保持 schema 9，不新增迁移。无账号代理时继承 CPA 全局代理；账号显式 direct/none 和专用代理仍分别生效。原生模型目录需要宿主支持 `host.auth.models`，旧宿主明确不支持时使用兼容读取；目录读取不会试发模型请求。详见 [rc.20 发布说明](releases/v0.2.0-rc.20.md)与 [API 优化说明](cpa-api-optimization.md)。
+**升级到 rc.21 须同时更新后台及接入层，并显式 `--restart` 重启 CPA。**本版增加业务调度与重置卡管理路由，数据库迁移至 schema 10；升级前须保存一致备份，不能直接回退旧后台。目录绑定使用配套 `cwr-codex.py`。重置卡功能需要支持官方账号协议的 Codex CLI；其代理继承后台进程环境或 `--reset-proxy`，不同于既有额度查询的 CPA 全局代理继承。详见 [rc.21 发布说明](releases/v0.2.0-rc.21.md)与[配置说明](account-scheduling.md)。
 
 以下为历史版本能力与迁移记录：rc.5 支持自动额度查询及随机延迟，不包含后续加入的模型唤醒、短句生成和自动模型规则；各包能力以对应发布说明为准。
 
@@ -28,13 +28,13 @@ rc.12 在额度查询完成时同步已核实的宿主账号状态，并提供�
 
 ## 首次切换
 
-当前后台和接入层均为 **v0.2.0-rc.20**。首次切换及从任意早期版本升级均须显式 `--restart`，重启 CPA 加载新接入层并注册账号模型目录路由。数据库仍为 schema 9，从 rc.13–rc.19 升级不增加迁移，保留现有 v2 数据和发送防重记录。更早版本仍须遵循下面的一致备份和降级限制，详见 [rc.20 发布说明](releases/v0.2.0-rc.20.md)。
+当前后台和接入层均为 **v0.2.0-rc.21**。首次切换及从任意早期版本升级均须显式 `--restart`，重启 CPA 加载调度扩展与管理路由。数据库升级至 schema 10，保留现有 v2 数据和发送防重记录；须遵循下面的一致备份和降级限制，详见 [rc.21 发布说明](releases/v0.2.0-rc.21.md)。
 
 rc.13 新增快捷唤醒与持久响应记录，数据库升级至 schema 9，首次启动自动迁移并保留现有任务及防重状态。升级前另存停机或 SQLite 在线一致备份；不能把旧后台直接换回迁移后的新库。原生接入层仍为 rc.8，详见 [rc.13 发布说明](releases/v0.2.0-rc.13.md)。
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.20 --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.21 --restart
 ```
 
 root 会话可省略 sudo。首次下载需要已有 curl。脚本安装缺少的运行依赖，识别当前 CPA 的配置、进程、用户及 systemd 服务；无法唯一确认时用参数明确指定，例如：
@@ -49,7 +49,7 @@ sudo bash /tmp/cwr-v2-install.sh --cpa-dir /opt/cpa --service cliproxyapi --rest
 sudo bash /tmp/cwr-v2-install.sh --cpa-dir /root/cliproxyapi --service cliproxyapi --user-service --user root --restart
 ```
 
-使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.20` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
+使用 `--dry-run` 预览，不下载安装包、不写入或重启。`--version v0.2.0-rc.21` 固定版本；默认只选择 v2 发布。首次切换、清理旧服务环境及接入层二进制变化必须显式 `--restart`，脚本不会自动决定重启 CPA。首次重启同时回收旧版插件 Go 运行时映射。
 
 ## 后续更新
 
@@ -87,7 +87,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 
 ```sh
 python3 install-v2.py --cpa-dir /opt/cpa --service cliproxyapi \
-  --version v0.2.0-rc.20 --package /path/codex-window-refresh-v2_v0.2.0-rc.20_linux_amd64.tar.gz \
+  --version v0.2.0-rc.21 --package /path/codex-window-refresh-v2_v0.2.0-rc.20_linux_amd64.tar.gz \
   --checksums /path/SHA256SUMS --restart
 ```
 

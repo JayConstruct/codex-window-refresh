@@ -1,9 +1,10 @@
-/* CPA ABI 1 / schema 6-7 bridge. No rules, credentials on disk, or Go runtime.
+/* CPA ABI 1 / schema 6-7 bridge. Expiring memory routing snapshots; no credentials on disk or Go runtime.
  * Host callbacks permit local auth reads, bounded quota HTTP and pinned streams.
  * The independent daemon owns all durable business state. */
 #define _GNU_SOURCE
 #include "json_api.h"
 #include "events.h"
+#include "scheduler.h"
 #include "version.h"
 #include <arpa/inet.h>
 #include <curl/curl.h>
@@ -436,13 +437,14 @@ static J *rpc(J*req) {
     }
     const char*expected=string(field(req,"bridge_instance_id"));
     if(!expected||strcmp(expected,instance)!=0)return error("bridge_instance_changed");
+    if(!strcmp(method,"bridge.scheduler.replace")) { J*r=cwr_scheduler_replace(field(req,"payload"));return r?r:error("invalid_payload");}
     if(!strcmp(method,"bridge.events.pull"))return cwr_events_pull(field(req,"payload"),instance,process_identity);
     if(!strcmp(method,"bridge.events.ack"))return cwr_events_ack(field(req,"payload"));
     if(!strcmp(method,"bridge.bindings.replace"))return cwr_bindings_replace(field(req,"payload"));
     int execute=!strcmp(method,"host.model.execute_stream"),read_stream=!strcmp(method,"host.model.stream_read"),close_stream=!strcmp(method,"host.model.stream_close");
     int model=execute||read_stream||close_stream;
     int http=!strcmp(method,"host.http.operation_open")||!strcmp(method,"host.http.do")||!strcmp(method,"host.http.cancel");
-    if(!model&&!http&&strcmp(method,"host.auth.list")&&strcmp(method,"host.auth.get")&&strcmp(method,"host.auth.get_runtime")&&strcmp(method,"host.auth.models"))return error("method_not_allowed");
+    if(!model&&!http&&strcmp(method,"host.auth.list")&&strcmp(method,"host.auth.get")&&strcmp(method,"host.auth.get_runtime")&&strcmp(method,"host.auth.models")&&strcmp(method,"host.routing.reset_cooldown"))return error("method_not_allowed");
     J*payload=field(req,"payload");
     if(!payload||json_object_get_type(payload)!=4)return error("invalid_payload");
     if(execute&&!model_payload(payload))return error("invalid_payload");
@@ -450,7 +452,7 @@ static J *rpc(J*req) {
     if(!model&&!http&&strcmp(method,"host.auth.list")) {
         const char*index=string(field(payload,"auth_index"));
         if(!index||!index[0]||strlen(index)>256)return error("invalid_payload");
-        if(!strcmp(method,"host.auth.models")&&json_object_object_length(payload)!=1)return error("invalid_payload");
+        if((!strcmp(method,"host.auth.models")||!strcmp(method,"host.routing.reset_cooldown"))&&json_object_object_length(payload)!=1)return error("invalid_payload");
     }
     int budget=json_object_get_int(field(req,"remaining_timeout_ms"));
     if(budget<1||budget>300000)return error("invalid_deadline");
@@ -629,6 +631,7 @@ static int stop_runtime(int bounded) {
     owner_lock=-1;
     running=0;
     cwr_events_clear();
+    cwr_scheduler_clear();
     return 1;
 }
 static int start_runtime(void) {
@@ -930,6 +933,7 @@ static J *registration(unsigned schema) {
     json_object_object_add(metadata,"GitHubRepository",json_object_new_string("https://github.com/JayConstruct/codex-window-refresh"));
     json_object_object_add(metadata,"ConfigFields",json_object_new_array());
     json_object_object_add(r,"metadata",metadata);
+    json_object_object_add(cap,"scheduler",json_object_new_boolean(1));
     json_object_object_add(cap,"management_api",json_object_new_boolean(1));
     json_object_object_add(cap,"request_interceptor",json_object_new_boolean(1));
     if(schema>=7) {
@@ -946,13 +950,13 @@ static J *registration(unsigned schema) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history","account-models"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history","account-models","scheduling","scheduling","reset-cards"
     };
-    for(int i=0;i<18;i++) {
+    for(int i=0;i<21;i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);
-        json_object_object_add(item,"Method",json_object_new_string(i==3||i==4||i==6||i==8||i==10||i==13||i==15?"POST":"GET"));
+        json_object_object_add(item,"Method",json_object_new_string(i==3||i==4||i==6||i==8||i==10||i==13||i==15||i==19?"POST":"GET"));
         json_object_object_add(item,"Path",json_object_new_string(path));
         json_object_array_add(list,item);
     }
@@ -975,6 +979,11 @@ static int plugin_call(char*method,uint8_t*payload,size_t size,Buffer*out) {
     out->len=0;
     if(!method||!method[0]||strnlen(method,257)>256||(size&&!payload))return 1;
     int hook=!strcmp(method,"request.intercept_before")||!strcmp(method,"request.intercept_after")||!strcmp(method,"request.complete")||!strcmp(method,"response.intercept_after")||!strcmp(method,"response.intercept_stream_chunk")||!strcmp(method,"websocket.response_event");
+    if(!strcmp(method,"scheduler.pick")) {
+        pthread_rwlock_rdlock(&gate);
+        J*request=size<=FRAME_LIMIT?parse(payload,size):NULL;
+        J*reply=cwr_scheduler_pick(request);int status=write_buffer(out,reply);json_object_put(reply);json_object_put(request);pthread_rwlock_unlock(&gate);return status;
+    }
     if(hook) {
         pthread_rwlock_rdlock(&gate);
         if(running&&!stopping)cwr_observe_hook(method,size<=(64u<<20)?payload:NULL,size<=(64u<<20)?size:0);

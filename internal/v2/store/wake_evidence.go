@@ -207,7 +207,7 @@ func wakeModelBusy(ctx context.Context, tx *sql.Tx, job WakeJob) (string, error)
 	var physical, account int
 	err := tx.QueryRowContext(ctx, `SELECT
  (SELECT count(*) FROM prompt_generations WHERE phase='running')+(SELECT count(*) FROM wake_jobs WHERE id!=? AND phase IN ('prepared','sending')),
- (SELECT count(*) FROM prompt_generations WHERE account_id=? AND (binding=? OR provider='antigravity') AND phase IN ('queued','running','unknown'))`, job.ID, job.AccountID, job.Account.Binding).Scan(&physical, &account)
+ (SELECT count(*) FROM prompt_generations WHERE account_id=? AND (binding=? OR provider='antigravity') AND phase IN ('queued','running','unknown'))+(SELECT count(*) FROM reset_attempts WHERE account_id=? AND binding=? AND phase IN ('sending','unknown','verifying'))`, job.ID, job.AccountID, job.Account.Binding, job.AccountID, job.Account.Binding).Scan(&physical, &account)
 	if err != nil {
 		return "", err
 	}
