@@ -74,9 +74,10 @@ type Run struct {
 	Account Account
 }
 type Store struct {
-	db     *sql.DB
-	lock   *os.File
-	writer chan struct{}
+	db            *sql.DB
+	lock          *os.File
+	writer        chan struct{}
+	trafficReader chan struct{}
 }
 
 func ID() string {
@@ -129,7 +130,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(8)
-	s := &Store{db: db, lock: lock, writer: make(chan struct{}, 1)}
+	s := &Store{db: db, lock: lock, writer: make(chan struct{}, 1), trafficReader: make(chan struct{}, 1)}
 	// Reject foreign or newer databases before creating any application tables.
 	var tables, versionTable int
 	if err = db.QueryRow("SELECT count(*),COALESCE(sum(name='schema_version'),0) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").Scan(&tables, &versionTable); err != nil {
@@ -147,7 +148,7 @@ func Open(dir string) (*Store, error) {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
-		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 11 {
+		if err = db.QueryRow("SELECT count(*),min(version),max(version) FROM schema_version").Scan(&count, &minVersion, &maxVersion); err != nil || count != 1 || minVersion < 1 || maxVersion > 12 {
 			s.Close()
 			return nil, errors.New("unsupported_database_schema")
 		}
@@ -171,7 +172,7 @@ func Open(dir string) (*Store, error) {
 			}
 		}
 		if err == nil {
-			_, err = migration.Exec("UPDATE schema_version SET version=11")
+			_, err = migration.Exec("UPDATE schema_version SET version=12")
 		}
 	}
 	if err == nil {
@@ -184,7 +185,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	var version int
-	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 11 {
+	if err = db.QueryRow("SELECT version FROM schema_version").Scan(&version); err != nil || version != 12 {
 		s.Close()
 		return nil, errors.New("unsupported_database_schema")
 	}

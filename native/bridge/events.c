@@ -327,6 +327,21 @@ void cwr_project_observed(const char *project,const char *name) {
     if(name)json_object_object_add(event,"project_name",json_object_new_string(name));
     enqueue(event);json_object_put(event);
 }
+/* The caller constructs only allowlisted metadata; the queue stays bounded. */
+void cwr_traffic_emit(const char *request,J *traffic) {
+    if(!request||!request[0]||strlen(request)>256)return;
+    J *event=json_object_new_object();
+    json_object_object_add(event,"kind",json_object_new_string("traffic"));
+    json_object_object_add(event,"request_id",json_object_new_string(request));
+    json_object_object_add(event,"traffic",json_object_get(traffic));
+    enqueue(event);json_object_put(event);
+}
+static void traffic_string(J *t,const char *key,J *value) {
+    const char *s=text(value);if(s)json_object_object_add(t,key,json_object_new_string(s));
+}
+static void traffic_positive(J *t,const char *key,J *value) {
+    if(value&&json_object_get_type(value)==3&&json_object_get_int64(value)>0)json_object_object_add(t,key,json_object_new_int64(json_object_get_int64(value)));
+}
 static const char*header_names[]= {
     "x-codex-allowed","x-codex-limit-reached", "x-codex-primary-used-percent","x-codex-primary-window-minutes","x-codex-primary-reset-at","x-codex-primary-reset-after-seconds", "x-codex-secondary-used-percent","x-codex-secondary-window-minutes","x-codex-secondary-reset-at","x-codex-secondary-reset-after-seconds"
 };
@@ -507,37 +522,54 @@ static J *websocket_quota(Slice payload,const char*event_type,int *is_headers) {
 }
 void cwr_observe_hook(const char *method,const void *payload,size_t size) {
     if(!strcmp(method,"usage.handle")) {
-        const char *names[]={"SelectionID","AuthID","Provider","Failed","Failure","Generate"};
-        Slice fields[6]={{0}},failure[1]={{0}};
-        if(!payload||!size||!select_fields((Slice){payload,size},names,fields,6))return;
+        const char *names[]={"SelectionID","AuthID","Provider","Failed","Failure","Generate","RequestID","TraceID","Model","SessionID","ParentSessionID","Latency","TTFT","Detail","Source","RequestedAt"};
+        Slice fields[16]={{0}},failure[1]={{0}},detail[4]={{0}};
+        if(!payload||!size||!select_fields((Slice){payload,size},names,fields,16))return;
         const char *failure_names[]={"StatusCode"};
         if(fields[4].data&&!select_fields(fields[4],failure_names,failure,1))return;
+        const char *detail_names[]={"InputTokens","OutputTokens","CachedTokens","CacheReadTokens"};
+        if(fields[13].data&&!select_fields(fields[13],detail_names,detail,4))return;
         J *selection=decode(fields[0]),*account=decode(fields[1]),*provider=decode(fields[2]),*failed=decode(fields[3]),*status=decode(failure[0]),*generate=decode(fields[5]);
         const char *name=text(provider);
-        if(name&&!strcmp(name,"codex")&&(!generate||json_object_get_type(generate)!=1||json_object_get_int(generate)))cwr_scheduler_usage(text(selection),text(account),json_object_get_int(failed),json_object_get_int(status));
-        json_object_put(selection);json_object_put(account);json_object_put(provider);json_object_put(failed);json_object_put(status);json_object_put(generate);
+        int generated=!generate||json_object_get_type(generate)!=1||json_object_get_int(generate);
+        if(name&&!strcmp(name,"codex")&&generated)cwr_scheduler_usage(text(selection),text(account),json_object_get_int(failed),json_object_get_int(status));
+        J *execution=decode(fields[6]),*source=decode(fields[14]);
+        int internal=text(source)&&!strcmp(text(source),"plugin_host_model_callback");
+        if(generated&&!internal&&text(execution)) {
+            J *t=json_object_new_object();json_object_object_add(t,"phase",json_object_new_string("usage"));
+            traffic_string(t,"selection_id",selection);traffic_string(t,"execution_id",execution);traffic_string(t,"account_id",account);traffic_string(t,"provider",provider);
+            json_object_object_add(t,"status",json_object_new_string(failed&&json_object_get_type(failed)==1?(json_object_get_int(failed)?"failed":"completed"):"unknown"));
+            if(json_object_get_int(status)>=100&&json_object_get_int(status)<=599)json_object_object_add(t,"http_status",json_object_new_int(json_object_get_int(status)));
+            const char *keys[]={"trace_id","model","session","parent_session","latency_ns","ttft_ns"};
+            for(int i=7;i<=12;i++){J *v=decode(fields[i]);if(i>=11)traffic_positive(t,keys[i-7],v);else traffic_string(t,keys[i-7],v);json_object_put(v);}
+            const char *token_keys[]={"input_tokens","output_tokens","cached_tokens"};
+            for(int i=0;i<3;i++){J *v=decode(detail[i]);if(i==2){J *read=decode(detail[3]);if(read&&json_object_get_int64(read)>0){json_object_put(v);v=read;}else json_object_put(read);}traffic_positive(t,token_keys[i],v);json_object_put(v);}
+            J *requested=decode(fields[15]);traffic_string(t,"requested_at",requested);json_object_put(requested);
+            cwr_traffic_emit(text(execution),t);json_object_put(t);
+        }
+        json_object_put(execution);json_object_put(source);json_object_put(selection);json_object_put(account);json_object_put(provider);json_object_put(failed);json_object_put(status);json_object_put(generate);
         return;
     }
     int before=!strcmp(method,"request.intercept_before"),selection=!strcmp(method,"request.intercept_after"),completion=!strcmp(method,"request.complete");
     int lifecycle=before||selection||completion,stream=!strcmp(method,"response.intercept_stream_chunk"),ws=!strcmp(method,"websocket.response_event");
     const char*root_names[]= {
-        "RequestID","Metadata","ResponseHeaders","ChunkIndex","Provider","AuthID","EventType","Payload","Outcome","StatusCode"
+        "RequestID","Metadata","ResponseHeaders","ChunkIndex","Provider","AuthID","EventType","Payload","Outcome","StatusCode","TraceID","Model","StartedAt","CompletedAt"
     };
     const char*meta_names[]= {
-        "caller_scope","selected_auth_id","source","generate","selection_id"
+        "caller_scope","selected_auth_id","source","generate","selection_id","canonical_session_id","parent_session_id"
     };
-    Slice root[10]= {
+    Slice root[14]= {
         {
             0
         }
-    },meta[5]= {
+    },meta[7]= {
         {
             0
         }
     };
     if(!payload||!size||!select_fields((Slice) {
         payload,size
-    },root_names,root,10)) {
+    },root_names,root,14)) {
         if(lifecycle)lost();
         return;
     }
@@ -549,7 +581,7 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
         json_object_put(index);
         if(!init)return;
     }
-    if(root[1].data&&!(root[1].size==4&&!memcmp(root[1].data,"null",4))&&!select_fields(root[1],meta_names,meta,5)) {
+    if(root[1].data&&!(root[1].size==4&&!memcmp(root[1].data,"null",4))&&!select_fields(root[1],meta_names,meta,7)) {
         if(lifecycle)lost();
         return;
     }
@@ -586,6 +618,15 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
         json_object_object_add(event,"request_id",json_object_new_string(request));
         if(who)json_object_object_add(event,"identity",json_object_new_string(who));
         if(selected)json_object_object_add(event,"account_id",json_object_new_string(selected));
+        J *traffic=json_object_new_object();
+        json_object_object_add(traffic,"phase",json_object_new_string(before?"started":selection?"selected":"completed"));
+        traffic_string(traffic,"caller",identity);traffic_string(traffic,"account_id",account);
+        const char *traffic_meta_keys[]={"selection_id","session","parent_session"};
+        for(int i=4;i<7;i++){J *value=decode(meta[i]);traffic_string(traffic,traffic_meta_keys[i-4],value);json_object_put(value);}
+        const char *traffic_root_keys[]={"trace_id","model","started_at","completed_at"};
+        for(int i=10;i<14;i++){J *value=decode(root[i]);traffic_string(traffic,traffic_root_keys[i-10],value);json_object_put(value);}
+        if(completion){J *outcome=decode(root[8]),*status=decode(root[9]);traffic_string(traffic,"status",outcome);if(json_object_get_int(status)>=100&&json_object_get_int(status)<=599)json_object_object_add(traffic,"http_status",json_object_new_int(json_object_get_int(status)));json_object_put(outcome);json_object_put(status);}
+        json_object_object_add(event,"traffic",traffic);
         enqueue(event);
         json_object_put(event);
         goto done;

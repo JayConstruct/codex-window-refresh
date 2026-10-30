@@ -12,6 +12,8 @@ import re
 import subprocess
 import tarfile
 
+from package_docs import render_document
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("packaging", ROOT / "scripts/package-release.py")
 packaging = importlib.util.module_from_spec(spec)
@@ -63,7 +65,7 @@ def main():
                 platform="linux", architecture=arch, host_abi=1, rpc_schema=6,
                 protocol_version=1, minimum_glibc_symbols=glibc,
                 go_version=packaging.command("go", "version"), model_execution=True,
-                wake=True, wake_providers=["codex"], scheduling=True, earned_reset_cards=True, database_schema=11,
+                wake=True, wake_providers=["codex"], scheduling=True, earned_reset_cards=True, database_schema=12,
                 prompt_generation=True, model_settings=True,
                 prompt_generation_providers=["codex", "antigravity"],
                 editable_generation_prompt=True,
@@ -73,12 +75,16 @@ def main():
         "window-refreshd": (daemon.read_bytes(), 0o755),
         "BUILD-INFO.json": ((json.dumps(info, indent=2) + "\n").encode(), 0o644),
     }
-    for name, source in {"install-v2.py": "scripts/install-v2.py", "install.py": "scripts/install.py",
-                         "INSTALL.md": "docs/backend-v2-install.md", "PROTOTYPE.md": "docs/backend-v2-prototype.md",
-                         "ACCOUNT-SCHEDULING.md": "docs/account-scheduling.md", "cwr-codex.py": "scripts/cwr-codex.py",
-                         "install-client.sh": "scripts/install-client.sh",
-                         "NOTICE": "native/bridge/NOTICE", "LICENSE.upstream": "third_party/cliproxyapi-reference/LICENSE"}.items():
-        members[name] = ((ROOT / source).read_bytes(), 0o644)
+    sources = {
+        "install-v2.py": "scripts/install-v2.py", "install.py": "scripts/install.py",
+        "INSTALL.md": "docs/user/install.md", "PROTOTYPE.md": "docs/development/architecture.md",
+        "ACCOUNT-SCHEDULING.md": "docs/user/account-scheduling.md", "cwr-codex.py": "scripts/cwr-codex.py",
+        "install-client.sh": "scripts/install-client.sh", "NOTICE": "native/bridge/NOTICE",
+        "LICENSE.upstream": "third_party/cliproxyapi-reference/LICENSE",
+    }
+    for name, source in sources.items():
+        content = render_document(ROOT, source, sources, commit) if source.endswith(".md") else (ROOT / source).read_bytes()
+        members[name] = (content, 0o644)
     output = pathlib.Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     name = f"codex-window-refresh-v2_{version}_linux_{arch}"

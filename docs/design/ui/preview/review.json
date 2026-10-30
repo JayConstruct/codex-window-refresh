@@ -1,0 +1,244 @@
+{
+  "viewport": {
+    "width": 1586,
+    "height": 992
+  },
+  "layouts": [
+    {
+      "name": "overview.png",
+      "page": "overview",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "accounts.png",
+      "page": "accounts",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "query.png",
+      "page": "query",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "wake.png",
+      "page": "wake",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "cards.png",
+      "page": "cards",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "models.png",
+      "page": "models",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "scheduling.png",
+      "page": "scheduling",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "diagnostics.png",
+      "page": "diagnostics",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "records-users.png",
+      "page": "history",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "records-plugin.png",
+      "page": "history",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "records-analysis.png",
+      "page": "history",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "records-tasks.png",
+      "page": "history",
+      "width": 1586,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "mobile-overview.png",
+      "page": "overview",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "mobile-accounts.png",
+      "page": "accounts",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "mobile-query.png",
+      "page": "query",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "mobile-wake.png",
+      "page": "wake",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "mobile-cards.png",
+      "page": "cards",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "mobile-models.png",
+      "page": "models",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "mobile-scheduling.png",
+      "page": "scheduling",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": false
+    },
+    {
+      "name": "mobile-diagnostics.png",
+      "page": "diagnostics",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "mobile-history.png",
+      "page": "history",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "mobile-records-plugin.png",
+      "page": "history",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "mobile-records-analysis.png",
+      "page": "history",
+      "width": 390,
+      "overflow": false,
+      "theme": "light",
+      "refreshVisible": true
+    },
+    {
+      "name": "white-overview.png",
+      "page": "overview",
+      "width": 1586,
+      "overflow": false,
+      "theme": "white",
+      "refreshVisible": false
+    },
+    {
+      "name": "white-models.png",
+      "page": "models",
+      "width": 1586,
+      "overflow": false,
+      "theme": "white",
+      "refreshVisible": false
+    },
+    {
+      "name": "white-history.png",
+      "page": "history",
+      "width": 1586,
+      "overflow": false,
+      "theme": "white",
+      "refreshVisible": true
+    },
+    {
+      "name": "dark-overview.png",
+      "page": "overview",
+      "width": 1586,
+      "overflow": false,
+      "theme": "dark",
+      "refreshVisible": false
+    },
+    {
+      "name": "dark-models.png",
+      "page": "models",
+      "width": 1586,
+      "overflow": false,
+      "theme": "dark",
+      "refreshVisible": false
+    },
+    {
+      "name": "dark-history.png",
+      "page": "history",
+      "width": 1586,
+      "overflow": false,
+      "theme": "dark",
+      "refreshVisible": true
+    }
+  ],
+  "exceptions": [],
+  "pageErrors": [],
+  "posts": 0,
+  "patches": 0
+}

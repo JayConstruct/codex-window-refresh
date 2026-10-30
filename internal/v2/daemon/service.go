@@ -30,6 +30,15 @@ var javascript []byte
 //go:embed web/panel.css
 var stylesheet []byte
 
+//go:embed web/records.js
+var recordsJavascript []byte
+
+//go:embed web/records.css
+var recordsStylesheet []byte
+
+//go:embed web/presentation.js
+var presentationJavascript []byte
+
 type Options struct {
 	QueryConcurrency     int
 	QueryTimeout         time.Duration
@@ -285,6 +294,12 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			data, kind = html, "text/html; charset=utf-8"
 		case "/ui/panel.js":
 			data, kind = javascript, "text/javascript; charset=utf-8"
+		case "/ui/records.js":
+			data, kind = recordsJavascript, "text/javascript; charset=utf-8"
+		case "/ui/records.css":
+			data, kind = recordsStylesheet, "text/css; charset=utf-8"
+		case "/ui/presentation.js":
+			data, kind = presentationJavascript, "text/javascript; charset=utf-8"
 		case "/ui/panel.css":
 			data, kind = stylesheet, "text/css; charset=utf-8"
 		}
@@ -309,7 +324,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 503, "storage_unavailable")
 			return
 		}
-		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]any{"quota_query": true, "model_execution": s.wakeSupported(), "wake_settings": true, "automatic_wake": s.wakeSupported(), "prompt_generation": s.generationSupported(), "editable_generation_prompt": s.editableGenerationPrompt(), "generation_accounts": s.generationAccountsSupported(), "prompt_generation_providers": s.generationProviders(), "model_settings": true, "account_models": s.accountModelsSupported(), "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+		writeJSON(w, 200, map[string]any{"version": version.Version, "instance_id": s.instance, "view_revision": view.Revision, "accounts_revision": view.AccountsRevision, "activity": view.Activity, "inventory": view.Inventory, "dashboard": view.Dashboard, "query_settings": view.QuerySettings, "protocol_version": 1, "read_only": true, "schema_version": 12, "query_timeout_seconds": s.options.QueryTimeout.Seconds(), "query_concurrency": s.options.QueryConcurrency, "last_error": s.lastError(), "capabilities": map[string]any{"traffic_records": true, "traffic_analysis": true, "quota_query": true, "model_execution": s.wakeSupported(), "wake_settings": true, "automatic_wake": s.wakeSupported(), "prompt_generation": s.generationSupported(), "editable_generation_prompt": s.editableGenerationPrompt(), "generation_accounts": s.generationAccountsSupported(), "prompt_generation_providers": s.generationProviders(), "model_settings": true, "account_models": s.accountModelsSupported(), "activity_tracking": true, "passive_quota": true, "inventory_sync": s.options.RequestInventorySync != nil, "query_settings": true, "automatic_quota_query": true, "randomized_quota_query": true}, "retention": map[string]any{"history_seconds": s.options.Retention.HistoryAge.Seconds(), "terminal_jobs": s.options.Retention.TerminalJobs, "idempotency_seconds": 30 * 24 * 60 * 60}})
+	case "GET /api/v2/traffic":
+		s.traffic(w, r)
 	case "GET /api/v2/task-history":
 		s.taskHistory(w, r)
 	case "GET /api/v2/wake-settings", "POST /api/v2/wake-settings":
@@ -382,9 +399,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch status {
-		case "", "all", "available", "disabled", "unavailable", "attention", "quota_exhausted", "quota_restricted":
+		case "", "all", "available", "disabled", "unavailable", "attention", "quota_exhausted", "quota_restricted", "usable", "quota_unknown":
 		default:
 			apiError(w, 400, "invalid_status")
+			return
+		}
+		order := r.URL.Query().Get("sort")
+		switch order {
+		case "", "default", "name", "five_hour", "weekly", "attention":
+		default:
+			apiError(w, 400, "invalid_sort")
 			return
 		}
 		limit := 100
@@ -409,7 +433,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			apiError(w, 400, "revision_required")
 			return
 		}
-		page, err := s.Store.AccountPageFiltered(r.Context(), r.URL.Query().Get("after"), limit, expected, search, status)
+		page, err := s.Store.AccountPageSorted(r.Context(), r.URL.Query().Get("after"), limit, expected, search, status, order)
 		if err != nil {
 			status := 503
 			if errors.Is(err, store.ErrViewChanged) {

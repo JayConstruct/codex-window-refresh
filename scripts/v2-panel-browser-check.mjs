@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {trafficFixture} from './fixtures/v2-traffic.mjs';
 import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
 import {readFile, writeFile, mkdir, mkdtemp, rm, access} from 'node:fs/promises';
@@ -49,6 +50,23 @@ const accounts = Array.from({length: 24}, (_, index) => {
       five_hour: {State: 'active', Remaining: {Value: percent, Unit: 'percent'}, ResetAt: later(4320), ConfirmedAt: observed()},
       weekly: {State: 'active', Remaining: {Value: [67, 91, 58, 34, 0, 12][index] ?? 67, Unit: 'percent'}, ResetAt: later(201600), ConfirmedAt: observed()}}};
 });
+if (process.env.CWR_DESIGN_REVIEW === '1') {
+  accounts.splice(18);
+  for (const [index, account] of accounts.entries()) {
+    account.status = [5,17].includes(index) ? 'disabled' : 'available';
+    if(index===4){account.quota=undefined;account.observed_at=later(-720);continue;}
+    account.quota.permission='allowed';
+    account.quota.five_hour.Remaining.Value=[64,28,0,91][index]??72;
+    account.quota.weekly.Remaining.Value=[82,74,43,0][index]??67;
+    if(index===16)account.quota.five_hour.Remaining.Value=0;
+    account.pending_query=undefined;
+  }
+  modelConfig={...modelConfig,default_model:'gpt-5-codex',default_prompt:'请用一句话解释一个编程概念。',phrases:['解释什么是幂等。','给出一个二分查找的使用场景。','用一句话说明依赖注入。','如何判断一个函数是否有副作用？']};
+  queryConfig.excluded_hours=['23:00-08:00']; wakeCapable=true;
+  schedulingConfig={...schedulingConfig,subagent_affinity:true,rebind_on:'quota',projects:[{project:'backend',name:'后端服务',accounts:['codex-01','codex-02'],directories:[]},{project:'review',name:'代码审查',accounts:['codex-02'],directories:[]},{project:'lab',name:'实验项目',accounts:['codex-03','codex-04','codex-05'],directories:[]}]};
+  observedProjects=[{project:'dir-'+'a'.repeat(64),name:'api-service',first_seen:observed(),last_seen:observed()},{project:'dir-'+'b'.repeat(64),name:'web-console',first_seen:later(-600),last_seen:later(-600)}];
+  resetCardsFixture={accounts:[{account_id:'codex-01',credits:{availableCount:1,credits:[{id:'rc-preview-A3',status:'available',resetType:'rateLimit',expiresAt:Math.floor(Date.now()/1000)+64800}]},observed_at:observed(),summary_observed_at:observed(),details_observed_at:observed()},{account_id:'codex-02',credits:{availableCount:2,credits:[]},observed_at:observed(),summary_observed_at:observed(),details_observed_at:observed()}],attempts:[{id:'reset-preview-1',account_id:'codex-01',credit_id:'rc-preview-K2',phase:'completed',outcome:'reset',created_at:observed(),updated_at:observed()}]};
+}
 const authFiles = accounts.map((account, index) => ({id: account.id, name: index === 0 ? 'real+primary.codex.json' : account.id + '.json',
   provider: 'codex', source: 'memory', auth_index: 'fixture-index-' + index, disabled: account.status === 'disabled', runtime_only: index === 2,
   ...(index === 3 ? {plugin_virtual_child: true} : {}), status: account.status === 'disabled' ? 'disabled' : 'active'}));
@@ -75,6 +93,15 @@ for (const [index, phase, reason] of [[0, 'unknown', 'weekly_reset'], [1, 'compl
   const jobID = 'persisted-wake-' + index, stamp = later(-1800 - index * 3600);
   wakeJobs.set(jobID, {job_id: jobID, account_id: 'persisted-wake-account-' + index, phase, reason, model: ['unknown', 'completed'].includes(phase) ? 'fixture-recorded-model' : '', created_at: stamp, updated_at: stamp,
     error_code: phase === 'unknown' ? 'wake_outcome_unknown' : phase === 'completed' ? 'window_verified' : '', hold_reason: phase === 'unknown' ? 'verification_pending' : '', response: phase === 'unknown' ? responseRecord : undefined});
+}
+// Keep the review-only overview sample small; regression fixtures retain all states.
+if (process.env.CWR_DESIGN_REVIEW === '1') {
+  fixtureJobs.splice(1, 1);
+  const batch = fixtureJobs.find(job => job.id === 'fixture-bulk');
+  Object.assign(batch, {total: accounts.length, waiting: accounts.length - 1});
+  Object.assign(jobs.get(batch.id), {total: batch.total, waiting: batch.waiting});
+  for (const id of jobs.keys()) if (!['fixture-running', 'fixture-bulk'].includes(id)) jobs.delete(id);
+  for (const id of wakeJobs.keys()) if (id !== 'persisted-wake-0') wakeJobs.delete(id);
 }
 const identity = () => ({instance_id: 'local-browser-fixture', view_revision: revision});
 function taskHistory(parameters) {
@@ -147,7 +174,7 @@ try {
       const url = new URL(request.url, 'http://127.0.0.1');
       if (url.pathname.startsWith('/other-cpa/')) url.pathname = '/cpa/' + url.pathname.slice('/other-cpa/'.length);
       if (url.pathname.startsWith(base)) {
-        const name = url.pathname.slice(base.length), filenames = {status: 'index.html', 'panel.js': 'panel.js', 'panel.css': 'panel.css'};
+        const name = url.pathname.slice(base.length), filenames = {status: 'index.html', 'panel.js': 'panel.js', 'panel.css': 'panel.css', 'records.js': 'records.js', 'records.css': 'records.css', 'presentation.js': 'presentation.js'};
         if (!filenames[name]) { response.writeHead(404); response.end(); return; }
         response.writeHead(200, {'Content-Type': name === 'status' ? 'text/html; charset=utf-8' : name.endsWith('.js') ? 'text/javascript' : 'text/css',
           'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"});
@@ -193,6 +220,7 @@ try {
       if (!url.pathname.startsWith(api)) { response.writeHead(404); response.end(); return; }
       if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
       const resource = url.pathname.slice(api.length);
+      if (resource === 'traffic' && request.method === 'GET') { json(response, 200, trafficFixture(url, identity)); return; }
       if (request.method === 'POST') {
         let body = ''; for await (const chunk of request) body += chunk;
         posts.push({resource, body, headers: request.headers});
@@ -309,10 +337,10 @@ try {
         json(response, 200, settings()); return;
       }
       if (resource === 'overview') {
-        json(response, 200, {...identity(), version: '0.2.0-rc.4', accounts_revision: accountsRevision, query_settings: {revision: settingsRevision, config: queryConfig}, read_only: true, query_concurrency: 8,
+        json(response, 200, {...identity(), version: '0.2.0-rc.27', schema_version:12, query_timeout_seconds:15, retention:{history_seconds:604800,terminal_jobs:10000}, accounts_revision: accountsRevision, query_settings: {revision: settingsRevision, config: queryConfig}, read_only: true, query_concurrency: 8,
           capabilities: {quota_query: true, passive_quota: true, model_execution: wakeCapable, wake_settings: wakeCapable, automatic_wake: wakeCapable, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true, generation_accounts: true, prompt_generation_providers: ['codex', 'antigravity'], editable_generation_prompt: true}, activity: {connected: true},
-          inventory: {status: 'ready', last_success_at: overviewObservedAt}, dashboard: {total: 24, available: 20, disabled: 2, unavailable: 2, capacity: 16, unknown_quota: 4, errors: 2,
-            tasks: {active: 3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
+          inventory: {status: 'ready', last_success_at: overviewObservedAt}, dashboard: {total: process.env.CWR_DESIGN_REVIEW==='1'?18:24, enabled:process.env.CWR_DESIGN_REVIEW==='1'?16:22, available: process.env.CWR_DESIGN_REVIEW==='1'?16:20, disabled: 2, unavailable: 2, capacity: process.env.CWR_DESIGN_REVIEW==='1'?12:16, unknown_quota: 4, unknown_enabled:process.env.CWR_DESIGN_REVIEW==='1'?1:2,quota_exhausted:process.env.CWR_DESIGN_REVIEW==='1'?3:2,five_hour_exhausted:process.env.CWR_DESIGN_REVIEW==='1'?2:1,weekly_exhausted:1,errors: 2,
+            tasks: {active: process.env.CWR_DESIGN_REVIEW==='1'?2:3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
             recent_events: [{kind: 'quota_query', at: overviewObservedAt, account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: overviewObservedAt, account_id: '', phase: 'queued'}, {kind: 'inventory', at: overviewObservedAt, phase: 'ready'}]}}); return;
       }
       if (resource === 'jobs') {
@@ -437,8 +465,8 @@ try {
     const writeCount = posts.length, patchCount = patches.length;
     await evaluate('document.querySelector("[data-page=scheduling]").click()');
     await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Scheduling did not load');
-    await evaluate('document.getElementById("cards-force").value="90000";document.getElementById("scheduling-form").requestSubmit()');
-    assert.equal(await evaluate('!document.getElementById("scheduling-validation").hidden && document.getElementById("cards-advanced").open && document.activeElement.id==="cards-force"'), true, 'Invalid advanced settings were not revealed and focused');
+    await evaluate('document.querySelector("[data-page=cards]").click();document.getElementById("cards-force").value="90000";document.getElementById("scheduling-form").requestSubmit()');
+    assert.equal(await evaluate('!document.getElementById("scheduling-validation").hidden && !document.querySelector("[data-view=cards]").hidden && document.activeElement.id==="cards-force"'), true, 'Invalid advanced settings were not revealed and focused');
     assert.equal(posts.length, writeCount, 'Invalid configuration reached the backend');
     await evaluate('document.getElementById("scheduling-reload").click()');
     await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled && document.getElementById("cards-force").value==="1800"'), 'Draft discard did not finish');
@@ -462,7 +490,7 @@ try {
     assert.equal(await evaluate('resetDetail.isConnected && resetDetail.open && document.activeElement===resetSummary'), true, 'Reset polling replaced expanded details');
     for (const width of [1586, 768, 390, 320]) {
       await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
-      await evaluate('document.getElementById("routing-text-editor").open=true');
+      await evaluate('document.querySelector("[data-page=scheduling]").click();document.getElementById("routing-text-editor").open=true');
       const layout = await evaluate('(()=>{const f=document.getElementById("scheduling-fields"),t=document.getElementById("routing-projects");return {overflow:document.documentElement.scrollWidth>innerWidth,border:getComputedStyle(f).borderWidth,textarea:t.clientWidth,parent:t.parentElement.clientWidth}})()');
       assert.equal(layout.overflow, false, 'Scheduling overflow at ' + width);
       assert.equal(layout.border, '0px', 'Scheduling kept the browser fieldset border');
@@ -476,7 +504,7 @@ try {
       const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: true, clip});
       await mkdir(output, {recursive: true}); await writeFile(join(output, 'scheduling-review-' + width + '.png'), Buffer.from(capture.data, 'base64'));
     }
-    await evaluate('document.getElementById("reset-next").click()');
+    await evaluate('document.querySelector("[data-page=cards]").click();document.getElementById("reset-next").click()');
     assert.equal(await evaluate('document.getElementById("reset-cards-list").children.length'), 2);
     await evaluate('document.getElementById("reset-search").value="credit-11";document.getElementById("reset-search").dispatchEvent(new Event("input"))');
     assert.equal(await evaluate('document.getElementById("reset-cards-list").children.length'), 1);
@@ -522,12 +550,12 @@ try {
     await cdp('DOM.setFileInputFiles',{nodeId:file.nodeId,files:[mapFile]});
     await waitFor(()=>evaluate('document.querySelectorAll("#routing-project-list .routing-project").length===2'),'Directory map import did not produce project rows');
     assert.equal(posts.length,0,'Directory import automatically saved');
-    await evaluate('document.querySelector("#routing-account-list .routing-account button").click()');
+    await evaluate('document.querySelector("#routing-account-list .routing-account input[type=checkbox]").click()');
     await evaluate('document.querySelectorAll("#routing-project-list .routing-project")[1].querySelector("button").click()');
-    await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[1].querySelector("button").click()');
-    assert.equal(await evaluate('document.querySelectorAll("#routing-project-list .routing-account-chip").length'),2);
-    assert.equal(await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[4].querySelector("button").disabled'),true,'Disabled account could be added');
-    await evaluate('document.querySelectorAll("#routing-project-list .routing-project")[0].querySelector("button").click();globalThis.directoryEditor=document.querySelector("#routing-project-list textarea");directoryEditor.value+="\\n";directoryEditor.dispatchEvent(new Event("input",{bubbles:true}));directoryEditor.focus();directoryEditor.setSelectionRange(directoryEditor.value.length,directoryEditor.value.length)');
+    await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[1].querySelector("input[type=checkbox]").click()');
+    assert.equal(await evaluate('Array.from(document.querySelectorAll("#routing-project-list .routing-project"),row=>row.textContent.includes("1 个首选账号")).filter(Boolean).length'),2, await evaluate('JSON.stringify({projects:document.getElementById("routing-project-list").textContent,editor:document.getElementById("routing-project-editor").textContent,checked:document.querySelector("#routing-account-list input").checked,text:document.getElementById("routing-projects").value})'));
+    assert.equal(await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[4].querySelector("input[type=checkbox]").disabled'),true,'Disabled account could be added');
+    await evaluate('document.querySelectorAll("#routing-project-list .routing-project")[0].querySelector("button").click();globalThis.directoryEditor=document.querySelector("#routing-project-editor textarea");directoryEditor.closest("details").open=true;directoryEditor.value+="\\n";directoryEditor.dispatchEvent(new Event("input",{bubbles:true}));directoryEditor.focus();directoryEditor.setSelectionRange(directoryEditor.value.length,directoryEditor.value.length)');
     await evaluate('document.getElementById("routing-accounts-refresh").click()'); await settleRefresh();
     const directoryState = await evaluate('({connected:directoryEditor.isConnected,value:directoryEditor.value,focus:document.activeElement===directoryEditor,active:document.activeElement.id})');
     assert.equal(directoryState.connected && directoryState.value.endsWith('\n') && directoryState.focus,true,'Account refresh lost directory input/newline/focus: '+JSON.stringify(directoryState));
@@ -549,7 +577,7 @@ try {
     await waitFor(async()=>{try{downloaded=JSON.parse(await readFile(join(output,'projects.json'),'utf8'));return true;}catch{return false;}},'Directory mapping did not download');
     assert.deepEqual(downloaded.projects,[{directory:'/work/project-a',project:'project-a'},{directory:'C:\\Work\\ProjectA',project:'project-a'},{directory:'/work/project-b',project:'project-b'}]);
     await evaluate('document.getElementById("display-mode").value="masked";document.getElementById("display-mode").dispatchEvent(new Event("change"))');
-    assert.equal(await evaluate('document.getElementById("routing-account-list").textContent.includes("codex-01") || document.querySelector("#routing-project-list .routing-selected-accounts").textContent.includes("codex-01")'),false,'Matching account privacy failed');
+    assert.equal(await evaluate('document.getElementById("routing-account-list").textContent.includes("codex-01") || document.querySelector("#routing-project-editor").textContent.includes("codex-01")'),false,'Matching account privacy failed');
     await evaluate('document.getElementById("display-mode").value="original";document.getElementById("display-mode").dispatchEvent(new Event("change"))');
     observedProjects = Array.from({length:12}, (_,index) => ({project:'dir-'+index.toString(16).padStart(64,'0'),name:index===0?'商城后台':'client-repo-'+index,first_seen:observed(),last_seen:observed()}));
     await evaluate('document.getElementById("refresh").click()');
@@ -558,8 +586,8 @@ try {
     await evaluate('document.getElementById("routing-observed-next").click()');
     assert.equal(await evaluate('document.querySelectorAll("#routing-observed-list article").length'),2);
     await evaluate('document.getElementById("routing-observed-previous").click();document.querySelector("#routing-observed-list button").click()');
-    await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[2].querySelector("button").click()');
-    const alias = await evaluate('document.querySelectorAll("#routing-project-list input[id^=routing-project-alias-]")[2].id');
+    await evaluate('document.querySelectorAll("#routing-account-list .routing-account")[2].querySelector("input[type=checkbox]").click()');
+    const alias = await evaluate('document.querySelector("#routing-project-editor input[id^=routing-project-alias-]").id');
     await evaluate('document.getElementById('+JSON.stringify(alias)+').value="商城业务";document.getElementById('+JSON.stringify(alias)+').dispatchEvent(new Event("input",{bubbles:true}))');
     await evaluate('document.getElementById("refresh").click()'); await settleRefresh();
     assert.equal(await evaluate('document.getElementById('+JSON.stringify(alias)+').value'),'商城业务','Discovery refresh lost project alias draft');
@@ -673,7 +701,7 @@ try {
     await settleRefresh();
     await evaluate('(() => {document.querySelector("[data-account-alias-id=codex-01]").click();document.getElementById("account-alias-value").value="自动刷新主账号";document.getElementById("account-alias-save").click();const mode=document.getElementById("display-mode");mode.value="alias";mode.dispatchEvent(new Event("change"))})()');
     await naturalPolls();
-    await evaluate('document.querySelector("[data-account-status-id=codex-01]").focus()');
+    await evaluate('document.querySelector("[data-account-status-id=codex-01]").closest("details").open=true;document.querySelector("[data-account-status-id=codex-01]").focus()');
     await startMutationProbe(['accounts', 'tasks', 'recent-events', 'diagnostics-content']);
     await naturalPolls(2);
     const overviewBudget = await endMutationProbe('same-state overview + alias, two native polls');
@@ -683,7 +711,7 @@ try {
     await awaitExternalStatus();
     assert.ok(readCountFor('auth-files') > authBefore, 'Timer-driven refresh skipped the live CPA status directory');
     assert.equal(revision, stableRevision); assert.equal(accountsRevision, stableAccountsRevision);
-    assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), '自动刷新主账号', 'Polling lost the privacy-safe alias');
+    assert.equal(await evaluate('document.querySelector("#accounts .account-identity").textContent'), '自动刷新主账号', 'Polling lost the privacy-safe alias');
     await screenshot('autorefresh-external-cpa-status.png');
     console.log('Autorefresh external CPA change passed without accounts/view revision changes or manual refresh.');
 
@@ -741,7 +769,7 @@ try {
     await new Promise(resolve => setTimeout(resolve, 1800));
     assert.ok(readCountFor('overview') - mergedSettled <= 1, 'Resume events stacked polling timers');
 
-    await evaluate('document.querySelector("[data-page=history]").click()');
+    await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
     await settleRefresh();
     const accountsGate = gate(), historyBeforeGate = readCountFor('task-history');
     resourceReadGates.set('accounts', accountsGate); revision++; accountsRevision++;
@@ -803,15 +831,68 @@ try {
   }
   await cdp('Page.enable'); await cdp('Runtime.enable'); await cdp('Log.enable'); await cdp('Network.enable');
   await cdp('Page.addScriptToEvaluateOnNewDocument', {source: `localStorage.setItem('cli-proxy-auth', JSON.stringify({state:{managementKey:${JSON.stringify(fixtureKey)},apiBase:location.origin+(location.pathname.startsWith('/other-cpa/')?'/other-cpa':'/cpa')}}));`});
+  if (process.env.CWR_DESIGN_REVIEW === '1') await cdp('Page.addScriptToEvaluateOnNewDocument', {source:`localStorage.setItem('cwr-v2-display:'+location.origin+'/cpa',JSON.stringify({version:1,mode:'alias',aliases:{'codex-01':'研发主账号','codex-02':'代码审查','codex-03':'备用账号 A','codex-04':'周期备用','codex-05':'备用账号 B','codex-06':'测试账号','codex-07':'日常开发'}}));`});
   await cdp('Emulation.setDeviceMetricsOverride', {width: 1586, height: 992, deviceScaleFactor: 1, mobile: false});
   await cdp('Page.navigate', {url: origin + base + 'status'});
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
   await evaluate('document.fonts.ready.then(() => true)');
   checks: {
+  if (process.env.CWR_DESIGN_REVIEW === '1') {
+    const layouts = [];
+    async function captureDesign(name) {
+      await evaluate('scrollTo(0,0)');
+      const layout = await evaluate(`({page:document.body.dataset.page,width:innerWidth,overflow:document.documentElement.scrollWidth>innerWidth,theme:document.documentElement.dataset.theme,refreshVisible:getComputedStyle(document.getElementById('refresh')).display!=='none'&&getComputedStyle(document.getElementById('refresh').parentElement).display!=='none'})`);
+      assert.equal(layout.overflow, false, 'Design page overflow: ' + name);
+      if (layout.page === 'history') assert.equal(layout.refreshVisible, true, 'Records refresh hidden: ' + name);
+      layouts.push({name,...layout}); await screenshot(name);
+    }
+    await evaluate(`localStorage.setItem('cli-proxy-theme',JSON.stringify({state:{theme:'light'},version:0}));dispatchEvent(new StorageEvent('storage',{key:'cli-proxy-theme'}))`);
+    await captureDesign('overview.png');
+    for (const page of ['accounts','query','wake','cards','models','scheduling','diagnostics']) {
+      await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
+      await new Promise(resolve=>setTimeout(resolve,800));
+      if(page==='accounts') await evaluate(`document.querySelector('.account-identity')?.click()`);
+      await captureDesign(page+'.png');
+    }
+    await evaluate(`document.querySelector('[data-page="history"]').click()`);
+    for(const page of ['users','plugin','analysis','tasks']) {
+      await evaluate(`document.querySelector('[data-record-page="${page}"]').click()`);
+      await new Promise(resolve=>setTimeout(resolve,600));
+      if (['users','plugin'].includes(page)) {
+        await evaluate(`document.querySelector('.rr-table tbody tr[tabindex="0"]')?.click()`);
+        await new Promise(resolve=>setTimeout(resolve,150));
+      }
+      await captureDesign('records-'+page+'.png');
+    }
+    await cdp('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+    for (const page of ['overview','accounts','query','wake','cards','models','scheduling','diagnostics','history']) {
+      await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
+      await new Promise(resolve=>setTimeout(resolve,350));
+      if(page==='history') await evaluate(`document.querySelector('[data-record-page="users"]').click()`);
+      await captureDesign('mobile-'+page+'.png');
+    }
+    for (const page of ['plugin','analysis']) {
+      await evaluate(`document.querySelector('[data-record-page="${page}"]').click()`);
+      await new Promise(resolve=>setTimeout(resolve,300)); await captureDesign('mobile-records-'+page+'.png');
+    }
+    await cdp('Emulation.setDeviceMetricsOverride', {width:1586,height:992,deviceScaleFactor:1,mobile:false});
+    for (const theme of ['white','dark']) {
+      await evaluate(`localStorage.setItem('cli-proxy-theme',JSON.stringify({state:{theme:'${theme}'},version:0}));dispatchEvent(new StorageEvent('storage',{key:'cli-proxy-theme'}))`);
+      for (const page of ['overview','models','history']) {
+        await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
+        await new Promise(resolve=>setTimeout(resolve,350)); await captureDesign(theme+'-'+page+'.png');
+      }
+    }
+    assert.equal(exceptions.length,0,JSON.stringify(exceptions)); assert.equal(pageErrors.length,0,JSON.stringify(pageErrors));
+    assert.equal(posts.length,0,'Design preview dispatched an upstream task'); assert.equal(patches.length,0,'Design preview changed CPA state');
+    await writeFile(join(output,'review.json'),JSON.stringify({viewport:{width:1586,height:992},layouts,exceptions,pageErrors,posts:posts.length,patches:patches.length},null,2));
+    console.log('DESIGN_REVIEW '+JSON.stringify({pages:layouts.length,exceptions,pageErrors,output}));
+    break checks;
+  }
   if (projectsOnly) { await runProjectMatchingChecks(); break checks; }
   if (schedulingOnly) { await runSchedulingChecks(); break checks; }
   if (autorefreshOnly) {
-    await evaluate('document.querySelector("[data-account-status-id=codex-01]").click()');
+    await evaluate('document.querySelector("[data-account-status-id=codex-01]").closest("details").open=true;document.querySelector("[data-account-status-id=codex-01]").click()');
     await waitFor(() => evaluate('document.querySelector("[data-account-status-id=codex-01]").dataset.state==="confirmed"'), 'Explicit fixture-only setup PATCH did not reach confirmed');
     assert.equal(patches.length, 1, 'Fixture setup must PATCH exactly once after explicit confirmation');
     await assertForegroundPollingCadence();
@@ -829,33 +910,62 @@ try {
     break checks;
   }
   assert.equal(await evaluate('document.getElementById("metric-total").textContent'), '24');
-  assert.equal(await evaluate('document.getElementById("metric-capacity").textContent'), '16 / 20');
+  assert.equal(await evaluate('document.getElementById("metric-capacity").textContent'), '16 / 22');
   assert.equal(posts.length, 0, 'Opening the page dispatched a write');
   assert.equal(await evaluate('document.querySelector("progress").value'), 82);
   assert.equal(await evaluate('document.getElementById("auto-wake").disabled'), true);
   assert.equal(await evaluate('document.getElementById("five-hour-query").disabled'), false);
   assert.match(await evaluate('document.getElementById("accounts").rows[0].textContent'), /等待查询 · 手动批量.*后计划查询/);
-  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector(".account-query").textContent'), '立即查询');
-  assert.match(await evaluate('Array.from(document.querySelectorAll("#tasks .task-item")).find(node=>node.textContent.includes("等待 23")).querySelector(".task-heading").textContent'), /查询中/);
-  assert.match(await evaluate('Array.from(document.querySelectorAll("#tasks .task-item")).find(node=>node.textContent.includes("处于排除时段")).textContent'), /等待查询.*已到计划时间/s);
+  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector(".account-query").textContent'), '查询');
+  await waitFor(() => evaluate('document.querySelectorAll("#tasks .overview-task-row").length===2'), 'Overview task preview did not load');
+  assert.match(await evaluate('document.getElementById("tasks").textContent'), /执行中/);
+  await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
+  await waitFor(() => evaluate(`!!document.querySelector('#history-list [data-render-key="query:fixture-bulk"] button')`), 'Batch task did not appear in history');
+  await evaluate(`document.querySelector('#history-list [data-render-key="query:fixture-bulk"] button').click()`);
+  await waitFor(() => evaluate('document.getElementById("history-detail-body").textContent.includes("等待 23")'), 'Batch task lost its waiting-account count');
+  assert.match(await evaluate('document.querySelector("#history-detail-body .task-heading").textContent'), /查询中/);
+  await evaluate(`document.querySelector('#history-list [data-render-key="query:fixture-waiting"] button').click()`);
+  await waitFor(() => evaluate('document.getElementById("history-detail-body").textContent.includes("处于排除时段")'), 'Excluded-hours task detail did not load');
+  assert.match(await evaluate('document.getElementById("history-detail-body").textContent'), /等待查询.*已到计划时间/s);
+  await evaluate('document.querySelector("[data-page=overview]").click()');
   assert.equal(await evaluate('document.body.textContent.includes("近期活跃用户")'), false);
   assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Desktop overflow');
   await screenshot('desktop.png');
-  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'true');
-  const mainBeforeCollapse = await evaluate('document.querySelector(".main-content").getBoundingClientRect().left');
-  await evaluate('document.getElementById("sidebar-toggle").click()');
-  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'false');
-  assert.equal(await evaluate('Math.round(document.getElementById("app-sidebar").getBoundingClientRect().width)'), 76);
-  assert.ok(await evaluate('document.querySelector(".main-content").getBoundingClientRect().left') < mainBeforeCollapse);
-  assert.equal(await evaluate('document.querySelector(".nav-item[data-page=models]").getAttribute("aria-label")'), '模型与提示词');
-  assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'Collapsed desktop overflow');
-  await screenshot('sidebar-collapsed.png');
+  async function assertHorizontalNavigation(width) {
+    await evaluate('scrollTo(0,0);new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+    const layout = await evaluate(`(() => {
+      const nav=document.getElementById('primary-navigation'), box=nav.getBoundingClientRect();
+      const items=Array.from(nav.querySelectorAll('.nav-item'),item=>item.getBoundingClientRect());
+      return {count:items.length,top:items.map(item=>item.top),itemsBottom:Math.max(...items.map(item=>item.bottom)),navBottom:box.bottom,mainTop:document.querySelector('.main-content').getBoundingClientRect().top,
+        visible:getComputedStyle(nav).display,scrollWidth:nav.scrollWidth,clientWidth:nav.clientWidth,
+        overflow:document.documentElement.scrollWidth>innerWidth,mainLeft:document.querySelector('.main-content').getBoundingClientRect().left};
+    })()`);
+    assert.equal(layout.count, 6);
+    assert.notEqual(layout.visible, 'none');
+    assert.ok(layout.top.every(top => Math.abs(top-layout.top[0])<1), 'Navigation wrapped or became vertical at '+width);
+    assert.ok(layout.mainTop >= layout.itemsBottom, 'Navigation is not above the page content: '+JSON.stringify(layout));
+    assert.equal(layout.mainLeft, 0, 'Old sidebar margin survived');
+    assert.equal(layout.overflow, false, 'Navigation overflowed the page at '+width);
+    if (width <= 768) assert.ok(layout.scrollWidth>=layout.clientWidth, 'Horizontal navigation lost its scroll container');
+  }
+  await assertHorizontalNavigation(1586);
+  await evaluate(`localStorage.setItem('cwr-v2-sidebar:/cpa/v0/management/codex-window-refresh/v2','true')`);
   await cdp('Page.reload');
-  await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length===6'), 'Reload did not reconnect after sidebar collapse');
-  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'false', 'Collapsed preference was not restored');
-  assert.equal(posts.length, 0, 'Collapsing or reloading sidebar dispatched a write');
-  await evaluate('document.getElementById("sidebar-toggle").click()');
-  assert.equal(await evaluate('document.getElementById("sidebar-toggle").getAttribute("aria-expanded")'), 'true');
+  await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length===6'), 'Reload did not reconnect');
+  await assertHorizontalNavigation(1586);
+  assert.equal(posts.length, 0, 'Navigation or reloading dispatched a write');
+  const storageBeforeTheme = await evaluate('JSON.stringify({...localStorage})');
+  for (const [theme,background] of [['light','rgb(250, 249, 245)'],['white','rgb(255, 255, 255)'],['dark','rgb(21, 20, 18)']]) {
+    await evaluate(`localStorage.setItem('cli-proxy-theme',JSON.stringify({state:{theme:${JSON.stringify(theme)}},version:0}));dispatchEvent(new StorageEvent('storage',{key:'cli-proxy-theme'}))`);
+    assert.equal(await evaluate('document.documentElement.dataset.theme'), theme);
+    assert.equal(await evaluate('getComputedStyle(document.documentElement).backgroundColor'), background);
+    const primaryBackground = theme === 'dark' ? 'rgb(232, 226, 217)' : 'rgb(45, 42, 38)';
+    await waitFor(() => evaluate('getComputedStyle(document.querySelector(".button-primary")).backgroundColor').then(color => color === primaryBackground), 'Theme button colors did not settle: ' + theme);
+    await screenshot('theme-'+theme+'-desktop.png');
+    assert.equal(posts.length, 0, 'Theme change dispatched a write');
+  }
+  await evaluate(`localStorage.removeItem('cli-proxy-theme');dispatchEvent(new StorageEvent('storage',{key:'cli-proxy-theme'}))`);
+  assert.equal(await evaluate('JSON.stringify({...localStorage})'), storageBeforeTheme, 'Theme following changed host storage');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 0, 'Overview fetched the generation directory before visiting models');
   for (const page of ['accounts', 'query', 'wake', 'scheduling', 'models', 'history', 'diagnostics', 'overview']) {
     await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
@@ -937,7 +1047,7 @@ try {
   await waitFor(() => evaluate('document.getElementById("settings-timezone").value==="Asia/Shanghai" && document.getElementById("settings-validation").hidden'), 'Supported timezone did not recover the editor');
   await evaluate('for(const [id,value] of [["settings-interval","90"],["settings-timezone","UTC"],["settings-delay-min","9"],["settings-delay-max","45"],["settings-excluded","01:00-02:00"]]){const field=document.getElementById(id);field.value=value;field.dispatchEvent(new Event("input"));}for(const id of ["settings-automatic","settings-five-hour","settings-weekly"]){const field=document.getElementById(id);field.checked=false;field.dispatchEvent(new Event("input"));}');
   const isolatedDraft = await editorDraft(), savedBeforeWeekly = structuredClone(queryConfig), revisionBeforeWeekly = settingsRevision;
-  assert.deepEqual(isolatedDraft.map(([id]) => id), ['settings-automatic', 'settings-five-hour', 'settings-weekly', 'settings-interval', 'settings-timezone', 'settings-delay-min', 'settings-delay-max', 'settings-excluded'], 'Draft snapshot omitted settings fields');
+  assert.deepEqual(isolatedDraft.map(([id]) => id).sort(), ['settings-automatic', 'settings-five-hour', 'settings-weekly', 'settings-interval', 'settings-interval-minutes', 'settings-timezone', 'settings-delay-min', 'settings-delay-max', 'settings-excluded'].sort(), 'Draft snapshot omitted settings fields');
   assert.equal(posts.filter(post => post.resource === 'settings').length, 3, 'Editor draft dispatched a write');
   await evaluate('document.querySelector("[data-page=overview]").click()');
   settingsPostGate = gate();
@@ -1044,8 +1154,8 @@ try {
   await waitFor(() => posts.filter(post => post.resource === 'jobs').length === 2, 'Batch query not dispatched');
   assert.deepEqual(JSON.parse(posts.filter(post => post.resource === 'jobs')[1].body), {kind: 'quota_query', account_id: ''});
   await waitFor(() => evaluate('document.getElementById("accounts").rows[0].textContent.includes("处于排除时段")'), 'Queue-only revision did not reload account pending state');
-  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector(".account-query").textContent'), '立即查询');
-  await evaluate('document.querySelector("[data-page=history]").click()');
+  assert.equal(await evaluate('document.getElementById("accounts").rows[0].querySelector(".account-query").textContent'), '查询');
+  await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
   await waitFor(() => evaluate(`!!document.querySelector('#history-list [data-render-key="query:fixture-bulk"] button')`), 'Persisted query history did not load');
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /处于排除时段/);
   assert.match(await evaluate('document.getElementById("history-list").textContent'), /手动批量/);
@@ -1072,15 +1182,15 @@ try {
   accountReadGate.release(); accountReadGate = undefined;
   await waitFor(() => evaluate('!document.getElementById("sync").disabled'), 'CPA sync did not finish');
   await clickWhenEnabled('next');
-  await waitFor(() => evaluate('document.getElementById("accounts-page-info").textContent === "7–12 / 24" && document.getElementById("accounts").rows[0]?.querySelector("strong")?.textContent === "codex-07"'), 'Next account page not displayed');
-  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll("#accounts .account-name strong"), node => node.textContent)'), accounts.slice(6, 12).map(account => account.id));
-  assert.ok(reads.some(path => path === api + 'accounts?limit=6&after=codex-06&revision=1'), 'Next page did not use the account cursor and revision');
+  await waitFor(() => evaluate('document.getElementById("accounts-page-info").textContent === "显示 7–12，共 24 个账号" && document.getElementById("accounts").rows[0]?.querySelector(".account-identity")?.textContent === "codex-07"'), async () => 'Next account page not displayed: ' + JSON.stringify({state:await evaluate('({page:document.getElementById("accounts-page-info").textContent,name:document.getElementById("accounts").rows[0]?.querySelector(".account-identity")?.textContent,disabled:document.getElementById("next").disabled})'),reads:reads.filter(path=>path.includes('/accounts?')).slice(-5)}));
+  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll("#accounts .account-identity"), node => node.textContent)'), accounts.slice(6, 12).map(account => account.id));
+  assert.ok(reads.some(path => {const url=new URL(path,'http://fixture');return url.pathname===api+'accounts'&&url.searchParams.get('limit')==='6'&&url.searchParams.get('after')==='codex-06'&&url.searchParams.get('revision')==='1';}), 'Next page did not use the account cursor and revision');
   await clickWhenEnabled('previous');
-  await waitFor(() => evaluate('document.getElementById("accounts-page-info").textContent === "1–6 / 24" && document.getElementById("accounts").rows[0]?.querySelector("strong")?.textContent === "codex-01"'), 'Previous account page not displayed');
-  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll("#accounts .account-name strong"), node => node.textContent)'), accounts.slice(0, 6).map(account => account.id));
+  await waitFor(() => evaluate('document.getElementById("accounts-page-info").textContent === "显示 1–6，共 24 个账号" && document.getElementById("accounts").rows[0]?.querySelector(".account-identity")?.textContent === "codex-01"'), 'Previous account page not displayed');
+  assert.deepEqual(await evaluate('Array.from(document.querySelectorAll("#accounts .account-identity"), node => node.textContent)'), accounts.slice(0, 6).map(account => account.id));
   await evaluate('document.getElementById("accounts-search").value="codex-24";document.getElementById("accounts-search").dispatchEvent(new Event("input"))');
   await waitFor(() => evaluate('document.getElementById("accounts").textContent.includes("codex-24") && document.getElementById("accounts").rows.length===1'), 'Full-pool search not applied');
-  assert.match(await evaluate('document.getElementById("accounts-page-info").textContent'), /1–1 \/ 1/);
+  assert.match(await evaluate('document.getElementById("accounts-page-info").textContent'), /显示 1–1，共 1 个账号/);
   await evaluate('document.getElementById("accounts-search").value="";document.getElementById("accounts-search").dispatchEvent(new Event("input"))');
   await waitFor(() => evaluate('document.getElementById("accounts").rows.length===6'), 'Search did not reset');
   accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
@@ -1093,15 +1203,15 @@ try {
   assert.equal(await evaluate('accountQueryButton.isConnected && document.activeElement===accountQueryButton'), true, 'Account refresh recreated the focused query button');
   const writesBeforeStatus = posts.length;
   accounts[0].status = 'disabled'; revision++; accountsRevision++;
-  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="手动禁用"'), 'Periodic host state did not update disabled badge');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="已禁用"'), 'Periodic host state did not update disabled badge');
   accounts[0].status = 'available'; accounts[0].quota.five_hour.Remaining.Value = 0; revision++; accountsRevision++;
-  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="额度耗尽"'), 'Quota evidence did not update exhausted badge');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge").textContent==="五小时耗尽"'), 'Quota evidence did not update exhausted badge');
   await evaluate('document.getElementById("accounts-filter").value="quota_exhausted";document.getElementById("accounts-filter").dispatchEvent(new Event("change"))');
   await waitFor(() => evaluate('document.getElementById("accounts").rows.length===1 && document.getElementById("accounts").rows[0].textContent.includes("codex-01")'), 'Exhausted status filter did not select the depleted account');
   accounts[0].quota.five_hour.Remaining.Value = 11; revision++; accountsRevision++;
   await waitFor(() => evaluate('document.getElementById("accounts").textContent.includes("没有符合条件的账号")'), 'Recovered quota remained in exhausted filter');
   await evaluate('document.getElementById("accounts-filter").value="all";document.getElementById("accounts-filter").dispatchEvent(new Event("change"))');
-  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge")?.textContent==="正常"'), 'Recovered quota did not restore normal badge');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[0].querySelector(".status-badge")?.textContent==="可用"'), 'Recovered quota did not restore normal badge');
   assert.equal(posts.length, writesBeforeStatus, 'Status polling issued an upstream query or model write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 1, 'Overview or quota actions refreshed the generation directory');
   await evaluate('document.querySelector("[data-page=models]").click()');
@@ -1241,10 +1351,10 @@ try {
   await evaluate('document.getElementById("wake-account").value="codex-01";document.getElementById("wake-account").dispatchEvent(new Event("input"));document.getElementById("wake-manual-consent").click()');
   await evaluate('document.querySelector("[data-page=overview]").click()');
   modelReadGate = gate();
-  await evaluate('document.querySelector("#accounts .account-wake").click()');
+  await evaluate('document.querySelector("#accounts .account-menu").open=true;document.querySelector("#accounts .account-wake").click()');
   await waitFor(() => modelReadGate.started, 'Immediate wake did not verify the saved model');
   assert.equal(await evaluate('document.querySelector("#accounts .account-wake").disabled'), true, 'Model verification did not lock duplicate wake clicks');
-  await evaluate('document.querySelector("#accounts .account-wake").click()');
+  await evaluate('document.querySelector("#accounts .account-menu").open=true;document.querySelector("#accounts .account-wake").click()');
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Wake bypassed saved model verification');
   assert.equal(await evaluate('!!document.querySelector("dialog[open]")'), false, 'Immediate wake opened a confirmation modal');
   modelReadGate.release(); modelReadGate = undefined;
@@ -1286,18 +1396,20 @@ try {
     await screenshot('wake-' + width + '.png');
     await evaluate('document.querySelector("[data-page=scheduling]").click()');
     await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Scheduling page did not load');
-    assert.equal(await evaluate('document.getElementById("reset-cards-list").textContent.includes("2 张，详情尚未读取")'), true, 'Quota reset summary was not shown');
+    await evaluate('document.querySelector("[data-page=cards]").click()');
+    assert.equal(await evaluate('!document.querySelector(".reset-records").hidden && document.getElementById("reset-cards-list").textContent.includes("2 张，详情尚未读取")'), true, 'Quota reset summary was not shown');
+    await evaluate('document.querySelector("[data-page=scheduling]").click()');
     assert.equal(await evaluate('document.getElementById("routing-subagent").checked'), true, 'Old settings did not default to child affinity');
     assert.equal(await evaluate('document.getElementById("routing-rebind").value'), 'quota', 'Old settings did not preserve temporary failover');
     assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'Scheduling layout overflow');
     await screenshot('scheduling-' + width + '.png');
+    await assertHorizontalNavigation(width);
     if (width === 390) {
-      await evaluate('document.getElementById("sidebar-toggle").click()');
-      assert.equal(await evaluate('getComputedStyle(document.getElementById("primary-navigation")).display'), 'none', 'Mobile navigation did not collapse');
-      assert.equal(await evaluate('document.documentElement.scrollWidth <= innerWidth'), true, 'Collapsed mobile overflow');
-      await screenshot('sidebar-collapsed-mobile.png');
-      await evaluate('document.getElementById("sidebar-toggle").click()');
-      assert.notEqual(await evaluate('getComputedStyle(document.getElementById("primary-navigation")).display'), 'none', 'Mobile navigation did not expand');
+      await evaluate('document.querySelector("#primary-navigation [data-page=diagnostics]").focus();new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
+      const focusedNav = await evaluate('(() => {const nav=document.getElementById("primary-navigation").getBoundingClientRect(),item=document.querySelector("#primary-navigation [data-page=diagnostics]").getBoundingClientRect();return {navLeft:nav.left,navRight:nav.right,itemLeft:item.left,itemRight:item.right};})()');
+      assert.ok(focusedNav.itemLeft>=focusedNav.navLeft-1&&focusedNav.itemRight<=focusedNav.navRight+1, 'Keyboard focus did not reveal the navigation item: '+JSON.stringify(focusedNav));
+      await screenshot('horizontal-navigation-mobile.png');
+      await evaluate('document.querySelector("#primary-navigation [data-page=overview]").focus()');
     }
     await evaluate('document.querySelector("[data-page=overview]").click()');
   }
@@ -1320,7 +1432,8 @@ try {
     const writesBeforeToast = posts.length;
     await evaluate(`(() => {
       document.querySelector('[data-page=query]').click();
-      const input = document.getElementById('account'); input.value = ''; input.focus();
+      document.getElementById('account').value = '';
+      document.getElementById('settings-excluded').focus();
       document.getElementById('query-single').onclick();
     })()`);
     const toast = await evaluate(`(() => {
@@ -1329,7 +1442,7 @@ try {
         inRegion: !!card.closest('#toast-region'), focus: document.activeElement.id,
         fits: box.left >= 0 && box.right <= innerWidth && box.top >= 0 && box.bottom <= innerHeight};
     })()`);
-    assert.deepEqual(toast, {visible: true, tone: 'error', role: 'alert', inRegion: true, focus: 'account', fits: true});
+    assert.deepEqual(toast, {visible: true, tone: 'error', role: 'alert', inRegion: true, focus: 'settings-excluded', fits: true});
     assert.equal(posts.length, writesBeforeToast, 'Displaying a validation toast wrote to the API');
     await screenshot('toast-error-' + width + '.png');
     await evaluate('document.getElementById("error").parentElement.querySelector(".toast-close").click()');
@@ -1375,11 +1488,11 @@ try {
       return {visible:!warning.hidden && box.width>0 && box.height>0, outside:!body.contains(warning), text:warning.textContent, fits:box.top>=0 && box.bottom<=innerHeight};
     })()`);
     assert.equal(state.visible && state.outside, true, 'Unknown warning must remain outside the scrollable detail body');
-    assert.match(state.text, /禁止.*(?:重复|重发)|不会.*重发/);
+    assert.match(state.text, /(?:禁止|请勿).*(?:重复|重发)|不会.*重发/);
     if (inViewport) assert.equal(state.fits, true, 'Unknown warning left the viewport while reading a long response');
   }
   const writesBeforeHistory = posts.length;
-  await evaluate('document.querySelector("[data-page=history]").click()');
+  await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
   await waitFor(() => evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false"'), 'Persisted history did not finish loading');
   assert.ok((await assertHistoryData()).total > 20, 'History fixture does not exercise real pagination');
   assert.deepEqual(await evaluate('Array.from(document.getElementById("history-trigger").options).map(option=>option.value).sort()'),
@@ -1561,7 +1674,7 @@ try {
   jobs.set(failureID, failureJob); fixtureJobs.unshift({...failureJob, items: undefined}); revision++;
   const writesBeforeDetails = posts.length;
   await evaluate('document.getElementById("refresh").onclick()');
-  await evaluate('document.querySelector("[data-page=history]").click()');
+  await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
   await waitFor(() => evaluate(`!!document.querySelector('#history-list [data-render-key="query:${failureID}"] button')`), 'Error summary did not expose details');
   await evaluate(`document.querySelector('#history-list [data-render-key="query:${failureID}"] button').click()`);
   await waitFor(() => evaluate('!!document.querySelector("#history-detail-body .task-errors")'), 'Per-account errors were not loaded');
@@ -1584,11 +1697,12 @@ try {
     return {checked:button?.getAttribute('aria-checked'),disabled:button?.disabled,phase:button?.dataset.state};
   })()`);
   async function assertAccountActionLayout(alias = '') {
+    await evaluate('document.querySelectorAll("#accounts .account-menu").forEach(menu=>menu.open=true)');
     const layout = await evaluate(`Array.from(document.querySelectorAll('#accounts .account-row'), row => {
       const rectangle=node=>{const box=node.getBoundingClientRect();return {width:box.width,height:box.height,top:box.top,bottom:box.bottom}};
-      const name=row.querySelector('.account-name strong'), style=getComputedStyle(name);
+      const name=row.querySelector('.account-identity'), style=getComputedStyle(name);
       return {row:rectangle(row),query:rectangle(row.querySelector('.account-query:not(.account-wake)')),
-        wake:rectangle(row.querySelector('.account-wake')),status:rectangle(row.querySelector('[data-account-status-id]')),
+        wake:rectangle(row.querySelector('.account-wake')),more:rectangle(row.querySelector('.account-more')),status:rectangle(row.querySelector('[data-account-status-id]')),
         pending:row.querySelector('.query-pending') ? {text:row.querySelector('.query-pending').textContent,...rectangle(row.querySelector('.query-pending'))} : null,
         alias:{...rectangle(name),text:name.textContent,title:name.title,whiteSpace:style.whiteSpace,overflow:style.overflow,textOverflow:style.textOverflow,scrollWidth:name.scrollWidth,clientWidth:name.clientWidth}};
     })`);
@@ -1599,8 +1713,8 @@ try {
       for (const action of ['query', 'wake', 'status']) {
         assert.ok(account[action].height >= 28 && account[action].height <= 40, 'Account action became stretched or too small (' + action + '): ' + detail);
       }
-      assert.ok(Math.abs(account.query.top - account.wake.top) <= 1, 'Query and wake buttons no longer share their first action row: ' + detail);
-      assert.ok(account.status.top >= Math.max(account.query.bottom, account.wake.bottom), 'CPA status switch must occupy a separate second action row: ' + detail);
+      assert.ok(Math.abs(account.query.top - account.more.top) <= 2, 'Query and menu no longer share their action row: ' + detail);
+      assert.ok(account.status.top >= account.wake.bottom, 'CPA status switch overlaps the wake action inside its menu: ' + detail);
       if (account.row.height > 140) await screenshot('account-action-row-too-tall-' + index + '.png');
       assert.ok(account.row.height <= 140, 'Account row became excessively tall: ' + detail);
     }
@@ -1613,10 +1727,11 @@ try {
       assert.equal(name.textOverflow, 'ellipsis', 'Long alias did not use an ellipsis');
       assert.ok(name.height <= 24 && name.scrollWidth > name.clientWidth, 'Long alias did not exercise single-line truncation: ' + JSON.stringify(name));
     }
+    await evaluate('document.querySelectorAll("#accounts .account-menu").forEach(menu=>menu.open=false)');
     return layout;
   }
   async function clickStatus(id = 'codex-01') {
-    await evaluate(`document.querySelector(${JSON.stringify(statusSelector(id))}).click()`);
+    await evaluate(`{const button=document.querySelector(${JSON.stringify(statusSelector(id))});button.closest("details").open=true;button.click()}`);
     assert.equal(await evaluate('!!document.querySelector("dialog[open]")'), false, 'CPA switch opened a confirmation modal');
   }
   async function verifyStatus() {
@@ -1641,7 +1756,7 @@ try {
   authPatchGate.release(); authPatchGate = undefined;
   await waitFor(async () => (await statusState()).phase === 'confirmed' && (await statusState()).checked === 'false', 'Disable was not GET-verified');
   assert.ok(reads.filter(path => path.endsWith('/auth-files')).length > beforeStatusCommitReads);
-  assert.equal(await evaluate('document.querySelector("#accounts .status-badge").textContent'), '手动禁用');
+  assert.equal(await evaluate('document.querySelector("#accounts .status-badge").textContent'), '已禁用');
   assert.equal(posts.length, writesBeforeCPAStatus);
   assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
   for (const outcome of ['disconnect', 'persist-hook-failed']) {
@@ -1698,7 +1813,7 @@ try {
   for (const [index, jobID] of skipIDs.entries()) wakeJobs.set(jobID, {job_id: jobID, account_id: 'codex-01', phase: 'skipped', reason: 'manual',
     created_at: observed(), updated_at: observed(), error_code: index ? 'window_already_active' : '', hold_reason: index ? '' : 'window_already_active'});
   revision++;
-  await evaluate('document.querySelector("[data-page=history]").click()');
+  await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
   await historyFilter('history-search', 'fixture-skipped-', 'input');
   const skipSummary = await assertHistoryData();
   assert.equal(skipSummary.total, 2); assert.equal(skipSummary.summary.failed, 0); assert.equal(skipSummary.summary.unknown, 0);
@@ -1721,7 +1836,7 @@ try {
     ['wake_account_ambiguous', /账号匹配不唯一/], ['wake_binding_missing', /缺少.*绑定/],
     ['wake_binding_changed', /账号绑定已变更/], ['wake_account_unavailable', /无法核实账号.*唤醒/]
   ];
-  await evaluate('document.querySelector("[data-page=history]").click()');
+  await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
   for (const [code, text] of preciseWakeErrors) {
     const jobID = 'fixture-precise-' + code;
     wakeJobs.set(jobID, {job_id: jobID, account_id: 'codex-01', phase: 'failed', reason: 'manual', error_code: code, created_at: observed(), updated_at: observed()}); revision++;
@@ -1741,7 +1856,7 @@ try {
     assert.equal(await evaluate('document.getElementById("display-mode").value'), mode);
   }
   async function setAlias(id, alias) {
-    await evaluate(`document.querySelector('[data-account-alias-id="${id}"]').click()`);
+    await evaluate(`{const button=document.querySelector('[data-account-alias-id="${id}"]');button.closest('details').open=true;button.click()}`);
     await waitFor(() => evaluate('document.getElementById("account-alias-dialog").open'), 'Alias editor did not open');
     await evaluate(`(() => {const aliasField=document.getElementById('account-alias-value');aliasField.value=${JSON.stringify(alias)};aliasField.dispatchEvent(new Event('input'))})()`);
     await clickWhenEnabled('account-alias-save');
@@ -1760,11 +1875,11 @@ try {
   }
   await evaluate('document.querySelector("[data-page=overview]").click()');
   accounts[1].id = 'bravo.fixture@example.test'; accountsRevision++; revision++;
-  await waitFor(() => evaluate('document.getElementById("accounts").rows[1]?.querySelector("strong")?.textContent==="bravo.fixture@example.test"'), 'Email display fixture did not reach account rendering');
+  await waitFor(() => evaluate('document.getElementById("accounts").rows[1]?.querySelector(".account-identity")?.textContent==="bravo.fixture@example.test"'), 'Email display fixture did not reach account rendering');
   const writesBeforeDisplay = posts.length, patchesBeforeDisplay = patches.length;
   await displayMode('masked');
-  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), 'c***1');
-  assert.equal(await evaluate('document.getElementById("accounts").rows[1].querySelector("strong").textContent'), 'b***@***', 'Email account was not masked');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-identity").textContent'), 'c***1');
+  assert.equal(await evaluate('document.getElementById("accounts").rows[1].querySelector(".account-identity").textContent'), 'b***@***', 'Email account was not masked');
   for (const page of ['overview', 'accounts', 'query', 'models', 'wake', 'history', 'diagnostics']) {
     await evaluate(`document.querySelector('[data-page="${page}"]').click()`);
     await assertNoVisibleAccountID();
@@ -1778,11 +1893,11 @@ try {
   await clickWhenEnabled('previous');
   await waitFor(() => evaluate('!!document.querySelector("[data-account-alias-id=codex-01]")'), 'Alias editing did not return to the first page');
   await displayMode('alias');
-  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), injectedAlias);
+  assert.equal(await evaluate('document.querySelector("#accounts .account-identity").textContent'), injectedAlias);
   assert.equal(await evaluate('document.querySelectorAll("#accounts img,#account-alias-dialog img").length'), 0, 'Alias became executable HTML');
   assert.notEqual(await evaluate('globalThis.aliasExecuted'), true);
   assert.match(await evaluate('document.getElementById("tasks").textContent'), /值班账号/, 'Overview task target did not use the saved alias');
-  await evaluate('globalThis.aliasButton=document.querySelector("[data-account-alias-id=codex-01]");aliasButton.focus()');
+  await evaluate('globalThis.aliasButton=document.querySelector("[data-account-alias-id=codex-01]");aliasButton.closest("details").open=true;aliasButton.focus()');
   const aliasReads = reads.filter(path => path.includes('/accounts?')).length;
   accounts[0].quota.weekly.Remaining.Value = 63; accountsRevision++; revision++;
   await waitFor(() => reads.filter(path => path.includes('/accounts?')).length > aliasReads, 'Alias focus test did not receive actual account polling');
@@ -1803,7 +1918,7 @@ try {
   await cdp('Page.reload');
   await waitFor(() => evaluate('document.getElementById("accounts")?.rows.length===6 && document.getElementById("login-section")?.hidden'), 'Display persistence reload did not connect');
   assert.equal(await evaluate('document.getElementById("display-mode").value'), 'alias');
-  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), injectedAlias);
+  assert.equal(await evaluate('document.querySelector("#accounts .account-identity").textContent'), injectedAlias);
   for (const width of [1586, 390]) {
     await cdp('Emulation.setDeviceMetricsOverride', {width, height: 992, deviceScaleFactor: 1, mobile: width < 600});
     assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Alias-mode overview overflow at ' + width);
@@ -1825,7 +1940,7 @@ try {
   await cdp('Page.navigate', {url: origin + '/other-cpa/v0/resource/plugins/codex-window-refresh/status'});
   await waitFor(() => evaluate('document.getElementById("accounts")?.rows.length===6 && document.getElementById("login-section")?.hidden'), 'Second CPA base fixture did not connect');
   assert.equal(await evaluate('document.getElementById("display-mode").value'), 'original', 'Display preferences leaked to another CPA base on the same origin');
-  assert.equal(await evaluate('document.querySelector("#accounts .account-name strong").textContent'), 'codex-01', 'Alias leaked to another CPA base');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-identity").textContent'), 'codex-01', 'Alias leaked to another CPA base');
   await cdp('Page.navigate', {url: origin + base + 'status'});
   await waitFor(() => evaluate('document.getElementById("accounts")?.rows.length===6 && document.getElementById("login-section")?.hidden'), 'Original CPA base did not reconnect');
   assert.equal(await evaluate('document.getElementById("display-mode").value'), 'alias');
@@ -1836,7 +1951,7 @@ try {
   await cdp('Page.navigate', {url: httpOrigin + base + 'status'});
   await waitFor(() => evaluate(`location.origin===${JSON.stringify(httpOrigin)} && document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length===6`), 'Non-secure local HTTP fixture did not connect');
   assert.equal(await evaluate('location.protocol==="http:" && !isSecureContext && typeof navigator.clipboard==="undefined"'), true, 'HTTP copy fallback was not tested in a genuinely insecure context');
-  await evaluate('document.querySelector("[data-page=history]").click()');
+  await evaluate('document.querySelector("[data-page=history]").click();document.querySelector("[data-record-page=tasks]").click()');
   await waitFor(() => evaluate('document.getElementById("history-refresh").getAttribute("aria-busy")==="false" && document.getElementById("history-count").textContent!=="— 条"'), 'HTTP task history did not load');
   await historyFilter('history-search', 'persisted-wake-0', 'input');
   await evaluate(`document.querySelector('#history-list [data-render-key="wake:persisted-wake-0"] button').click()`);
@@ -1894,7 +2009,7 @@ try {
   if (server) await new Promise(resolve => server.close(resolve));
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
-if (!autorefreshOnly && !schedulingOnly && !projectsOnly) {
+if (!autorefreshOnly && !schedulingOnly && !projectsOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
   console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });

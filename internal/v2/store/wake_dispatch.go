@@ -241,6 +241,17 @@ func (st *Store) AuthorizeWake(ctx context.Context, id string, at time.Time) (Wa
 		if decision != "" {
 			return updateWake(ctx, tx, job, "queued", "", decision, at)
 		}
+		evidence := map[string]any{"recorded_at": queryStamp(at), "policy_revision": job.PolicyRevision, "model_revision": job.ModelRevision, "trigger": job.Reason, "account_bound": true, "quota_checked": true, "activity_check_passed": true, "execution": "pinned_account", "quota_observed_at": queryStamp(snapshot.ObservedAt)}
+		if job.Reason != "manual" && job.Reason != "weekly_reset" {
+			missing, _, e := wakeCapacity(ctx, tx, settings.Config, at, job.ID)
+			if e != nil {
+				return e
+			}
+			evidence["capacity_missing"] = missing
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT INTO traffic_operation_evidence VALUES(?,'wake',?,?) ON CONFLICT(job_id) DO UPDATE SET evidence=excluded.evidence,recorded_at=excluded.recorded_at", job.ID, mustTrafficJSON(evidence), queryStamp(at)); err != nil {
+			return err
+		}
 		if err = updateWake(ctx, tx, job, "sending", "", "", at); err != nil {
 			return err
 		}

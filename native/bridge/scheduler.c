@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -24,7 +25,7 @@ typedef struct {
     int detached;
 } Affinity;
 typedef struct {
-    char id[LABEL],account[LABEL],selection[LABEL];
+    char id[LABEL],account[LABEL],selection[LABEL],reason[64];
     time_t expires;
     int session_slot;
     uint64_t generation;
@@ -359,6 +360,9 @@ static void observe_project(const char *scope,const char *project,const char *na
 }
 J *cwr_scheduler_pick(J *request) {
     J *result=json_object_new_object();pthread_mutex_lock(&lock);time_t now=monotonic(),wall=time(NULL);
+    SessionKey key={0};char parent[LABEL]={0};
+    const char *decision_reason=NULL,*selection=NULL,*scope=NULL,*project=NULL,*model=NULL;
+    J *preference=NULL;unsigned chosen_load=0;
     J *config=get(snapshot,"config");int enabled=json_object_get_int(get(config,"enabled"));
     J *candidates=either(request,"Candidates","candidates"),*options=either(request,"Options","options");
     J *metadata=either(options,"Metadata","metadata"),*headers=either(options,"Headers","headers");
@@ -370,24 +374,23 @@ J *cwr_scheduler_pick(J *request) {
         if(!provider||strcmp(provider,"codex"))goto done;
         if(!text(either(json_object_array_get_idx(candidates,i),"ID","id"))){if(enabled)reject(result,"scheduler_unavailable");goto done;}
     }
-    const char *scope=text(get(metadata,"caller_scope")),*project=header(headers,"X-CWR-Project");
+    scope=text(get(metadata,"caller_scope"));project=header(headers,"X-CWR-Project");
     observe_project(scope,project,header(headers,"X-CWR-Project-Name"),now);
-    if(!enabled)goto done;
     /* A daemon outage stops quota optimization, not business routing. Keep
      * ownership of affinity and use the host's current available candidates. */
-    SessionKey key={0};char parent[LABEL]={0};
-    const char *model=text(get(metadata,"requested_model"));if(!model)model=text(either(request,"Model","model"));
+    model=text(get(metadata,"requested_model"));if(!model)model=text(either(request,"Model","model"));
     if(scope)strcpy(key.scope,scope);
     if(project)strcpy(key.project,project);
     if(model)strcpy(key.model,model);
     strcpy(key.provider,"codex");session_identity(metadata,headers,key.session,parent);
-    const char *selection=text(get(metadata,"selection_id"));
+    selection=text(get(metadata,"selection_id"));
+    if(!enabled){decision_reason="host_selected";goto done;}
     if(selection)for(unsigned i=0;i<SLOTS;i++)if(pending[i].expires>now&&!strcmp(pending[i].id,selection)) {
         int slot=pending[i].session_slot;
         int current=slot<0||(sessions[slot].expires>now&&sessions[slot].generation==pending[i].generation);
         if(current&&candidate_index(candidates,pending[i].account)>=0&&!held(pending[i].account)&&!forbidden(pending[i].account)) {
             json_object_object_add(result,"Handled",json_object_new_boolean(1));
-            json_object_object_add(result,"AuthID",json_object_new_string(pending[i].account));goto done;
+            json_object_object_add(result,"AuthID",json_object_new_string(pending[i].account));decision_reason=pending[i].reason[0]?pending[i].reason:"available_pool";goto done;
         }
         pending[i].expires=0;
     }
@@ -397,17 +400,18 @@ J *cwr_scheduler_pick(J *request) {
     int chosen=-1,preserve=0,detached=own>=0&&sessions[own].detached;
     const char *pin=text(get(metadata,"pinned_auth_id"));
     if(pin) {
-        chosen=candidate_index(candidates,pin);preserve=1;
+        chosen=candidate_index(candidates,pin);preserve=1;decision_reason="pinned";
         if(chosen<0||forbidden(pin)||held(pin)||inflight(pin,now)>=(unsigned)json_object_get_int(get(config,"max_inflight"))){reject(result,"scheduler_busy");goto done;}
     } else if(bound>=0&&sessions[bound].account[0]) {
         chosen=candidate_index(candidates,sessions[bound].account);
+        if(chosen>=0)decision_reason=bound==own?"session_affinity":"parent_affinity";
         if(chosen>=0&&(held(sessions[bound].account)||inflight(sessions[bound].account,now)>=(unsigned)json_object_get_int(get(config,"max_inflight")))){reject(result,"scheduler_busy");goto done;}
         if(chosen<0) {
             const char *rebind=text(get(config,"rebind_on"));
             if(own>=0&&sessions[own].account[0]&&(!rebind||strcmp(rebind,"any")))preserve=1;else detached=1;
         }
     }
-    J *preference=NULL,*projects=get(config,"projects");
+    J *projects=get(config,"projects");
     for(size_t i=0;i<length(projects);i++) {
         J *p=json_object_array_get_idx(projects,i);
         if(!strcmp(text(get(p,"project")),key.project)){preference=get(p,"accounts");break;}
@@ -416,6 +420,16 @@ J *cwr_scheduler_pick(J *request) {
     if(chosen<0){reject(result,"scheduler_busy");goto done;}
     const char *account=text(either(json_object_array_get_idx(candidates,(size_t)chosen),"ID","id"));
     if(!account){reject(result,"scheduler_busy");goto done;}
+    if(!decision_reason) {
+        if(own>=0&&sessions[own].failed_until>now)decision_reason="failover";
+        else {
+            int preferred=0;for(size_t i=0;i<length(preference);i++)if(!strcmp(text(json_object_array_get_idx(preference,i)),account)){preferred=1;break;}
+            int state_index=object_index(get(snapshot,"accounts"),account);J *state=state_index<0?NULL:json_object_array_get_idx(get(snapshot,"accounts"),(size_t)state_index);
+            int fresh=deadline>now&&state&&json_object_get_int64(get(state,"valid_until"))>wall;
+            decision_reason=preferred?"project_preference":fresh?"quota_load":"available_pool";
+        }
+    }
+    chosen_load=inflight(account,now);
     unsigned reservation=SLOTS,occupied=0;
     for(unsigned i=0;i<SLOTS;i++) {
         if(pending[i].expires<=now)reservation=i;else occupied++;
@@ -429,8 +443,31 @@ J *cwr_scheduler_pick(J *request) {
     pending[reservation]=(Execution){.expires=now+15,.session_slot=slot,.generation=slot<0?0:sessions[slot].generation};
     if(selection)strcpy(pending[reservation].id,selection);
     strcpy(pending[reservation].account,account);
+    snprintf(pending[reservation].reason,sizeof(pending[reservation].reason),"%s",decision_reason?decision_reason:"unknown");
     json_object_object_add(result,"Handled",json_object_new_boolean(1));
     json_object_object_add(result,"AuthID",json_object_new_string(account));
 done:
+    if(selection&&scope) {
+        const char *picked=text(get(result,"AuthID"));int rejected=json_object_get_int(get(result,"Reject"));
+        if(picked||rejected||(decision_reason&&!strcmp(decision_reason,"host_selected"))) {
+            J *t=json_object_new_object(),*evidence=json_object_new_object();
+            json_object_object_add(t,"phase",json_object_new_string("decision"));
+            json_object_object_add(t,"selection_id",json_object_new_string(selection));
+            json_object_object_add(t,"caller",json_object_new_string(scope));
+            if(project)json_object_object_add(t,"project",json_object_new_string(project));
+            if(model)json_object_object_add(t,"model",json_object_new_string(model));
+            if(key.session[0])json_object_object_add(t,"session",json_object_new_string(key.session));
+            if(parent[0])json_object_object_add(t,"parent_session",json_object_new_string(parent));
+            if(picked)json_object_object_add(t,"account_id",json_object_new_string(picked));
+            json_object_object_add(t,"reason",json_object_new_string(rejected?"scheduler_busy":decision_reason?decision_reason:"unknown"));
+            json_object_object_add(t,"status",json_object_new_string(rejected?"not_sent":"selected"));
+            json_object_object_add(evidence,"snapshot_fresh",json_object_new_boolean(deadline>now));
+            json_object_object_add(evidence,"candidate_count",json_object_new_int64((int64_t)length(candidates)));
+            if(picked)json_object_object_add(evidence,"inflight",json_object_new_int((int)chosen_load));
+            if(get(config,"max_inflight"))json_object_object_add(evidence,"max_inflight",json_object_new_int(json_object_get_int(get(config,"max_inflight"))));
+            json_object_object_add(t,"evidence",evidence);
+            cwr_traffic_emit(selection,t);json_object_put(t);
+        }
+    }
     pthread_mutex_unlock(&lock);return reply(result);
 }

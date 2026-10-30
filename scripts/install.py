@@ -349,7 +349,7 @@ def infer(args):
     wrapper = configs.get(PLUGIN, {})
     require(isinstance(wrapper, dict), "现有插件包装配置必须是映射。")
     require(not set(wrapper) - {"enabled", "priority", "config_file", "state_dir", "quota_transport", "management_url", "management_key_env", "store"},
-            "现有插件含未支持的包装字段，请先按 docs/plugin.md 调整。")
+            "现有插件含未支持的包装字段，请先按 docs/legacy/v1/plugin.md 调整。")
     require(wrapper.get("store") is None or isinstance(wrapper["store"], dict), "插件 store 必须是映射。")
     existing_dir = plugins.get("dir")
     require(existing_dir is None or isinstance(existing_dir, str), "plugins.dir 必须是路径字符串。")
@@ -936,7 +936,7 @@ def hot_install(args, plan, unpacked):
     metadata = json.loads((unpacked / "BUILD-INFO.json").read_text())
     require(metadata.get("hot_reload_protocol") == 2, "目标安装包不支持本机版本文件确认；请使用普通安装并重启 CPA。")
     record_file = plan["record"] / "installed.json"
-    require(record_file.is_file(), "热重载需要已有安装记录；首次请在一键命令后加 --restart，手动安装请参照 docs/install.md。")
+    require(record_file.is_file(), "热重载需要已有安装记录；首次请在一键命令后加 --restart，手动安装请参照 docs/legacy/v1/install.md。")
     previous = json.loads(private_file(record_file).read_text())
     require(previous.get("config") == str(plan["config"])
             and previous.get("checker") == str(plan["directory"] / "window-refresh"),
@@ -1333,7 +1333,7 @@ def main():
     release = pathlib.Path("/etc/os-release").read_text()
     require(re.search(r'^ID=["\x27]?debian["\x27]?$', release, re.M)
             and re.search(r'^VERSION_ID=["\x27]?(12|13)["\x27]?$', release, re.M),
-            "当前自动安装仅支持 Debian 12/13；其他系统请按 docs/install.md 手动安装。")
+            "当前自动安装仅支持 Debian 12/13；其他系统请按 docs/legacy/v1/install.md 手动安装。")
     require(args.version == "latest" or version_key(args.version) is not None,
             "版本须为 latest、vX.Y.Z 或 vX.Y.Z-rc.N。")
     require(args.uninstall or not args.package or args.version != "latest",

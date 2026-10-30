@@ -64,7 +64,7 @@ fi
 os_release=$(cat /etc/os-release)
 if [[ ! $os_release =~ (^|$'\n')ID=\"?debian\"?($|$'\n') ||
       ! $os_release =~ (^|$'\n')VERSION_ID=\"?(12|13)\"?($|$'\n') ]]; then
-  printf '一键安装仅支持 Debian 12/13；其他系统请参照 docs/install.md。\n' >&2
+  printf '一键安装仅支持 Debian 12/13；其他系统请参照 docs/legacy/v1/install.md。\n' >&2
   exit 1
 fi
 case "$(uname -m)" in

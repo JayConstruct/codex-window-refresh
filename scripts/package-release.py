@@ -14,6 +14,7 @@ import subprocess
 import tarfile
 
 from release_check import check_release
+from package_docs import render_document
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -85,14 +86,16 @@ def main():
         "codex-window-refresh.so": (library.read_bytes(), 0o644),
         "window-refresh": (cli.read_bytes(), 0o755),
         "config.example.yaml": (policy.encode(), 0o600),
-        "INSTALL.md": ((ROOT / "docs/install.md").read_bytes(), 0o644),
-        "PLUGIN.md": ((ROOT / "docs/plugin.md").read_bytes(), 0o644),
-        "RUNTIME.md": ((ROOT / "docs/runtime.md").read_bytes(), 0o644),
         "NOTICE": ((ROOT / "cmd/plugin/NOTICE").read_bytes(), 0o644),
         "LICENSE.upstream": ((ROOT / "third_party/cliproxyapi-reference/LICENSE").read_bytes(), 0o644),
         "BUILD-INFO.json": ((json.dumps(info, ensure_ascii=False, indent=2) + "\n").encode(), 0o644),
         "install.py": (installer.encode(), 0o755),
     }
+    documents = {"INSTALL.md": "docs/legacy/v1/install.md", "PLUGIN.md": "docs/legacy/v1/plugin.md",
+                 "RUNTIME.md": "docs/legacy/v1/runtime.md"}
+    sources = {**documents, "config.example.yaml": "config.example.yaml", "install.py": "scripts/install.py"}
+    for name, source in documents.items():
+        members[name] = (render_document(ROOT, source, sources, commit), 0o644)
     output = pathlib.Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     name = f"codex-window-refresh_{args.version}_linux_{arch}"

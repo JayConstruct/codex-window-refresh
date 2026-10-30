@@ -4,6 +4,7 @@
 void cwr_events_reset(void);
 void cwr_events_clear(void);
 void cwr_observe_hook(const char *,const void *,size_t);
+void cwr_traffic_emit(const char *,J *);
 void cwr_project_observed(const char *,const char *);
 J *cwr_events_pull(J *,const char *,const char *);
 J *cwr_events_ack(J *);

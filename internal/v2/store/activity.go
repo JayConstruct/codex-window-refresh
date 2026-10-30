@@ -116,7 +116,10 @@ func validateBatch(b events.Batch) error {
 			return errors.New("invalid_event_batch")
 		}
 		switch e.Kind {
-		case "started", "account_selected", "completed":
+		case "started", "account_selected", "completed", "traffic":
+			if !validTraffic(e.Traffic) {
+				return errors.New("invalid_traffic_event")
+			}
 		case "project_observed":
 			if !policy.DirectoryProject.MatchString(e.Project) || len(e.ProjectName) > 256 {
 				return errors.New("invalid_project_event")
@@ -181,6 +184,11 @@ func (s *Store) ApplyEvents(ctx context.Context, b events.Batch) (uint64, error)
 				}
 			}
 			c = EventCursor{Instance: b.Instance, HostProcess: b.HostProcess, Status: status, Reason: reason}
+			if previous.Instance != "" {
+				if err = markTrafficUnknown(ctx, tx); err != nil {
+					return err
+				}
+			}
 		} else if c.HostProcess != b.HostProcess || b.After > c.Sequence || b.LossEpoch < c.LossEpoch {
 			return errors.New("invalid_event_cursor")
 		}
@@ -189,6 +197,9 @@ func (s *Store) ApplyEvents(ctx context.Context, b events.Batch) (uint64, error)
 		lost := (b.Gap && b.After >= c.Sequence) || c.Sequence < b.Acknowledged || c.Sequence+1 < b.Earliest || b.LossEpoch > c.LossEpoch
 		if lost {
 			c.Status, c.Reason = "gap", "events_lost"
+			if err = markTrafficUnknown(ctx, tx); err != nil {
+				return err
+			}
 			if _, err = tx.ExecContext(ctx, "UPDATE activity_requests SET phase='unknown' WHERE phase='active'"); err != nil {
 				return err
 			}
@@ -203,7 +214,14 @@ func (s *Store) ApplyEvents(ctx context.Context, b events.Batch) (uint64, error)
 			if e.Sequence != c.Sequence+1 {
 				return errors.New("noncontiguous_event_batch")
 			}
-			if e.Kind == "project_observed" {
+			if e.Traffic != nil {
+				if err = applyTraffic(ctx, tx, b.Instance, e, &c); err != nil {
+					return err
+				}
+			}
+			if e.Kind == "traffic" {
+				err = nil
+			} else if e.Kind == "project_observed" {
 				err = applyProject(ctx, tx, e)
 			} else if e.Kind == "quota_observed" {
 				err = applyQuota(ctx, tx, e)

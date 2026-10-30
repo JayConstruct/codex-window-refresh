@@ -1,158 +1,76 @@
 # Codex Window Refresh
 
-CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，支持手动查询、可选自动查询和按需模型唤醒。插件 ID 为 `codex-window-refresh`。
+CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `codex-window-refresh`。当前主线为 **V2：C 原生接入层 + 独立 Go 后台 + SQLite**。
 
-**v0.2.0-rc.27** 修复客户端提供商启动错误：直接运行 `cwr-codex` 默认使用已记住的 ID 或 `cliproxyapi`；提供商定义缺失或名称为空时，提示输入实际 ID，保存到客户端自己的 `~/.config/cwr/client.json` 后重试，下次直接运行即可。`--provider` 仍可单次覆盖，不读取或修改 Codex 配置。已有 rc.26 服务端只需更新客户端即可获得修复。配套后台为 rc.27，原生接入层保持 rc.26，数据库保持 schema 11。详见 [rc.27 发布说明](docs/releases/v0.2.0-rc.27.md)和[使用说明](docs/account-scheduling.md#项目与账号)。
+当前后台、客户端及原生接入层为 **v0.2.0-rc.28**，数据库为 **schema 12**。新版“Codex 调度台”采用横向导航，重构总览、账号、自动化、项目调度与设置，新增用户请求、插件调用和分流分析。设计稿及实现截图见 [UI 重构说明](docs/development/ui-redesign.md)，升级要求见 [发布说明](docs/releases/v0.2.0-rc.28.md)。
 
-服务器安装见 [Debian 12/13 安装指南](docs/install.md)。测试版安装包从 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases) 下载，按 `amd64` / `arm64` 选择并校验 SHA-256；包内示例策略默认关闭自动请求。
+## 安装与更新
 
-## 一键安装或更新
-
-当前 **v0.2.0-rc.27 独立后台**使用[单独的 v2 安装入口](docs/backend-v2-install.md)。首次切换执行：
+服务端支持 Debian 12/13、Linux amd64/arm64。首次切换 V2 或从 rc.27 及更早版本升级到 rc.28 时，执行：
 
 ```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.27 --restart
+curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.28 --restart
 ```
 
-v2 提供额度查询、活动观测、模型配置、显式手动短句候选生成及 Codex 模型唤醒，自动查询和自动唤醒默认关闭，已有明确保存的规则保持不变。首次切换会停止 v1 功能，成功后清除 v1 数据、旧版本及临时恢复副本；后续更新保留 v2 数据。只有后台改变且接入层文件一致时只重启后台，接入层改变时仍须显式 `--restart`。下面的旧入口继续更新 v1，不会自动切换 v2。
+已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；本次接入层新增页面资源和运行记录路由，需要显式 `--restart` 加载。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。
 
-**已有 V2 后续更新**使用以下命令，默认按版本号选择最新已发布的 V2（包括 rc），不依赖 GitHub 的 Latest 标记或发布列表顺序：
+完整参数、用户服务、离线安装与失败恢复见 [V2 安装指南](docs/user/install.md)。下载与 SHA-256 校验文件见 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases)。
+
+客户端支持 Linux/macOS，需要 Python 3.10+ 和 curl，无需 sudo：
 
 ```sh
-curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh && sudo bash /tmp/cwr-v2-install.sh --version latest --restart
+curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh
+bash /tmp/cwr-client-install.sh
 ```
 
-可用 `--version v0.2.0-rc.27` 固定本次版本。**后台为 rc.27，接入层保持 rc.26**；从 rc.26 更新后台时，安装器确认接入层文件完全一致后可仅重启后台。从 rc.25 或更早版本升级须显式 `--restart`，并迁移到 schema 11，保留已有规则、额度和发送防重记录；schema 11 不能直接交给 rc.25 或更早后台。仅修复客户端启动无需更新服务端，重新运行下方客户端安装命令即可。重置卡详情和自动兑换另需支持账号协议的 Codex CLI，代理配置见[完整说明](docs/account-scheduling.md)。
+默认安装到 `~/.local/bin`。进入项目目录运行 `cwr-codex`，首次请求后在服务端选择项目账号并保存；提供商启动错误时按提示输入实际 ID，客户端会记住选择。详见 [项目账号调度与重置卡](docs/user/account-scheduling.md)。
 
-**客户端安装或更新（Linux/macOS，无需 sudo）**：
+V1 用户继续使用 [V1 安装指南](docs/legacy/v1/install.md)；`scripts/install.sh` 和 `cpa-quota-upgrade.sh` 仍是 V1 入口。
 
-```sh
-curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh
-```
+## 当前 V2 行为
 
-需要 Python 3.10+ 和 curl。默认安装到 `~/.local/bin`，进入项目目录运行 `cwr-codex`；若目录尚未在 PATH 中，可运行 `~/.local/bin/cwr-codex`。安装器校验配套版本脚本的 SHA-256，下载失败保留旧安装。首次请求后，在服务端“客户端最近出现的项目”选择账号并保存。直接执行 `codex` 不额外添加项目头，已有目录映射仍优先生效。
+- Codex 调度台统一展示账号容量、耗尽窗口、后台任务及待办；用户请求、插件调用与分流分析按真实观测展示，缺失证据保留为未知。
+- 支持单账号、批量及可选自动额度查询；额度查询不发送模型请求。
+- 页面连接后默认自动读取后台状态；“同步 CPA”只核对宿主本地账号，不查询上游额度。关闭页面不终止后台任务。
+- 新安装的自动查询、自动唤醒、项目调度及重置卡查询/自动兑换默认关闭；升级保留用户已明确保存的规则。
+- 手动唤醒先查询额度并核对账号、活动与发送保护，通过准入后才发送指定账号模型。模型完成和窗口启动分别核实，结果未知不自动重发。
+- 短句候选支持指定 Codex 或反重力账号及实际可用模型；生成会消耗模型额度，应用和保存由用户明确操作。反重力不参与 Codex 窗口唤醒。
+- 窗口时间依据上游证据；零使用率或未来 reset 时间不足以单独确认窗口未启动。
 
-rc.5 的新版 [V2 网页面板](docs/backend-v2-panel.md)采用浅色运行总览与侧栏布局，默认自动更新。已接入持久化批量随机延迟、定期及五小时/周到期额度查询、网页设置与差异预览；手动单账号立即查询，查询均不发送模型请求。自动查询默认关闭，模型唤醒仍明确禁用。升级 rc.5 须添加 `--restart` 更新接入层；数据库迁移与降级限制见[发布说明](docs/releases/v0.2.0-rc.5.md)。
+页面操作、规则与数据口径见 [V2 面板指南](docs/user/panel.md)。
 
-rc.6 进一步支持侧栏折叠、总览到期查询开关直接保存、模型/提示词配置和短句池，以及显式确认的手动候选生成。手动生成会消耗所选 Codex 账号模型额度；仅查看页面、配置保存及额度查询不会触发模型请求，生成结果需确认加入草稿并保存，自动唤醒仍未实现。升级 rc.6 需要迁移到 schema 5、同时更新接入层并添加 `--restart`；详见[发布说明](docs/releases/v0.2.0-rc.6.md)。
+## 文档与目录
 
-rc.7 支持使用 CPA 反重力账号生成短句候选，并提供独立生成账号目录。明确选择 Codex 或反重力账号及其实际可用模型后才生成，不回退其他账号；反重力不计入 Codex 额度查询和容量统计。升级会迁移到 schema 6，须同时更新后台与接入层并添加 `--restart`；详见[发布说明](docs/releases/v0.2.0-rc.7.md)。
-
-rc.8 增加可编辑候选生成提示词及 Codex 模型唤醒，数据库迁移到 schema 8（包含此前源码 schema 7 的提示词快照）。rc.7 仍为 schema 6，不包含这些功能。首次升级默认关闭自动唤醒、五小时、周及每日规则；手动唤醒先只读查询额度、核对绑定和活动状态，通过准入后才发送指定账号模型。自动规则显式开启后，后续额度观测（包括额度查询结果）可触发独立唤醒任务；额度查询操作本身仍不发送模型请求。反重力仅支持候选生成，不支持唤醒。
-
-唤醒与候选生成共用物理模型并发和账号发送保护；模型返回完成不等于窗口已启动，需只读额度证据核实。结果未知不自动重发，重启保持防重记录。网页显示计划和核实状态，不展示近期活跃用户数。功能、安全边界与升级要求见 [V2 网页面板](docs/backend-v2-panel.md)及 [rc.8 发布说明](docs/releases/v0.2.0-rc.8.md)。首次升级到 rc.8 或更新版本时须更新旧接入层并显式 `--restart`，升级前请保留一致备份。
-
-rc.9 修复轮询导致输入框失焦，支持按账号读取 CPA 注册模型和显式填入 Codex 风格提示词草稿；唤醒请求禁用工具，不伪造客户端身份。查询返回整五小时/七天的占位值不显示倒计时，后台每 30 秒同步账号状态，并区分正常、禁用、暂不可用、额度耗尽及受限。数据库仍为 schema 8，原生接入层仍为 rc.8；配置和发送防重记录继续保留，详见 [rc.9 发布说明](docs/releases/v0.2.0-rc.9.md)。
-
-rc.10 进一步修复跨页面轮询干扰：候选复选框、账号按钮和历史控件保持节点及焦点，查询详情保留展开状态；未变化的读取不取消确认，历史任务读取不打断无关账号草稿。后台分页读取与显式操作隔离，旧请求不能覆盖新页面。数据库和接入层保持不变，详见 [rc.10 发布说明](docs/releases/v0.2.0-rc.10.md)。
-
-rc.11 将操作反馈统一到右上角 toast，不抢焦点，相同轮询结果不重复弹出；错误和结果未知警告可手动收起，任务安全保护不变。独立下载入口不再复用残留旧安装器，并明确区分 V1/V2 入口、后台与接入层版本；详见 [rc.11 发布说明](docs/releases/v0.2.0-rc.11.md)。
-
-rc.12 在额度查询时同步已核实的 CPA 账号状态，不必等待下一轮定时同步；查询失败不误判额度耗尽，不清空有效额度。查询、唤醒及候选生成任务可展开脱敏错误详情，查看不重发任务，轮询保留详情展开和焦点。数据库及接入层不变，详见 [rc.12 发布说明](docs/releases/v0.2.0-rc.12.md)。
-
-rc.13 在账号“立即查询”旁新增“立即唤醒”，当前页确认额度消耗后提交，不保存其他页面草稿。唤醒记录持久保存脱敏响应与错误摘要，重启可复查；未知结果仍禁止自动重发。数据库升级至 schema 9、接入层仍为 rc.8，详见 [rc.13 发布说明](docs/releases/v0.2.0-rc.13.md)。
-
-rc.14 重做统一任务记录，展示后台持久保存的手动及自动查询、唤醒任务，支持全量筛选分页、统计和只读详情。完善真实查询耗时、排队进度、常驻未知警告、HTTP 复制与手机焦点；修复乱序状态回退、响应更新失焦及快捷唤醒快速重开。数据库仍为 schema 9，接入层更新至 rc.14，须显式 `--restart`；详见 [rc.14 发布说明](docs/releases/v0.2.0-rc.14.md)。
-
-rc.15 增加主页面 CPA 认证文件启停，按真实文件名和索引确认修改，随后只读核实，结果不明不重发。账号支持原始、打码与浏览器本地别称显示；唤醒错误按实际账号、绑定和同步状态细分，已跳过任务不再计作错误。数据库仍为 schema 9，接入层沿用 rc.14，详见 [rc.15 发布说明](docs/releases/v0.2.0-rc.15.md)。
-
-rc.16 优化为连接后全自动读取后台结果，返回前台及网络恢复时立即补读，临时连接故障自动重试，CPA 外部启停变化自动核实。只更新变化内容，减少定时闪烁，保留焦点、草稿及展开详情；读取失败相互隔离，并修复窄屏任务详情操作越界。刷新不额外查询额度或调用模型，认证失效/主动断开不自动恢复，详见 [rc.16 发布说明](docs/releases/v0.2.0-rc.16.md)。
-
-rc.17 将账号启停改为拨动开关，禁用状态显示“手动禁用”；主页面立即查询、立即唤醒和启停直接操作，不弹确认窗。自动唤醒额度提示首次确认后按浏览器及 CPA 地址记忆，后续开关、编辑和刷新不重复提示。后台状态核实、重复提交及未知发送保护继续保留，详见 [rc.17 发布说明](docs/releases/v0.2.0-rc.17.md)。
-
-rc.18 修复容量已满足的旧唤醒任务长期显示排队或执行中：未发送任务结束为“已跳过”，容量缺口恢复后可在同一周期重新安排，已有历史记录保持终态，跨五小时周期继续调度。额度预检暂缓时回到排队，已发送和未知结果保护保留。本次一并发布此前本地 rc.17 的页面直接操作与账号拨动开关；后台为 rc.18，接入层和数据库不变，详见 [rc.18 发布说明](docs/releases/v0.2.0-rc.18.md)。
-
-rc.19 已按宿主能力协商 schema 6/7，并在 schema 7 省略请求拦截正文，减少长上下文传输；详见 [rc.19 发布说明](docs/releases/v0.2.0-rc.19.md)。
-
-rc.20 修正额度查询的 CPA 全局代理继承，支持绑定原桥接实例的 HTTP 取消与回收；通过 `host.auth.models` 读取精确账号模型并兼容旧宿主，减少同步数据库写入、启停状态全量读取和 SSE 正文块解析分配。30 秒完整身份核对、模型手动填写及发送保护保持原有行为；后台和接入层均为 rc.20，数据库仍为 schema 9，升级须显式 `--restart`。
-
-## 旧版 V1 安装与更新（不更新 V2）
-
-Debian 12/13 已安装 V1 rc.21 或更新版插件时，更新直接执行同一行，默认热重载：
-
-```sh
-curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install.sh -o /tmp/codex-window-refresh-install.sh && sudo bash /tmp/codex-window-refresh-install.sh
-```
-
-[统一入口](scripts/install.sh) 默认热重载更新，不重启 CPA，无需管理 key；自动补齐依赖、识别 CPA 路径及系统级/用户级 systemd 服务、校验安装包并备份，确认新实例接管后才报告成功。**首次安装、rc.20 及更早版本或缺少版本文件时，在命令末尾加 `--restart`，普通安装后重启已核实的服务一次**；热重载失败不会自动改为重启。相同版本且插件文件一致时不重复安装或重启。
-
-升级保留已有策略、模型和窗口状态。首次无需密钥或模型输入；在面板填写实际模型后再按需开启唤醒，不猜测模型。可追加 `--cpa-dir /实际路径`、`--model 实际模型`、`--dry-run`；`--no-restart` 改为普通安装但不重启、不执行热重载确认。CPA 路径或服务无法唯一识别时停止，不重启未知进程；Docker 见安装指南。已下载源码可直接运行 `sudo bash scripts/install.sh`；旧 `cpa-quota-upgrade.sh` 同样默认热重载。
-
-直接运行或 systemd 部署可使用 [自动安装脚本](scripts/install.py)：`sudo python3 install.py --cpa-dir /root/cliproxyapi`。默认安装最新已发布版本（包含 rc 测试版），支持预览、备份、升级与卸载；默认使用宿主凭据查询额度，无需后台管理密钥；首次自动识别模型时可临时输入网页登录密钥，或用 `--model` 跳过识别，无法识别时提示手动填写。可核实识别运行中的 CPA 系统级或用户级服务，交互安装结束询问是否重启；未知启动方式提示手动重启。用户服务可用 `--user-service --service 服务名 --user 用户名` 指定。可用 `--model` 指定模型、`--version` 固定版本。先安装 `python3-yaml`，完整命令和服务参数见安装指南。
-
-当前已实现 **Linux 原生插件原型**：后台协调器、持久化状态、宿主额度查询与可选管理桥、指定账号执行、活动与正常请求额度观测及已认证管理 API。普通 HTTP/流式响应头和 WebSocket 额度事件可更新对应账号，完整有效的活跃窗口证据会推迟后台重复查询。手动查询始终允许；定期额度查询与模型唤醒默认关闭，需用户手动开启并保存，已有配置中显式开启的设置保持不变。“立即查询额度”分批查询额度接口，账号卡片的“查询此账号额度”只查询指定账号，两者都不发送模型请求。只查看额度时保持“启用模型唤醒”关闭，仍可手动查询并被动更新。面板按总览、账号额度、额度查询、模型唤醒和诊断与高级分区；页面自动刷新默认关闭，手动勾选后每 5 秒读取快照，也可随时点击“更新页面数据”。面板显示额度来源与手动查询进度，各页面共用草稿和保存栏。动态库已通过本地 C 假宿主加载验证；尚未在真实 CPA 宿主或生产账号上联调。
-
-## v0.1.0-rc.28 内存开销与热重载释放修复
-
-修复热重载暂停后旧实例仍保留调度器、历史和状态快照的问题，并在安全释放后归还闲置堆内存。状态快照改为复制可变容器；状态保存以流式指纹复核文件，避免重复完整解析；启动复用首次已验证的状态，空闲比较不再保留整份 JSON。保留原有策略、窗口与发送抑制记录。遇到内存上涨或 OOM 重启循环时先停用插件止住循环，升级本版建议显式 `--restart` 一次，以清理旧版驻留内存。模拟大状态测量及尚需真实宿主确认的限制见 [发布说明](docs/releases/v0.1.0-rc.28.md)。
-
-## 功能与默认行为
-
-- 支持单账号、批量和可选的自动额度查询，同步 CPA 账号状态；查询额度不发送模型请求，也不解除 CPA 的禁用标记。
-- “从 CPA 刷新”只同步宿主本地账号与状态，不连接上游。页面自动刷新默认关闭，可手动开启。
-- 模型自动唤醒默认关闭。开启后按五小时、周重置及每日规则执行；手动唤醒先查询最新额度并核对账号，满足条件才发送。
-- 下一次唤醒显示已抽定的具体时刻和当前规则范围；窗口倒计时依据服务端证据，等待核对不重新抽取原定时间。
-- 短句池支持使用 Codex 或反重力账号的可用模型生成候选，确认应用并保存后生效。
-- 管理面板支持规则编辑、配置差异预览、计划与历史查询；升级保留已有策略、窗口和防重复发送记录。
-
-各版本改动见 [发布说明目录](docs/releases/)。
-
-## 文档
-
-- [后端 v2：构建、安全边界与验证](docs/backend-v2-prototype.md)
-- [后端 v2 安装、脚本更新与回退](docs/backend-v2-install.md)
-- [后端 v2 重建设计（独立后台，兼容现有 CPA；分阶段实现中）](docs/backend-v2-design.md)
-- [面板设计参考与浏览器偏好保存](docs/panel-design-references.md)
-- [用户规则与调度逻辑](docs/codex-refresh-design.md)
-- [核心模型与并发边界](docs/core-architecture.md)
-- [官方 CPA 接口核对](docs/cpa-integration.md)
-- [配置与管理接口](docs/config-management.md)
-- [实现阶段与验收边界](docs/implementation-plan.md)
-- [运行时实现与限制](docs/runtime.md)
-- [插件构建、配置与管理 API](docs/plugin.md)
-- [额度与执行适配器](docs/cpa-adapter.md)
-- [单账号额度查询故障检查与方案完善](docs/quota-query-review.md)
-- [额度查询性能优化与验收](docs/query-performance.md)
-- [持久化存储](docs/storage.md)
-- [配置草案](config.example.yaml)
-
-窗口重置关系采用用户描述的账号行为，并通过实际观测核对。新窗口时间以服务端报告为准，不使用本地发送时间加 5 小时推算。
-
-## 项目目录
+[文档导航](docs/README.md)按使用指南、开发资料、研究记录、V1 历史资料和发布说明组织。
 
 ```text
-cmd/          原生插件入口和配置检查命令
-internal/     调度、状态存储、CPA 适配及网页资源
-scripts/      安装、打包、检查脚本及其测试
-docs/         使用说明、设计资料和历史发布说明
-release/      当前发布版本
-third_party/  上游许可和固定源码来源清单
+cmd/window-refreshd/   V2 独立后台入口
+native/bridge/         V2 C 原生接入层及假宿主测试
+internal/v2/           V2 API、任务执行、规则、观测与 SQLite
+internal/core/         共享领域规则
+internal/cpa/          CPA 适配与额度解析，部分由 V2 复用
+cmd/plugin/            V1 Go 原生插件入口
+cmd/window-refresh/    V1 策略文件检查命令
+internal/              其余 V1 配置、运行时、存储与面板
+scripts/               安装、打包、检查与浏览器验证入口
+scripts/tests/         Python 安装与打包工具测试
+tests/web/             按 V1/V2 分开的网页 Node 测试
+docs/                  分类文档与历史发布说明
+release/               V1/V2 当前发布版本
+third_party/           上游许可和固定源码来源清单
 ```
 
-## 实现
+## 开发与验证
 
-`internal/core` 实现窗口证据、意图合并、容量计算和发送准入；`internal/runtime` 协调观测、规则与执行；`internal/storage` 在发送前原子落盘，并通过进程锁限制单实例；`internal/cpa` 对接官方宿主 RPC 和显式管理桥；`cmd/plugin` 导出 C ABI 入口。
-
-管理摘要提供人数、容量缺口和阻塞原因，读取状态不等待网络请求。查询和生成有独立超时，失败查询退避且全轮查询数量受限；活动在途人数增量更新。额度解析拒绝矛盾的字段与倒计时。详见 [运行时说明](docs/runtime.md)。
-
-已核对的 CPA 版本提供由认证身份派生的 `caller_scope`，按该字段在请求开始时去重，并通过生命周期结束事件释放在途记录。一个共享 key 的多人算一个身份，账号近期请求数也不等于独立用户数。首版只实现这一统计来源，其他身份模式明确拒绝应用，旧版兼容与完成请求统计降级尚未实现。
-
-## 本地检查
-
-需要 Go 1.23 或更新版本，Go 依赖由 `go.mod` 管理。完整测试包含 v2 SQLite 存储，因此需要 CGO 和 C 编译器；原生加载测试还需要 Python 3。v2 C 接入层的额外依赖和独立构建命令见 [原型说明](docs/backend-v2-prototype.md)。
+需要 Go 1.23+、CGO、C 编译器、Python 3 和 Node.js 18+。V2 原生构建还需要 pthread、libcurl 开发包和 json-c SONAME 5，详见 [架构与构建](docs/development/architecture.md)。
 
 ```sh
-make check
-make race
-make build
-make native-smoke
-make panel-check
+make check             # 文档链接、全部 Go 测试与 vet
+make v2-build          # 独立后台和 C 接入层
+make v2-smoke          # V2 网页测试及原生假宿主端到端验证
+make panel-check       # V1 和 V2 网页 Node 测试
+make release-check     # V1 和 V2 发布版本检查
 ```
 
-`make plugin` 生成 `bin/codex-window-refresh.so`；`bin/window-refresh check /absolute/path/config.yaml` 验证策略文件。示例中的模型占位符必须替换成部署宿主实际可用的模型名；初次联调建议将 `enabled` 设为 `false`。宿主配置见 [插件说明](docs/plugin.md)。
-
-`make panel-check` 需要 Node.js 18 或更新版本，验证面板的认证、草稿、保存和请求行为。`make clean` 清除本地构建、打包、Python 缓存和 Go 测试分析产物。
-
-首版实际生成并发为 1。没有上游窗口状态的正向证据时不会唤醒；零使用率和未来 reset 时间本身不足以确认窗口未启动。官方宿主目前也没有前台请求与后台唤醒之间的原子互斥接口，插件只能查询并观察后尽量避开。分布式执行尚未实现。
-
-发布流程由 `.github/workflows/prerelease.yml` 管理。提交前运行 `make release-check`，核对 `release/version.txt`、插件内置版本和对应发布说明；CI 与打包复用 `scripts/release_check.py`。更新 `release/version.txt` 为新的 `vX.Y.Z-rc.N` 并添加对应 `docs/releases/` 说明后，主分支提交触发两种架构的测试与打包；修改工作流、脚本或脚本测试也会触发检查。全部通过才发布 Pre-release，已发布版本只做构建检查而不覆盖下载文件。需要手动重试时从 Actions 运行该工作流。
+测试范围、浏览器验证、V1 构建与双架构发布流程见 [开发检查与发布](docs/development/testing.md)。本地假宿主测试和空账号 CPA 注册验证不等于真实账号或生产负载验收，具体边界见 [架构与验证范围](docs/development/architecture.md)。

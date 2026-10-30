@@ -3,7 +3,16 @@ name: Build and publish v2 prerelease
 on:
   push:
     branches: [main]
-    paths: [release/v2-version.txt, .github/workflows/v2-prerelease.yml, scripts/v2-panel-browser-check.mjs, 'native/bridge/tests/**']
+    paths:
+      - release/v2-version.txt
+      - .github/workflows/v2-prerelease.yml
+      - Makefile
+      - scripts/package-v2.py
+      - scripts/package-release.py
+      - scripts/package_docs.py
+      - scripts/v2-panel-browser-check.mjs
+      - 'native/bridge/tests/**'
+      - 'tests/web/v2/**'
   workflow_dispatch:
 
 permissions:

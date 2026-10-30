@@ -1,4 +1,4 @@
-# 调度策略示例；CPA 插件包装配置另见 docs/plugin.md。
+# V1 调度策略示例；CPA 插件包装配置另见 docs/legacy/v1/plugin.md。
 # execution.model 必须按部署环境填写；占位值会被配置验证拒绝。
 schema_version: 1
 enabled: false

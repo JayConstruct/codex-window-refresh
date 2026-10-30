@@ -1,0 +1,21 @@
+name: Check documentation
+
+on:
+  push:
+    paths: ['README.md', 'docs/**', 'tests/**/*.md', 'scripts/docs_check.py', 'scripts/package_docs.py', 'scripts/tests/test_documentation.py', '.github/workflows/docs.yml']
+  pull_request:
+    paths: ['README.md', 'docs/**', 'tests/**/*.md', 'scripts/docs_check.py', 'scripts/package_docs.py', 'scripts/tests/test_documentation.py', '.github/workflows/docs.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  documentation:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: make docs-check
+      - run: python3 -m unittest discover -s scripts/tests -p test_documentation.py -v

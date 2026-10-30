@@ -826,7 +826,7 @@ static J *proxy(J*req) {
     char endpoint[128];
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
-        int readable=!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"task-history")||!strcmp(tail,"account-models")||!strcmp(tail,"scheduling")||!strcmp(tail,"reset-cards");
+        int readable=!strcmp(tail,"traffic")||!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"task-history")||!strcmp(tail,"account-models")||!strcmp(tail,"scheduling")||!strcmp(tail,"reset-cards");
         int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"scheduling");
         if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
@@ -835,9 +835,9 @@ static J *proxy(J*req) {
         tail=path+strlen(RESOURCE);
         if(!strcmp(tail,"healthz"))snprintf(endpoint,sizeof(endpoint),"/healthz");
         else {
-            if(strcmp(tail,"status")&&strcmp(tail,"panel.js")&&strcmp(tail,"panel.css"))return http_error(404,"not_found");
+            if(strcmp(tail,"status")&&strcmp(tail,"panel.js")&&strcmp(tail,"panel.css")&&strcmp(tail,"records.js")&&strcmp(tail,"records.css")&&strcmp(tail,"presentation.js"))return http_error(404,"not_found");
             snprintf(endpoint,sizeof(endpoint),"/ui/%s",tail);
-            type=strcmp(tail,"status")==0?"text/html; charset=utf-8":strcmp(tail,"panel.js")==0?"text/javascript; charset=utf-8":"text/css; charset=utf-8";
+            type=strcmp(tail,"status")==0?"text/html; charset=utf-8":strstr(tail,".js")?"text/javascript; charset=utf-8":"text/css; charset=utf-8";
         }
     }
     else return http_error(404,"not_found");
@@ -847,7 +847,7 @@ static J *proxy(J*req) {
     snprintf(target,sizeof(target),"http://localhost%s",endpoint);
     J*query=field(req,"Query");
     const char*allowed[]= {
-        "job_id","after","limit","revision","search","status","type","source","trigger","from","to","page","today_from","today_to","account_id"
+        "job_id","after","limit","revision","search","status","type","source","trigger","from","to","page","today_from","today_to","account_id","kind","id","request_id","project","caller","account","model","session","sort"
     };
     for(size_t index=0;index<sizeof(allowed)/sizeof(allowed[0]);index++) {
         J*v=field(query,allowed[index]);
@@ -953,9 +953,9 @@ static J *registration(unsigned schema) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history","account-models","scheduling","scheduling","reset-cards"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history","account-models","scheduling","scheduling","reset-cards","traffic"
     };
-    for(int i=0;i<21;i++) {
+    for(size_t i=0;i<sizeof(paths)/sizeof(*paths);i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);
@@ -964,12 +964,12 @@ static J *routes(void) {
         json_object_array_add(list,item);
     }
     const char*assets[]= {
-        "/status","/panel.js","/panel.css","/healthz"
+        "/status","/panel.js","/panel.css","/healthz","/records.js","/records.css","/presentation.js"
     };
-    for(int i=0;i<4;i++) {
+    for(size_t i=0;i<sizeof(assets)/sizeof(*assets);i++) {
         J*item=json_object_new_object();
         json_object_object_add(item,"Path",json_object_new_string(assets[i]));
-        if(!i)json_object_object_add(item,"Menu",json_object_new_string("Codex Window Refresh v2"));
+        if(!i)json_object_object_add(item,"Menu",json_object_new_string("Codex 调度台"));
         json_object_array_add(resources,item);
     }
     json_object_object_add(r,"Routes",list);

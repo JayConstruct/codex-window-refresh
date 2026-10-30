@@ -2,9 +2,12 @@ GOCACHE ?= /tmp/codex-window-refresh-go-cache
 export GOCACHE
 export GOTOOLCHAIN := local
 
-.PHONY: check test vet race build plugin native-smoke installer-check panel-check release-check clean v2-build v2-smoke v2-panel-browser-check
+.PHONY: check docs-check test vet race build plugin native-smoke installer-check panel-check v1-panel-check v2-panel-check release-check v1-release-check v2-release-check clean v2-build v2-smoke v2-panel-browser-check
 
-check: test vet
+check: docs-check test vet
+
+docs-check:
+	python3 scripts/docs_check.py
 
 test:
 	go test ./...
@@ -29,11 +32,21 @@ native-smoke: plugin
 installer-check: build
 	python3 -m unittest discover -s scripts/tests -v
 
-panel-check:
-	node --test scripts/tests/panel*.test.cjs
+panel-check: v1-panel-check v2-panel-check
 
-release-check:
+v1-panel-check:
+	node --test tests/web/v1/*.test.cjs
+
+v2-panel-check:
+	node --test tests/web/v2/*.test.cjs
+
+release-check: v1-release-check v2-release-check
+
+v1-release-check:
 	python3 scripts/release_check.py
+
+v2-release-check:
+	python3 scripts/package-v2.py --check
 
 # Build and package v2 independently from v1.
 v2-build:
@@ -41,9 +54,8 @@ v2-build:
 	CGO_ENABLED=1 go build -buildvcs=false -o bin/window-refreshd ./cmd/window-refreshd
 	cc -std=c11 -Wall -Wextra -Werror -fPIC -fvisibility=hidden -shared -o bin/codex-window-refresh-v2-bridge.so native/bridge/bridge.c native/bridge/events.c native/bridge/scheduler.c -pthread -lcurl -l:libjson-c.so.5
 
-v2-smoke: v2-build
+v2-smoke: v2-build v2-panel-check
 	python3 native/bridge/tests/smoke.py
-	node --test native/bridge/tests/*.test.cjs
 
 v2-panel-browser-check:
 	node scripts/v2-panel-browser-check.mjs

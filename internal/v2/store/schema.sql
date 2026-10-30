@@ -1,6 +1,6 @@
 PRAGMA application_id=0x43575232;
 CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL);
-INSERT INTO schema_version SELECT 11 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
+INSERT INTO schema_version SELECT 12 WHERE NOT EXISTS(SELECT 1 FROM schema_version);
 CREATE TABLE IF NOT EXISTS routing_projects(
  project TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
  first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
@@ -194,3 +194,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS reset_account_live ON reset_attempts(account_i
 CREATE INDEX IF NOT EXISTS reset_attempts_ready ON reset_attempts(phase,next_at);
 CREATE TRIGGER IF NOT EXISTS scheduling_insert AFTER INSERT ON scheduling_settings BEGIN UPDATE view_state SET revision=revision+1; END;
 CREATE TRIGGER IF NOT EXISTS scheduling_update AFTER UPDATE ON scheduling_settings BEGIN UPDATE view_state SET revision=revision+1; END;
+
+-- Execution records are separate from activity safety state and never retain keys or bodies.
+CREATE TABLE IF NOT EXISTS traffic_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),salt TEXT NOT NULL);
+INSERT OR IGNORE INTO traffic_meta VALUES(1,lower(hex(randomblob(32))));
+CREATE TABLE IF NOT EXISTS traffic_requests(
+ id TEXT PRIMARY KEY,bridge_instance TEXT NOT NULL,request_id TEXT NOT NULL,trace_id TEXT NOT NULL DEFAULT '',
+ project TEXT NOT NULL DEFAULT '',caller TEXT NOT NULL DEFAULT '',session TEXT NOT NULL DEFAULT '',model TEXT NOT NULL DEFAULT '',
+ account_id TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'running',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,data TEXT NOT NULL,
+ UNIQUE(bridge_instance,request_id)
+);
+CREATE INDEX IF NOT EXISTS traffic_requests_time ON traffic_requests(created_at DESC);
+CREATE INDEX IF NOT EXISTS traffic_requests_trace ON traffic_requests(bridge_instance,trace_id);
+CREATE TABLE IF NOT EXISTS traffic_attempts(
+ id TEXT PRIMARY KEY,bridge_instance TEXT NOT NULL,selection_id TEXT NOT NULL DEFAULT '',execution_id TEXT NOT NULL DEFAULT '',
+ request_id TEXT NOT NULL DEFAULT '',trace_id TEXT NOT NULL DEFAULT '',account_id TEXT NOT NULL DEFAULT '',reason TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'selected',executed INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS traffic_attempts_selection ON traffic_attempts(bridge_instance,selection_id);
+CREATE INDEX IF NOT EXISTS traffic_attempts_request ON traffic_attempts(request_id,created_at);
+CREATE INDEX IF NOT EXISTS traffic_attempts_trace ON traffic_attempts(bridge_instance,trace_id);
+CREATE TABLE IF NOT EXISTS traffic_operation_evidence(job_id TEXT PRIMARY KEY,kind TEXT NOT NULL,evidence TEXT NOT NULL,recorded_at TEXT NOT NULL);

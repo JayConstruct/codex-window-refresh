@@ -56,22 +56,26 @@ type DashboardEvent struct {
 }
 
 type Dashboard struct {
-	Revision         uint64           `json:"view_revision"`
-	AccountsRevision uint64           `json:"accounts_revision"`
-	Total            int              `json:"total"`
-	Available        int              `json:"available"`
-	Normal           int              `json:"normal"`
-	QuotaExhausted   int              `json:"quota_exhausted"`
-	QuotaRestricted  int              `json:"quota_restricted"`
-	Disabled         int              `json:"disabled"`
-	Unavailable      int              `json:"unavailable"`
-	Capacity         int              `json:"capacity"`
-	UnknownQuota     int              `json:"unknown_quota"`
-	Errors           int              `json:"errors"`
-	Tasks            DashboardTasks   `json:"tasks"`
-	RecentJobs       []JobSummary     `json:"recent_jobs"`
-	ActiveJobs       []JobSummary     `json:"active_jobs"`
-	RecentEvents     []DashboardEvent `json:"recent_events"`
+	Revision          uint64           `json:"view_revision"`
+	AccountsRevision  uint64           `json:"accounts_revision"`
+	Total             int              `json:"total"`
+	Available         int              `json:"available"`
+	Normal            int              `json:"normal"`
+	QuotaExhausted    int              `json:"quota_exhausted"`
+	QuotaRestricted   int              `json:"quota_restricted"`
+	Disabled          int              `json:"disabled"`
+	Unavailable       int              `json:"unavailable"`
+	Capacity          int              `json:"capacity"`
+	Enabled           int              `json:"enabled"`
+	UnknownEnabled    int              `json:"unknown_enabled"`
+	FiveHourExhausted int              `json:"five_hour_exhausted"`
+	WeeklyExhausted   int              `json:"weekly_exhausted"`
+	UnknownQuota      int              `json:"unknown_quota"`
+	Errors            int              `json:"errors"`
+	Tasks             DashboardTasks   `json:"tasks"`
+	RecentJobs        []JobSummary     `json:"recent_jobs"`
+	ActiveJobs        []JobSummary     `json:"active_jobs"`
+	RecentEvents      []DashboardEvent `json:"recent_events"`
 }
 
 func freshQuotaField(snapshot quota.Snapshot, field string, at time.Time) bool {
@@ -224,6 +228,23 @@ func readDashboard(ctx context.Context, tx *sql.Tx, revision, accountsRevision u
 			dashboard.Unavailable++
 		}
 		known, capacity := quotaState([]byte(raw), at)
+		if status != "disabled" {
+			dashboard.Enabled++
+			if display != "quota_exhausted" && display != "quota_restricted" && (!known || status != "available") {
+				dashboard.UnknownEnabled++
+			}
+		}
+		if display == "quota_exhausted" {
+			var snapshot quota.Snapshot
+			if json.Unmarshal([]byte(raw), &snapshot) == nil {
+				if snapshot.Weekly != nil && snapshot.Weekly.Remaining != nil && snapshot.Weekly.Remaining.Value == 0 {
+					dashboard.WeeklyExhausted++
+				} else {
+					dashboard.FiveHourExhausted++
+				}
+			}
+		}
+
 		if !known {
 			dashboard.UnknownQuota++
 		}

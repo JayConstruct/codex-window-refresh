@@ -35,6 +35,9 @@ func (s *Store) AccountPageFiltered(ctx context.Context, after string, limit int
 	if limit < 1 || limit > 500 || len(search) > 256 {
 		return page, errors.New("invalid_account_filter")
 	}
+	if status == "usable" || status == "quota_unknown" {
+		return s.accountEvidencePage(ctx, after, limit, expected, search, status)
+	}
 	filter := "status!='removed' AND instr(lower(id),lower(?))>0"
 	switch status {
 	case "", "all":

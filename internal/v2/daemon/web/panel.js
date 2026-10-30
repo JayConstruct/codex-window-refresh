@@ -4,14 +4,15 @@
   const RESOURCE = '/v0/resource/plugins/codex-window-refresh/';
   const PAGE_SIZE = 6;
   const pages = {
-    overview: ['运行总览', '掌握账号额度与实时查询任务'],
-    accounts: ['账号额度', '查看五小时与周额度，按账号查询最新结果'],
-    query: ['额度查询', '管理查询规则与随机延迟，不发送模型请求'],
-    wake: ['模型唤醒', '配置后台唤醒规则、手动执行并核实任务结果'],
-    scheduling: ['账号调度与重置卡', '管理项目账号偏好、额度分配和赠送卡到期兑换'],
-    models: ['模型与提示词', '管理唤醒模型、提示词与短句池'],
-    history: ['任务记录', '统一查看手动与自动任务，追踪执行进度与响应结果'],
-    diagnostics: ['诊断与设置', '检查 CPA 连接、查询能力与后台异常']
+    overview: ['账号池概览', '额度、任务与需要处理的事项'],
+    accounts: ['账号管理', '查看额度、管理账号状态与执行操作'],
+    query: ['自动化', '规则保存后，由后台持续执行'],
+    wake: ['自动化', '规则保存后，由后台持续执行'],
+    cards: ['自动化', '规则保存后，由后台持续执行'],
+    scheduling: ['项目调度', '为项目匹配首选账号，保持会话连续'],
+    models: ['自动化', '规则保存后，由后台持续执行'],
+    history: ['运行记录', '用户请求、分流依据与上游执行'],
+    diagnostics: ['设置与诊断', '连接、显示偏好与后台运行状态']
   };
   const codes = {
     unauthorized: '管理认证失败，请重新连接', forbidden: '管理访问被拒绝',
@@ -88,6 +89,19 @@
       }
       try { return JSON.parse(raw); } catch { return raw; }
     } catch { return null; }
+  }
+  function followHostTheme(context) {
+    const media = context.matchMedia?.('(prefers-color-scheme: dark)');
+    const apply = () => {
+      const saved = storedValue(context, 'cli-proxy-theme');
+      const preference = saved?.state?.theme ?? saved;
+      const theme = ['light', 'white', 'dark'].includes(preference) ? preference : media?.matches ? 'dark' : 'white';
+      context.document.documentElement.setAttribute('data-theme', theme);
+    };
+    apply();
+    media?.addEventListener?.('change', apply);
+    context.addEventListener?.('storage', event => { if (event.key === 'cli-proxy-theme' || event.key === null) apply(); });
+    return apply;
   }
   function readPanelKey(context, base) {
     const candidate = (key, address) => {
@@ -525,6 +539,7 @@
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
+  const applyHostTheme = followHostTheme(context);
   const toasts = createToastCenter(document, context);
   for (const id of ['error', 'notice', 'rules-message', 'wake-overview-message', 'settings-message', 'wake-settings-message', 'wake-manual-message', 'wake-history-message', 'model-message', 'generation-message']) $(id).hidden = true;
   let base;
@@ -574,6 +589,14 @@
   const settingsFields = {automatic: 'settings-automatic', fiveHour: 'settings-five-hour', weekly: 'settings-weekly', interval: 'settings-interval', timezone: 'settings-timezone', delayMin: 'settings-delay-min', delayMax: 'settings-delay-max', excluded: 'settings-excluded'};
   const pending = new Map(), controllers = new Set(), queryBusy = new Set(), unresolved = new Map();
   const errorLimits = new Map();
+  const presentation = context.CWRPresentation;
+  let selectedAccountID = '', recordsPage = 'users', overviewTaskData = null, overviewTaskLoading = false;
+  let selectedBatchBusy = false;
+  let taskOpenSequence = 0, navigationEpoch = 0, accountTaskSequence = 0, selectedAccountTasks = null, selectedAccountTasksError = false;
+  const selectedAccounts = new Set();
+  const recordsPanel = context.CWRRecords?.mount({root: $('runtime-records-root'), request: (path, options) => api(path, options),
+    displayAccount, hideRefresh: true, onTask: (id, kind) => openRecordedTask(id, kind), onViewAccount: id => openAccountDetail(id),
+    onNavigate: page => { recordsPage = page; for (const button of document.querySelectorAll('[data-record-page]')) { const selected = button.dataset.recordPage === page; button.classList.toggle('active', selected); button.setAttribute('aria-selected', String(selected)); } }});
   const setText = (id, text) => { if ($(id)) setLiveText($(id), text); };
   function setLiveText(node, text) {
     const raw = String(text), value = displayText(raw);
@@ -666,7 +689,7 @@
     }
     if (alias) displayPreference.aliases[aliasSelection] = alias;
     else delete displayPreference.aliases[aliasSelection];
-    persistDisplayPreference(); closeAliasDialog(); applyDisplayPrivacy(document.documentElement);
+    persistDisplayPreference(); closeAliasDialog(); applyDisplayPrivacy(document.documentElement); renderAccounts(); renderPreferences();
   }
   function statusBusy() { return [...statusOperations.values()].some(state => ['reading', 'checking', 'saving', 'verifying'].includes(state.phase)); }
   function accountStatusBlocksWake(id) {
@@ -803,21 +826,18 @@
     }
     if (!prepared) applyDisplayPrivacy(parent);
   }
-  const sidebarPreference = 'cwr-v2-sidebar:' + base;
-  function renderSidebar(collapsed, persist = false) {
-    $('app-sidebar').dataset.collapsed = String(collapsed);
-    document.documentElement?.classList.toggle('sidebar-collapsed', collapsed);
-    const label = collapsed ? '展开侧栏' : '收起侧栏';
-    $('sidebar-toggle').setAttribute('aria-expanded', String(!collapsed));
-    $('sidebar-toggle').setAttribute('aria-label', label); $('sidebar-toggle').setAttribute('title', label);
-    setText('sidebar-toggle-label', label);
-    if (persist) { try { context.localStorage.setItem(sidebarPreference, String(collapsed)); } catch {} }
-  }
   function element(tag, className, text) {
     const item = document.createElement(tag);
     if (className) item.className = className;
     if (text !== undefined) item.textContent = text;
     return item;
+  }
+  function icon(name) {
+    const graphic = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    graphic.setAttribute('class', 'icon'); graphic.setAttribute('aria-hidden', 'true');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', '#icon-' + name); graphic.append(use);
+    return graphic;
   }
   function taskErrorDetails(code, job, account = '', kind = 'query') {
     const diagnostic = taskDiagnostic(code), details = element('details', 'task-error-details');
@@ -881,10 +901,14 @@
   function renderSettings() {
     const supported = settingsSupported(), dirty = draftDirty(), draft = readDraft();
     const errors = settingsBase ? validateQueryDraft(draft).errors : {};
+    if ($('settings-interval-minutes') && document.activeElement !== $('settings-interval-minutes')) {
+      const value = Number(draft.interval); $('settings-interval-minutes').value = draft.interval !== '' && Number.isFinite(value) ? String(value / 60) : '';
+    }
     $('settings-fields').disabled = !connected || !supported || !settingsBase || settingsSaving || settingsLoading;
     $('settings-save').disabled = !connected || !supported || !dirty || !!Object.keys(errors).length || settingsConflict || settingsNeedsVerification || settingsSaving || settingsLoading;
     $('settings-reload').disabled = !connected || !supported || settingsSaving || settingsLoading;
     for (const [name, id] of Object.entries(settingsFields)) setAttribute($(id), 'aria-invalid', !!errors[name]);
+    if ($('settings-interval-minutes')) setAttribute($('settings-interval-minutes'), 'aria-invalid', !!errors.interval);
     setText('settings-validation', Object.values(errors).join('；')); $('settings-validation').hidden = !Object.keys(errors).length;
     $('settings-conflict').hidden = !settingsConflict;
     setText('settings-status', !connected ? '等待连接' : !supported ? '尚未接入' : settingsLoading ? '读取中' : settingsSaving ? '保存中' : settingsConflict ? '设置冲突' : dirty ? '未保存草稿' : savedSettings ? '版本 ' + savedSettings.revision : '尚未读取');
@@ -1285,6 +1309,7 @@
     setText('model-status', !connected ? '等待连接' : !supported ? '尚未接入' : modelSaving ? '保存中' : modelLoading ? '读取中' : modelNeedsVerification ? '需要核实' : modelConflict ? '设置冲突' : dirty ? '未保存草稿' : savedModelSettings ? '版本 ' + savedModelSettings.revision : '尚未读取');
     setText('model-save', modelSaving ? '保存中…' : '保存配置');
     setText('model-phrase-count', parseModelPhrases(draft.phrases).length + ' / 200 条');
+    renderPhrasePool(locked);
     $('model-preview').disabled = locked || !!Object.keys(errors).length;
     for (const id of ['model-import', 'model-export', 'model-deduplicate', 'model-clear', 'model-confirm-action', 'model-cancel-action']) $(id).disabled = locked;
     $('model-confirmation').hidden = !modelConfirmation;
@@ -1303,6 +1328,21 @@
     } else rows.push(element('p', '', connected && !supported ? '当前后台未提供模型配置能力。' : '进入本页后读取已保存配置。'));
     updateChildren(diff, rows);
     renderGeneration();
+  }
+  function renderPhrasePool(locked = false) {
+    const root = $('model-phrase-list'); if (!root) return;
+    const phrases = $('model-phrases').value.split('\n').filter((phrase, index, values) => phrase !== '' || index < values.length - 1), rows = [];
+    for (const [index, phrase] of phrases.entries()) {
+      const row = element('div', 'phrase-row'); row.dataset.renderKey = 'phrase:' + index;
+      const input = element('input'); input.type = 'text'; input.value = phrase; input.disabled = locked; input.maxLength = 512; input.setAttribute('aria-label', '短句 ' + (index + 1));
+      input.oninput = function () { const values = $('model-phrases').value.split('\n'); values[index] = this.value; $('model-phrases').value = values.join('\n'); modelDraftChanged(); };
+      const remove = element('button', 'text-button', '×'); remove.type = 'button'; remove.disabled = locked; remove.setAttribute('aria-label', '删除短句 ' + (index + 1));
+      remove.onclick = () => { const values = $('model-phrases').value.split('\n'); values.splice(index, 1); $('model-phrases').value = values.join('\n'); modelDraftChanged(); };
+      row.append(element('span', '', index + 1), input, remove); rows.push(row);
+    }
+    const add = element('button', 'button button-outline', '+ 添加短句'); add.type = 'button'; add.disabled = locked || phrases.length >= 200;
+    add.onclick = () => { const values = $('model-phrases').value.split('\n'); if (values.length === 1 && !values[0]) values.length = 0; values.push(''); $('model-phrases').value = values.join('\n') + '\n'; modelDraftChanged(); const fields = root.querySelectorAll('input'); fields[fields.length - 1]?.focus(); };
+    rows.push(add); updateChildren(root, rows);
   }
   async function reloadModelSettings(discard = false, explicit = false) {
     if (!connected || !modelSupported() || modelLoading || modelPolling || modelSaving || modelNeedsVerification && !explicit) return false;
@@ -1504,6 +1544,7 @@
     $('generation-refresh-accounts').disabled = !connected || !generationCatalogSupported() || generationCatalogLoading;
     setText('generation-directory-status', !connected ? '尚未连接，账号目录仅读取本地 CPA，不调用模型。' : !generationCatalogSupported() ? '当前后台没有账号目录；兼容手动输入 Codex 账号。' : generationCatalogLoading ? '正在读取本地 CPA 账号目录，不调用模型…' : generationCatalogError ? '读取账号目录失败：' + generationCatalogError + '。请显式刷新，不会发送模型请求。' : generationCatalog?.instance === views.instance ? '已读取 ' + generationCatalog.accounts.length + ' 个生成账号；与 Codex 额度统计独立。仅显式刷新，不随页面轮询。' : '请刷新生成账号，仅读取本地 CPA，不调用模型。');
     setText('generation-account-help', account.text);
+    for (const button of document.querySelectorAll('[data-generation-provider]')) { const selected = button.dataset.generationProvider === (account.provider || generationAccountIdentity?.provider || 'codex'); button.classList.toggle('active', selected); button.setAttribute('aria-pressed', String(selected)); button.disabled = !connected || generationSubmitting || generationReading || generationUnconfirmed || generationUnknown; }
     setText('generation-consent-label', '我确认通过' + (account.provider ? ' ' + generationProviderName(account.provider) : '所选账号') + ' 发送一次模型请求，可能消耗该账号额度。');
     $('generation-verify').hidden = !generationUnconfirmed && !generationUnknown;
     $('generation-verify').disabled = !connected || !supported || generationSubmitting || generationReading || generationUnknown && !generationTask?.job_id;
@@ -1592,13 +1633,14 @@
   }
   function setConnection(text) {
     setText('connection', text);
-    setText('sidebar-connection', connected ? 'CPA 已连接' : connecting ? '正在连接 CPA' : 'CPA 未连接');
-    if ($('sidebar-connection')) setData($('sidebar-connection'), 'connected', connected);
+    setText('header-connection', connected ? 'CPA 已连接' : connecting ? '正在连接 CPA' : 'CPA 未连接');
+    if ($('header-connection')) setData($('header-connection'), 'connected', connected);
   }
   function controls() {
     for (const id of ['query', 'query-single', 'refresh', 'sync']) if ($(id)) $(id).disabled = !connected || syncing && id === 'sync' || queryBusy.has('batch') && id === 'query';
     $('connect').disabled = connecting; $('key').disabled = connecting;
-    setText('query', unresolved.has('batch') ? '重试批量查询' : '批量查询');
+    setText('query', unresolved.has('batch') ? '核实批量查询' : selectedAccounts.size ? '查询已选 ' + selectedAccounts.size + ' 个' : '查询全部');
+    setText('header-query', selectedBatchBusy ? '正在提交查询' : selectedAccounts.size ? '查询已选 ' + selectedAccounts.size + ' 个' : '查询额度');
     if ($('disconnect')) $('disconnect').hidden = !connected;
     if ($('previous')) $('previous').disabled = !connected || updatingAccounts || !previousCursors.length;
     if ($('next')) $('next').disabled = !connected || updatingAccounts || !nextCursor;
@@ -1609,9 +1651,14 @@
     renderGeneration();
     renderModelCatalogs();
     renderScheduling();
+    renderRuleSummaries();
+    recordsPanel?.setContext({connected, instanceId: views.instance || '', displayAccount});
     if ($('history-refresh')) $('history-refresh').disabled = !connected;
   }
   function stop() {
+    recordsPanel?.disconnect(); overviewTaskLoading = false; overviewTaskData = null;
+    selectedAccounts.clear(); selectedBatchBusy = false;
+    taskOpenSequence++; accountTaskSequence++; selectedAccountTasks = null; selectedAccountTasksError = false;
     toasts.clear();
     closeQuickWake();
     closeAliasDialog();
@@ -1656,6 +1703,9 @@
     if (!key) throw Object.assign(new Error('unauthorized'), {code: 'unauthorized'});
     const current = generation, controller = new AbortController();
     controllers.add(controller);
+    const cancel = () => controller.abort();
+    if (options.signal?.aborted) controller.abort();
+    options.signal?.addEventListener?.('abort', cancel, {once: true});
     let timedOut = false;
     const deadline = setTimeout(() => { timedOut = true; controller.abort(); }, 10000);
     try {
@@ -1675,7 +1725,7 @@
     } catch (error) {
       if (error.code) throw error;
       throw Object.assign(new Error('request_failed'), {code: timedOut ? 'timeout' : 'network'});
-    } finally { clearTimeout(deadline); controllers.delete(controller); }
+    } finally { clearTimeout(deadline); controllers.delete(controller); options.signal?.removeEventListener?.('abort', cancel); }
   }
   function badge(label, kind) {
     const span = element('span', 'status-badge ' + kind);
@@ -1704,14 +1754,23 @@
   }
   function renderAccounts() {
     const rows = [];
-    for (const account of accountsData) {
+    const ordered = accountsData;
+    for (const account of ordered) {
       const row = element('tr', 'account-row'), name = element('td', 'account-name');
       row.dataset.renderKey = 'account:' + account.id;
-      const identityLabel = element('strong', '', account.id); identityLabel.title = account.id; name.append(identityLabel);
+      row.dataset.selected = String(activePage === 'accounts' && selectedAccountID === account.id);
+      const selection = element('td', 'account-selection'), checkbox = element('input', 'account-select');
+      checkbox.type = 'checkbox'; checkbox.checked = selectedAccounts.has(account.id); checkbox.disabled = !connected || selectedBatchBusy;
+      checkbox.setAttribute('aria-label', '选择账号 ' + account.id);
+      checkbox.onchange = function () { if (this.checked) selectedAccounts.add(account.id); else selectedAccounts.delete(account.id); controls(); };
+      selection.append(checkbox);
+      const identityLabel = element('button', 'account-identity', account.id); identityLabel.type = 'button'; identityLabel.title = account.id;
+      identityLabel.onclick = () => openAccountDetail(account.id);
+      name.append(identityLabel, element('small', 'account-secondary', maskedAccount(account.id)));
       const aliasButton = element('button', 'text-button account-alias', '编辑别称'); aliasButton.type = 'button'; aliasButton.dataset.accountAliasId = account.id; aliasButton.dataset.renderKey = 'alias';
       aliasButton.setAttribute('aria-label', '编辑账号 ' + account.id + ' 的浏览器别称'); aliasButton.onclick = function () { openAliasDialog(account.id, this); }; name.append(aliasButton);
       const state = statusOperations.get(account.id);
-      const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '手动禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : accountStatus(account);
+      const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '已禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : presentation?.accountView(account) || accountStatus(account);
       status.append(badge(value.label, value.kind));
       status.title = (account.status_observed_at ? 'CPA 状态：' + age(account.status_observed_at) + '同步。' : '') + (value.kind === 'attention' ? '额度状态来自最近一次额度观测；重置或恢复需重新核实，不以本地倒计时自动恢复正常。' : '后台定时同步 CPA 账号状态。');
       const five = element('td'), weekly = element('td'), observed = element('td'), action = element('td');
@@ -1719,7 +1778,7 @@
       const observedAge = element('span', 'observed-age', age(account.observed_at)); observedAge.dataset.observedAt = account.observed_at || '';
       observed.append(observedAge, element('small', 'observed-source', account.observed_at ? sourceText(account.quota?.source) : '等待首次查询'));
       const accountKey = 'account:' + account.id;
-      const button = element('button', 'account-query', queryBusy.has(accountKey) ? '提交中…' : unresolved.has(accountKey) ? '重试查询' : '立即查询');
+      const button = element('button', 'account-query', queryBusy.has(accountKey) ? '提交中…' : unresolved.has(accountKey) ? '核实查询' : '查询');
       button.type = 'button'; button.disabled = !connected || queryBusy.has(accountKey);
       button.setAttribute('aria-label', '立即查询账号 ' + account.id); button.onclick = () => submitQuery(account.id);
       const buttons = element('div', 'account-buttons');
@@ -1739,19 +1798,118 @@
       statusButton.disabled = !connected || statusBusy() || !independentAuthFile(account) || account.status === 'removed';
       statusButton.title = independentAuthFile(account) ? '真实修改 CPA 认证文件状态；启用可能恢复业务及自动任务的额度消耗，禁用不发送模型。' : '虚拟子账号、运行时或配置密钥不能独立启停；不会修改其父级凭据。';
       statusButton.onclick = function () { return toggleAccountStatus(account.id); };
-      buttons.append(button, wakeButton, statusButton); action.append(buttons);
+      const menu = element('details', 'account-menu'), more = element('summary', 'account-more', '…'), menuItems = element('div', 'account-menu-items');
+      more.setAttribute('aria-label', '账号更多操作：' + account.id);
+      const detailButton = element('button', 'text-button', '查看账号详情'); detailButton.type = 'button'; detailButton.onclick = () => openAccountDetail(account.id);
+      menuItems.append(detailButton, wakeButton, statusButton, aliasButton); menu.append(more, menuItems);
+      buttons.append(button, menu); action.append(buttons);
       if (['queued', 'running'].includes(account.pending_query?.phase)) action.append(queueAnnotation(account.pending_query, 'query-pending'));
-      row.append(name, status, five, weekly, observed, action); rows.push(row);
+      row.append(selection, name, five, weekly, status, observed, action); rows.push(row);
     }
     if (!accountsData.length) {
       const row = element('tr'), cell = element('td', 'empty-state', connected ? ($('accounts-search').value || $('accounts-filter').value !== 'all' ? '没有符合条件的账号' : '尚无账号，后台将自动同步 CPA') : '连接 CPA 后显示真实账号额度');
-      cell.colSpan = 6; row.append(cell); rows.push(row);
+      cell.colSpan = 7; row.append(cell); rows.push(row);
     }
     updateChildren($('accounts'), rows);
     const total = overviewData?.dashboard?.total ?? accountsData.length;
-    setText('accounts-count', connected ? total + ' 个账号' : '等待连接');
-    setText('accounts-page-info', accountsData.length ? (pageStart + 1) + '–' + (pageStart + accountsData.length) + ' / ' + (filteredTotal ?? overviewData?.dashboard?.total ?? '—') : '0 / ' + (connected ? filteredTotal ?? total : '—'));
+    setText('accounts-count', connected ? String(total) : '—');
+    setText('accounts-page-info', accountsData.length ? '显示 ' + (pageStart + 1) + '–' + (pageStart + accountsData.length) + '，共 ' + (filteredTotal ?? overviewData?.dashboard?.total ?? '—') + ' 个账号' : '共 ' + (connected ? filteredTotal ?? total : '—') + ' 个账号');
+    if ($('account-select-all')) { $('account-select-all').checked = !!accountsData.length && accountsData.every(account => selectedAccounts.has(account.id)); $('account-select-all').indeterminate = accountsData.some(account => selectedAccounts.has(account.id)) && !$('account-select-all').checked; $('account-select-all').disabled = !connected || selectedBatchBusy || !accountsData.length; }
+    renderAccountDetail(); renderAccountTabs();
+    if ($('account-pages')) {
+      const current = previousCursors.length + 1, buttons = [];
+      for (let index = 1; index <= current; index++) {
+        const button = element('button', 'button button-small', String(index)); button.type = 'button'; button.setAttribute('aria-label', '账号第 ' + index + ' 页');
+        if (index === current) button.setAttribute('aria-current', 'page');
+        button.disabled = !connected || updatingAccounts;
+        button.onclick = async () => {
+          if (!connected || updatingAccounts || index === current) return;
+          cursor = index === 1 ? '' : previousCursors[index - 1]; previousCursors = previousCursors.slice(0, index - 1); pageStart = (index - 1) * PAGE_SIZE;
+          try { await accounts(); } catch (error) { report(error); }
+        }; buttons.push(button);
+      }
+      if (nextCursor) { const button = element('button', 'button button-small', String(current + 1)); button.type = 'button'; button.disabled = !connected || updatingAccounts; button.onclick = () => $('next').onclick(); buttons.push(button); }
+      updateChildren($('account-pages'), buttons);
+    }
     controls();
+  }
+  function openAccountDetail(id) {
+    if (!id) return;
+    selectedAccountID = id;
+    selectedAccountTasks = null;
+    selectedAccountTasksError = false;
+    if (activePage !== 'accounts') navigate('accounts');
+    renderAccounts();
+    if (connected) void loadAccountTasks(id);
+    if (connected && !accountsData.some(account => account.id === id) && !routingKnownAccounts.has(id)) {
+      const current = generation;
+      void api('/accounts?search=' + encodeURIComponent(id) + '&limit=100').then(data => {
+        if (current !== generation || selectedAccountID !== id) return;
+        const account = data.accounts?.find(item => item.id === id);
+        if (account) { routingKnownAccounts.set(id, account); renderAccountDetail(); }
+        else notice('当前账号清单中未找到此账号。', 'info');
+      }).catch(report);
+    }
+    if (connected && !schedulingSaved && !schedulingLoading) void loadScheduling().then(renderAccountDetail).catch(report);
+    if (connected && !resetData) void loadResetCards().then(renderAccountDetail).catch(report);
+  }
+  async function loadAccountTasks(id = selectedAccountID) {
+    if (!connected || !id) return;
+    const current = generation, sequence = ++accountTaskSequence, view = views.begin('account-tasks:' + id);
+    try {
+      const data = await api('/task-history?search=' + encodeURIComponent(id) + '&limit=10');
+      if (current !== generation || sequence !== accountTaskSequence || id !== selectedAccountID) return;
+      validateTaskHistoryPage(data);
+      if (!views.accept('account-tasks:' + id, view, data)) return;
+      selectedAccountTasks = data.records.filter(task => task.account_id === id); selectedAccountTasksError = false; renderAccountDetail();
+    } catch (error) { if (current === generation && sequence === accountTaskSequence && id === selectedAccountID) { selectedAccountTasksError = true; renderAccountDetail(); } }
+  }
+  function renderAccountDetail() {
+    const root = $('account-detail');
+    if (!root) return;
+    const account = accountsData.find(item => item.id === selectedAccountID) || routingKnownAccounts.get(selectedAccountID);
+    root.hidden = activePage !== 'accounts' || !account;
+    const slot = $('accounts-page-slot'); if (slot) slot.classList.toggle('with-detail', !root.hidden);
+    if (root.hidden) return;
+    const rows = [], heading = element('div', 'account-detail-heading');
+    heading.append(element('h2', '', '账号详情'));
+    const close = element('button', 'text-button', '×'); close.type = 'button'; close.setAttribute('aria-label', '关闭账号详情');
+    close.onclick = () => { selectedAccountID = ''; renderAccounts(); }; heading.append(close); rows.push(heading);
+    const identity = element('div', 'detail-section'); identity.append(element('h3', 'account-detail-name', account.id), element('p', 'account-secondary', maskedAccount(account.id)), badge((presentation?.accountView(account) || accountStatus(account)).label, (presentation?.accountView(account) || accountStatus(account)).kind));
+    const state = statusOperations.get(account.id), enabled = typeof state?.disabled === 'boolean' ? !state.disabled : account.status !== 'disabled';
+    const switchRow = element('div', 'summary-row'), toggle = element('button', 'account-status-switch');
+    toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', String(enabled)); toggle.setAttribute('aria-label', 'CPA 账号状态：' + account.id);
+    toggle.append(element('span', 'account-status-track'), element('span', '', state?.phase === 'unknown' ? '只读核实' : enabled ? '已启用' : '已禁用'));
+    toggle.disabled = !connected || statusBusy() || !independentAuthFile(account); toggle.onclick = () => toggleAccountStatus(account.id);
+    switchRow.append(element('span', 'muted', 'CPA 账号状态'), toggle); identity.append(switchRow); rows.push(identity);
+    const actions = element('div', 'account-detail-actions');
+    const query = element('button', 'button button-primary', '查询额度'); query.type = 'button'; query.disabled = !connected || queryBusy.has('account:' + account.id); query.onclick = () => submitQuery(account.id);
+    const wake = element('button', 'button button-outline', '立即唤醒'); wake.type = 'button'; wake.disabled = quickWakeBlocked() || !!quickWakeAccount || account.status !== 'available' || accountStatusBlocksWake(account.id); wake.onclick = () => startQuickWake(account.id);
+    actions.append(query, wake); rows.push(actions);
+    const quota = element('section', 'detail-section detail-quota'); quota.append(element('h3', '', '额度概况'));
+    for (const [key, label] of [['five_hour', '五小时剩余'], ['weekly', '周额度剩余']]) { const row = element('div', 'detail-quota-row'); row.append(element('strong', '', label), renderQuota(account.quota, key)); quota.append(row); }
+    quota.append(element('p', 'field-help', '观测来源：' + sourceText(account.quota?.source) + ' · 数据更新：' + age(account.observed_at))); rows.push(quota);
+    const cards = resetData?.accounts?.find(item => item.account_id === account.id || item.id === account.id), cardSection = element('section', 'detail-section');
+    cardSection.append(element('h3', '', '重置卡'), element('p', '', cards ? '可用 ' + (cards.available_count ?? cards.summary?.available_count ?? cards.credits?.availableCount ?? '未知') + ' 张' : '尚无已观测卡片详情'));
+    const cardLink = element('button', 'text-button', '查看详情 →'); cardLink.type = 'button'; cardLink.onclick = () => navigate('cards'); cardSection.append(cardLink); rows.push(cardSection);
+    const projects = presentation?.matchingProjects(account.id, schedulingSaved?.config) || [], projectSection = element('section', 'detail-section');
+    projectSection.append(element('h3', '', '首选项目')); const chips = element('div', 'detail-projects');
+    for (const project of projects) chips.append(element('span', 'count-badge', project));
+    if (!projects.length) chips.append(element('span', 'muted', schedulingSaved ? '未设为项目首选账号' : '正在读取项目匹配'));
+    projectSection.append(chips); rows.push(projectSection);
+    const related = (selectedAccountTasks || []).slice(0, 2), taskSection = element('section', 'detail-section'); taskSection.append(element('h3', '', '最近任务'));
+    for (const task of related) { const button = element('button', 'overview-task-row text-button', (task.type === 'wake' ? '窗口唤醒' : '额度查询') + ' · ' + historyStatus(task).label); button.type = 'button'; button.onclick = () => openTaskRecord(task); taskSection.append(button); }
+    if (selectedAccountTasksError) taskSection.append(element('p', 'muted', '最近任务读取失败，稍后自动重试'));
+    else if (!related.length) taskSection.append(element('p', 'muted', selectedAccountTasks === null ? '正在读取相关任务' : '暂无最近任务记录'));
+    rows.push(taskSection);
+    const alias = element('button', 'text-button detail-footer', '编辑本地别称'); alias.type = 'button'; alias.onclick = function () { openAliasDialog(account.id, this); }; rows.push(alias);
+    updateChildren(root, rows);
+  }
+  function renderAccountTabs() {
+    const data = overviewData?.dashboard, current = $('accounts-filter')?.value || 'all';
+    const counts = {all: data?.total, available: data?.capacity, usable: data?.capacity, quota_exhausted: data?.quota_exhausted, attention: data?.unknown_enabled, quota_unknown: data?.unknown_enabled, disabled: data?.disabled};
+    for (const node of document.querySelectorAll('[data-account-count]')) setLiveText(node, counts[node.dataset.accountCount] ?? '—');
+    for (const button of document.querySelectorAll('[data-account-filter]')) { const filter = {available: 'usable', attention: 'quota_unknown'}[button.dataset.accountFilter] || button.dataset.accountFilter; button.classList.toggle('active', filter === current); button.setAttribute('aria-pressed', String(filter === current)); }
   }
   function updateTimes() {
     for (const node of document.querySelectorAll('[data-reset-at]')) setLiveText(node, resetText(node.dataset.resetAt));
@@ -2010,16 +2168,32 @@
   }
   async function openJob(id) {
     if (!connected) return;
-    const current = generation, resource = 'job:' + id, sequence = views.begin(resource), opener = document.activeElement;
+    const current = generation, resource = 'job:' + id, sequence = views.begin(resource), opener = document.activeElement, openSequence = ++taskOpenSequence, navigation = navigationEpoch;
     try {
       const job = await api('/jobs?job_id=' + encodeURIComponent(id));
-      if (current !== generation) return;
+      if (current !== generation || openSequence !== taskOpenSequence || navigation !== navigationEpoch) return;
       validateQueryJob(job, id);
       if (job.instance_id !== views.instance || !views.accept(resource, sequence, job)) return;
       pending.set(id, job);
-      navigate('history');
+      recordsPage = 'tasks'; navigate('history');
       selectHistory({...job, id: 'query:' + id, type: 'query', source: ['manual_single', 'manual_batch'].includes(job.trigger) ? 'manual' : job.trigger ? 'automatic' : '', status: displayedJobPhase(job)}, job, opener);
     } catch (error) { if (current === generation || error.code === 'unauthorized') report(error); }
+  }
+  async function openRecordedTask(id, kind) {
+    if (!['wake', 'model_wake'].includes(kind)) {
+      if (['generation', 'prompt_generation'].includes(kind)) { navigate('models'); notice('可在模型与提示词页面核实候选生成任务。', 'info'); return; }
+      if (kind === 'reset' || kind === 'reset_card') { navigate('cards'); return; }
+      return openJob(id);
+    }
+    if (!connected) return;
+    const current = generation, openSequence = ++taskOpenSequence, navigation = navigationEpoch;
+    try {
+      const job = await api('/wake-jobs?job_id=' + encodeURIComponent(id));
+      if (current !== generation || openSequence !== taskOpenSequence || navigation !== navigationEpoch || job.instance_id !== views.instance) return;
+      validateWakeJob(job, id);
+      const record = {job_id: id, account_id: job.account_id, type: 'wake', source: job.reason === 'manual' ? 'manual' : 'automatic', trigger: job.reason, phase: job.phase, status: ['checking', 'prepared', 'sending', 'verifying'].includes(job.phase) ? 'running' : job.phase, created_at: job.created_at, updated_at: job.updated_at, model: job.model || '', error_code: job.error_code, hold_reason: job.hold_reason};
+      recordsPage = 'tasks'; navigate('history', false); selectHistory({...record, id: 'wake:' + id, instance_id: views.instance, view_revision: job.view_revision || 0}, job);
+    } catch (error) { if (current === generation) report(error); }
   }
   function recentJobs() {
     const jobs = new Map([...(overviewData?.dashboard?.recent_jobs || []), ...(overviewData?.dashboard?.active_jobs || [])].map(job => [job.job_id || job.id, job]));
@@ -2028,10 +2202,11 @@
   }
   function renderTasks() {
     const jobs = recentJobs(), active = jobs.filter(job => !['completed', 'failed', 'cancelled'].includes(job.phase));
-    updateChildren($('tasks'), active.length ? active.slice(0, 3).map(job => taskElement(job)) : [element('div', 'empty-state', connected ? '暂无执行中的任务' : '连接后查看后台任务')]);
-    setText('tasks-count', Math.max(active.length, overviewData?.dashboard?.tasks?.active || 0) + ' 项');
     const latest = active[0];
     setText('job', latest ? (phaseNames[displayedJobPhase(latest)] || '查询任务') + ' · ' + (latest.account_id || latest.target || '全部账号') : '查询额度不发送模型请求');
+    if (presentation && overviewTaskData) { renderDashboard(); return; }
+    updateChildren($('tasks'), active.length ? active.slice(0, 3).map(job => taskElement(job)) : [element('div', 'empty-state', connected ? '暂无执行中的任务' : '连接后查看后台任务')]);
+    setText('tasks-count', Math.max(active.length, overviewData?.dashboard?.tasks?.active || 0) + ' 项');
   }
   function renderEvents() {
     const events = overviewData?.dashboard?.recent_events || [], rows = [];
@@ -2055,7 +2230,7 @@
     setText('metric-status-detail', ready ? '后台独立运行' : connected ? '保留已保存数据' : '请连接管理接口');
     setText('metric-total', stats ? String(stats.total) : '—');
     setText('metric-total-detail', stats ? (stats.normal ?? stats.available) + ' 正常 · ' + stats.disabled + ' 禁用 · ' + (stats.quota_exhausted || 0) + ' 额度耗尽 · ' + (stats.quota_restricted || 0) + ' 额度受限 · ' + stats.unavailable + ' 暂不可用' : '等待同步账号');
-    setText('metric-capacity', stats ? stats.capacity + ' / ' + stats.available : '— / —');
+    if (!presentation) setText('metric-capacity', stats ? stats.capacity + ' / ' + stats.available : '— / —');
     setText('metric-capacity-detail', stats ? '已核实可用窗口 · ' + (stats.unknown_quota || 0) + ' 待核实' : '等待额度观测');
     setText('metric-errors', stats ? String(stats.errors + (data.last_error ? 1 : 0)) : '—');
     setText('metric-errors-detail', stats?.errors || data?.last_error ? '查看诊断详情' : stats ? '当前无已报告异常' : '等待后台数据');
@@ -2068,31 +2243,161 @@
       setText('batch-query-note', randomized ? '每个账号由后台分别设置随机延迟，关闭页面后继续执行。' : '执行方式以当前后台能力及任务反馈为准。');
       setText('diagnostic-query-note', (automatic ? '自动额度查询已接入。' : '自动额度查询尚未接入。') + (randomized ? '批量及自动查询按账号随机延迟。' : '') + (wakeExecutionSupported() ? '模型唤醒独立确认并按后台安全规则执行。' : '模型唤醒尚未接入。'));
     }
-    renderSettings(); renderTasks(); renderEvents(); renderDiagnostics();
+    renderSettings(); renderTasks(); renderEvents(); renderDiagnostics(); renderDashboard(); renderRuleSummaries();
+  }
+  function openTaskRecord(record) {
+    recordsPage = 'tasks';
+    navigate('history', false);
+    selectHistory({...record, id: record.type + ':' + record.job_id, instance_id: views.instance, view_revision: overviewTaskData?.view_revision ?? 0});
+    void readHistoryDetail();
+  }
+  function openTaskFilter(status = '', account = '') {
+    recordsPage = 'tasks'; historyFilters.status = status; historyFilters.page = 1;
+    historyFilters.search = account; $('history-search').value = account;
+    navigate('history');
+  }
+  async function loadOverviewTasks() {
+    if (!connected || overviewTaskLoading) return;
+    const current = generation, sequence = views.begin('overview-tasks'); overviewTaskLoading = true;
+    try {
+      const data = await api('/task-history?status=running&limit=6');
+      if (current !== generation) return;
+      validateTaskHistoryPage(data);
+      if (!views.accept('overview-tasks', sequence, data)) return;
+      overviewTaskData = data; renderDashboard(); renderAccountDetail();
+    } catch (error) { if (current === generation && error.code !== 'stale' && activePage === 'overview') setText('metric-running-detail', '任务记录暂不可用，保留上次状态'); }
+    finally { if (current === generation) overviewTaskLoading = false; }
+  }
+  function renderDashboard() {
+    if (!presentation) return;
+    const value = presentation.overviewSummary(overviewData, overviewTaskData), stats = overviewData?.dashboard;
+    const number = amount => amount === null ? '—' : String(amount);
+    if ($('metric-capacity')) updateChildren($('metric-capacity'), [element('span', 'metric-main-number', number(value.capacity)), element('span', 'metric-denominator', ' / ' + number(value.enabled))]);
+    setText('metric-resetting', number(value.exhausted)); setText('metric-running', number(value.running)); setText('metric-attention', number(value.attention));
+    setText('capacity-available', number(value.capacity)); setText('capacity-exhausted', number(value.exhausted)); setText('capacity-unknown', number(value.other));
+    setText('capacity-pool', stats ? '已启用 ' + number(value.enabled) + ' · 已禁用 ' + stats.disabled : '等待账号同步');
+    for (const [id, count] of [['capacity-bar-available', value.capacity], ['capacity-bar-exhausted', value.exhausted], ['capacity-bar-unknown', value.other]]) {
+      if ($(id)) { $(id).style.width = value.enabled > 0 && count !== null ? Math.max(0, Math.min(100, count / value.enabled * 100)) + '%' : '0%'; }
+    }
+    const five = stats?.five_hour_exhausted, weekly = stats?.weekly_exhausted;
+    setText('metric-resetting-detail', Number.isInteger(five) && Number.isInteger(weekly) ? '五小时耗尽 ' + five + ' · 周额度耗尽 ' + weekly : '等待已耗尽窗口重置');
+    setText('metric-running-detail', overviewTaskData ? '执行中 ' + overviewTaskData.status_counts.running + ' · 等待执行 ' + overviewTaskData.status_counts.queued : '读取额度查询与窗口核实任务');
+    setText('metric-attention-detail', value.unknownTasks !== null && value.unknownAccounts !== null ? '未知结果 ' + value.unknownTasks + ' · 待核实账号 ' + value.unknownAccounts : '读取未知结果与账号观测');
+    const tasks = (overviewTaskData?.records || []).filter(task => ['running', 'queued'].includes(task.status)), taskRows = [];
+    for (const task of tasks.slice(0, 2)) {
+      const row = element('button', 'overview-task-row'); row.type = 'button'; row.dataset.renderKey = task.type + ':' + task.job_id;
+      const symbol = element('span', 'task-preview-icon'); symbol.append(icon(task.type === 'wake' ? 'send' : 'query'));
+      const content = element('div', 'overview-task-copy');
+      content.append(element('strong', '', task.type === 'wake' ? (task.account_id || '账号') + ' · 窗口唤醒' : task.account_id || '批量额度查询'));
+      content.append(element('small', 'muted', task.type === 'wake' ? wakePhases[task.phase] || '等待核实' : task.total ? task.completed + ' / ' + task.total + ' 个账号已完成' : '等待后台查询'));
+      row.append(symbol, content);
+      if (task.type === 'query' && task.total > 0) {
+        const progress = element('progress', 'task-preview-progress'); progress.max = task.total; progress.value = Math.min(task.total, Math.max(0, task.completed)); progress.setAttribute('aria-label', '已完成 ' + task.completed + ' / ' + task.total + ' 个账号'); row.append(progress);
+      } else if (task.type === 'wake' && task.phase === 'verifying') {
+        const progress = element('span', 'task-preview-progress'); progress.dataset.indeterminate = 'true'; progress.setAttribute('aria-label', '等待窗口核实'); row.append(progress);
+      }
+      row.append(badge(task.type === 'wake' && task.phase === 'verifying' ? '核实中' : task.status === 'queued' ? '等待执行' : '执行中', task.phase === 'verifying' ? 'attention' : 'available'));
+      row.onclick = () => openTaskRecord(task); taskRows.push(row);
+    }
+    if ($('tasks') && overviewTaskData) updateChildren($('tasks'), taskRows.length ? taskRows : [element('p', 'empty-state', '暂无执行中的任务')]);
+    if ($('account-recent-tasks')) {
+      const records = (stats?.recent_jobs || []).filter(task => !selectedAccountID || (task.target || task.account_id) === selectedAccountID).slice(0, 3);
+      updateChildren($('account-recent-tasks'), records.length ? records.map(task => {
+        const row = element('button', 'overview-task-row'); row.type = 'button'; row.dataset.renderKey = task.id || task.job_id;
+        const copy = element('div'); copy.append(element('strong', '', task.target || task.account_id || '批量额度查询'), element('small', 'muted', triggerNames[task.trigger] || '额度查询'));
+        row.append(copy, badge(phaseNames[task.phase] || '待核实', task.phase === 'failed' ? 'attention' : 'available'), element('small', 'muted', age(task.updated_at))); row.onclick = () => openJob(task.id || task.job_id); return row;
+      }) : [element('p', 'empty-state', '暂无相关额度查询记录')]);
+    }
+    if (value.running !== null) setText('tasks-count', value.running);
+    const attention = [];
+    const addAttention = (key, title, description, action, callback) => {
+      const row = element('div', 'overview-attention-row'); row.dataset.renderKey = key;
+      const text = element('div'); text.append(element('strong', '', title), element('small', 'muted', description));
+      const button = element('button', 'text-button', action + ' →'); button.type = 'button'; button.onclick = callback; row.append(icon(key === 'accounts' ? 'clock' : 'info'), text, button); attention.push(row);
+    };
+    if (value.unknownTasks > 0) addAttention('unknown', value.unknownTasks + ' 个任务结果未知', '仅核实原任务，暂勿重复发送', '查看原任务', () => openTaskFilter('unknown'));
+    if (value.unknownAccounts > 0) addAttention('accounts', value.unknownAccounts + ' 个账号额度待核实', '重新查询后更新已核实状态', '查看账号', () => { $('accounts-filter').value = 'quota_unknown'; navigate('accounts'); changeFilter(); });
+    if (overviewData?.last_error) addAttention('backend', message(overviewData.last_error), '查看当前后台运行信息', '查看诊断', () => navigate('diagnostics'));
+    if (overviewData?.inventory?.error_code) addAttention('inventory', 'CPA 账号同步尚未就绪', message(overviewData.inventory.error_code), '查看诊断', () => navigate('diagnostics'));
+    setText('overview-attention-count', attention.length);
+    if ($('overview-attention')) updateChildren($('overview-attention'), attention.length ? attention : [element('p', 'empty-state', connected ? value.attention === null ? '正在核实待办状态' : '暂无需要处理的事项' : '连接后显示需要处理的事项')]);
+    renderAccountTabs();
+  }
+  function renderRuleSummaries() {
+    const query = savedSettings?.config, wake = savedWakeSettings?.config, scheduling = schedulingSaved?.config;
+    if ($('overview-automation')) {
+      const rows = [];
+      for (const [label, enabled, page, symbol] of [['额度查询', query ? query.automatic || query.on_five_hour_expiry || query.on_weekly_expiry : null, 'query', 'settings'], ['窗口唤醒', wake?.enabled, 'wake', 'send'], ['重置卡使用', scheduling ? scheduling.cards.enabled && scheduling.cards.auto_consume : null, 'cards', 'calendar']]) {
+        const row = element('button', 'overview-rule-row'); row.type = 'button'; row.dataset.renderKey = page;
+        const name = element('span', 'overview-rule-label'), state = element('span', 'overview-rule-state ' + (enabled === true ? 'rule-enabled' : 'muted'));
+        name.append(icon(symbol), element('span', '', label)); state.append(element('span', 'status-dot' + (enabled === true ? ' available-dot' : '')), element('span', '', enabled === true ? '已开启' : enabled === false ? '未开启' : '待核实'));
+        row.append(name, state); row.onclick = () => navigate(page); rows.push(row);
+      }
+      const row = element('button', 'overview-rule-row'); row.type = 'button'; row.dataset.renderKey = 'models';
+      const name = element('span', 'overview-rule-label muted'); name.append(icon('message'), element('span', '', savedModelSettings?.config.default_model ? '模型与提示词已配置' : '模型与提示词'));
+      row.append(name, element('span', '', '查看 →')); row.onclick = () => navigate('models'); rows.push(row);
+      updateChildren($('overview-automation'), rows);
+    }
+    setText('query-state-label', !query ? '查询规则待核实' : query.automatic ? '自动查询已开启' : query.on_five_hour_expiry || query.on_weekly_expiry ? '到期补查已开启' : '自动查询未启用');
+    if ($('query-rule-summary')) {
+      const rows = [];
+      for (const [label, value] of [['定期查询', query ? query.automatic ? '开启' : '关闭' : '—'], ['五小时到期补查', query ? query.on_five_hour_expiry ? '开启' : '关闭' : '—'], ['周额度到期补查', query ? query.on_weekly_expiry ? '开启' : '关闭' : '—'], ['随机延迟', query ? query.random_delay.min_seconds + '–' + query.random_delay.max_seconds + ' 秒' : '—'], ['排除时段', query?.excluded_hours.join('、') || '无']]) { const row = element('div', 'summary-row'); row.append(element('span', 'muted', label), element('strong', '', value)); rows.push(row); }
+      updateChildren($('query-rule-summary'), rows);
+    }
+    if ($('query-queue')) {
+      const rows = accountsData.filter(account => account.pending_query).slice(0, 3).map(account => { const row = element('div', 'summary-row'); row.dataset.renderKey = account.id; const copy = element('div'); copy.append(element('strong', '', account.id), queueAnnotation(account.pending_query)); row.append(copy); return row; });
+      updateChildren($('query-queue'), rows.length ? rows : [element('p', 'empty-state', connected ? '当前账号页暂无排队查询' : '连接后读取查询队列')]);
+    }
+    if ($('wake-model-summary')) {
+      const rows = [], config = savedModelSettings?.config;
+      for (const [label, value] of [['默认模型', config?.default_model || '尚未配置'], ['提示词方式', config?.prompt_mode === 'random' ? '随机短句池' : '固定提示词']]) { const row = element('div', 'summary-row'); row.append(element('span', 'muted', label), element('strong', '', value)); rows.push(row); }
+      if (config?.default_prompt) rows.push(element('p', 'prompt-preview', config.default_prompt.slice(0, 160)));
+      const link = element('button', 'text-button', '编辑模型与提示词 →'); link.type = 'button'; link.onclick = () => navigate('models'); rows.push(link); updateChildren($('wake-model-summary'), rows);
+    }
+    setText('footer-version', overviewData?.version ? 'v' + overviewData.version.replace(/^v/, '') : 'V2');
+    renderPreferences();
   }
   function renderDiagnostics() {
     const data = overviewData, inventory = data?.inventory;
     const rows = [
-      ['后台版本', data?.version || '尚未连接'], ['后台实例', data?.instance_id || '—'],
-      ['CPA 账号同步', inventory?.status === 'ready' ? '已连接' : '等待同步'],
-      ['账号状态同步间隔', inventory?.refresh_interval_seconds ? inventory.refresh_interval_seconds + ' 秒（页面关闭后继续）' : '连接后核实'],
-      ['CPA 接入连接', data?.activity?.connected ? '已连接' : '等待连接'],
-      ['最近成功同步', inventory?.last_success_at ? new Date(inventory.last_success_at).toLocaleString('zh-CN', {hour12: false}) : '—'],
+      ['后台版本', data?.version || '尚未连接'], ['接入层版本', data?.bridge_version || '—'],
+      ['数据库版本', data?.schema_version ? 'schema ' + data.schema_version : '—'],
+      ['账号同步间隔', inventory?.refresh_interval_seconds ? inventory.refresh_interval_seconds + ' 秒' : '—'],
       ['额度查询并发', data?.query_concurrency ? String(data.query_concurrency) : '—'],
-      ['正常业务额度观测', data?.capabilities?.passive_quota ? '支持' : '尚未连接'],
-      ['自动额度查询', data?.capabilities?.automatic_quota_query ? '支持，按已保存规则执行' : '尚未接入'],
-      ['按账号随机查询延迟', data?.capabilities?.randomized_quota_query ? '支持，由后台持久保存' : '尚未接入'],
-      ['模型执行', wakeExecutionSupported() ? '已接入，仅明确授权的任务可执行' : '尚未接入'], ['后台异常', data?.last_error ? message(data.last_error) : '无已报告异常'],
-      ['账号同步异常', inventory?.error_code ? message(inventory.error_code) : '无已报告异常']
+      ['单账号查询超时', data?.query_timeout_seconds ? data.query_timeout_seconds + ' 秒' : '—'],
+      ['任务保留', data?.retention ? data.retention.history_seconds / 86400 + ' 天 · 最多 ' + data.retention.terminal_jobs + ' 项' : '—']
     ];
     updateChildren($('diagnostics-content'), rows.map(([label, value]) => {
       const row = element('div', 'diagnostic-row'); row.dataset.renderKey = label; row.append(element('span', '', label), element('strong', '', value)); return row;
     }));
+    if ($('diagnostic-capabilities')) updateChildren($('diagnostic-capabilities'), [
+      ['额度查询', data?.capabilities?.quota_query], ['窗口唤醒', data?.capabilities?.model_execution],
+      ['被动额度观测', data?.capabilities?.passive_quota], ['反重力候选生成', data?.capabilities?.prompt_generation_providers?.includes('antigravity')]
+    ].map(([label, available]) => { const row = element('div', 'summary-row'); row.append(element('span', 'muted', label), badge(available === true ? '可用' : data ? '未提供' : '待核实', available === true ? 'available' : 'disabled')); return row; }));
+    renderPreferences();
+  }
+  function renderPreferences() {
+    const theme = document.documentElement.getAttribute('data-theme');
+    setText('preference-current-theme', '当前：' + ({light: '暖灰', white: '纯白', dark: '深色'}[theme] || '跟随系统'));
+    for (const button of document.querySelectorAll('[data-display-mode]')) { button.classList.toggle('active', button.dataset.displayMode === displayPreference.mode); button.setAttribute('aria-pressed', String(button.dataset.displayMode === displayPreference.mode)); }
+    if ($('host-theme-link')) $('host-theme-link').href = base.slice(0, -API.length) + '/management.html';
+    if ($('preferences-aliases')) {
+      const ids = [...new Set([...accountsData.map(account => account.id), ...Object.keys(displayPreference.aliases)])].slice(0, 2);
+      const rows = ids.map(id => { const row = element('div', 'summary-row'); row.dataset.renderKey = id; const button = element('button', 'button button-outline', displayPreference.aliases[id] || '设置别称'); button.type = 'button'; button.onclick = function () { openAliasDialog(id, this); }; row.append(element('span', 'muted', maskedAccount(id)), button); return row; });
+      updateChildren($('preferences-aliases'), rows.length ? rows : [element('p', 'field-help', '同步账号后可在此设置本地别称')]);
+    }
+    if ($('settings-connection')) {
+      const rows = [], prefix = base.slice(0, -API.length);
+      for (const [label, value] of [['管理地址', context.location.origin + prefix], ['认证方式', '复用 CPA 管理登录或本页输入'], ['连接状态', connected ? '已连接' : '未连接'], ['最近成功同步', overviewData?.inventory?.last_success_at ? historyDate(overviewData.inventory.last_success_at, true) : '—']]) { const row = element('div', 'summary-row'); row.append(element('span', 'muted', label), element('strong', '', value)); rows.push(row); }
+      updateChildren($('settings-connection'), rows);
+    }
   }
   async function accounts(reset = false, expectedRevision = accountsRevision, background = false) {
     const current = generation, sequence = views.begin('accounts'), filtersAt = filterSequence;
     const search = $('accounts-search').value.trim(), status = $('accounts-filter').value || 'all';
     let path = '/accounts?limit=' + PAGE_SIZE;
+    const sort = $('accounts-sort')?.value;
+    if (sort && sort !== 'default') path += '&sort=' + encodeURIComponent(sort);
     if (search) path += '&search=' + encodeURIComponent(search);
     if (status !== 'all') path += '&status=' + encodeURIComponent(status);
     const after = reset ? '' : cursor;
@@ -2183,18 +2488,22 @@
           read(() => accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing));
         }
         read(pollJobs);
-        if (activePage === 'scheduling') { read(() => loadScheduling()); read(() => loadResetCards()); if (!routingAccountsLoading) read(() => loadRoutingAccounts(false, true)); }
+        if (['overview', 'accounts'].includes(activePage)) read(loadOverviewTasks);
+        if (activePage === 'accounts' && selectedAccountID) read(() => loadAccountTasks());
+        if (['overview', 'scheduling', 'cards'].includes(activePage)) { read(() => loadScheduling()); if (activePage === 'cards') read(() => loadResetCards()); if (activePage === 'scheduling' && !routingAccountsLoading) read(() => loadRoutingAccounts(false, true)); }
         if (activePage === 'history') {
-          if (!historyPolling) read(() => loadHistory(true));
-          if (historySelected && !historyDetailPolling) read(() => readHistoryDetail(true));
+          if (recordsPage === 'tasks') {
+            if (!historyPolling) read(() => loadHistory(true));
+            if (historySelected && !historyDetailPolling) read(() => readHistoryDetail(true));
+          } else read(() => recordsPanel?.refresh());
         }
         if (wakeSettingsSupported()) read(() => reloadWakeSettings());
-        if (activePage === 'wake') read(() => loadWakeJobs());
+        if (activePage === 'wake') { read(() => loadWakeJobs()); if (!savedModelSettings) read(() => reloadModelSettings()); }
         if (wakeActive()) read(() => readWakeJob());
         if (activePage === 'models') { ensureGenerationAccounts(); read(() => reloadModelSettings()); read(() => pollGeneration()); }
         await Promise.all(reads);
         if (current !== generation) return;
-        updateTimes();
+        updateTimes(); renderRuleSummaries(); renderDashboard();
         setText('auto-status', failures.length ? '部分数据待更新 · 自动重试' : '数据自动更新');
         setData($('auto-status'), 'state', failures.length ? 'degraded' : 'online');
         setConnection('独立后台已连接 · 页面自动更新');
@@ -2235,9 +2544,12 @@
       await accounts(true);
       if (current !== generation) return;
       if (wakeSettingsSupported()) await reloadWakeSettings();
-      if (activePage === 'scheduling') await Promise.all([loadScheduling(), loadResetCards(), loadRoutingAccounts()]);
+      if (['overview', 'accounts'].includes(activePage)) await loadOverviewTasks();
+      if (['overview', 'scheduling', 'cards'].includes(activePage)) await loadScheduling();
+      if (activePage === 'cards') await loadResetCards();
+      if (activePage === 'scheduling') await loadRoutingAccounts();
       if (activePage === 'wake') await loadWakeJobs();
-      if (activePage === 'history') await loadHistory();
+      if (activePage === 'history') { if (recordsPage === 'tasks') await loadHistory(); else { recordsPanel?.setContext({connected, instanceId: views.instance || '', displayAccount}); recordsPanel?.show(recordsPage); } }
       if (activePage === 'query' && settingsSupported() && !savedSettings) await reloadSettings();
       if (activePage === 'models') { ensureGenerationAccounts(); await reloadModelSettings(); await pollGeneration(); }
       clearError(); monitor(current);
@@ -2323,48 +2635,41 @@
   }
   function renderRoutingProjects() {
     renderObservedProjects();
-    const rows = routingProjects.map(row => {
-      const card = element('article', 'routing-project'); card.id = 'routing-project-row-' + row.key; card.dataset.renderKey = 'project:' + row.key; card.dataset.selected = String(row.key === routingSelectedProject);
-      const heading = element('div', 'routing-project-heading'), choose = element('button', 'text-button', row.key === routingSelectedProject ? '正在匹配账号' : '匹配账号');
-      choose.type = 'button'; choose.setAttribute('aria-pressed', row.key === routingSelectedProject);
-      choose.onclick = () => {
-        routingSelectedProject = row.key; renderScheduling();
-        if (context.matchMedia?.('(max-width: 1100px)').matches) { $('routing-account-title').scrollIntoView({block: 'start'}); $('routing-account-title').focus({preventScroll: true}); }
-      };
-      const remove = element('button', 'text-button', '删除项目'); remove.type = 'button';
-      remove.onclick = () => {
-        if (!routingEditable()) return;
-        routingProjects = routingProjects.filter(item => item.key !== row.key);
-        if (routingSelectedProject === row.key) routingSelectedProject = routingProjects[0]?.key ?? null;
-        routingProjectChanged();
-      };
-      heading.append(choose, remove); card.append(heading);
-      const nameID = 'routing-project-name-' + row.key, nameLabel = element('label', 'field-label', '项目标识'), name = element('input');
-      nameLabel.setAttribute('for', nameID); name.id = nameID; name.type = 'text'; name.value = row.project; name.autocomplete = 'off'; name.placeholder = '例如 project-a';
-      if (routingInvalidFields.has(nameID)) name.setAttribute('aria-invalid', 'true');
-      name.oninput = function () { row.project = this.value; syncRoutingProjectText(); };
-      const aliasID = 'routing-project-alias-' + row.key, aliasLabel = element('label', 'field-label', '项目名称（可选）'), alias = element('input');
-      aliasLabel.setAttribute('for', aliasID); alias.id = aliasID; alias.type = 'text'; alias.value = row.name || ''; alias.placeholder = '例如 商城后台';
-      if (routingInvalidFields.has(aliasID)) alias.setAttribute('aria-invalid', 'true');
-      alias.oninput = function () { row.name = this.value; };
-      const directoryID = 'routing-project-directories-' + row.key, directoryLabel = element('label', 'field-label', '客户端目录（每行一个，可留空）'), directory = element('textarea');
-      directoryLabel.setAttribute('for', directoryID); directory.id = directoryID; directory.rows = 2; directory.value = row.directoryText ?? row.directories.join('\n'); directory.placeholder = '/work/project-a 或 C:\\work\\project-a';
-      if (routingInvalidFields.has(directoryID)) directory.setAttribute('aria-invalid', 'true');
-      directory.oninput = function () { row.directoryText = this.value; row.directories = this.value.split('\n').map(value => value.trim()).filter(Boolean); syncRoutingProjectText(); };
-      card.append(nameLabel, name, aliasLabel, alias, directoryLabel, directory, element('p', 'field-help', '首选账号 ' + row.accounts.length + ' 个 · ' + (row.directories.length ? row.directories.length + ' 个目录' : /^dir-[a-f0-9]{64}$/.test(row.project) ? '客户端自动目录标识' : '尚未绑定客户端目录')));
-      const selected = element('div', 'routing-selected-accounts');
-      for (const id of row.accounts) {
-        const chip = element('button', 'routing-account-chip'); chip.type = 'button'; chip.dataset.renderKey = 'account:' + id;
-        const account = routingKnownAccounts.get(id);
-        chip.append(element('span', '', id + (account ? ' · ' + accountStatus(account).label : ' · 待核实')), document.createTextNode(' ×'));
-        chip.setAttribute('aria-label', '从项目中移除首选账号 ' + id);
-        chip.onclick = () => { if (routingEditable()) { row.accounts = row.accounts.filter(value => value !== id); routingProjectChanged(); } };
-        selected.append(chip);
-      }
-      if (!row.accounts.length) selected.append(element('p', 'field-help', '请点击“匹配账号”，在右侧清单中加入首选账号。'));
-      card.append(selected); return card;
-    });
-    updateChildren($('routing-project-list'), rows.length ? rows : [element('p', 'field-help', '尚无项目。新增项目，或导入客户端已有的 projects.json，再为项目选择账号。')]);
+    const editor = $('routing-project-editor'), rows = [];
+    const search = $('routing-project-search')?.value.trim().toLowerCase() || '';
+    for (const project of routingProjects.filter(project => !search || (project.name || '').toLowerCase().includes(search) || project.project.toLowerCase().includes(search))) {
+      const row = element('article', 'routing-project'); row.id = 'routing-project-row-' + project.key;
+      row.dataset.renderKey = 'project:' + project.key; row.dataset.selected = String(project.key === routingSelectedProject);
+      const select = element('button', 'routing-project-select'); select.type = 'button';
+      select.append(element('strong', '', project.name || project.project || '未命名项目'), element('small', 'muted', project.accounts.length + ' 个首选账号'));
+      select.setAttribute('aria-pressed', String(project.key === routingSelectedProject));
+      select.onclick = () => { routingSelectedProject = project.key; renderScheduling(); };
+      const remove = element('button', 'text-button routing-project-remove', '×'); remove.type = 'button'; remove.title = '删除项目'; remove.disabled = !routingEditable();
+      remove.onclick = () => { if (!routingEditable()) return; routingProjects = routingProjects.filter(item => item.key !== project.key); if (routingSelectedProject === project.key) routingSelectedProject = routingProjects[0]?.key ?? null; routingProjectChanged(); };
+      row.append(select, remove); rows.push(row);
+    }
+    updateChildren($('routing-project-list'), rows.length ? rows : [element('p', 'empty-state', '新增项目或从最近发现中选择一个项目')]);
+    if (editor) {
+      const project = routingProjects.find(row => row.key === routingSelectedProject), content = [];
+      if (project) {
+        content.push(element('h2', '', project.name || project.project || '新项目'));
+        const fields = element('div', 'settings-grid');
+        for (const [field, prefix, label, value] of [['name', 'alias', '项目名称', project.name || ''], ['project', 'name', '项目标识', project.project]]) {
+          const wrapper = element('div'), input = element('input'), id = 'routing-project-' + prefix + '-' + project.key, title = element('label', 'field-label', label);
+          input.id = id; input.value = value; input.type = 'text'; input.autocomplete = 'off'; title.setAttribute('for', id);
+          if (routingInvalidFields.has(id)) input.setAttribute('aria-invalid', 'true');
+          input.oninput = function () { project[field] = this.value; if (field === 'project') syncRoutingProjectText(); };
+          wrapper.append(title, input); fields.append(wrapper);
+        }
+        content.push(fields);
+        const directory = element('details', 'routing-directory-editor'), title = element('summary', '', '客户端目录（可选）'), input = element('textarea');
+        input.id = 'routing-project-directories-' + project.key; input.rows = 2; input.value = project.directoryText ?? project.directories.join('\n'); input.placeholder = '每行一个客户端绝对路径';
+        if (routingInvalidFields.has(input.id)) { input.setAttribute('aria-invalid', 'true'); directory.open = true; }
+        input.oninput = function () { project.directoryText = this.value; project.directories = this.value.split('\n').map(value => value.trim()).filter(Boolean); syncRoutingProjectText(); };
+        directory.append(title, input, element('p', 'field-help', '目录属于运行客户端的电脑，后台不会扫描客户端文件。')); content.push(directory);
+      } else content.push(element('p', 'empty-state', '选择左侧项目后匹配首选账号'));
+      updateChildren(editor, content);
+    }
     $('routing-project-add').disabled = !routingEditable() || routingProjects.length >= 128;
     $('routing-map-import').disabled = !routingEditable();
     $('routing-map-export').disabled = !routingEditable() || schedulingDirty || schedulingConflict || schedulingNeedsVerification || !routingProjects.some(row => row.directories.length);
@@ -2390,7 +2695,8 @@
         $('routing-account-title').scrollIntoView?.({block: 'nearest'});
       };
       heading.append(element('strong', '', configured?.name || item.name || '未命名目录'), choose);
-      row.append(heading, element('code', '', item.project), element('p', 'field-help', '最近出现：' + historyDate(item.last_seen, true) + (configured ? schedulingDirty ? ' · 已加入项目草稿' : ' · 已保存首选账号' : ' · 待配置首选账号')));
+      row.title = item.project;
+      row.append(heading, element('p', 'field-help', age(item.last_seen) + (configured ? schedulingDirty ? ' · 已加入草稿' : ' · 已匹配' : '')));
       return row;
     });
     updateChildren($('routing-observed-list'), rows.length ? rows : [element('p', 'field-help', routingObserved.length ? '没有匹配的项目。' : '尚未观测到目录标识。请使用新版启动器发送一次 Codex 请求。')]);
@@ -2412,21 +2718,19 @@
     const accounts = current ? routingAccounts.accounts : [];
     setText('routing-account-page', current ? '共 ' + (routingAccounts.filter_total ?? routingAccounts.total ?? accounts.length) + ' 个账号 · 当前 ' + ((routingAccounts.offset || 0) + (accounts.length ? 1 : 0)) + '–' + ((routingAccounts.offset || 0) + accounts.length) : '尚未读取');
     const rows = accounts.map(account => {
-      const chosen = project?.accounts.includes(account.id), node = element('article', 'routing-account'), heading = element('div', 'routing-account-heading');
+      const chosen = project?.accounts.includes(account.id), node = element('article', 'routing-account');
       node.dataset.renderKey = 'account:' + account.id; node.dataset.selected = String(!!chosen);
-      const button = element('button', chosen ? 'button button-outline' : 'button button-primary', chosen ? '移除首选' : '加入首选'); button.type = 'button';
-      button.disabled = !project || !routingEditable() || routingAccountsBlocking || !chosen && account.status !== 'available';
-      button.onclick = () => {
+      const checkbox = element('input', 'routing-account-checkbox'); checkbox.type = 'checkbox'; checkbox.checked = !!chosen;
+      checkbox.disabled = !project || !routingEditable() || routingAccountsBlocking || !chosen && account.status !== 'available';
+      checkbox.setAttribute('aria-label', (chosen ? '移除首选账号 ' : '选择首选账号 ') + account.id);
+      checkbox.onchange = function () {
         if (!project || !routingEditable() || routingAccounts?.instance_id !== views.instance || !chosen && account.status !== 'available') return;
-        project.accounts = chosen ? project.accounts.filter(id => id !== account.id) : [...project.accounts, account.id];
+        project.accounts = this.checked ? [...new Set([...project.accounts, account.id])] : project.accounts.filter(id => id !== account.id);
         routingProjectChanged();
       };
-      heading.append(element('strong', '', account.id), button); node.append(heading);
-      const five = windowView(account.quota, 'five_hour'), weekly = windowView(account.quota, 'weekly');
-      node.append(element('p', 'field-help', accountStatus(account).label + ' · 5 小时剩余 ' + (five.percent === null ? '未知' : five.percent + '%') + ' · 周剩余 ' + (weekly.percent === null ? '未知' : weekly.percent + '%')));
-      node.append(element('p', 'field-help', '额度观测：' + historyDate(account.quota?.observed_at || account.observed_at, true)));
-      const others = routingProjects.filter(row => row.key !== project?.key && row.accounts.includes(account.id)).map(row => row.project || '未命名项目');
-      if (others.length) node.append(element('p', 'field-help', '其他首选项目：' + others.join('、')));
+      const name = element('div', 'routing-account-identity'); name.append(element('strong', '', account.id), element('small', 'muted', maskedAccount(account.id)));
+      const state = presentation?.accountView(account) || accountStatus(account);
+      node.append(checkbox, name, renderQuota(account.quota, 'five_hour'), renderQuota(account.quota, 'weekly'), badge(state.label, state.kind));
       return node;
     });
     updateChildren($('routing-account-list'), rows.length ? rows : [element('p', 'field-help', current ? '没有匹配的账号，请调整搜索或状态。' : '连接后读取 Codex 账号清单。')]);
@@ -2544,6 +2848,8 @@
     for (const id of [...Object.values(schedulingNumbers), ...Object.values(cardNumbers), 'routing-projects']) $(id).removeAttribute('aria-invalid');
   }
   function schedulingInvalid(id, text) {
+    if (id.startsWith('cards-') && activePage !== 'cards') navigate('cards', false);
+    if (id.startsWith('routing-') && activePage !== 'scheduling') navigate('scheduling', false);
     if (id.startsWith('routing-project-') || id === 'routing-account-title') routingInvalidFields.add(id);
     $(id).setAttribute('aria-invalid', 'true');
     const details = $(id).closest?.('details'); if (details) details.open = true;
@@ -2734,7 +3040,8 @@
     const empty = !resetData ? '连接后读取后台记录。' : $('reset-search').value.trim() || $('reset-attention').checked ? '没有匹配的记录，请调整搜索或筛选。' : resetTab === 'cards' ? '尚无重置卡观测。查询账号额度可同步卡片数量；开启详情查询后补充到期时间。' : '尚无兑换记录。';
     updateChildren(list, rows.length ? rows : [element('p', 'field-help', empty)]);
   }
-  $('scheduling-form').addEventListener('input', () => {
+  $('scheduling-form').addEventListener('input', event => {
+    if (event.target?.id?.startsWith('reset-') || event.target?.classList.contains('routing-account-checkbox') || ['routing-observed-search', 'routing-account-search', 'routing-account-status', 'routing-project-search'].includes(event.target?.id)) return;
     readRoutingProjectText(); routingEditSequence++;
     schedulingDirty = true; schedulingError = ''; schedulingNotice = ''; clearSchedulingValidation(); renderScheduling();
   });
@@ -2776,22 +3083,44 @@
 
   function navigate(name, loadSettings = true) {
     if (!Object.hasOwn(pages, name)) return;
-    activePage = name;
+    navigationEpoch++; activePage = name;
+    const automation = ['query', 'wake', 'cards', 'models'].includes(name);
+    document.body.dataset.page = name;
     for (const view of document.querySelectorAll('[data-view]')) view.hidden = view.dataset.view !== name;
     for (const button of document.querySelectorAll('[data-page]')) {
-      const selected = button.dataset.page === name; button.classList.toggle('active', selected);
+      const selected = button.dataset.primaryPage ? button.dataset.primaryPage === (automation ? 'query' : name) : button.dataset.page === name; button.classList.toggle('active', selected);
       if (selected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
     }
+    if ($('automation-navigation')) $('automation-navigation').hidden = !automation;
+    if ($('records-navigation')) $('records-navigation').hidden = name !== 'history';
+    if ($('scheduling-form')) $('scheduling-form').hidden = !['scheduling', 'cards'].includes(name);
+    if ($('scheduling-actions')) $('scheduling-actions').hidden = !['scheduling', 'cards'].includes(name);
+    if ($('header-query')) $('header-query').hidden = !['overview', 'accounts'].includes(name);
+    if ($('sync')) $('sync').hidden = !['overview', 'accounts'].includes(name);
+    setText('refresh-label', name === 'history' ? '刷新记录' : '重新读取状态');
+    $('refresh').setAttribute('aria-label', name === 'history' ? '刷新记录' : '重新读取状态');
     const slot = name === 'accounts' ? $('accounts-page-slot') : $('overview-account-slot');
     if (slot && $('account-card')) slot.append($('account-card'));
     setText('page-title', pages[name][0]); setText('page-description', pages[name][1]); setText('breadcrumb', pages[name][0]);
-    document.title = '窗口助手 · ' + pages[name][0];
+    document.title = 'Codex 调度台 · ' + pages[name][0];
+    if (name !== 'history') recordsPanel?.show('tasks');
     if (connected) { renderTasks(); renderDiagnostics(); }
     if (name === 'scheduling' && connected) { void loadScheduling().catch(report); void loadResetCards().catch(report); void loadRoutingAccounts().catch(report); }
+    if (name === 'cards' && connected) { void loadScheduling().catch(report); void loadResetCards().catch(report); }
     if (name === 'query' && loadSettings && connected && settingsSupported() && (!savedSettings || savedSettings.instance_id !== views.instance)) void reloadSettings();
     if (name === 'models' && loadSettings && connected) { ensureGenerationAccounts(); void reloadModelSettings(); void pollGeneration(); }
-    if (name === 'wake' && loadSettings && connected) { ensureWakeSettings(); void loadWakeJobs(); }
-    if (name === 'history') { renderHistory(); if (loadSettings && connected) void loadHistory(); }
+    if (name === 'wake' && loadSettings && connected) { ensureWakeSettings(); void loadWakeJobs(); if (!savedModelSettings) void reloadModelSettings(); }
+    if (name === 'history') showRecordsPage(recordsPage, loadSettings);
+    renderAccountDetail(); renderRuleSummaries();
+  }
+  function showRecordsPage(page, load = true) {
+    if (!['users', 'plugin', 'analysis', 'tasks'].includes(page)) return;
+    recordsPage = page;
+    for (const button of document.querySelectorAll('[data-record-page]')) { const selected = button.dataset.recordPage === page; button.classList.toggle('active', selected); button.setAttribute('aria-selected', String(selected)); }
+    if ($('task-history-root')) $('task-history-root').hidden = page !== 'tasks';
+    recordsPanel?.setContext({connected, instanceId: views.instance || '', displayAccount});
+    recordsPanel?.show(page);
+    if (page === 'tasks') { renderHistory(); if (load && connected) void loadHistory(); }
   }
   function changeFilter() {
     clearTimeout(filterTimer); filterSequence++;
@@ -2799,14 +3128,25 @@
     const current = generation;
     filterTimer = setTimeout(() => { if (current === generation && connected) void accounts(true).catch(report); }, 200);
   }
-  $('sidebar-toggle').onclick = () => renderSidebar($('app-sidebar').dataset.collapsed !== 'true', true);
+  async function querySelectedAccounts() {
+    if (!connected || selectedBatchBusy || queryBusy.has('batch')) return;
+    if (unresolved.has('batch') || !selectedAccounts.size) return submitQuery();
+    const ids = [...selectedAccounts], current = generation;
+    selectedBatchBusy = true; queryBusy.add('batch'); controls(); renderAccounts();
+    try {
+      for (const id of ids) { if (current !== generation || !connected) return; await submitQuery(id); }
+    } finally {
+      if (current === generation) { selectedBatchBusy = false; queryBusy.delete('batch'); controls(); renderAccounts(); }
+    }
+  }
   $('display-mode').value = displayPreference.mode;
   $('display-mode').onchange = () => {
     if (!['original', 'masked', 'alias'].includes($('display-mode').value)) return;
     displayPreference.mode = $('display-mode').value; persistDisplayPreference(); applyDisplayPrivacy(document.documentElement);
     renderRoutingProjects(); renderRoutingAccounts();
     renderResetCards();
-    renderGeneration();
+    renderGeneration(); renderAccounts(); renderPreferences();
+    recordsPanel?.setContext({connected, instanceId: views.instance || '', displayAccount});
   };
   $('account-alias-form').onsubmit = event => { event.preventDefault(); saveAlias(); };
   $('account-alias-cancel').onclick = closeAliasDialog;
@@ -2815,19 +3155,43 @@
     if (!Object.hasOwn(pages, button.dataset.page)) continue;
     button.setAttribute('title', pages[button.dataset.page][0]); button.setAttribute('aria-label', pages[button.dataset.page][0]);
   }
-  let sidebarCollapsed = false;
-  try { sidebarCollapsed = context.localStorage.getItem(sidebarPreference) === 'true'; } catch {}
-  renderSidebar(sidebarCollapsed);
   $('connect').onclick = () => connect($('key').value);
   $('key').addEventListener('keydown', event => { if (event.key === 'Enter') void connect($('key').value); });
   if ($('disconnect')) $('disconnect').onclick = () => { stop(); setConnection('已断开，后台仍持续运行'); setText('metric-status', '未连接'); };
-  $('query').onclick = () => submitQuery();
+  $('query').onclick = querySelectedAccounts;
   if ($('query-single')) $('query-single').onclick = () => {
     const target = resolveDisplayAccount($('account').value);
     if (!target || target.length > 256 || /[\x00\r\n]/.test(target)) { report({code: 'invalid_account_id'}); return; }
     return submitQuery(target);
   };
-  $('refresh').onclick = () => refresh(true); $('sync').onclick = syncInventory;
+  $('refresh').onclick = () => {
+    if (activePage !== 'history') return refresh(true);
+    if (recordsPage !== 'tasks') return recordsPanel?.refresh();
+    void loadHistory(); if (historySelected && !historyDetailLoading) void readHistoryDetail();
+  }; $('sync').onclick = syncInventory;
+  if ($('routing-project-search')) $('routing-project-search').oninput = renderRoutingProjects;
+  if ($('settings-interval-minutes')) $('settings-interval-minutes').addEventListener('input', function () { $('settings-interval').value = this.value === '' ? '' : String(Number(this.value) * 60); renderSettings(); rememberFeedback('settings-message', '草稿尚未保存，请核对差异后保存。'); });
+  for (const button of document.querySelectorAll('[data-generation-provider]')) button.onclick = async () => {
+    if (button.disabled) return;
+    const provider = button.dataset.generationProvider;
+    if (!generationCatalog) await reloadGenerationAccounts();
+    const current = generationCatalog?.accounts.find(account => account.id === resolveDisplayAccount($('generation-account').value));
+    if (current?.provider !== provider) { $('generation-account').value = ''; $('generation-model').value = ''; generationAccountIdentity = {id: '', provider}; clearModelCatalog('generation'); }
+    $('generation-account-options').replaceChildren(...(generationCatalog?.accounts || []).filter(account => account.provider === provider).map(account => { const option = element('option'); option.value = account.id; option.label = generationProviderName(provider); return option; }));
+    $('generation-consent').checked = false; renderGeneration();
+  };
+  for (const button of document.querySelectorAll('[data-record-page]')) button.onclick = () => showRecordsPage(button.dataset.recordPage);
+  for (const button of document.querySelectorAll('[data-account-filter]')) button.onclick = () => {
+    const value = {available: 'usable', attention: 'quota_unknown'}[button.dataset.accountFilter] || button.dataset.accountFilter;
+    $('accounts-filter').value = value; renderAccountTabs(); changeFilter();
+  };
+  if ($('accounts-filter')) for (const [value, label] of [['usable', '已核实可用窗口'], ['quota_unknown', '额度待核实']]) {
+    if (![...$('accounts-filter').querySelectorAll('option')].some(option => option.value === value)) { const option = element('option', '', label); option.value = value; $('accounts-filter').append(option); }
+  }
+  if ($('accounts-sort')) $('accounts-sort').onchange = () => { filterSequence++; if (connected) void accounts(true).catch(report); };
+  if ($('account-select-all')) $('account-select-all').onchange = function () { for (const account of accountsData) { if (this.checked) selectedAccounts.add(account.id); else selectedAccounts.delete(account.id); } renderAccounts(); };
+  for (const button of document.querySelectorAll('[data-display-mode]')) button.onclick = () => { $('display-mode').value = button.dataset.displayMode; $('display-mode').onchange(); };
+  for (const [toggleID, panelID] of [['query-manual-toggle', 'manual-query-panel'], ['manual-wake-toggle', 'manual-wake-panel']]) if ($(toggleID) && $(panelID)) $(toggleID).onclick = () => { $(panelID).hidden = !$(panelID).hidden; $(toggleID).setAttribute('aria-expanded', String(!$(panelID).hidden)); };
   $('query-settings-form').onsubmit = event => { event.preventDefault(); return saveSettings(); };
   $('settings-reload').onclick = () => reloadSettings(true);
   $('rules-reload').onclick = () => reloadSettings();
@@ -2958,16 +3322,16 @@
     const previous = cursor; cursor = previousCursors.pop(); pageStart = Math.max(0, pageStart - PAGE_SIZE);
     try { await accounts(); } catch (error) { previousCursors.push(cursor); cursor = previous; pageStart += PAGE_SIZE; report(error); }
   };
-  for (const button of document.querySelectorAll('[data-page]')) button.addEventListener('click', () => navigate(button.dataset.page));
-  for (const button of document.querySelectorAll('[data-action="batch"]')) button.addEventListener('click', () => submitQuery());
+  for (const button of document.querySelectorAll('[data-page]')) button.addEventListener('click', () => { if (button.dataset.recordTarget === 'tasks') recordsPage = 'tasks'; navigate(button.dataset.page); });
+  for (const button of document.querySelectorAll('[data-action="batch"]')) button.addEventListener('click', () => button.id === 'header-query' ? querySelectedAccounts() : submitQuery());
   function resumeUpdates() {
     if (!connected || document.hidden) return;
     void refresh(); monitor(generation);
   }
   document.addEventListener?.('visibilitychange', () => {
-    if (document.hidden) monitor(generation); else resumeUpdates();
+    if (document.hidden) monitor(generation); else { applyHostTheme(); resumeUpdates(); }
   });
-  context.addEventListener?.('focus', resumeUpdates);
+  context.addEventListener?.('focus', () => { applyHostTheme(); resumeUpdates(); });
   context.addEventListener?.('resize', fitHistoryDetail);
   context.addEventListener?.('scroll', fitHistoryDetail, {passive: true});
   context.addEventListener?.('pagehide', event => {

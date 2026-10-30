@@ -66,6 +66,18 @@ func (s *Store) Prune(ctx context.Context, at time.Time, p Retention) error {
 				return err
 			}
 		}
+		if _, err = tx.ExecContext(ctx, "UPDATE traffic_requests SET status='unknown',data=json_set(data,'$.status','unknown') WHERE status='running' AND updated_at<?", at.UTC().Add(-24*time.Hour).Format("2006-01-02T15:04:05.000000000Z")); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM traffic_requests WHERE id IN(SELECT id FROM traffic_requests WHERE status!='running' AND (updated_at<? OR id IN(SELECT id FROM traffic_requests WHERE status!='running' ORDER BY updated_at DESC LIMIT -1 OFFSET ?)) ORDER BY updated_at LIMIT 256)`, cutoff, p.TerminalJobs); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM traffic_attempts WHERE id IN(SELECT id FROM traffic_attempts WHERE (request_id!='' AND NOT EXISTS(SELECT 1 FROM traffic_requests r WHERE r.id=traffic_attempts.request_id)) OR (request_id='' AND updated_at<?) LIMIT 256)`, at.UTC().Add(-time.Hour).Format("2006-01-02T15:04:05.000000000Z")); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, "DELETE FROM traffic_operation_evidence WHERE rowid IN(SELECT rowid FROM traffic_operation_evidence WHERE kind='wake' AND NOT EXISTS(SELECT 1 FROM wake_jobs w WHERE w.id=job_id) LIMIT 256)"); err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx, "UPDATE activity_requests SET phase='unknown' WHERE phase='active' AND last_event_at<?", at.UTC().Add(-24*time.Hour).Format("2006-01-02T15:04:05.000000000Z"))
 		if err != nil {
 			return err

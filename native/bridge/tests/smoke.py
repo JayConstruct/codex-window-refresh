@@ -148,7 +148,7 @@ class NativeBridge(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(self.call('scheduler.pick', request)['result'], {})
         batch = self.rpc('bridge.events.pull', {'after': 0}, instance)['result']
-        self.assertEqual(len(batch['events']), 1)
+        self.assertEqual(len([e for e in batch['events'] if e['kind']=='project_observed']), 1)
         self.assertEqual(batch['events'][0]['kind'], 'project_observed')
         self.assertEqual(batch['events'][0]['project'], project)
         self.assertEqual(batch['events'][0]['project_name'], '%E4%B8%AD%E6%96%87%20repo')
@@ -163,7 +163,7 @@ class NativeBridge(unittest.TestCase):
             if change == 'missing-candidate-id': del bad['Candidates'][0]['ID']
             if change == 'invalid-id': bad['Options']['Headers']['X-Cwr-Project'] = ['dir-' + 'Z' * 64]
             self.assertEqual(self.call('scheduler.pick', bad)['result'], {})
-        self.assertEqual(self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['latest_sequence'], 1)
+        self.assertEqual(len([e for e in self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['events'] if e['kind']=='project_observed']), 1)
         snapshot['config']['enabled'] = True
         snapshot['config']['projects'] = [{'project': project, 'accounts': ['b']}]
         self.assertTrue(self.rpc('bridge.scheduler.replace', snapshot, instance)['ok'])
@@ -525,6 +525,75 @@ class NativeBridge(unittest.TestCase):
         snapshot['accounts'][1]['reset_at']=int(time.time())+3600;self.sticky_snapshot(snapshot)
         self.assertEqual(self.sticky_pick('main')[1]['AuthID'],'a')
 
+    def test_traffic_decision_usage_and_lifecycle_are_allowlisted(self):
+        snapshot=self.routing_snapshot([{'project':'work','accounts':['a']}],cap=32)
+        self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('private-session',project='work')
+        metadata=self.sticky_started(request,choice,'inbound-record')
+        selection=metadata['selection_id']
+        self.call('usage.handle',{'RequestID':'execution-one','SelectionID':selection,'TraceID':'trace',
+                  'AuthID':choice['AuthID'],'Provider':'codex','Model':'fixture-model','Generate':True,
+                  'Failed':False,'Latency':2100000000,'TTFT':130000000,'Detail':{'InputTokens':120,'OutputTokens':30},
+                  'APIKey':'NEVER-CAPTURE-API-KEY','Failure':{'Body':'NEVER-CAPTURE-BODY'}})
+        self.sticky_completed('inbound-record',metadata)
+        instance=self.rpc('bridge.hello')['result']['bridge_instance_id']
+        observed=self.rpc('bridge.events.pull',{'after':0},instance)['result']
+        traffic=[e['traffic'] for e in observed['events'] if e.get('traffic')]
+        decision=next(t for t in traffic if t['phase']=='decision')
+        usage=next(t for t in traffic if t['phase']=='usage')
+        self.assertEqual(decision['reason'],'project_preference')
+        self.assertEqual(decision['project'],'work')
+        self.assertEqual(usage['execution_id'],'execution-one')
+        self.assertEqual(usage['selection_id'],selection)
+        self.assertEqual(usage['input_tokens'],120)
+        self.assertEqual(usage['status'],'completed')
+        self.assertNotIn('http_status',usage)
+        self.assertNotIn('cached_tokens',usage)
+        self.assertNotIn('NEVER-CAPTURE',json.dumps(observed))
+        before=observed['latest_sequence']
+        self.call('usage.handle',{'RequestID':'internal','AuthID':'a','Provider':'codex','Generate':True,
+                                 'Source':'plugin_host_model_callback','Failed':False})
+        self.assertEqual(self.rpc('bridge.events.pull',{'after':before},instance)['result']['latest_sequence'],before)
+
+    def test_traffic_records_reach_database_and_analysis_without_model_calls(self):
+        snapshot=self.routing_snapshot([{'project':'work','accounts':['a']}],cap=32)
+        self.sticky_snapshot(snapshot)
+        self.call('request.intercept_before',{'RequestID':'business-record','TraceID':'trace-business',
+                  'Model':'fixture-model','Metadata':{'caller_scope':'private-caller-scope'}})
+        request,choice=self.sticky_pick('private-session',project='work',scope='private-caller-scope')
+        metadata=self.sticky_started(request,choice,'business-record')
+        self.call('usage.handle',{'RequestID':'business-attempt','SelectionID':metadata['selection_id'],
+                  'TraceID':'trace-business','AuthID':choice['AuthID'],'Provider':'codex','Model':'fixture-model',
+                  'Generate':True,'Failed':False,'Latency':2100000000,'Detail':{'InputTokens':120,'OutputTokens':30},
+                  'APIKey':'NEVER-STORE-KEY','Failure':{'Body':'NEVER-STORE-BODY'}})
+        self.sticky_completed('business-record',metadata)
+        self.start_daemon()
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            status,page=self.management('traffic',query={'kind':['users']})
+            if status==200 and page.get('summary',{}).get('attempts')==1:break
+            time.sleep(.025)
+        self.assertEqual(status,200,page)
+        self.assertEqual(page['summary'],{'requests':1,'attempts':1,'recovered':0,'unknown':0})
+        record=page['records'][0]
+        self.assertEqual(record['reason'],'project_preference')
+        self.assertEqual(record['project'],'work')
+        self.assertEqual(record['status'],'completed')
+        self.assertEqual(record['input_tokens'],120)
+        self.assertTrue(record['caller'].startswith('caller-'))
+        self.assertTrue(record['session'].startswith('session-'))
+        self.assertNotIn('private-caller-scope',json.dumps(page))
+        self.assertNotIn('private-session',json.dumps(page))
+        self.assertNotIn('NEVER-STORE',json.dumps(page))
+        status,detail=self.management('traffic',query={'kind':['users'],'id':[record['id']]})
+        self.assertEqual(status,200,detail)
+        self.assertEqual(len(detail['record']['attempts']),1)
+        self.assertIsNone(detail['record']['attempts'][0]['http_status'])
+        status,analysis=self.management('traffic',query={'kind':['analysis']})
+        self.assertEqual(analysis['accounts'][0]['attempts'],1)
+        self.assertEqual(analysis['projects'][0]['accounts'],{'a':1})
+        self.assertEqual(self.models,0)
+
     def test_schema7_omits_unused_interceptor_request_bodies(self):
         registration = self.call('plugin.reconfigure', {'schema_version': 7})
         self.assertTrue(registration['ok'], registration)
@@ -749,9 +818,13 @@ class NativeBridge(unittest.TestCase):
         routes = self.call('management.register', {})
         self.assertTrue(routes['ok'], routes)
         menus = [r for r in routes['result']['Resources'] if r.get('Menu')]
+        self.assertEqual([r['Menu'] for r in menus], ['Codex 调度台'])
         self.assertEqual(len(menus), 1)
         self.assertEqual(menus[0]['Path'], '/status')
-        self.assertIn('/healthz', [r['Path'] for r in routes['result']['Resources']])
+        self.assertEqual({r['Path'] for r in routes['result']['Resources']},
+                         {'/status', '/panel.js', '/panel.css', '/healthz', '/records.js', '/records.css', '/presentation.js'})
+        self.assertIn(('GET', '/v0/management/codex-window-refresh/v2/traffic'),
+                      {(r['Method'], r['Path']) for r in routes['result']['Routes']})
         self.assertIn({'Method': 'POST', 'Path': '/v0/management/codex-window-refresh/v2/sync'},
                       routes['result']['Routes'])
         for endpoint in ('model-settings', 'prompt-generations'):
@@ -1058,7 +1131,7 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual([e['kind'] for e in batch['events']], ['started', 'account_selected', 'completed'])
         self.assertFalse(batch['gap'])
         for event in batch['events']:
-            self.assertLessEqual(set(event), {'sequence', 'kind', 'request_id', 'identity', 'account_id', 'at'})
+            self.assertLessEqual(set(event), {'sequence', 'kind', 'request_id', 'identity', 'account_id', 'at', 'traffic'})
         self.assertNotIn('secret', json.dumps(batch))
         self.assertTrue(self.rpc('bridge.events.ack', {'through': 3}, instance)['ok'])
         empty = self.rpc('bridge.events.pull', {'after': 3}, instance)['result']
@@ -1630,6 +1703,7 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(info['prompt_generation_providers'], ['codex', 'antigravity'])
         self.assertIs(info['editable_generation_prompt'], True)
         self.assertEqual((info['host_abi'], info['rpc_schema'], info['protocol_version']), (1, 6, 1))
+        self.assertEqual(info['database_schema'], 12)
         self.assertIs(info['real_account_validation'], False)
         self.assertEqual(self.models, 0)
 
