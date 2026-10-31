@@ -3935,7 +3935,7 @@ function quotaOverview(revision, capacity, total = 2) {
     quota_exhausted: 0, unknown_enabled: total - capacity, unknown_quota: total - capacity, errors: 0};
   return data;
 }
-const quotaWarnings = row => descendants(row.children[5]).filter(node => node.className === 'observed-warning');
+const quotaUpdateTime = row => descendants(row.children[5]).find(node => node.className === 'observed-age');
 const quotaPercentages = row => descendants(row).filter(node => node.className === 'quota-percent').map(node => node.textContent);
 const openQuotaDetail = async (ui, index = 0) => {
   descendants(ui.get('accounts').children[index]).find(node => node.className === 'account-identity').onclick();
@@ -3958,7 +3958,7 @@ test('fresh 100-percent unknown windows keep their percentages and explain windo
     const row = ui.get('accounts').children[index];
     assert.equal(row.children[4].textContent, '窗口待核实');
     assert.doesNotMatch(row.children[4].textContent + row.children[4].title, /过期|已超过/);
-    assert.deepEqual(quotaPercentages(row), expected); assert.equal(quotaWarnings(row).length, 0);
+    assert.deepEqual(quotaPercentages(row), expected); assert.equal(row.children[5].textContent, quotaUpdateTime(row).textContent);
     const explanation = await openQuotaDetail(ui, index);
     assert.match(explanation.textContent, /额度数据已更新/); assert.match(explanation.textContent, /100%/);
     assert.match(explanation.textContent, /查询额度也不会启动窗口/);
@@ -3968,7 +3968,7 @@ test('fresh 100-percent unknown windows keep their percentages and explain windo
   assert.equal(mutations(ui).length, 0);
 });
 
-test('older quota evidence moves its warning to the update column while normal accounts and percentages remain visible', async () => {
+test('older quota evidence keeps only relative update time while its reason remains in account details', async () => {
   const at = Date.now() - 1000, old = new Date(at - 600000).toISOString();
   let revision = 1, accounts = [observedQuotaAccount('old-weekly-only', at, 88, 100), observedQuotaAccount('old-all-fields', at, 100, 93)];
   const ui = panel(url => {
@@ -3986,13 +3986,14 @@ test('older quota evidence moves its warning to the update column while normal a
   accounts[1].observed_at = old; accounts[1].quota.observed_at = old;
   revision++; await ui.get('refresh').onclick();
   for (const [index, expected] of [[0, ['88%', '100%']], [1, ['100%', '93%']]]) {
-    const row = ui.get('accounts').children[index], warnings = quotaWarnings(row);
+    const row = ui.get('accounts').children[index];
     assert.equal(row.children[4].textContent, '正常');
     assert.ok(descendants(row.children[4]).some(node => node.className === 'status-badge available'));
     assert.doesNotMatch(row.children[4].textContent, /过期|待核实/);
     assert.deepEqual(quotaPercentages(row), expected);
-    assert.equal(warnings.length, 1); assert.equal(warnings[0].textContent, '额度待更新');
-    assert.match(warnings[0].title, /周额度.*超过 5 分钟/);
+    assert.equal(row.children[5].textContent, quotaUpdateTime(row).textContent);
+    assert.equal(quotaUpdateTime(row).dataset.observedAt, accounts[index].observed_at);
+    assert.doesNotMatch(row.children[5].textContent, /待更新|待核实/);
     const explanation = await openQuotaDetail(ui, index);
     assert.match(explanation.textContent, /CPA 账号状态正常/); assert.match(explanation.textContent, /显示的是上次观测额度/);
     assert.match(explanation.textContent, /不表示账号不可用/);
@@ -4002,7 +4003,7 @@ test('older quota evidence moves its warning to the update column while normal a
   assert.equal(mutations(ui).length, 0);
 });
 
-test('a completed quota query refreshes stale hints and distinguishes a fresh unknown window without resending or calling models', async () => {
+test('a completed quota query refreshes the displayed observation time without extra hints or repeated calls', async () => {
   for (const windowState of ['active', 'unknown', 'weekly_stale']) {
     let revision = 1, polled = 0;
     let account = observedQuotaAccount('query-refresh-account', Date.now() - 600000, 100, 100);
@@ -4025,11 +4026,11 @@ test('a completed quota query refreshes stale hints and distinguishes a fresh un
     }, {presentation: CWRPresentation});
     await ui.get('connect').onclick();
     assert.equal(ui.get('accounts').children[0].children[4].textContent, '正常');
-    assert.equal(quotaWarnings(ui.get('accounts').children[0])[0].textContent, '额度待更新');
+    assert.match(ui.get('accounts').children[0].children[5].textContent, /10 分钟前/);
     await openQuotaDetail(ui);
     await accountQuery(ui).onclick();
     const row = ui.get('accounts').children[0];
-    assert.ok(polled > 0); assert.equal(quotaWarnings(row).length, windowState === 'weekly_stale' ? 1 : 0);
+    assert.ok(polled > 0); assert.equal(row.children[5].textContent, '刚刚');
     assert.equal(row.children[4].textContent, windowState === 'active' ? '可用' : windowState === 'unknown' ? '窗口待核实' : '正常');
     assert.deepEqual(quotaPercentages(row), ['100%', '100%']);
     assert.equal(descendants(row.children[5]).find(node => node.className === 'observed-age').dataset.observedAt, account.observed_at);
@@ -4039,7 +4040,6 @@ test('a completed quota query refreshes stale hints and distinguishes a fresh un
     else if (windowState === 'weekly_stale') {
       assert.match(explanation.textContent, /周额度的观测已超过 5 分钟/);
       assert.doesNotMatch(explanation.textContent, /五小时额度的观测/);
-      assert.match(quotaWarnings(row)[0].title, /周额度的观测/);
     } else assert.equal(explanation, undefined);
     await ui.tick(5000); await flush();
     const posts = mutations(ui);

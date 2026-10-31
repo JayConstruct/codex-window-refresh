@@ -476,7 +476,7 @@ try {
     await reload();
     let rows = await readRows();
     assert.equal(rows[0].status, '窗口待核实'); assert.match(rows[0].quota, /100%/); assert.doesNotMatch(rows[0].updated, /待更新/);
-    assert.equal(rows[1].status, '正常'); assert.match(rows[1].updated, /额度待更新/);
+    assert.equal(rows[1].status, '正常'); assert.match(rows[1].updated, /^10 分钟前$/);
     assert.equal(rows[2].status, '额度数据不完整');
     await evaluate(`document.querySelector('.account-identity').click()`); await settleRefresh();
     assert.match(await evaluate(`document.querySelector('#account-detail .quota-status-explanation').textContent`), /窗口是否已启动尚未确认/);
@@ -490,11 +490,11 @@ try {
     accounts.splice(0, accounts.length, ...structuredClone(original));
     for (const account of accounts) { account.observed_at = old; if(account.quota) account.quota.observed_at = old; }
     await reload(); rows = await readRows();
-    assert.equal(rows.slice(0,4).every(row=>row.status==='正常'&&row.updated.includes('额度待更新')), true, 'Evidence expiry changed healthy CPA accounts into unavailable accounts');
+    assert.equal(rows.slice(0,4).every(row=>row.status==='正常'&&/^10 分钟前$/.test(row.updated)), true, 'Old observations should retain normal accounts and only display relative update time');
     assert.equal(rows[4].status, '已禁用'); assert.equal(rows[5].status, '暂不可用');
     await screenshot('quota-stale-observations-desktop.png');
     accounts.splice(0, accounts.length, ...structuredClone(original)); await reload();
-    assert.doesNotMatch((await readRows())[0].updated, /额度待更新/);
+    assert.match((await readRows())[0].updated, /^刚刚$/);
     assert.equal(posts.length, 0); assert.equal(patches.length, 0);
     assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
     console.log('Quota status Chromium checks passed: fresh 100% placeholders, incomplete observations, account health separated from five-minute capacity freshness, detail explanations, refresh recovery, desktop/mobile overflow and zero writes. Screenshots: '+output);

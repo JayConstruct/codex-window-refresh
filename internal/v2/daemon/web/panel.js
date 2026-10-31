@@ -1776,12 +1776,7 @@
       const five = element('td'), weekly = element('td'), observed = element('td'), action = element('td');
       five.append(renderQuota(account.quota, 'five_hour')); weekly.append(renderQuota(account.quota, 'weekly'));
       const observedAge = element('span', 'observed-age', age(account.observed_at)); observedAge.dataset.observedAt = account.observed_at || '';
-      observed.append(observedAge, element('small', 'observed-source', account.observed_at ? sourceText(account.quota?.source) : '等待首次查询'));
-      const observation = presentation?.quotaAssessment(account);
-      if (observation?.reason === 'stale' || observation?.reason === 'future') {
-        const hint = element('small', 'observed-warning', observation.reason === 'stale' ? '额度待更新' : '观测时间待核实');
-        hint.title = observation.fields.join('、') + (observation.reason === 'stale' ? '的观测已超过 5 分钟' : '的观测时间晚于当前页面时间'); observed.append(hint);
-      }
+      observed.append(observedAge);
       const accountKey = 'account:' + account.id;
       const button = element('button', 'account-query', queryBusy.has(accountKey) ? '提交中…' : unresolved.has(accountKey) ? '核实查询' : '查询');
       button.type = 'button'; button.disabled = !connected || queryBusy.has(accountKey);
