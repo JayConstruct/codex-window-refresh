@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const CWRPresentation = require('../../../internal/v2/daemon/web/presentation.js');
-const {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, requestID, validateQueryDraft, configDraft, queueText} = require('../../../internal/v2/daemon/web/panel.js');
+const {ViewTracker, apiBase, readPanelKey, readLogin, age, resetText, windowView, accountStatus, requestID, validateQueryDraft, configDraft, queueText} = require('../../../internal/v2/daemon/web/panel.js');
 const script = fs.readFileSync(path.resolve(__dirname, '../../../internal/v2/daemon/web/panel.js'), 'utf8');
 const view = (instance = 'a', revision = 1) => ({instance_id: instance, view_revision: revision});
 const origin = 'http://127.0.0.1:8317';
@@ -255,7 +255,7 @@ function panel(respond, options = {}) {
         : await respond(url, settings, calls);
       return {ok: response[0] < 400, status: response[0], json: async () => response[1]};
     },
-    AbortController, URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, atob,
+    AbortController, URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, atob, btoa,
     crypto: options.crypto || {randomUUID: () => 'fixture-idempotency-key'},
     addEventListener: (name, callback) => events.set(name, callback),
     setTimeout: (fn, delay) => { timers.set(++nextTimer, {fn, delay}); return nextTimer; }, clearTimeout: id => timers.delete(id),
@@ -1248,6 +1248,110 @@ test('same-origin saved authentication connects automatically on opening', async
   assert.equal(ui.get('login-section').hidden, true);
   assert.equal(ui.calls[0].headers.Authorization, 'Bearer fixture-auto-key');
   assert.ok([...ui.timers.values()].some(timer => timer.delay === 5000));
+});
+test('remembered manual login survives reopening and page exit without copying or changing CPA authentication', async () => {
+  const storage = {}, ui = panel(basic, {storage});
+  const secret = '管理-key-remembered';
+  ui.get('key').value = secret; ui.get('auto-login').checked = true;
+  await ui.get('connect').onclick();
+  const name = 'cwr-v2-auth:' + origin, encoded = storage[name];
+  assert.match(encoded, /^enc::v1::/); assert.equal(encoded.includes(secret), false);
+  assert.equal(ui.get('key').value, ''); assert.equal(ui.get('login-section').hidden, true);
+  assert.deepEqual(Object.keys(storage), [name]);
+  assert.equal(readLogin(ui.clock, apiBase(location)).key, secret);
+  ui.events.get('pagehide')({persisted: false}); assert.equal(storage[name], encoded);
+  const reopened = panel(basic, {storage}); await flush();
+  assert.equal(reopened.get('login-section').hidden, true); assert.equal(reopened.get('auto-login').checked, true);
+  assert.equal(reopened.calls.every(call => call.headers.Authorization === 'Bearer ' + secret), true);
+  assert.equal(storage[name], encoded); assert.equal(mutations(reopened).length, 0);
+});
+test('unchecked login remains memory-only and explicit preferences suppress host auto-login on reload', async () => {
+  const storage = {}, ui = panel(basic, {storage});
+  assert.equal(ui.get('auto-login').checked, false);
+  await ui.get('connect').onclick();
+  assert.equal(JSON.stringify(storage).includes('fixture-key'), false);
+  const host = JSON.stringify({state: {managementKey: 'host-key', apiBase: origin}});
+  storage['cli-proxy-auth'] = host;
+  const reopened = panel(basic, {storage}); await flush();
+  assert.equal(reopened.calls.length, 0); assert.equal(reopened.get('login-section').hidden, false);
+  assert.equal(storage['cli-proxy-auth'], host);
+});
+test('saved plugin login is restricted to its origin and proxy prefix, including copied credentials', async () => {
+  const storage = {}, ui = panel(basic, {storage});
+  ui.get('auto-login').checked = true; await ui.get('connect').onclick();
+  for (const address of [{...location, pathname: '/other' + location.pathname}, {...location, origin: 'https://other.example', host: 'other.example'}]) {
+    const target = address.origin + (address.pathname.startsWith('/other/') ? '/other' : '');
+    storage['cwr-v2-auth:' + target] = storage['cwr-v2-auth:' + origin];
+    const other = panel(basic, {storage, location: address}); await flush();
+    assert.equal(other.calls.length, 0); assert.equal(other.get('login-section').hidden, false);
+  }
+});
+test('manual remembered login takes precedence over outdated host credentials and does not modify them', async () => {
+  const storage = {'cli-proxy-auth': JSON.stringify({state: {managementKey: 'outdated-host-key', apiBase: origin}})};
+  const host = storage['cli-proxy-auth'], ui = panel(basic, {storage}); await flush();
+  assert.equal(storage['cwr-v2-auth:' + origin], undefined, 'Host auto-login must remain read-only');
+  ui.get('disconnect').onclick(); ui.get('key').value = 'updated-manual-key'; ui.get('auto-login').checked = true;
+  await ui.get('connect').onclick();
+  const reopened = panel(basic, {storage}); await flush();
+  assert.equal(reopened.calls[0].headers.Authorization, 'Bearer updated-manual-key');
+  assert.equal(storage['cli-proxy-auth'], host);
+});
+test('disconnect and authentication rejection erase remembered credentials and suppress host fallback after reload', async () => {
+  for (const status of [0, 401, 403]) {
+    let reject = false;
+    const storage = {}, ui = panel(url => status && reject ? [status, {error: 'unauthorized'}] : basic(url), {storage});
+    ui.get('auto-login').checked = true; await ui.get('connect').onclick();
+    storage['cli-proxy-auth'] = JSON.stringify({state: {managementKey: 'fixture-key', apiBase: origin}});
+    const host = storage['cli-proxy-auth'];
+    reject = true;
+    if (status) await ui.tick(5000); else ui.get('disconnect').onclick();
+    assert.equal(ui.get('auto-login').checked, false);
+    assert.equal(JSON.stringify(storage['cwr-v2-auth:' + origin]).includes('fixture-key'), false);
+    assert.equal(readLogin(ui.clock, apiBase(location)).key, '');
+    const reopened = panel(basic, {storage}); await flush();
+    assert.equal(reopened.calls.length, 0); assert.equal(reopened.get('login-section').hidden, false);
+    assert.equal(storage['cli-proxy-auth'], host); assert.equal(refreshTimers(ui).length, 0);
+  }
+});
+test('initial remembered authentication rejection is cleared without retrying after reopening', async () => {
+  const storage = {}, first = panel(basic, {storage});
+  first.get('auto-login').checked = true; await first.get('connect').onclick();
+  const rejected = panel(() => [401, {error: 'unauthorized'}], {storage}); await flush();
+  assert.equal(rejected.calls.length, 1); assert.equal(refreshTimers(rejected).length, 0);
+  assert.equal(readLogin(rejected.clock, apiBase(location)).key, '');
+  const reopened = panel(basic, {storage}); await flush(); assert.equal(reopened.calls.length, 0);
+});
+test('remembering waits for authentication success and preserves the choice through a transient retry', async () => {
+  let fail = true;
+  const ui = panel(url => url.endsWith('/overview') && fail ? [503, {error: 'backend_unavailable'}] : basic(url));
+  ui.get('auto-login').checked = true; await ui.get('connect').onclick();
+  assert.equal(ui.storage['cwr-v2-auth:' + origin], undefined);
+  fail = false; await ui.tick(5000); await flush();
+  assert.equal(readLogin(ui.clock, apiBase(location)).key, 'fixture-key');
+  assert.equal(ui.get('login-section').hidden, true); assert.equal(mutations(ui).length, 0);
+});
+test('late successful connection cannot remember credentials after explicit disconnect', async () => {
+  let release;
+  const ui = panel(url => url.endsWith('/overview') ? new Promise(resolve => { release = () => resolve([200, overview()]); }) : basic(url));
+  ui.get('auto-login').checked = true;
+  const pending = ui.get('connect').onclick(); await flush();
+  assert.equal(ui.storage['cwr-v2-auth:' + origin], undefined); assert.equal(ui.get('auto-login').disabled, true);
+  ui.get('disconnect').onclick(); release(); await pending;
+  assert.equal(readLogin(ui.clock, apiBase(location)).key, '');
+  const reopened = panel(basic, {storage: ui.storage}); await flush(); assert.equal(reopened.calls.length, 0);
+});
+test('blocked or malformed login storage falls back to a usable manual connection without leaking the key', async () => {
+  for (const options of [{storageBlocked: true}, {storageReadBlocked: true, storageBlocked: true}, {storage: {['cwr-v2-auth:' + origin]: 'enc::v1::damaged'}}]) {
+    const ui = panel(basic, options); assert.equal(ui.calls.length, 0);
+    ui.get('auto-login').checked = true; await ui.get('connect').onclick();
+    assert.equal(ui.get('login-section').hidden, true); assert.equal(ui.get('key').value, '');
+    if (options.storageBlocked) assert.match(ui.get('notice').textContent, /无法保存登录偏好/);
+    assert.equal(JSON.stringify(ui.storage).includes('fixture-key'), false);
+  }
+  const ui = panel(basic); ui.get('auto-login').checked = true;
+  ui.clock.btoa = undefined; await ui.get('connect').onclick();
+  assert.equal(ui.storage['cwr-v2-auth:' + origin], undefined);
+  assert.match(ui.get('notice').textContent, /无法保存登录偏好/);
 });
 test('disconnect clears timers and disables stale per-account actions', async () => {
   const ui = panel(basic); await ui.get('connect').onclick(); ui.get('disconnect').onclick();

@@ -15,6 +15,7 @@ const autorefreshOnly = process.env.CWR_AUTOREFRESH_ONLY === '1';
 const schedulingOnly = process.env.CWR_SCHEDULING_ONLY === '1';
 const projectsOnly = process.env.CWR_PROJECTS_ONLY === '1';
 const quotaStatusOnly = process.env.CWR_QUOTA_STATUS_ONLY === '1';
+const authOnly = process.env.CWR_AUTH_ONLY === '1';
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], patches = [], reads = [], exceptions = [], pageErrors = [];
@@ -875,6 +876,55 @@ try {
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
   await evaluate('document.fonts.ready.then(() => true)');
   checks: {
+  if (authOnly) {
+    const storageKey = 'cwr-v2-auth:' + origin + '/cpa';
+    const hostAuth = await evaluate('localStorage.getItem("cli-proxy-auth")');
+    assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`), null, 'CPA auto-login copied host credentials');
+    await evaluate('document.getElementById("disconnect").click()');
+    for (const width of [1586, 390]) {
+      await cdp('Emulation.setDeviceMetricsOverride', {width, height: width === 390 ? 844 : 992, deviceScaleFactor: 1, mobile: width === 390});
+      const layout = await evaluate(`(() => {const label=document.querySelector('.login-remember').getBoundingClientRect(),input=document.getElementById('auto-login').getBoundingClientRect();return {overflow:document.documentElement.scrollWidth>innerWidth,labelVisible:label.left>=0&&label.right<=innerWidth,inputVisible:input.width>=18&&input.height>=18}})()`);
+      assert.deepEqual(layout, {overflow: false, labelVisible: true, inputVisible: true});
+      await screenshot('auto-login-' + width + '.png');
+    }
+    async function reloadLoggedOut() {
+      await cdp('Page.reload');
+      await waitFor(() => evaluate('!!document.getElementById("connect") && !document.getElementById("login-section").hidden && !document.getElementById("connect").disabled'), 'Reload did not preserve logout');
+      const count = reads.length;
+      await new Promise(resolve => setTimeout(resolve, 250));
+      assert.equal(reads.length, count, 'Reload silently reused CPA credentials');
+      assert.equal(await evaluate('document.getElementById("auto-login").checked'), false);
+    }
+    async function manualLogin(remember) {
+      await evaluate(`document.getElementById('key').value=${JSON.stringify(fixtureKey)};document.getElementById('auto-login').checked=${remember};document.getElementById('connect').click()`);
+      await waitFor(() => evaluate('document.getElementById("login-section").hidden && document.getElementById("accounts").rows.length===6'), 'Manual login did not connect');
+      assert.equal(await evaluate('document.getElementById("key").value'), '');
+    }
+    await reloadLoggedOut();
+    await manualLogin(false);
+    assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)}).includes(${JSON.stringify(fixtureKey)})`), false);
+    await reloadLoggedOut();
+    await manualLogin(true);
+    const encoded = await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`);
+    assert.match(encoded, /^enc::v1::/); assert.equal(encoded.includes(fixtureKey), false);
+    await cdp('Page.reload');
+    await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length===6'), 'Remembered login did not restore');
+    assert.equal(await evaluate('document.getElementById("auto-login").checked'), true);
+    assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`), encoded);
+    assert.equal(await evaluate('localStorage.getItem("cli-proxy-auth")'), hostAuth);
+    unauthorized = true;
+    await evaluate('dispatchEvent(new Event("focus"))');
+    await waitFor(() => evaluate('!document.getElementById("login-section").hidden && document.getElementById("query").disabled'), 'Authentication expiry did not log out');
+    unauthorized = false;
+    assert.equal(JSON.parse(await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`)).autoLogin, false);
+    await reloadLoggedOut();
+    assert.equal(await evaluate('localStorage.getItem("cli-proxy-auth")'), hostAuth);
+    assert.equal(posts.length, 0); assert.equal(patches.length, 0);
+    assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
+    console.log('Auto-login browser checks passed: CPA reuse, desktop/mobile checkbox, opt-in persistence, reload restoration, explicit logout, authentication expiry and unchanged host credentials.');
+    console.log('Local fixture screenshots: ' + output);
+    break checks;
+  }
   if (process.env.CWR_DESIGN_REVIEW === '1') {
     const layouts = [];
     async function captureDesign(name) {
@@ -2048,7 +2098,7 @@ try {
   if (server) await new Promise(resolve => server.close(resolve));
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
-if (!autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaStatusOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
+if (!authOnly && !autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaStatusOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
   console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
@@ -2060,5 +2110,8 @@ if (!autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaStatusOnly && 
   const quotaChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_QUOTA_STATUS_ONLY:'1', CWR_AUTOREFRESH_ONLY:'0', CWR_PROJECTS_ONLY:'0', CWR_SCREENSHOT_DIR:join(output,'quota-status')}, stdio:'inherit'});
   const quotaResult = await new Promise((resolve,reject)=>{quotaChild.once('error',reject);quotaChild.once('exit',(code,signal)=>resolve({code,signal}));});
   assert.equal(quotaResult.code,0,'Isolated quota status Chromium fixture failed: '+JSON.stringify(quotaResult));
-  console.log('V2 full, automatic-refresh, project-matching and quota status Chromium fixtures all passed.');
+  const authChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTH_ONLY:'1', CWR_SCREENSHOT_DIR:join(output,'auto-login')}, stdio:'inherit'});
+  const authResult = await new Promise((resolve,reject)=>{authChild.once('error',reject);authChild.once('exit',(code,signal)=>resolve({code,signal}));});
+  assert.equal(authResult.code,0,'Isolated auto-login Chromium fixture failed: '+JSON.stringify(authResult));
+  console.log('V2 full, automatic-refresh, project-matching, quota status and auto-login Chromium fixtures all passed.');
 }

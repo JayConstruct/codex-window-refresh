@@ -12,9 +12,21 @@ rc.26 起支持客户端自动目录标识，无需维护 `projects.json`。rc.2
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh
 ```
 
-默认安装到 `~/.local/bin`，提供 `cwr-codex` 命令及兼容原路径的 `cwr-codex.py`。未加入 PATH 时可运行 `~/.local/bin/cwr-codex`；自定义目录使用 `bash /tmp/cwr-client-install.sh --bin-dir /absolute/path`。重新下载并运行同一安装命令即可更新，安装器下载配套标签版本并校验 SHA-256，下载或校验失败不会覆盖旧脚本。已有 Codex 配置、目录映射和 shell 配置保留。离线安装可在完整解压的发行包中运行 `bash install-client.sh`，无需 curl。
+默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，自动为 Codeman 的 Codex 模式配置客户端启动入口。**重启 Codeman 服务后**，新建或恢复的 Codex 会话自动按工作目录携带项目标识，模型、推理强度、动画及恢复会话参数继续由 Codeman 传入。
 
-1. 在运行 Codex 的电脑进入项目目录，执行 `cwr-codex`，再发送一次正常请求。新版脚本不读取 Codex 配置，默认使用已记住的提供商 ID，没有记忆时使用 `cliproxyapi`。若 Codex 报该提供商定义缺失或名称为空，则提示输入实际 ID，保存到客户端设置后自动重试；下次直接运行即可。
+Codeman 使用默认用户服务 `codeman-web.service` 时，一条命令安装本版客户端、配置入口并重启 Codeman：
+
+```sh
+curl -fSL --retry 3 https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/v0.2.0-rc.31/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh --codeman-dir "$HOME/.codeman" && systemctl --user restart codeman-web.service
+```
+
+使用其他启动方式时，仅运行安装器，再通过原来的管理方式重启 Codeman。
+
+Codeman 入口使用其 CLI 注册表 `~/.codeman/clis.json`，通过已安装的 `app/dist/config/cli-registry` 模块读取并校验当前启动模板；保留其他 CLI、Codex 开关及现有参数。首次修改已有注册表时保存 `clis.json.cwr-backup`，注册表及备份使用 `0600` 权限。重复安装更新入口路径，不重复添加启动参数。不替换原始 Codex 程序，不修改 shell 或 Codex 配置。无效注册表、已有自定义 Codex 启动命令或缺少注册表模块时，原注册表保持不变并提示原因。
+
+仍提供 `cwr-codex` 命令及兼容原路径的 `cwr-codex.py`，终端可直接使用；未加入 PATH 时可运行 `~/.local/bin/cwr-codex`。自定义安装目录使用 `--bin-dir /absolute/path`；Codeman 入口记录客户端绝对路径，不要求安装目录已在 Codeman 的 PATH 中。`--codeman-dir /path/to/.codeman` 可指定包含 `app` 的 Codeman 数据目录，`--no-codeman` 仅安装客户端。已有客户端也可执行 `cwr-codex --setup-codeman /path/to/.codeman` 单独配置。配置 Codeman 入口另需 Node.js 及支持 CLI 注册表的 Codeman；普通客户端仍只需 Python。重新下载并运行同一安装命令即可更新，下载或校验失败不会覆盖旧脚本。已有 Codex 配置和目录映射保留。离线安装可在完整解压的发行包中运行 `bash install-client.sh`，无需 curl。
+
+1. 在 Codeman 中选择项目目录，以 Codex 模式启动会话，再发送一次正常请求；终端也可进入项目目录执行 `cwr-codex`。新版脚本不读取 Codex 配置，默认使用已记住的提供商 ID，没有记忆时使用 `cliproxyapi`。若 Codex 报该提供商定义缺失或名称为空，则在会话终端按提示输入实际 ID，保存到客户端设置后自动重试；下次无需再填。
 2. 在面板“账号调度与重置卡”找到“客户端最近出现的项目”。客户端上报目录名和 `dir-` 开头的稳定标识；点击“匹配账号”，可填写便于辨认的项目名称，再从 CPA 账号清单选择首选账号。
 3. 开启业务账号调度并“保存并应用全部设置”。账号偏好保存在服务端，后续新会话按该项目选择账号，客户端无需重新下载文件。已有会话绑定继续沿用原账号。
 
@@ -51,13 +63,13 @@ project-b = account-3
 python3 scripts/cwr-codex.py --project project-a --directory /work/project-a
 ```
 
-通过脚本启动时，启动器始终为本次 Codex 进程传入 `X-CWR-Project` 请求头设置；直接运行 `codex` 时，启动器不参与，也就不会额外添加项目头。启动器不读取或检测 Codex 配置及 profile，客户端使用 Python 3.10+ 即可，无需安装 `tomli`。
+通过脚本或已配置的 Codeman Codex 入口启动时，启动器为本次 Codex 进程传入 `X-CWR-Project` 请求头设置；终端直接运行原始 `codex` 时，不额外添加项目头。启动器不读取或检测 Codex 配置及 profile，普通客户端使用 Python 3.10+ 即可，无需安装 `tomli`。
 
 新版默认使用 `cliproxyapi`，交互输入的 ID 保存到 `$XDG_CONFIG_HOME/cwr/client.json`（未指定 XDG_CONFIG_HOME 时为 `~/.config/cwr/client.json`）。脚本只捕获当前提供商对应的 `provider name must not be empty` 启动错误；回车、Ctrl+C 或输入结束可取消，HTTP、认证或其他错误照常退出。非交互运行时不等待输入，会提示通过 `--provider` 指定 ID。客户端安装或更新保留这个记忆文件。
 
 `--provider` 可单次覆盖已记住的 ID，例如 `--provider my_proxy`；成功启动不会把单次覆盖写成默认值。启动器将头部设置写入 `model_providers.<ID>.http_headers.X-CWR-Project` 启动参数，不替换 `model_provider`，不修改 Codex 配置文件或服务器调度总开关。提供商 ID 及其 CPA 地址由用户配置，启动器不自动判断或切换。Codex 的 profile 和其他命令行参数照常透传。
 
-这些是 [rc.28 启动器](../../scripts/cwr-codex.py)的用法。rc.25 安装包仍包含提供商检测逻辑。当前脚本的显式 `--project` 和原有目录映射可配合旧后台使用，自动发现需要后台和接入层至少为 rc.26。rc.27 的提供商交互修复可单独更新客户端。启动器不保存密钥、不改写请求正文，请求头仅通过本次启动参数传入。
+这些是[当前客户端启动器](../../scripts/cwr-codex.py)的用法，旧安装器需要更新后才会配置 Codeman 入口。rc.25 安装包仍包含提供商检测逻辑。当前脚本的显式 `--project` 和原有目录映射可配合旧后台使用，自动发现需要后台和接入层至少为 rc.26。rc.27 的提供商交互修复可单独更新客户端。启动器不保存密钥、不改写请求正文，请求头仅通过本次启动参数传入。
 
 需要沿用自定义项目标识或将多个目录合并到同一项目时，可选创建 `~/.config/cwr/projects.json`：
 
@@ -68,7 +80,7 @@ python3 scripts/cwr-codex.py --project project-a --directory /work/project-a
 ]}
 ```
 
-然后在对应目录执行 `python3 /path/to/cwr-codex.py`，新版会使用已记住的提供商 ID 或默认 `cliproxyapi`。手动 `--project` 优先，其次是现有目录映射的最长路径匹配，最后自动生成目录标识；默认映射文件不存在时直接使用自动标识，不创建文件。`--map` 可指定另一份映射，显式指定的文件不存在、内容损坏或映射重复时会报错。希望已有目录改用自动标识时，移除对应映射即可。Codex 参数放在 `--` 后，例如 `-- exec "检查测试结果"`。目录统一由启动器的 `--directory` 指定。需要普通启动时直接执行 `codex`。
+然后在 Codeman 中使用对应目录启动 Codex，或在终端执行 `python3 /path/to/cwr-codex.py`。新版会使用已记住的提供商 ID 或默认 `cliproxyapi`。手动 `--project` 优先，其次是现有目录映射的最长路径匹配，最后自动生成目录标识；默认映射文件不存在时直接使用自动标识，不创建文件。`--map` 可指定另一份映射，显式指定的文件不存在、内容损坏或映射重复时会报错。希望已有目录改用自动标识时，移除对应映射即可。使用 `cwr-codex` 时，Codex 参数放在 `--` 后，例如 `cwr-codex -- exec "检查测试结果"`。启动目录可用原生 `-C`/`--cd` 指定，也可使用启动器的 `--directory`；项目标识按最终目录计算。终端直接执行 `codex` 可普通启动。
 
 ## 额度分配
 

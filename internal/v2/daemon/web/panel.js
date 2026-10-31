@@ -120,6 +120,36 @@
     if (current) return current;
     return candidate(storedValue(context, 'managementKey'), storedValue(context, 'apiBase') || storedValue(context, 'apiUrl'));
   }
+  function loginAddress(context, base) {
+    return context.location.origin + base.slice(0, -API.length);
+  }
+  function readLogin(context, base) {
+    const address = loginAddress(context, base);
+    const saved = storedValue(context, 'cwr-v2-auth:' + address);
+    if (saved?.version === 1 && saved.apiBase === address) {
+      const key = saved.managementKey;
+      if (saved.autoLogin === true && typeof key === 'string' && key.trim() && !/[\x00-\x1f\x7f]/.test(key)) return {key: key.trim(), remember: true};
+      return {key: '', remember: false};
+    }
+    const key = readPanelKey(context, base);
+    return {key, remember: !!key};
+  }
+  function saveLogin(context, base, key = '') {
+    const address = loginAddress(context, base);
+    const saved = {version: 1, apiBase: address, autoLogin: !!key};
+    try {
+      let raw;
+      if (key) {
+        saved.managementKey = key;
+        const bytes = new context.TextEncoder().encode(JSON.stringify(saved));
+        const mask = new context.TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + context.location.host + '|' + context.navigator.userAgent);
+        for (let index = 0; index < bytes.length; index++) bytes[index] ^= mask[index % mask.length];
+        raw = 'enc::v1::' + context.btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join(''));
+      } else raw = JSON.stringify(saved);
+      context.localStorage.setItem('cwr-v2-auth:' + address, raw);
+      return true;
+    } catch { return false; }
+  }
   function timestamp(raw) {
     if (typeof raw !== 'string' || raw.startsWith('0001-')) return NaN;
     return Date.parse(raw);
@@ -530,7 +560,7 @@
       directories.add(key); return {directory: item.directory, project: item.project};
     });
   }
-  if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText, historyTimeRange, historyQuery, historyStatus, historyDuration, validateQueryJob, validateTaskHistoryPage, projectDirectoryKey, readProjectDirectoryMap};
+  if (typeof module !== 'undefined' && module.exports) module.exports = {ViewTracker, apiBase, readPanelKey, readLogin, saveLogin, age, resetText, windowView, accountStatus, jobCounts, requestID, validateQueryDraft, configDraft, queueText, historyTimeRange, historyQuery, historyStatus, historyDuration, validateQueryJob, validateTaskHistoryPage, projectDirectoryKey, readProjectDirectoryMap};
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {modelDefaults, parseModelPhrases, exportModelPhrases, deduplicateModelPhrases, modelConfigDraft, validateModelDraft, modelPromptPreview});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {wakeDefaults, wakeConfigDraft, validateWakeDraft});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
@@ -1638,7 +1668,7 @@
   }
   function controls() {
     for (const id of ['query', 'query-single', 'refresh', 'sync']) if ($(id)) $(id).disabled = !connected || syncing && id === 'sync' || queryBusy.has('batch') && id === 'query';
-    $('connect').disabled = connecting; $('key').disabled = connecting;
+    $('connect').disabled = connecting; $('key').disabled = connecting; $('auto-login').disabled = connecting;
     setText('query', unresolved.has('batch') ? '核实批量查询' : selectedAccounts.size ? '查询已选 ' + selectedAccounts.size + ' 个' : '查询全部');
     setText('header-query', selectedBatchBusy ? '正在提交查询' : selectedAccounts.size ? '查询已选 ' + selectedAccounts.size + ' 个' : '查询额度');
     if ($('disconnect')) $('disconnect').hidden = !connected;
@@ -1699,6 +1729,11 @@
     for (const button of document.querySelectorAll('.task-open')) button.disabled = true;
     renderHistory();
   }
+  function signOut(text) {
+    stop(); $('auto-login').checked = false;
+    if (!saveLogin(context, base)) notice('浏览器无法清除自动登录记录，请在浏览器设置中清除此站点的数据。', 'warning');
+    setConnection(text);
+  }
   async function api(path, options = {}, management = false) {
     if (!key) throw Object.assign(new Error('unauthorized'), {code: 'unauthorized'});
     const current = generation, controller = new AbortController();
@@ -1713,7 +1748,7 @@
       const response = await fetch(endpoint + path, {...options, headers: {'Authorization': 'Bearer ' + key, 'Accept': 'application/json', ...(options.body ? {'Content-Type': 'application/json'} : {}), ...(options.headers || {})}, credentials: 'omit', redirect: 'error', cache: 'no-store', signal: controller.signal});
       if (current !== generation) throw Object.assign(new Error('stale'), {code: 'stale'});
       if (response.status === 401 || response.status === 403) {
-        stop(); setConnection('认证失效，请重新连接');
+        signOut('认证失效，请重新连接');
         throw Object.assign(new Error('unauthorized'), {code: 'unauthorized', status: response.status});
       }
       const data = management ? await boundedManagementJSON(response) : await response.json();
@@ -2531,7 +2566,7 @@
       if (current === generation && connected) monitor(current);
     }, document.hidden ? 30000 : active ? 1500 : 5000);
   }
-  async function connect(value) {
+  async function connect(value, remember = $('auto-login').checked, persist = true) {
     stop(); views = new ViewTracker(); overviewData = null; accountsRevision = -1; accountsViewRevision = -1;
     if (typeof value !== 'string' || !value.trim() || /[\x00-\x1f\x7f]/.test(value)) { report({code: 'invalid_key'}); return; }
     key = value.trim(); $('key').value = ''; connecting = true; setConnection('正在连接 CPA'); controls();
@@ -2540,6 +2575,7 @@
       const data = await overview();
       if (current !== generation || !data) return;
       connected = true; connecting = false; $('login-section').hidden = true;
+      if (persist && !saveLogin(context, base, remember ? key : '')) notice('已连接，但浏览器无法保存登录偏好；请允许站点存储后重新连接。', 'warning');
       setConnection('独立后台已连接 · 页面自动更新'); setText('auto-status', '数据自动更新'); setData($('auto-status'), 'state', 'online'); controls();
       await refreshConfirmedStatuses();
       if (current !== generation) return;
@@ -2556,13 +2592,13 @@
       if (activePage === 'models') { ensureGenerationAccounts(); await reloadModelSettings(); await pollGeneration(); }
       clearError(); monitor(current);
     } catch (error) {
-      if (current !== generation && error.code !== 'unauthorized') return;
+      if (current !== generation) { if (error.code === 'unauthorized') report(error); return; }
       if (current === generation && connected) { report(error); monitor(current); }
       else if (current === generation && (['network', 'timeout', 'backend_unavailable', 'bridge_unavailable', 'storage_unavailable'].includes(error.code) || error.status >= 500)) {
         setConnection('暂时无法连接 · 5 秒后自动重试'); setText('auto-status', '连接中断 · 自动重试');
         report(error);
         connectRetryTimer = setTimeout(() => {
-          if (current === generation && !connected && !connecting) void connect(value);
+          if (current === generation && !connected && !connecting) void connect(value, remember, persist);
         }, 5000);
       } else { stop(); setConnection('连接失败，请重新连接'); report(error); }
     } finally { if (current === generation) { connecting = false; controls(); } }
@@ -3159,7 +3195,7 @@
   }
   $('connect').onclick = () => connect($('key').value);
   $('key').addEventListener('keydown', event => { if (event.key === 'Enter') void connect($('key').value); });
-  if ($('disconnect')) $('disconnect').onclick = () => { stop(); setConnection('已断开，后台仍持续运行'); setText('metric-status', '未连接'); };
+  if ($('disconnect')) $('disconnect').onclick = () => { signOut('已断开，后台仍持续运行'); setText('metric-status', '未连接'); };
   $('query').onclick = querySelectedAccounts;
   if ($('query-single')) $('query-single').onclick = () => {
     const target = resolveDisplayAccount($('account').value);
@@ -3344,6 +3380,7 @@
     if (event.persisted) resumeUpdates();
   });
   navigate('overview'); controls(); renderAccounts(); renderTasks(); renderEvents(); renderDiagnostics();
-  const saved = readPanelKey(context, base);
-  if (saved) void connect(saved);
+  const saved = readLogin(context, base);
+  $('auto-login').checked = saved.remember;
+  if (saved.key) void connect(saved.key, saved.remember, false);
 })();

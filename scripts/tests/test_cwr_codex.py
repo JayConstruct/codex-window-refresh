@@ -83,9 +83,37 @@ class DirectoryRouting(LauncherFixture):
         self.assertIn('model_providers.cpa.http_headers.X-CWR-Project="nested"', command)
         self.assertEqual(command[-1], "a;$(echo literal)")
         self.assertEqual(command[2], str(nested))
-        for arguments in [["--", "--cd=/another/project"], ["-C", "/another/project"]]:
+
+    def test_native_directory_options_use_the_requested_project_and_forward_remaining_arguments(self):
+        nested = self.root / "requested project"
+        nested.mkdir()
+        for arguments in [["-C", str(nested)], ["--cd", str(nested)], ["--cd=" + str(nested)],
+                          ["-C" + str(nested)], ["-C=" + str(nested)], ["exec", "-C", str(nested)]]:
+            with self.subTest(arguments=arguments):
+                command = launcher.command(self.args(project=None, map=None, arguments=["--", *arguments]))
+                self.assertEqual(command[1:3], ["-C", str(nested)])
+                project = launcher.directory_project(nested)[1]
+                self.assertIn('model_providers.cpa.http_headers.X-CWR-Project="' + project + '"', command)
+                self.assertEqual(command.count("-C"), 1)
+                if arguments[0] == "exec":
+                    self.assertEqual(command[-1], "exec")
+        with mock.patch.dict(os.environ, {"HOME": str(self.root)}), mock.patch("os.getcwd", return_value=str(self.root)):
+            directory, extra = launcher.launch_directory(["-C", "~/requested project", "resume", "--last"], "/unused")
+        self.assertEqual(directory, nested)
+        self.assertEqual(extra, ["resume", "--last"])
+
+    def test_directory_flags_do_not_consume_option_values_or_literal_prompts(self):
+        cases = [["-c", "-Config-literal", "exec", "--", "-C", "/prompt"],
+                 ["--profile", "-Cprofile", "exec", "prompt"],
+                 ["exec", "--", "--cd=/literal/prompt"]]
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                directory, extra = launcher.launch_directory(arguments, self.root)
+                self.assertEqual(directory, self.root)
+                self.assertEqual(extra, arguments)
+        for arguments in [["-C"], ["--cd="], ["-C", str(self.root), "--cd", str(self.root)]]:
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
-                launcher.command(self.args(arguments=arguments))
+                launcher.launch_directory(arguments, self.root)
 
     def test_missing_and_duplicate_directory_mappings_are_rejected(self):
         with self.assertRaises(ValueError):

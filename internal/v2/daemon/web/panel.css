@@ -114,8 +114,10 @@ body[data-page="history"] .sub-navigation button { min-height:40px; padding-bott
 .login-icon { display:grid; place-items:center; width:40px; height:40px; color:var(--primary-active); background:var(--bg-tertiary); border-radius:10px; }
 .login-intro h2 { font-size:15px; }
 .login-intro p,.connection-message { color:var(--text-secondary); font-size:12px; }
-.login-controls { display:flex; flex:0 1 350px; gap:8px; }
+.login-fields { flex:0 1 350px; min-width:0; }
+.login-controls { display:flex; gap:8px; }
 .login-controls input { width:100%; min-width:0; }
+.login-remember { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--text-secondary); font-size:12px; cursor:pointer; }
 .connection-message { width:100%; }
 .feedback { margin-bottom:14px; padding:12px 16px; border:1px solid var(--border-color); border-radius:9px; font-size:13px; }
 .feedback-error { color:var(--error-text); background:var(--error-soft); border-color:var(--error-border); }

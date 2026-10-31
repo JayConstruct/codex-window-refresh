@@ -8,6 +8,7 @@ import os
 import posixpath
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -16,6 +17,84 @@ import threading
 from urllib.parse import quote
 
 DEFAULT_PROVIDER = "cliproxyapi"
+
+CODEMAN_SETUP = r"""
+import {pathToFileURL} from 'node:url';
+import {join} from 'node:path';
+let input = '';
+for await (const chunk of process.stdin) input += chunk;
+const {config, launcher} = JSON.parse(input);
+const directory = process.argv[1];
+const {STOCK_CLIS} = await import(pathToFileURL(join(directory, 'stock.js')));
+const {resolveRegistry} = await import(pathToFileURL(join(directory, 'registry.js')));
+const warnings = [];
+const entry = resolveRegistry(STOCK_CLIS, config, warnings).entries.find(entry => entry.id === 'codex');
+if (!entry || warnings.length) throw new Error('invalid_registry');
+const variants = entry.launch.variants.map(variant => {
+  const args = variant.args;
+  if (args[0]?.valueFrom === 'cwrExecutable' && args[1]?.lit === '--') return variant;
+  if (args[0]?.lit !== 'codex') throw new Error('custom_codex_command');
+  return {...variant, args: [{valueFrom: 'cwrExecutable', quote: 'single'}, {lit: '--'}, ...args.slice(1)]};
+});
+config.clis.codex ??= {};
+config.clis.codex.launch ??= {};
+config.clis.codex.launch.params ??= {};
+config.clis.codex.launch.params.cwrExecutable = {type: 'enum', values: [launcher], default: launcher};
+config.clis.codex.launch.variants = variants;
+const validated = [];
+resolveRegistry(STOCK_CLIS, config, validated);
+if (validated.length) throw new Error('unsupported_registry');
+process.stdout.write(JSON.stringify(config, null, 2) + '\n');
+"""
+
+
+def configure_codeman(directory):
+    """Use Codeman's own registry to preserve its current Codex launch options."""
+    root = Path(directory).expanduser().resolve(strict=True)
+    modules = root / "app" / "dist" / "config" / "cli-registry"
+    if not all((modules / name).is_file() for name in ("stock.js", "registry.js")):
+        raise ValueError("未找到 Codeman CLI 注册表模块，请指定正确的 --setup-codeman 目录或更新 Codeman")
+    node = shutil.which("node")
+    if not node:
+        raise ValueError("配置 Codeman 入口需要 Node.js，请在能运行 Codeman 的环境中执行安装器")
+    path = root / "clis.json"
+    original = None
+    config = {"schemaVersion": 1, "clis": {}}
+    if path.exists():
+        if path.stat().st_size > 1024 * 1024:
+            raise ValueError("Codeman CLI 注册表过大，原文件未修改")
+        original = path.read_bytes()
+        try:
+            config = json.loads(original)
+        except (ValueError, UnicodeError):
+            raise ValueError("Codeman CLI 注册表不是有效 JSON，原文件未修改") from None
+        if not isinstance(config, dict) or not isinstance(config.get("clis"), dict):
+            raise ValueError("Codeman CLI 注册表格式无效，原文件未修改")
+    payload = json.dumps({"config": config, "launcher": str(Path(__file__).absolute())})
+    result = subprocess.run([node, "--input-type=module", "-e", CODEMAN_SETUP, str(modules)],
+                            input=payload, capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise ValueError("Codeman CLI 注册表校验失败或已有自定义 Codex 启动命令，原文件未修改")
+    content = result.stdout.encode("utf-8")
+    json.loads(content)  # Refuse an incomplete helper result before touching the original.
+    if original == content and (path.stat().st_mode & 0o777) == 0o600:
+        return path
+    backup = root / "clis.json.cwr-backup"
+    if original is not None and not backup.exists():
+        with os.fdopen(os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as stream:
+            stream.write(original)
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=".cwr-codeman-", delete=False) as stream:
+            staged = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, path)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+    return path
 
 
 def valid_provider(value):
@@ -170,15 +249,46 @@ def project_for(directory, mappings, fallback=None):
     return max(matches)[1]
 
 
+def launch_directory(arguments, fallback):
+    """Honor native Codex directory flags without interpreting option values or -- prompts."""
+    value_options = {"-c", "--config", "-p", "--profile", "-m", "--model", "-s", "--sandbox",
+                     "-a", "--ask-for-approval", "-i", "--image", "--remote", "--remote-auth-token-env",
+                     "--local-provider", "--add-dir", "--enable", "--disable", "-o", "--output-last-message",
+                     "--output-schema"}
+    directory, extra, index = None, [], 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == "--":
+            extra.extend(arguments[index:])
+            break
+        if value in ("-C", "--cd") or value.startswith(("--cd=", "-C")):
+            if directory is not None:
+                raise ValueError("请只指定一次 -C 或 --cd 启动目录")
+            if value in ("-C", "--cd"):
+                index += 1
+                if index >= len(arguments):
+                    raise ValueError("请为 -C 或 --cd 指定启动目录")
+                directory = arguments[index]
+            else:
+                directory = value.split("=", 1)[1] if value.startswith("--cd=") else value[2:].removeprefix("=")
+            if not directory:
+                raise ValueError("启动目录不能为空")
+        else:
+            extra.append(value)
+            if value in value_options and index + 1 < len(arguments):
+                index += 1
+                extra.append(arguments[index])
+        index += 1
+    return Path(directory if directory is not None else fallback).expanduser().resolve(strict=True), extra
+
+
 def command(args):
-    directory = Path(args.directory).expanduser().resolve(strict=True)
+    extra = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+    directory, extra = launch_directory(extra, args.directory)
     if not directory.is_dir():
         raise ValueError("启动目录必须是文件夹")
     if not valid_provider(args.provider):
         raise ValueError("调度提供商 ID 无效")
-    extra = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-    if any(value in ("-C", "--cd") or value.startswith("--cd=") or value.startswith("-C") for value in extra):
-        raise ValueError("请使用启动器的 --directory 指定目录")
     argv = [args.codex, "-C", str(directory)]
     project = args.project
     root, automatic = directory_project(directory)
@@ -208,8 +318,18 @@ def main():
     parser.add_argument("--map", help="可选目录映射；默认读取 ~/.config/cwr/projects.json（存在时），未匹配目录自动生成标识")
     parser.add_argument("--provider", help="本次使用的提供商 ID；默认使用已记住的 ID 或 cliproxyapi，配置报错时可输入并记住")
     parser.add_argument("--codex", default="codex")
+    parser.add_argument("--setup-codeman", nargs="?", const="~/.codeman", metavar="DIRECTORY",
+                        help="配置 Codeman 的 Codex 启动入口，默认 ~/.codeman；保留模型、推理强度及恢复参数")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if args.setup_codeman is not None:
+        try:
+            path = configure_codeman(args.setup_codeman)
+        except (ValueError, OSError, subprocess.TimeoutExpired) as error:
+            parser.error(str(error))
+        print("Codeman 的 Codex 入口已配置：" + str(path))
+        print("重启 Codeman 服务后，新建及恢复的 Codex 会话会自动携带项目标识。")
+        return 0
     args.provider = args.provider or saved_provider() or DEFAULT_PROVIDER
     try:
         while True:

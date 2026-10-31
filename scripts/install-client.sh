@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLIENT_VERSION=v0.2.0-rc.30
-CLIENT_SHA256=0608a3f1dd4c827fd6fb2e1ffb613877db0ab19716a72c9b94938fe5815ba37b
+CLIENT_VERSION=v0.2.0-rc.31
+CLIENT_SHA256=10de067c5c6983a00f60b347017a8a7b7c757bee8a1dd60c2ebefc836149c512
 version=$CLIENT_VERSION
 bin_dir=${HOME:-}/.local/bin
+codeman_dir=${HOME:-}/.codeman
+configure_codeman=auto
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bin-dir)
       [[ $# -ge 2 && -n $2 ]] || { printf '请为 --bin-dir 指定安装目录。\n' >&2; exit 1; }
       bin_dir=$2; shift 2 ;;
+    --codeman-dir)
+      [[ $# -ge 2 && -n $2 ]] || { printf '请为 --codeman-dir 指定 Codeman 数据目录。\n' >&2; exit 1; }
+      codeman_dir=$2; configure_codeman=yes; shift 2 ;;
+    --no-codeman) configure_codeman=no; shift ;;
     --help|-h)
-      printf '%s\n' '用法：bash install-client.sh [--bin-dir /path/to/bin]' \
+      printf '%s\n' '用法：bash install-client.sh [--bin-dir /path/to/bin] [--codeman-dir /path/to/.codeman | --no-codeman]' \
         "安装或更新本安装器配套的客户端 $CLIENT_VERSION，默认目录为 ~/.local/bin。" \
         '需要 Python 3.10+ 和 curl，支持 Linux/macOS，无需 sudo。' \
-        '提供 cwr-codex 命令及 cwr-codex.py；不修改 Codex 配置、目录映射或 shell 配置。' \
+        '提供 cwr-codex 命令；检测到 ~/.codeman/app 时自动配置 Codeman 的 Codex 启动入口。' \
+        '重启 Codeman 服务后，Codex 会话自动携带项目标识；保留模型、推理强度和恢复参数。' \
+        '--codeman-dir 指定 Codeman 数据目录；--no-codeman 仅安装客户端，不配置 Codeman。' \
+        '不修改原始 Codex 程序、Codex 配置、目录映射或 shell 配置。' \
         '直接运行默认使用 cliproxyapi；提供商报错时可输入 ID 并记住，下次无需再填。' \
         '再次下载并运行安装器即可更新；可在已解压的发行包目录中离线安装。'
       exit 0 ;;
@@ -37,15 +46,16 @@ else
     -o "$temporary/cwr-codex.py"
 fi
 
-python3 - "$temporary/cwr-codex.py" "$CLIENT_SHA256" "$bin_dir" <<'PY'
+python3 - "$temporary/cwr-codex.py" "$CLIENT_SHA256" "$bin_dir" "$configure_codeman" "$codeman_dir" <<'PY'
 import ast
 import hashlib
 import os
 from pathlib import Path
 import sys
 import tempfile
+import subprocess
 
-source, expected, target = sys.argv[1:]
+source, expected, target, configure_codeman, codeman_directory = sys.argv[1:]
 try:
     content = Path(source).read_bytes()
     if hashlib.sha256(content).hexdigest() != expected:
@@ -77,9 +87,12 @@ try:
             if path is not None:
                 path.unlink(missing_ok=True)
     print("客户端已安装：" + str(command))
+    codeman = Path(codeman_directory).expanduser().resolve()
+    if configure_codeman == "yes" or configure_codeman == "auto" and (codeman / "app").is_dir():
+        subprocess.run([sys.executable, str(script), "--setup-codeman", str(codeman)], check=True)
     if str(destination) not in os.environ.get("PATH", "").split(os.pathsep):
         print("请将此目录加入 PATH：" + str(destination))
-except (OSError, ValueError, SyntaxError) as error:
+except (OSError, ValueError, SyntaxError, subprocess.CalledProcessError) as error:
     sys.exit("客户端安装失败：" + str(error))
 PY
-printf '版本：%s。进入项目目录运行 cwr-codex，或使用安装输出中的完整路径。\n' "$version"
+printf '版本：%s。终端可运行 cwr-codex；Codeman 配置生效后可直接从 Codeman 启动 Codex。\n' "$version"

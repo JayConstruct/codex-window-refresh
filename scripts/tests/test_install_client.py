@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from test_codeman_client import codeman_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -19,10 +20,10 @@ class ClientInstallerTests(unittest.TestCase):
         self.destination = self.root / "client bin"
         self.operations = self.root / "downloads"
 
-    def install(self, *arguments, status="0", source=None):
-        environment = dict(os.environ, HOME=str(self.root), TEST_DOWNLOAD_STATUS=status,
-                           TEST_CLIENT_SOURCE=str(source or ROOT / "scripts/cwr-codex.py"),
-                           TEST_OPERATIONS=str(self.operations))
+    def install(self, *arguments, status="0", source=None, environment=None):
+        environment = {**os.environ, "HOME": str(self.root), "TEST_DOWNLOAD_STATUS": status,
+                       "TEST_CLIENT_SOURCE": str(source or ROOT / "scripts/cwr-codex.py"),
+                       "TEST_OPERATIONS": str(self.operations), **(environment or {})}
         shell = '''
 curl() {
   printf '%s\\n' "$*" >> "$TEST_OPERATIONS"
@@ -89,7 +90,8 @@ bash "$1" "${@:2}"
             self.assertFalse(list(self.destination.glob(".cwr-*")))
 
     def test_invalid_options_and_directory_targets_fail_without_replacing_files(self):
-        for arguments in [["--bin-dir"], ["--bin-dir", ""], ["--version", "main"]]:
+        for arguments in [["--bin-dir"], ["--bin-dir", ""], ["--version", "main"],
+                          ["--codeman-dir"], ["--codeman-dir", ""]]:
             result = self.install(*arguments)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.operations.exists())
@@ -103,3 +105,28 @@ bash "$1" "${@:2}"
     def test_installer_checksum_matches_launcher(self):
         expected = hashlib.sha256((ROOT / "scripts/cwr-codex.py").read_bytes()).hexdigest()
         self.assertIn("CLIENT_SHA256=" + expected + "\n", self.installer.read_text())
+
+    @unittest.skipUnless(shutil.which("node"), "Codeman setup requires Node.js")
+    def test_detected_codeman_is_configured_without_changing_shell_or_codex_binary(self):
+        codeman = codeman_fixture(self.root / ".codeman")
+        shell = self.root / ".bashrc"
+        shell.write_text("# preserve shell configuration\n")
+        binary = self.root / ".local/bin/codex"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("original Codex executable")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Codeman 的 Codex 入口已配置", result.stdout)
+        self.assertTrue((codeman / "clis.json").is_file())
+        self.assertEqual(shell.read_text(), "# preserve shell configuration\n")
+        self.assertEqual(binary.read_text(), "original Codex executable")
+
+    @unittest.skipUnless(shutil.which("node"), "Codeman setup requires Node.js")
+    def test_explicit_codeman_directory_and_opt_out(self):
+        codeman = codeman_fixture(self.root / "custom codeman")
+        result = self.install("--codeman-dir", str(codeman), "--no-codeman")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((codeman / "clis.json").exists())
+        result = self.install("--codeman-dir", str(codeman), "--bin-dir", "~/client bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((codeman / "clis.json").is_file())

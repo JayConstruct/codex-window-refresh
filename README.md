@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `codex-window-refresh`。当前主线为 **V2：C 原生接入层 + 独立 Go 后台 + SQLite**。
 
-当前后台及客户端为 **v0.2.0-rc.30**，原生接入层保持 **v0.2.0-rc.28**，数据库为 **schema 12**。rc.30 将账号的数据更新列简化为相对时间；正常账号和刚查询的 100% 额度不再被误标为“观测已过期”。Codex 调度台采用横向导航，包含总览、账号、自动化、项目调度、运行记录及设置；设计稿及实现截图见 [UI 重构说明](docs/development/ui-redesign.md)，升级要求见 [发布说明](docs/releases/v0.2.0-rc.30.md)。
+当前后台及客户端为 **v0.2.0-rc.31**，原生接入层保持 **v0.2.0-rc.28**，数据库为 **schema 12**。rc.31 增加页面“记住密钥并自动登录”，客户端安装器可自动接入 Codeman 的 Codex 启动入口，保留模型、推理强度及恢复会话参数。Codex 调度台采用横向导航，包含总览、账号、自动化、项目调度、运行记录及设置；设计稿及实现截图见 [UI 重构说明](docs/development/ui-redesign.md)，升级要求见 [发布说明](docs/releases/v0.2.0-rc.31.md)。
 
 ## 安装与更新
 
@@ -10,10 +10,10 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `c
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.30 --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.31 --restart
 ```
 
-已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；从 rc.28 更新到 rc.30 时，接入层文件完全一致即可省略 `--restart`，仅重启后台；从 rc.27 或更早版本升级仍需重启 CPA 加载配套接入层。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。
+已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；从 rc.28 更新到 rc.31 时，接入层文件完全一致即可省略 `--restart`，仅重启后台；从 rc.27 或更早版本升级仍需重启 CPA 加载配套接入层。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。
 
 完整参数、用户服务、离线安装与失败恢复见 [V2 安装指南](docs/user/install.md)。下载与 SHA-256 校验文件见 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases)。
 
@@ -24,7 +24,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 bash /tmp/cwr-client-install.sh
 ```
 
-默认安装到 `~/.local/bin`。进入项目目录运行 `cwr-codex`，首次请求后在服务端选择项目账号并保存；提供商启动错误时按提示输入实际 ID，客户端会记住选择。详见 [项目账号调度与重置卡](docs/user/account-scheduling.md)。
+默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，安装器自动配置 Codeman 的 Codex 启动入口；重启 Codeman 服务后，从 Codeman 新建或恢复 Codex 会话即可自动携带项目标识，保留模型和推理强度参数。终端仍可运行 `cwr-codex`；首次请求后在服务端选择项目账号并保存。提供商启动错误时按提示输入实际 ID，客户端会记住选择。详见 [项目账号调度与重置卡](docs/user/account-scheduling.md)。
 
 V1 用户继续使用 [V1 安装指南](docs/legacy/v1/install.md)；`scripts/install.sh` 和 `cpa-quota-upgrade.sh` 仍是 V1 入口。
 
