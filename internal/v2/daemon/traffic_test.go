@@ -2,10 +2,36 @@ package daemon
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"codex-window-refresh/internal/v2/store"
 )
+
+func TestTrafficCallerLookupAcceptsOnlyBoundedDigests(t *testing.T) {
+	service, _, _ := historyService(t)
+	scope := strings.Repeat("a", 64)
+	valid := `{"scopes":["` + scope + `"]}`
+	response := request(service, "POST", "/api/v2/traffic-callers", valid, "")
+	var result struct {
+		Instance string   `json:"instance_id"`
+		Callers  []string `json:"callers"`
+	}
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &result) != nil || result.Instance != service.instance || len(result.Callers) != 1 || !strings.HasPrefix(result.Callers[0], "caller-") {
+		t.Fatal(response.Code, response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != "no-store" || strings.Contains(response.Body.String(), scope) || strings.Contains(response.Body.String(), "salt") {
+		t.Fatal("identity material exposed", response.Body.String())
+	}
+	for _, body := range []string{"", "null", `{}`, `{"scopes":[]}`, `{"scopes":["raw-key"]}`, valid + `{}`, strings.Replace(valid, "}", `,"name":"private-name"}`, 1), `{"scopes":["` + strings.Repeat("b", 6200) + `"]}`} {
+		if got := request(service, "POST", "/api/v2/traffic-callers", body, ""); got.Code != 400 {
+			t.Fatal("invalid lookup accepted", got.Code, got.Body.String())
+		}
+	}
+	if got := request(service, "POST", "/api/v2/traffic-callers?scope=x", valid, ""); got.Code != 400 {
+		t.Fatal(got.Code)
+	}
+}
 
 func TestTrafficAPIReadOnlyEmptyFiltersAndStaticAssets(t *testing.T) {
 	service, db, _ := historyService(t)

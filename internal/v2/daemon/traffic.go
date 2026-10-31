@@ -1,13 +1,38 @@
 package daemon
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 
 	"codex-window-refresh/internal/v2/store"
 )
+
+func (s *Service) trafficCallers(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 6144)
+	var input struct {
+		Scopes []string `json:"scopes"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if r.URL.RawQuery != "" || decoder.Decode(&input) != nil || decoder.Decode(new(any)) != io.EOF {
+		apiError(w, 400, "invalid_caller_scopes")
+		return
+	}
+	callers, err := s.Store.ResolveTrafficCallers(r.Context(), input.Scopes)
+	if err != nil {
+		if errors.Is(err, store.ErrTrafficFilter) {
+			apiError(w, 400, "invalid_caller_scopes")
+		} else {
+			apiError(w, 503, "storage_unavailable")
+		}
+		return
+	}
+	writeJSON(w, 200, map[string]any{"instance_id": s.instance, "callers": callers})
+}
 
 func (s *Service) traffic(w http.ResponseWriter, r *http.Request) {
 	if len(r.URL.RawQuery) > 4096 {

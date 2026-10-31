@@ -279,6 +279,18 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(account['credits'], {'availableCount': 2, 'credits': None})
         self.assertEqual(account.get('details_observed_at', ''), '')
         self.assertNotIn('not-for-storage', json.dumps(cards))
+        self.call('request.intercept_after',{'RequestID':'business-reset-count','Metadata':{'selected_auth_id':'a'}})
+        frame={'type':'codex.rate_limits','rate_limit_reset_credits':{'available_count':1,'credits':[{'token':'not-for-storage'}]}}
+        self.call('websocket.response_event',{'RequestID':'business-reset-count','Provider':'codex','AuthID':'a','EventType':'codex.rate_limits','Payload':base64.b64encode(json.dumps(frame).encode()).decode()})
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            status,cards=self.management('reset-cards')
+            account=next(a for a in cards['accounts'] if a['account_id']=='a')
+            if account['credits']['availableCount']==1:break
+            time.sleep(.025)
+        self.assertEqual(account['credits']['availableCount'],1,cards)
+        self.assertIsNone(account['credits']['credits'])
+        self.assertNotIn('not-for-storage',json.dumps(cards))
         self.assertEqual(len(self.quota_requests), 1)
         self.assertEqual(self.models, 0)
 
@@ -556,11 +568,12 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(self.rpc('bridge.events.pull',{'after':before},instance)['result']['latest_sequence'],before)
 
     def test_traffic_records_reach_database_and_analysis_without_model_calls(self):
+        scope=hashlib.sha256(b'cli-proxy-api:caller-scope:v1\x00fixture-key').hexdigest()
         snapshot=self.routing_snapshot([{'project':'work','accounts':['a']}],cap=32)
         self.sticky_snapshot(snapshot)
         self.call('request.intercept_before',{'RequestID':'business-record','TraceID':'trace-business',
-                  'Model':'fixture-model','Metadata':{'caller_scope':'private-caller-scope'}})
-        request,choice=self.sticky_pick('private-session',project='work',scope='private-caller-scope')
+                  'Model':'fixture-model','Metadata':{'caller_scope':scope}})
+        request,choice=self.sticky_pick('private-session',project='work',scope=scope)
         metadata=self.sticky_started(request,choice,'business-record')
         self.call('usage.handle',{'RequestID':'business-attempt','SelectionID':metadata['selection_id'],
                   'TraceID':'trace-business','AuthID':choice['AuthID'],'Provider':'codex','Model':'fixture-model',
@@ -585,6 +598,13 @@ class NativeBridge(unittest.TestCase):
         self.assertNotIn('private-caller-scope',json.dumps(page))
         self.assertNotIn('private-session',json.dumps(page))
         self.assertNotIn('NEVER-STORE',json.dumps(page))
+        status,lookup=self.management('traffic-callers',method='POST',body={'scopes':[scope]})
+        self.assertEqual(status,200,lookup)
+        self.assertEqual(lookup['callers'],[record['caller']])
+        self.assertNotIn(scope,json.dumps(lookup))
+        self.assertNotIn('salt',lookup)
+        status,invalid=self.management('traffic-callers',method='POST',body={'scopes':['raw-key']})
+        self.assertEqual(status,400,invalid)
         status,detail=self.management('traffic',query={'kind':['users'],'id':[record['id']]})
         self.assertEqual(status,200,detail)
         self.assertEqual(len(detail['record']['attempts']),1)
@@ -653,6 +673,30 @@ class NativeBridge(unittest.TestCase):
         self.assertFalse(self.rpc('host.http.do', request, instance)['ok'])
         self.assertTrue(self.rpc('host.http.cancel', {'operation_id': operation}, instance)['ok'])
         self.assertEqual(len(self.quota_requests), 1)
+
+    def test_reset_http_only_allows_fixed_detail_and_idempotent_consume_requests(self):
+        self.allow_quota_http=True
+        instance=self.rpc('bridge.hello')['result']['bridge_instance_id']
+        for consume in [False,True]:
+            operation=self.rpc('host.http.operation_open',{},instance)['result']['operation_id']
+            request=self.quota_request(operation)
+            request['url']='https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'+('/consume' if consume else '')
+            request['headers'].update({'Openai-Beta':['codex-1'],'Originator':['Codex Desktop']})
+            if consume:
+                request['method']='POST'
+                request['headers']['Content-Type']=['application/json']
+                request['body']=base64.b64encode(json.dumps({'credit_id':'card-1','redeem_request_id':'persisted-attempt'}).encode()).decode()
+                for body in [{'redeem_request_id':'persisted-attempt'},{'credit_id':'card-1','redeem_request_id':''},{'credit_id':'card-1','redeem_request_id':'persisted-attempt','token':'must-not-send'}]:
+                    invalid={**request,'body':base64.b64encode(json.dumps(body).encode()).decode()}
+                    self.assertFalse(self.rpc('host.http.do',invalid,instance)['ok'])
+            for change in [{'url':request['url']+'?extra=1'},{'url':'https://example.invalid/consume'},{'headers':{**request['headers'],'X-Private':['secret']}}]:
+                self.assertFalse(self.rpc('host.http.do',{**request,**change},instance)['ok'])
+            self.assertTrue(self.rpc('host.http.do',request,instance)['ok'])
+            self.assertFalse(self.rpc('host.http.do',request,instance)['ok'])
+            self.assertTrue(self.rpc('host.http.cancel',{'operation_id':operation},instance)['ok'])
+        self.assertEqual(len(self.quota_requests),2)
+        self.assertEqual(json.loads(base64.b64decode(self.quota_requests[1]['body'])),{'credit_id':'card-1','redeem_request_id':'persisted-attempt'})
+        self.assertEqual(self.models,0)
 
     def test_quota_http_cancel_survives_all_eight_blocked_requests(self):
         self.allow_quota_http = self.block_quota_http = True
@@ -1140,6 +1184,72 @@ class NativeBridge(unittest.TestCase):
         self.assertTrue(self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['gap'])
         self.assertFalse(self.rpc('bridge.events.ack', {'through': 4}, instance)['ok'])
 
+    def test_lifecycle_accepts_explicit_caller_scope_and_legacy_metadata(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        scope = hashlib.sha256(b'cli-proxy-api:caller-scope:v1\x00fixture-caller').hexdigest()
+        variants = [
+            {'CallerScope': scope},
+            {'CallerScope': scope, 'Metadata': None},
+            {'CallerScope': scope, 'Metadata': {}},
+            {'CallerScope': scope, 'Metadata': {'caller_scope': ''}},
+            {'CallerScope': scope, 'Metadata': {'caller_scope': None}},
+            {'Metadata': {'caller_scope': scope}},
+            {'CallerScope': scope, 'Metadata': {'caller_scope': scope}},
+        ]
+        for index, fields in enumerate(variants):
+            request = {'RequestID': 'caller-shape-' + str(index), **fields,
+                       'Headers': {'Authorization': ['Bearer NEVER-CAPTURE-KEY']},
+                       'Body': base64.b64encode(b'NEVER-CAPTURE-BODY').decode()}
+            self.assertEqual(self.call('request.intercept_before', request), {'ok': True, 'result': {}})
+        observed = self.rpc('bridge.events.pull', {'after': 0}, instance)['result']
+        self.assertEqual(len(observed['events']), len(variants))
+        for event in observed['events']:
+            self.assertEqual(event['identity'], scope)
+            self.assertEqual(event['traffic']['caller'], scope)
+        self.assertNotIn('NEVER-CAPTURE', json.dumps(observed))
+        for fields in [{'CallerScope': ''}, {'CallerScope': 123}, {'CallerScope': 'x' * 257},
+                       {'CallerScope': scope, 'Metadata': {'source': 'plugin_host_model_callback'}},
+                       {'CallerScope': scope, 'Metadata': {'generate': False}}]:
+            self.call('request.intercept_before', {'RequestID': 'no-caller', **fields,
+                      'Headers': {'Authorization': ['Bearer NEVER-CAPTURE-KEY']}})
+        self.assertEqual(self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['latest_sequence'], len(variants))
+
+    def test_explicit_caller_reaches_records_lookup_filters_and_analysis(self):
+        scope = hashlib.sha256(b'cli-proxy-api:caller-scope:v1\x00fixture-caller').hexdigest()
+        # No scheduler decision carries a caller here. Later hooks deliberately
+        # omit it, as completion and usage metadata are best effort snapshots.
+        for phase in ['before', 'after']:
+            request = 'caller-' + phase
+            self.call('request.intercept_before', {'RequestID': request, **({'CallerScope': scope} if phase == 'before' else {})})
+            self.call('request.intercept_after', {'RequestID': request,
+                      **({'CallerScope': scope} if phase == 'after' else {}),
+                      'Metadata': {'selected_auth_id': 'a', 'selection_id': request + '-selection'}})
+            self.call('usage.handle', {'RequestID': request + '-execution', 'SelectionID': request + '-selection',
+                      'AuthID': 'a', 'Provider': 'codex', 'Generate': True, 'Failed': False})
+            self.call('request.complete', {'RequestID': request, 'Outcome': 'succeeded', 'Metadata': None})
+        self.start_daemon()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, page = self.management('traffic', query={'kind': ['users']})
+            if status == 200 and page.get('summary', {}).get('attempts') == 2:
+                break
+            time.sleep(.025)
+        self.assertEqual(status, 200, page)
+        status, lookup = self.management('traffic-callers', method='POST', body={'scopes': [scope]})
+        self.assertEqual(status, 200, lookup)
+        caller = lookup['callers'][0]
+        self.assertEqual([record['caller'] for record in page['records']], [caller, caller])
+        for record in page['records']:
+            status, detail = self.management('traffic', query={'kind': ['users'], 'id': [record['id']]})
+            self.assertEqual(status, 200, detail)
+            self.assertEqual(detail['record']['caller'], caller)
+        status, filtered = self.management('traffic', query={'kind': ['analysis'], 'caller': [caller]})
+        self.assertEqual(status, 200, filtered)
+        self.assertEqual(filtered['summary']['requests'], 2)
+        self.assertEqual(filtered['callers'][0]['caller'], caller)
+        self.assertNotIn(scope, json.dumps(page))
+        self.assertEqual(self.models, 0)
+
     def test_lifecycle_capacity_loss_and_internal_request_filter(self):
         instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
         for metadata in ({'caller_scope': 'internal', 'source': 'plugin_host_model_callback'},
@@ -1177,7 +1287,7 @@ class NativeBridge(unittest.TestCase):
         for index in [-1, 0, 1, 100]:
             self.assertEqual(self.call('response.intercept_stream_chunk', {'RequestID': 'stream', 'ChunkIndex': index, 'ResponseHeaders': headers, 'Body': 'c2VjcmV0'}), {'ok': True, 'result': {}})
         self.call('request.intercept_after', {'RequestID': 'websocket', 'Metadata': {'selected_auth_id': 'a'}})
-        frame = {'type': 'codex.rate_limits', 'rate_limits': {'allowed': True, 'primary': {'usedPercent': 40, 'windowMinutes': 300, 'resetAfterSeconds': 2900, 'private': 'secret-window'}, 'private': 'secret-rate'}, 'message': 'secret-text'}
+        frame = {'type': 'codex.rate_limits', 'rate_limit_reset_credits':{'available_count':2,'credits':[{'access_token':'secret-card'}]}, 'rate_limits': {'allowed': True, 'primary': {'usedPercent': 40, 'windowMinutes': 300, 'resetAfterSeconds': 2900, 'private': 'secret-window'}, 'private': 'secret-rate'}, 'message': 'secret-text'}
         websocket = {'RequestID': 'websocket', 'Provider': 'codex', 'AuthID': 'a', 'EventType': 'codex.rate_limits', 'Payload': base64.b64encode(json.dumps(frame).encode()).decode()}
         self.assertEqual(self.call('websocket.response_event', websocket), {'ok': True, 'result': {}})
         websocket['AuthID'] = 'another'
@@ -1188,6 +1298,7 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(observations[0]['binding'], 'one')
         self.assertEqual(observations[0]['headers']['x-codex-primary-used-percent'], ['25'])
         self.assertEqual(observations[2]['quota']['rate_limits']['primary']['usedPercent'], 40)
+        self.assertEqual(observations[2]['quota']['rate_limit_reset_credits'],{'available_count':2})
         self.assertNotIn('secret', json.dumps(batch))
         self.assertEqual(batch, self.rpc('bridge.events.pull', {'after': 0}, instance)['result'])
         for change in [{'Provider': 'claude'}, {'Metadata': {'source': 'plugin_host_model_callback'}},

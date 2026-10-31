@@ -23,6 +23,38 @@ func dashboardSnapshot(at time.Time) quota.Snapshot {
 	}
 }
 
+func TestDisplayAvailabilityDoesNotInventActiveWindowsOrSurviveReset(t *testing.T) {
+	ctx, st := context.Background(), openTest(t)
+	accounts := []Account{{ID: "full", Status: "available"}, {ID: "stale", Status: "available"}, {ID: "due", Status: "available"}, {ID: "disabled", Status: "disabled"}}
+	if err := st.SyncInventory(ctx, accounts); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().UTC().Add(-time.Second)
+	for _, account := range accounts {
+		q := dashboardSnapshot(at)
+		switch account.ID {
+		case "full":
+			q.FiveHour.State = core.WindowUnknown
+			q.Weekly.State = core.WindowUnknown
+			q.FiveHour.Remaining.Value = 100
+			q.Weekly.Remaining.Value = 100
+		case "stale":
+			q.ObservedAt = at.Add(-time.Hour)
+		case "due":
+			q.FiveHour.ResetAt = at.Add(-time.Minute)
+		}
+		saveDashboardSnapshot(t, st, account.ID, q)
+	}
+	dashboard, err := st.Dashboard(ctx)
+	if err != nil || dashboard.QuotaAvailable != 2 || dashboard.Capacity != 0 {
+		t.Fatal(dashboard, err)
+	}
+	page, err := st.AccountPageFiltered(ctx, "", 10, nil, "", "usable")
+	if err != nil || page.FilterTotal != 2 || page.Accounts[0].ID != "full" || page.Accounts[1].ID != "stale" {
+		t.Fatal(page, err)
+	}
+}
+
 func saveDashboardSnapshot(t *testing.T, st *Store, id string, snapshot quota.Snapshot) {
 	t.Helper()
 	raw, err := json.Marshal(snapshot)

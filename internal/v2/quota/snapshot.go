@@ -38,28 +38,52 @@ func Normalize(raw []byte, headers http.Header, binding, source string, at, star
 		class = core.ObservationQuery
 	}
 	o, err := cpa.ParseQuota(raw, core.QuotaRead{}, at, class, core.AccountState{})
-	if err != nil {
+	credits := resetCount(raw)
+	if err != nil && credits == nil {
 		return Snapshot{}, err
 	}
-	s := Snapshot{Source: source, Binding: binding, ObservedAt: at, ReadStartedAt: started, Permission: o.Permission, FiveHour: o.FiveHour, Weekly: o.Weekly}
-	// The official usage payload includes only an optional count. Detail IDs
-	// and expiration dates must still come from the dedicated account reader.
-	if source == "cpa_wham_usage" && headers == nil {
-		var usage struct {
-			Credits *struct {
-				Count *int `json:"available_count"`
-			} `json:"rate_limit_reset_credits"`
-		}
-		if json.Unmarshal(raw, &usage) == nil && usage.Credits != nil && usage.Credits.Count != nil && *usage.Credits.Count >= 0 && *usage.Credits.Count <= 100000 {
-			s.ResetCredits = &policy.ResetCredits{AvailableCount: *usage.Credits.Count}
-		}
-	}
+	s := Snapshot{Source: source, Binding: binding, ObservedAt: at, ReadStartedAt: started, Permission: o.Permission, FiveHour: o.FiveHour, Weekly: o.Weekly, ResetCredits: credits}
 	for _, w := range []*core.WindowEvidence{s.FiveHour, s.Weekly} {
 		if w != nil {
 			w.Source = source
 		}
 	}
 	return s, nil
+}
+
+// Counts reported by usage reads or bound native quota events share the same
+// field ordering. Missing counts never erase earlier observations or imply zero.
+func resetCount(raw []byte) *policy.ResetCredits {
+	type count struct {
+		Snake *int `json:"available_count"`
+		Camel *int `json:"availableCount"`
+	}
+	var payload struct {
+		Snake *count `json:"rate_limit_reset_credits"`
+		Camel *count `json:"rateLimitResetCredits"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return nil
+	}
+	var value *int
+	for _, item := range []*count{payload.Snake, payload.Camel} {
+		if item == nil {
+			continue
+		}
+		for _, candidate := range []*int{item.Snake, item.Camel} {
+			if candidate == nil {
+				continue
+			}
+			if *candidate < 0 || *candidate > 100000 || value != nil && *value != *candidate {
+				return nil
+			}
+			value = candidate
+		}
+	}
+	if value == nil {
+		return nil
+	}
+	return &policy.ResetCredits{AvailableCount: *value}
 }
 
 // Merge compares each field's read boundary independently. A query begun before

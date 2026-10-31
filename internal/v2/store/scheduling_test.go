@@ -251,8 +251,99 @@ func TestResetViewsUseQuotaSummaryWithoutRefreshingDetailFreshness(t *testing.T)
 		t.Fatal(err)
 	}
 	views, _, err = s.ResetViews(ctx)
-	if err != nil || len(views) != 0 {
+	if err != nil || len(views) != 1 || views[0].Credits != nil {
 		t.Fatal("replacement inherited count", views, err)
+	}
+}
+
+func TestResetDetailReadsFollowEvidenceAndExpiryRatherThanElapsedIntervals(t *testing.T) {
+	at := time.Now().UTC()
+	expires := at.Add(2 * time.Hour).Unix()
+	allowed := core.PermissionAllowed
+	q := quota.Snapshot{ObservedAt: at, Permission: &allowed, ResetCredits: &policy.ResetCredits{AvailableCount: 2}, Fields: map[string]quota.Stamp{"reset_credits": {ObservedAt: at}}, FiveHour: &core.WindowEvidence{State: core.WindowActive, Remaining: &core.QuotaAmount{Value: 10, Unit: "percent"}, ResetAt: at.Add(3 * time.Hour)}}
+	cards := &policy.ResetCredits{AvailableCount: 2, Credits: []policy.ResetCredit{{ID: "card", Status: "available", ResetType: "codexRateLimits", ExpiresAt: &expires}}}
+	p := policy.DefaultScheduling().Cards
+	if !resetDetailNeeded(q, nil, time.Time{}, "", p, at) {
+		t.Fatal("new positive count did not request details")
+	}
+	if resetDetailNeeded(quota.Snapshot{}, nil, time.Time{}, "", p, at) {
+		t.Fatal("unknown count caused a CLI read")
+	}
+	if resetDetailNeeded(q, cards, at, "", p, at.Add(20*time.Minute)) {
+		t.Fatal("unchanged account caused periodic details read")
+	}
+	q.ResetCredits.AvailableCount = 3
+	q.Fields["reset_credits"] = quota.Stamp{ObservedAt: at.Add(time.Second)}
+	if !resetDetailNeeded(q, cards, at, "", p, at.Add(time.Second)) {
+		t.Fatal("changed count was ignored")
+	}
+	q.ResetCredits.AvailableCount = 0
+	if resetDetailNeeded(q, cards, at, "", p, at.Add(time.Second)) {
+		t.Fatal("zero count caused a CLI read")
+	}
+	q.ResetCredits.AvailableCount = 2
+	q.Fields["reset_credits"] = quota.Stamp{ObservedAt: at}
+	p.AutoConsume = true
+	if resetDetailNeeded(q, cards, at, "", p, at.Add(time.Hour)) {
+		t.Fatal("no new use or expiry boundary caused a read")
+	}
+	boundary := time.Unix(expires, 0).Add(-time.Duration(p.ForceBeforeSeconds) * time.Second)
+	if !resetDetailNeeded(q, cards, at, "", p, boundary) {
+		t.Fatal("known force deadline was ignored")
+	}
+	if resetDetailNeeded(q, cards, boundary, "", p, boundary.Add(time.Minute)) {
+		t.Fatal("deadline repeatedly queried unchanged details")
+	}
+	q.ObservedAt = at.Add(time.Minute)
+	if !resetDetailNeeded(q, cards, at, "", p, q.ObservedAt) {
+		t.Fatal("actionable new usage did not trigger verification")
+	}
+	if resetDetailNeeded(q, cards, at, "", p, q.ObservedAt, q.ObservedAt.Add(time.Second)) {
+		t.Fatal("our own quota read retriggered detail lookup")
+	}
+}
+
+func TestResetReadWatermarkPreservesNewerPassiveCountsAndNilDetailBaseline(t *testing.T) {
+	st, ctx := openTest(t), context.Background()
+	at := time.Now().UTC().Add(-time.Second)
+	a := schedulingFixture(t, st, at)
+	expires := at.Add(time.Hour).Unix()
+	cards := &policy.ResetCredits{AvailableCount: 2, Credits: []policy.ResetCredit{{ID: "card", Status: "available", ResetType: "codexRateLimits", ExpiresAt: &expires}}}
+	if err := st.RecordResetCredits(ctx, a, cards, "", at, 900); err != nil {
+		t.Fatal(err)
+	}
+	newAt := at.Add(100 * time.Millisecond)
+	q := quota.Snapshot{Binding: a.Binding, Source: "cpa_websocket_quota", ObservedAt: newAt, ReadStartedAt: newAt, ResetCredits: &policy.ResetCredits{AvailableCount: 0}}
+	raw, _ := json.Marshal(q)
+	if err := st.SaveResetQuota(ctx, a, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordResetCredits(ctx, a, cards, "", at, 900, at.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	views, _, err := st.ResetViews(ctx)
+	if err != nil || views[0].Credits.AvailableCount != 0 || views[0].SummarySource != "cpa_websocket_quota" || views[0].SummaryObservedAt != queryStamp(newAt) {
+		t.Fatal("check timestamp replaced newer passive count", views, err)
+	}
+	q.ObservedAt = at.Add(2 * time.Second)
+	q.ReadStartedAt = q.ObservedAt
+	q.ResetCredits.AvailableCount = 2
+	raw, _ = json.Marshal(q)
+	if err = st.SaveResetQuota(ctx, a, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.RecordResetCredits(ctx, a, nil, "", at.Add(3*time.Second), 900); err != nil {
+		t.Fatal(err)
+	}
+	views, _, err = st.ResetViews(ctx)
+	if err != nil || views[0].Credits.AvailableCount != 2 || views[0].DetailsObservedAt != "" || views[0].SummaryObservedAt != queryStamp(q.ObservedAt) {
+		t.Fatal(views, err)
+	}
+	if _, err = st.db.Exec("UPDATE inventory_state SET last_success_at=?", queryStamp(at.Add(70*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.NextResetAccount(ctx, at.Add(70*time.Second)); err != ErrNotFound {
+		t.Fatal("nil details caused repeated query", err)
 	}
 }
 

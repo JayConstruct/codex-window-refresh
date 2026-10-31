@@ -18,6 +18,13 @@ SPEC.loader.exec_module(v2)
 
 
 class V2PackageTests(unittest.TestCase):
+    def test_backend_unit_can_pin_codex_without_shell_or_path_dependency(self):
+        plan = {"service":{"scope":"user"}, "codex_binary":"/opt/codex runtime/bin/codex"}
+        locations = {"runtime":"/tmp/cwr/run", "data":"/tmp/cwr/data"}
+        unit = v2.render_unit(plan, locations, pathlib.Path("/opt/window-refreshd")).decode()
+        self.assertIn('--codex-binary "/opt/codex runtime/bin/codex"', unit)
+        self.assertNotIn("/bin/sh", unit)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

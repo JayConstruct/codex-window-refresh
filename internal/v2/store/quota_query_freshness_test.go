@@ -192,7 +192,7 @@ func assertQuotaFreshnessCapacity(t *testing.T, s *Store, capacity, unknown int)
 	if err != nil || dashboard.Total != 1 || dashboard.Capacity != capacity || dashboard.UnknownEnabled != unknown || dashboard.UnknownQuota != unknown {
 		t.Fatalf("dashboard capacity=%d unknown=%d: %+v err=%v", capacity, unknown, dashboard, err)
 	}
-	for filter, count := range map[string]int{"usable": capacity, "quota_unknown": unknown} {
+	for filter, count := range map[string]int{"usable": dashboard.QuotaAvailable, "quota_unknown": unknown} {
 		page, err := s.AccountPageFiltered(ctx, "", 10, nil, "", filter)
 		if err != nil || page.FilterTotal != count || len(page.Accounts) != count {
 			t.Fatalf("%s filter disagrees with dashboard: %+v err=%v", filter, page, err)

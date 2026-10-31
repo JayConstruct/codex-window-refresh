@@ -86,7 +86,7 @@ func TestEvidenceFilterSetsMatchDashboardEnabledAndUnknownCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Dashboard.Enabled != 6 || view.Dashboard.UnknownEnabled != 3 || unknown.FilterTotal != view.Dashboard.UnknownEnabled || usable.FilterTotal != view.Dashboard.Capacity || view.Dashboard.WeeklyExhausted != 1 || view.Dashboard.FiveHourExhausted != 0 {
+	if view.Dashboard.Enabled != 6 || view.Dashboard.UnknownEnabled != 3 || unknown.FilterTotal != view.Dashboard.UnknownEnabled || usable.FilterTotal != view.Dashboard.QuotaAvailable || view.Dashboard.Capacity != 1 || view.Dashboard.QuotaAvailable != 2 || view.Dashboard.WeeklyExhausted != 1 || view.Dashboard.FiveHourExhausted != 0 {
 		t.Fatalf("dashboard %+v unknown %+v usable %+v", view.Dashboard, unknown, usable)
 	}
 }

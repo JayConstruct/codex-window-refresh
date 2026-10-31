@@ -66,6 +66,7 @@ type Dashboard struct {
 	Disabled          int              `json:"disabled"`
 	Unavailable       int              `json:"unavailable"`
 	Capacity          int              `json:"capacity"`
+	QuotaAvailable    int              `json:"quota_available"`
 	Enabled           int              `json:"enabled"`
 	UnknownEnabled    int              `json:"unknown_enabled"`
 	FiveHourExhausted int              `json:"five_hour_exhausted"`
@@ -114,6 +115,36 @@ func quotaState(raw []byte, at time.Time) (bool, bool) {
 	}
 	capacity := *snapshot.Permission == core.PermissionAllowed && snapshot.FiveHour.State == core.WindowActive && snapshot.FiveHour.Remaining.Value > 0 && snapshot.Weekly.State != core.WindowExpired && snapshot.Weekly.Remaining.Value > 0
 	return true, capacity
+}
+
+// Display availability uses the last reported balance until its reset boundary.
+// Active-window capacity above remains fresh evidence for automatic preparation.
+func quotaAvailable(raw []byte, at time.Time) bool {
+	var snapshot quota.Snapshot
+	if json.Unmarshal(raw, &snapshot) != nil || snapshot.Permission == nil || *snapshot.Permission != core.PermissionAllowed || snapshot.FiveHour == nil || snapshot.Weekly == nil {
+		return false
+	}
+	for _, field := range []string{"permission", "five_hour", "weekly"} {
+		observed := snapshot.ObservedAt
+		if stamp, exists := snapshot.Fields[field]; exists {
+			observed = stamp.ObservedAt
+		}
+		if observed.IsZero() || observed.After(at) {
+			return false
+		}
+	}
+	for _, window := range []*core.WindowEvidence{snapshot.FiveHour, snapshot.Weekly} {
+		if window.State != core.WindowActive && window.State != core.WindowInactive && window.State != core.WindowUnknown {
+			return false
+		}
+		if window.Remaining == nil || math.IsNaN(window.Remaining.Value) || math.IsInf(window.Remaining.Value, 0) || window.Remaining.Value <= 0 || window.Remaining.Unit == "percent" && window.Remaining.Value > 100 {
+			return false
+		}
+		if !window.ResetAt.IsZero() && !at.Before(window.ResetAt) || window.State == core.WindowActive && window.ResetAt.IsZero() {
+			return false
+		}
+	}
+	return true
 }
 
 func recentJobs(ctx context.Context, tx *sql.Tx, limit int) ([]JobSummary, error) {
@@ -228,6 +259,10 @@ func readDashboard(ctx context.Context, tx *sql.Tx, revision, accountsRevision u
 			dashboard.Unavailable++
 		}
 		known, capacity := quotaState([]byte(raw), at)
+		available := status == "available" && quotaAvailable([]byte(raw), at)
+		if available {
+			dashboard.QuotaAvailable++
+		}
 		if status != "disabled" {
 			dashboard.Enabled++
 			if display != "quota_exhausted" && display != "quota_restricted" && (!known || status != "available") {

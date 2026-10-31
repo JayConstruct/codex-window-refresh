@@ -31,7 +31,7 @@ type SchedulingConfig struct {
 type ResetConfig struct {
 	Enabled            bool `json:"enabled"`
 	AutoConsume        bool `json:"auto_consume"`
-	PollSeconds        int  `json:"poll_seconds"`
+	PollSeconds        int  `json:"poll_seconds"` // Legacy configuration field; detail reads are event driven.
 	ExpirySeconds      int  `json:"expiry_seconds"`
 	ForceBeforeSeconds int  `json:"force_before_seconds"`
 	MinUsedPercent     int  `json:"min_used_percent"`

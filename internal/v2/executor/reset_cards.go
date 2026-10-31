@@ -1,6 +1,6 @@
 package executor
 
-// Earned resets use the documented Codex App Server account protocol. This
+// Optional CLI compatibility uses the Codex App Server account protocol. This
 // adapter never opens a model thread and never writes CPA tokens to disk.
 import (
 	"bufio"
@@ -10,6 +10,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +24,48 @@ type resetRPC struct {
 	input  io.WriteCloser
 	output *bufio.Scanner
 	next   int
+}
+
+// ResetCLI only resolves the local executable; it does not read credentials or
+// contact account services. Explicit paths never fall back to another binary.
+func (c *CPA) ResetCLI() (string, error) {
+	home, _ := os.UserHomeDir()
+	return resolveResetCLI(c.CodexBinary, home)
+}
+
+func resolveResetCLI(configured, home string) (string, error) {
+	if configured == "" {
+		configured = "codex"
+	}
+	if path, err := exec.LookPath(configured); err == nil {
+		return filepath.Abs(path)
+	} else if configured != "codex" {
+		if errors.Is(err, os.ErrPermission) {
+			return "", errors.New("reset_codex_not_executable")
+		}
+		return "", errors.New("reset_codex_unavailable")
+	}
+	if home != "" {
+		paths := []string{filepath.Join(home, ".local/bin/codex"), filepath.Join(home, ".codex/packages/standalone/current/bin/codex"), filepath.Join(home, ".npm-global/bin/codex")}
+		nvm, _ := filepath.Glob(filepath.Join(home, ".nvm/versions/node/*/bin/codex"))
+		sort.Slice(nvm, func(i, j int) bool {
+			a, b := strings.Split(strings.TrimPrefix(filepath.Base(filepath.Dir(filepath.Dir(nvm[i]))), "v"), "."), strings.Split(strings.TrimPrefix(filepath.Base(filepath.Dir(filepath.Dir(nvm[j]))), "v"), ".")
+			for k := 0; k < min(len(a), len(b)); k++ {
+				x, _ := strconv.Atoi(a[k])
+				y, _ := strconv.Atoi(b[k])
+				if x != y {
+					return x > y
+				}
+			}
+			return nvm[i] > nvm[j]
+		})
+		for _, path := range append(paths, nvm...) {
+			if resolved, err := exec.LookPath(path); err == nil {
+				return resolved, nil
+			}
+		}
+	}
+	return "", errors.New("reset_codex_unavailable")
 }
 
 func (r *resetRPC) call(method string, params any, result any) error {
@@ -49,6 +94,12 @@ func (r *resetRPC) call(method string, params any, result any) error {
 			continue
 		}
 		if len(response.Error) > 0 && string(response.Error) != "null" {
+			var failure struct {
+				Code int `json:"code"`
+			}
+			if json.Unmarshal(response.Error, &failure) == nil && failure.Code == -32601 {
+				return errors.New("reset_protocol_unsupported")
+			}
 			return errors.New("reset_account_rpc_failed")
 		}
 		if len(response.Result) == 0 || json.Unmarshal(response.Result, result) != nil {
@@ -61,6 +112,10 @@ func (r *resetRPC) call(method string, params any, result any) error {
 func (c *CPA) resetAccountRPC(ctx context.Context, a store.Account, method string, params, result any) error {
 	ctx, timeoutCancel := context.WithTimeout(ctx, 45*time.Second)
 	defer timeoutCancel()
+	binary, err := c.ResetCLI()
+	if err != nil {
+		return err
+	}
 	cred, err := c.resetBinding(ctx, a)
 	if err != nil {
 		return err
@@ -83,10 +138,6 @@ func (c *CPA) resetAccountRPC(ctx context.Context, a store.Account, method strin
 		return errors.New("reset_runtime_unavailable")
 	}
 	defer os.RemoveAll(dir)
-	binary := c.CodexBinary
-	if binary == "" {
-		binary = "codex"
-	}
 	processCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(processCtx, binary, "app-server", "--listen", "stdio://", "-c", `cli_auth_credentials_store="ephemeral"`)
@@ -95,7 +146,7 @@ func (c *CPA) resetAccountRPC(ctx context.Context, a store.Account, method strin
 	for _, e := range os.Environ() {
 		key, _, _ := strings.Cut(e, "=")
 		switch strings.ToUpper(key) {
-		case "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "CHATGPT_BASE_URL", "CODEX_API_KEY":
+		case "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "CHATGPT_BASE_URL", "CODEX_API_KEY", "PATH":
 			continue
 		}
 		if strings.HasPrefix(key, "OTEL_") {
@@ -109,7 +160,7 @@ func (c *CPA) resetAccountRPC(ctx context.Context, a store.Account, method strin
 		}
 		cmd.Env = append(cmd.Env, e)
 	}
-	cmd.Env = append(cmd.Env, "CODEX_HOME="+dir)
+	cmd.Env = append(cmd.Env, "CODEX_HOME="+dir, "PATH="+filepath.Dir(binary)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	if proxy != "" && proxy != "direct" {
 		cmd.Env = append(cmd.Env, "HTTPS_PROXY="+proxy, "HTTP_PROXY="+proxy, "ALL_PROXY="+proxy)
 	}
@@ -122,8 +173,8 @@ func (c *CPA) resetAccountRPC(ctx context.Context, a store.Account, method strin
 	if err != nil {
 		return errors.New("reset_runtime_unavailable")
 	}
-	if cmd.Start() != nil {
-		return errors.New("reset_codex_unavailable")
+	if err := cmd.Start(); err != nil {
+		return errors.New("reset_runtime_unavailable")
 	}
 	defer func() { input.Close(); cancel(); _ = cmd.Wait() }()
 	rpc := resetRPC{input: input, output: bufio.NewScanner(output)}
@@ -156,6 +207,9 @@ func (c *CPA) resetAccountRPC(ctx context.Context, a store.Account, method strin
 	return nil
 }
 func (c *CPA) ReadResetCredits(ctx context.Context, a store.Account) (*policy.ResetCredits, error) {
+	if c.CodexBinary == "" {
+		return c.readResetCreditsHTTP(ctx, a)
+	}
 	var response struct {
 		Credits *policy.ResetCredits `json:"rateLimitResetCredits"`
 	}
@@ -177,6 +231,9 @@ func (c *CPA) ReadResetCredits(ctx context.Context, a store.Account) (*policy.Re
 func (c *CPA) ConsumeResetCredit(ctx context.Context, a store.Account, creditID, key string) (string, error) {
 	if !policy.RoutingLabel(creditID) || !policy.RoutingLabel(key) {
 		return "", errors.New("reset_request_invalid")
+	}
+	if c.CodexBinary == "" {
+		return c.consumeResetCreditHTTP(ctx, a, creditID, key)
 	}
 	var response struct {
 		Outcome string `json:"outcome"`

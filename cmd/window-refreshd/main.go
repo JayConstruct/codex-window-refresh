@@ -37,8 +37,8 @@ func run() error {
 	flag.DurationVar(&timeout, "query-timeout", 15*time.Second, "per account quota query deadline")
 	flag.DurationVar(&historyAge, "history-retention", 7*24*time.Hour, "terminal job history age (1h..8760h)")
 	flag.IntVar(&terminalJobs, "terminal-jobs", 10000, "maximum retained terminal jobs (1..50000)")
-	flag.StringVar(&codexBinary, "codex-binary", "codex", "Codex CLI binary for earned reset cards (no model execution)")
-	flag.StringVar(&resetProxy, "reset-proxy", "", "default reset account transport proxy; inherits process proxy when empty")
+	flag.StringVar(&codexBinary, "codex-binary", "", "optional Codex CLI override for reset cards; defaults to CPA HTTP without CLI")
+	flag.StringVar(&resetProxy, "reset-proxy", "", "default reset account transport proxy; inherits CPA global proxy when empty")
 	flag.Parse()
 	st, err := store.Open(data)
 	if err != nil {

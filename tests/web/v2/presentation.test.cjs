@@ -3,6 +3,25 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {quotaEvidence, quotaAssessment, accountView, overviewSummary} = require('../../../internal/v2/daemon/web/presentation.js');
 
+test('reset query status counts down without restoring quota and respects disabled accounts', () => {
+  const at = Date.parse('2026-10-31T00:00:00Z'), account = observedAccount(at - 3600000);
+  account.quota.five_hour.Remaining.Value = 0;
+  account.pending_query = {phase:'queued',trigger:'five_hour_expiry',scheduled_at:new Date(at+3000).toISOString()};
+  assert.equal(accountView(account, at).label, '3 秒后查询');
+  assert.equal(accountView(account, at+1001).label, '2 秒后查询');
+  assert.equal(accountView(account, at+3000).label, '等待查询');
+  assert.equal(account.quota.five_hour.Remaining.Value, 0);
+  account.pending_query.phase='running'; assert.equal(accountView(account, at+4000).label, '查询中');
+  account.pending_query.phase='queued'; account.pending_query.hold_reason='excluded_hours';
+  assert.equal(accountView(account, at).label, '等待允许查询时段');
+  account.status='disabled'; assert.equal(accountView(account, at).label, '已禁用');
+});
+
+test('summary separates available balances from fresh active capacity', () => {
+  const summary = overviewSummary({dashboard:{enabled:8,quota_available:6,capacity:0,quota_exhausted:1}}, null);
+  assert.equal(summary.usable, 6); assert.equal(summary.capacity, 0); assert.equal(summary.other, 1);
+});
+
 const observedAccount = at => ({status: 'available', observed_at: new Date(at).toISOString(), quota: {permission: 'allowed', observed_at: new Date(at).toISOString(),
   five_hour: {State: 'active', ResetAt: new Date(at + 3600000).toISOString(), Remaining: {Value: 64, Unit: 'percent'}},
   weekly: {State: 'active', ResetAt: new Date(at + 86400000).toISOString(), Remaining: {Value: 82, Unit: 'percent'}}}});
@@ -40,7 +59,7 @@ test('fresh 100-percent windows await activation evidence and are never describe
     for (const field of fields) { account.quota[field].Remaining.Value = 100; account.quota[field].State = 'unknown'; }
     assert.deepEqual(quotaEvidence(account, at), {known: false, usable: false});
     const state = accountView(account, at);
-    assert.equal(state.label, '窗口待核实'); assert.match(state.description, /额度数据已更新/);
+    assert.equal(state.label, '可用'); assert.match(state.description, /额度数据已更新/);
     assert.doesNotMatch(state.description, /过期|已超过/);
     assert.match(state.description, /查询额度也不会启动窗口/);
     assert.equal(quotaAssessment(account, at).reason, 'unconfirmed');
@@ -53,7 +72,7 @@ test('a five-minute evidence timeout changes capacity freshness without changing
   assert.equal(accountView(account, at + 300000).label, '可用');
   assert.deepEqual(quotaEvidence(account, at + 300001), {known: false, usable: false});
   const stale = accountView(account, at + 300001);
-  assert.equal(stale.label, '正常'); assert.equal(stale.kind, 'available');
+  assert.equal(stale.label, '可用'); assert.equal(stale.kind, 'available');
   assert.match(stale.description, /CPA 账号状态正常/); assert.match(stale.description, /已超过 5 分钟/);
   assert.equal(quotaAssessment(account, at + 300001).reason, 'stale');
   assert.equal(JSON.stringify(account), before);
@@ -71,7 +90,7 @@ test('missing and old per-field evidence cannot borrow a new query timestamp', (
   account.quota.fields = {weekly: {observed_at: new Date(at - 600000).toISOString()}};
   assert.equal(quotaAssessment(account, at).reason, 'stale');
   assert.deepEqual(quotaAssessment(account, at).fields, ['周额度']);
-  assert.equal(accountView(account, at).label, '正常');
+  assert.equal(accountView(account, at).label, '可用');
   assert.match(accountView(account, at).description, /周额度/);
   assert.deepEqual(quotaEvidence(account, at), {known: false, usable: false});
 });

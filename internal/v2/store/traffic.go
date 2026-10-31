@@ -160,6 +160,29 @@ func trafficHash(parts ...string) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
+
+// ResolveTrafficCallers maps host caller digests to database-local handles without
+// retaining the input or exposing the database salt. Raw API keys are not accepted.
+func (s *Store) ResolveTrafficCallers(ctx context.Context, scopes []string) ([]string, error) {
+	if len(scopes) == 0 || len(scopes) > 64 {
+		return nil, ErrTrafficFilter
+	}
+	for _, scope := range scopes {
+		decoded, err := hex.DecodeString(scope)
+		if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != scope {
+			return nil, ErrTrafficFilter
+		}
+	}
+	var salt string
+	if err := s.db.QueryRowContext(ctx, "SELECT salt FROM traffic_meta WHERE singleton=1").Scan(&salt); err != nil {
+		return nil, err
+	}
+	callers := make([]string, len(scopes))
+	for i, scope := range scopes {
+		callers[i] = "caller-" + trafficHash(salt, "caller", scope)
+	}
+	return callers, nil
+}
 func markTrafficUnknown(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx, "UPDATE traffic_requests SET status='unknown',data=json_set(data,'$.status','unknown') WHERE status='running'")
 	return err

@@ -231,12 +231,17 @@ static J *host_callback(const char*method,J*payload) {
 }
 /* These handles are local to this bridge instance. Reserve a separate control
  * callback lane so eight blocked HTTP requests can still be cancelled. */
+static unsigned char *unbase64(const char*in,size_t *size,size_t limit);
 static int quota_payload(J*payload) {
-    if(!equals(field(payload,"method"),"GET")||!equals(field(payload,"url"),"https://chatgpt.com/backend-api/wham/usage")||json_object_object_length(payload)!=4)return 0;
+    int usage=equals(field(payload,"method"),"GET")&&equals(field(payload,"url"),"https://chatgpt.com/backend-api/wham/usage");
+    int details=equals(field(payload,"method"),"GET")&&equals(field(payload,"url"),"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits");
+    int consume=equals(field(payload,"method"),"POST")&&equals(field(payload,"url"),"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume");
+    if((!usage&&!details&&!consume)||json_object_object_length(payload)!=(consume?5:4))return 0;
     J*headers=field(payload,"headers");
-    if(!headers||json_object_get_type(headers)!=4||json_object_object_length(headers)!=4)return 0;
-    const char*names[]={"Authorization","Chatgpt-Account-Id","Accept","User-Agent"};
-    for(size_t i=0;i<4;i++) {
+    size_t count=usage?4:consume?7:6;
+    if(!headers||json_object_get_type(headers)!=4||json_object_object_length(headers)!=(int)count)return 0;
+    const char*names[]={"Authorization","Chatgpt-Account-Id","Accept","User-Agent","Openai-Beta","Originator","Content-Type"};
+    for(size_t i=0;i<count;i++) {
         J*values=field(headers,names[i]);
         if(!values||json_object_get_type(values)!=5||json_object_array_length(values)!=1)return 0;
         J*value=json_object_array_get_idx(values,0);
@@ -246,7 +251,17 @@ static int quota_payload(J*payload) {
             if(strncmp(text,"Bearer ",7)||!text[7])return 0;
             for(const unsigned char*p=(const unsigned char*)text+7;*p;p++)if(*p<33||*p>126)return 0;
         }
-        if((i==2&&strcmp(text,"application/json"))||(i==3&&strcmp(text,"codex-window-refresh-v2")))return 0;
+        if((i==2&&strcmp(text,"application/json"))||(i==3&&strcmp(text,"codex-window-refresh-v2"))||(i==4&&strcmp(text,"codex-1"))||(i==5&&strcmp(text,"Codex Desktop"))||(i==6&&strcmp(text,"application/json")))return 0;
+    }
+    if(consume) {
+        const char *encoded=string(field(payload,"body"));
+        size_t size=0;
+        unsigned char *body=encoded?unbase64(encoded,&size,1024):NULL;
+        if(!body)return 0;
+        J *request=parse(body,size);free(body);
+        int valid=request&&json_object_get_type(request)==4&&json_object_object_length(request)==2&&bounded_text(field(request,"redeem_request_id"),256)&&bounded_text(field(request,"credit_id"),256);
+        json_object_put(request);
+        if(!valid)return 0;
     }
     return 1;
 }
@@ -827,7 +842,7 @@ static J *proxy(J*req) {
     if(!strncmp(path,MGMT,strlen(MGMT))) {
         tail=path+strlen(MGMT);
         int readable=!strcmp(tail,"traffic")||!strcmp(tail,"overview")||!strcmp(tail,"accounts")||!strcmp(tail,"jobs")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"generation-accounts")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"task-history")||!strcmp(tail,"account-models")||!strcmp(tail,"scheduling")||!strcmp(tail,"reset-cards");
-        int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"scheduling");
+        int writable=!strcmp(tail,"jobs")||!strcmp(tail,"sync")||!strcmp(tail,"settings")||!strcmp(tail,"model-settings")||!strcmp(tail,"prompt-generations")||!strcmp(tail,"wake-settings")||!strcmp(tail,"wake-jobs")||!strcmp(tail,"scheduling")||!strcmp(tail,"traffic-callers");
         if(!((!strcmp(method,"GET")&&readable)||(!strcmp(method,"POST")&&writable)))return http_error(404,"not_found");
         snprintf(endpoint,sizeof(endpoint),"/api/v2/%s",tail);
     }
@@ -953,13 +968,13 @@ static J *registration(unsigned schema) {
 static J *routes(void) {
     J*r=json_object_new_object(),*list=json_object_new_array(),*resources=json_object_new_array();
     const char*paths[]= {
-        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history","account-models","scheduling","scheduling","reset-cards","traffic"
+        "overview","accounts","jobs","jobs","sync","settings","settings","model-settings","model-settings","prompt-generations","prompt-generations","generation-accounts","wake-settings","wake-settings","wake-jobs","wake-jobs","task-history","account-models","scheduling","scheduling","reset-cards","traffic","traffic-callers"
     };
     for(size_t i=0;i<sizeof(paths)/sizeof(*paths);i++) {
         J*item=json_object_new_object();
         char path[256];
         snprintf(path,sizeof(path),"%s%s",MGMT,paths[i]);
-        json_object_object_add(item,"Method",json_object_new_string(i==3||i==4||i==6||i==8||i==10||i==13||i==15||i==19?"POST":"GET"));
+        json_object_object_add(item,"Method",json_object_new_string(i==3||i==4||i==6||i==8||i==10||i==13||i==15||i==19||i==22?"POST":"GET"));
         json_object_object_add(item,"Path",json_object_new_string(path));
         json_object_array_add(list,item);
     }

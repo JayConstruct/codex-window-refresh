@@ -41,6 +41,9 @@
     invalid_query_settings: '查询设置无效，请检查字段', settings_unconfirmed: '保存结果尚未确认，请重新加载设置核实，不要直接重复提交'
   };
   Object.assign(codes, {invalid_scheduling_settings: '调度设置无效，请检查字段范围与项目账号', reset_codex_unavailable: '后台未找到支持重置卡协议的 Codex CLI', reset_runtime_unavailable: '无法启动重置卡适配器', reset_protocol_invalid: '重置卡协议响应无效', reset_transport_failed: '重置卡连接中断', reset_account_rpc_failed: '官方账号接口拒绝操作或协议版本不支持', reset_timeout: '重置卡操作超时', reset_verification_incomplete: '正在等待两种额度窗口的完整可用证据', reset_operation_failed: '重置卡操作未完成'});
+  Object.assign(codes, {reset_codex_unavailable: '服务器未找到 Codex CLI，请在后台服务运行用户下安装，或通过 --codex-binary 指定绝对路径', reset_codex_not_executable: '指定的 Codex CLI 无执行权限，请检查服务用户的文件权限', reset_protocol_unsupported: '当前 Codex CLI 不支持重置卡协议，请更新服务器上的 CLI', reset_runtime_unavailable: 'Codex CLI 启动失败，请检查执行权限、运行依赖和后台服务日志'});
+  Object.assign(codes, {reset_authentication_failed:'重置卡接口认证失败，请更新该账号凭据',reset_permission_denied:'上游拒绝访问该账号的重置卡接口',reset_rate_limited:'重置卡接口暂时限流，等待后重试',reset_upstream_failed:'重置卡接口返回异常，请查看任务记录',reset_response_too_large:'重置卡响应超过大小限制'});
+  codes.reset_transport_failed = '重置卡请求未完成，请检查 CPA 接入层版本、网络和代理；兑换重试会保留原操作标识';
   codes.secure_random_unavailable = '浏览器无法生成安全的任务标识，请更换浏览器或使用 HTTPS';
   function requestID(crypto) {
     if (typeof crypto?.randomUUID === 'function') {
@@ -123,6 +126,55 @@
   function loginAddress(context, base) {
     return context.location.origin + base.slice(0, -API.length);
   }
+
+  // Synchronous SHA-256 also works on CPA installations served over plain HTTP.
+  function callerDigest(value) {
+    const bytes = new TextEncoder().encode(value), size = Math.ceil((bytes.length + 9) / 64) * 64;
+    const padded = new Uint8Array(size); padded.set(bytes); padded[bytes.length] = 128;
+    const data = new DataView(padded.buffer); data.setUint32(size - 8, Math.floor(bytes.length / 0x20000000)); data.setUint32(size - 4, bytes.length * 8);
+    const state = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+    const constants = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+    const rotate = (word, bits) => word >>> bits | word << (32 - bits), words = new Uint32Array(64);
+    for (let offset = 0; offset < size; offset += 64) {
+      for (let i = 0; i < 16; i++) words[i] = data.getUint32(offset + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const x = words[i - 15], y = words[i - 2];
+        words[i] = words[i - 16] + (rotate(x, 7) ^ rotate(x, 18) ^ x >>> 3) + words[i - 7] + (rotate(y, 17) ^ rotate(y, 19) ^ y >>> 10);
+      }
+      let [a,b,c,d,e,f,g,h] = state;
+      for (let i = 0; i < 64; i++) {
+        const first = h + (rotate(e, 6) ^ rotate(e, 11) ^ rotate(e, 25)) + (e & f ^ ~e & g) + constants[i] + words[i];
+        const second = (rotate(a, 2) ^ rotate(a, 13) ^ rotate(a, 22)) + (a & b ^ a & c ^ b & c);
+        h=g; g=f; f=e; e=(d+first)>>>0; d=c; c=b; b=a; a=(first+second)>>>0;
+      }
+      [a,b,c,d,e,f,g,h].forEach((word, i) => { state[i] += word; });
+    }
+    return Array.from(state, word => word.toString(16).padStart(8, '0')).join('');
+  }
+  function readCallerNames(context, base) {
+    const saved = storedValue(context, 'api-key-names:v1:' + loginAddress(context, base));
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return {};
+    return Object.fromEntries(Object.entries(saved).slice(0, 10000).filter(([id, label]) => /^[a-f0-9]{64}$/.test(id) && typeof label === 'string' && label.trim() && label.length <= 256 && !/[\p{Cc}]/u.test(label)).map(([id, label]) => [id, label.trim()]));
+  }
+  async function resolveCallerNames(context, base, request) {
+    const names = readCallerNames(context, base), labels = Object.create(null);
+    if (!Object.keys(names).length) return labels;
+    const data = await request('/api-keys', {}, true), keys = data?.['api-keys'];
+    if (!Array.isArray(keys) || keys.length > 10000 || keys.some(key => typeof key !== 'string' || key.length > 4096)) return labels;
+    const address = loginAddress(context, base), entries = new Map();
+    for (const key of keys) {
+      const label = names[callerDigest(JSON.stringify(['api-key-name', address, key]))];
+      if (label && key.trim()) entries.set(callerDigest('cli-proxy-api:caller-scope:v1\0' + key.trim()), label);
+    }
+    const scopes = [...entries.keys()];
+    for (let start = 0; start < scopes.length; start += 64) {
+      const batch = scopes.slice(start, start + 64);
+      const response = await request('/traffic-callers', {method: 'POST', body: JSON.stringify({scopes: batch})});
+      if (!Array.isArray(response?.callers) || response.callers.length !== batch.length || response.callers.some(id => typeof id !== 'string' || !/^caller-[a-f0-9]{64}$/.test(id))) throw new Error('invalid_caller_response');
+      response.callers.forEach((id, index) => { labels[id] = entries.get(batch[index]); });
+    }
+    return labels;
+  }
   function readLogin(context, base) {
     const address = loginAddress(context, base);
     const saved = storedValue(context, 'cwr-v2-auth:' + address);
@@ -174,7 +226,7 @@
     return '约 ' + minutes + ' 分钟后重置';
   }
   function sourceText(source) {
-    const sources = {cpa_wham_usage: '主动查询', cpa_response_headers: '正常业务响应', cpa_websocket_quota: '正常业务推送', cpa_model_response: '模型响应'};
+    const sources = {cpa_wham_usage: '主动查询', cpa_response_headers: '正常业务响应', cpa_websocket_quota: '正常业务推送', cpa_model_response: '模型响应', codex_account: '重置卡详情查询'};
     return Object.hasOwn(sources, source) ? sources[source] : '额度观测';
   }
   function windowView(quota, name, now = Date.now()) {
@@ -566,6 +618,7 @@
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {createToastCenter});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {taskDiagnostic, resolveStatusAccount, sameStatusIdentity, independentAuthFile, maskedAccount, readDisplayPreference, skippedReason});
+  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {callerDigest, readCallerNames, resolveCallerNames});
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
@@ -586,7 +639,7 @@
   let displayMatcher = null, displayMatcherDirty = true;
   const statusOperations = new Map();
   let aliasSelection = '', aliasOpener = null, statusReadSequence = 0;
-  let key = '', generation = 0, views = new ViewTracker(), pollTimer, connectRetryTimer;
+  let key = '', generation = 0, views = new ViewTracker(), pollTimer, connectRetryTimer, timeTimer;
   let connected = false, connecting = false, refreshing = false, refreshQueued = false, refreshForceQueued = false;
   let overviewData = null, accountsData = [], accountsRevision = 0, accountsViewRevision = -1, cursor = '', nextCursor = '', previousCursors = [], pageStart = 0, filteredTotal = null;
   let filterTimer, filterSequence = 0, updatingAccounts = false, syncing = false;
@@ -621,11 +674,12 @@
   const errorLimits = new Map();
   const presentation = context.CWRPresentation;
   let selectedAccountID = '', recordsPage = 'users', overviewTaskData = null, overviewTaskLoading = false;
+  let callerNames = Object.create(null), callerNamesRead = 0, callerNamesSignature = '';
   let selectedBatchBusy = false;
   let taskOpenSequence = 0, navigationEpoch = 0, accountTaskSequence = 0, selectedAccountTasks = null, selectedAccountTasksError = false;
   const selectedAccounts = new Set();
   const recordsPanel = context.CWRRecords?.mount({root: $('runtime-records-root'), request: (path, options) => api(path, options),
-    displayAccount, hideRefresh: true, onTask: (id, kind) => openRecordedTask(id, kind), onViewAccount: id => openAccountDetail(id),
+    displayAccount, displayCaller, hideRefresh: true, onTask: (id, kind) => openRecordedTask(id, kind), onViewAccount: id => openAccountDetail(id),
     onNavigate: page => { recordsPage = page; for (const button of document.querySelectorAll('[data-record-page]')) { const selected = button.dataset.recordPage === page; button.classList.toggle('active', selected); button.setAttribute('aria-selected', String(selected)); } }});
   const setText = (id, text) => { if ($(id)) setLiveText($(id), text); };
   function setLiveText(node, text) {
@@ -644,6 +698,26 @@
   function displayAccount(id) {
     if (displayPreference.mode === 'original') return id;
     return displayPreference.mode === 'alias' && Object.hasOwn(displayPreference.aliases, id) ? displayPreference.aliases[id] : maskedAccount(id);
+  }
+  function displayCaller(id) {
+    return callerNames[id] || context.CWRRecords?.callerLabel?.(id) || '调用方未知';
+  }
+  async function refreshCallerNames() {
+    if (!connected) return;
+    const signature = JSON.stringify([views.instance, readCallerNames(context, base)]);
+    if (signature === callerNamesSignature) return;
+    callerNamesSignature = signature;
+    const sequence = ++callerNamesRead, current = generation, instance = views.instance;
+    callerNames = Object.create(null);
+    recordsPanel?.setContext({displayCaller});
+    try {
+      const labels = await resolveCallerNames(context, base, api);
+      if (sequence !== callerNamesRead || current !== generation || instance !== views.instance || !connected) return;
+      callerNames = labels;
+      recordsPanel?.setContext({displayCaller});
+    } catch {
+      if (sequence === callerNamesRead) callerNamesSignature = '';
+    }
   }
   function displayText(value) {
     let text = String(value);
@@ -1667,6 +1741,11 @@
     if ($('header-connection')) setData($('header-connection'), 'connected', connected);
   }
   function controls() {
+    for (const button of document.querySelectorAll('[data-reset-query-account]')) {
+      const id = button.dataset.resetQueryAccount, busy = queryBusy.has('account:' + id);
+      button.disabled = !connected || busy;
+      setLiveText(button, busy ? '提交中…' : unresolved.has('account:' + id) ? '核实查询' : '查询卡片数量');
+    }
     for (const id of ['query', 'query-single', 'refresh', 'sync']) if ($(id)) $(id).disabled = !connected || syncing && id === 'sync' || queryBusy.has('batch') && id === 'query';
     $('connect').disabled = connecting; $('key').disabled = connecting; $('auto-login').disabled = connecting;
     setText('query', unresolved.has('batch') ? '核实批量查询' : selectedAccounts.size ? '查询已选 ' + selectedAccounts.size + ' 个' : '查询全部');
@@ -1686,6 +1765,8 @@
     if ($('history-refresh')) $('history-refresh').disabled = !connected;
   }
   function stop() {
+    clearTimeout(timeTimer);
+    callerNamesRead++; callerNamesSignature = ''; callerNames = Object.create(null);
     recordsPanel?.disconnect(); overviewTaskLoading = false; overviewTaskData = null;
     selectedAccounts.clear(); selectedBatchBusy = false;
     taskOpenSequence++; accountTaskSequence++; selectedAccountTasks = null; selectedAccountTasksError = false;
@@ -1805,8 +1886,8 @@
       const aliasButton = element('button', 'text-button account-alias', '编辑别称'); aliasButton.type = 'button'; aliasButton.dataset.accountAliasId = account.id; aliasButton.dataset.renderKey = 'alias';
       aliasButton.setAttribute('aria-label', '编辑账号 ' + account.id + ' 的浏览器别称'); aliasButton.onclick = function () { openAliasDialog(account.id, this); }; name.append(aliasButton);
       const state = statusOperations.get(account.id);
-      const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '已禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : presentation?.accountView(account) || accountStatus(account);
-      status.append(badge(value.label, value.kind));
+      const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '已禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : presentation?.accountView(account, Date.now()) || accountStatus(account);
+      const stateBadge = badge(value.label, value.kind); stateBadge.dataset.accountStateId = account.id; status.append(stateBadge);
       status.title = (account.status_observed_at ? 'CPA 状态：' + age(account.status_observed_at) + '同步。' : '') + (value.description || (value.kind === 'attention' ? '额度状态来自最近一次额度观测；重置或恢复需重新核实，不以本地倒计时自动恢复正常。' : '后台定时同步 CPA 账号状态。'));
       const five = element('td'), weekly = element('td'), observed = element('td'), action = element('td');
       five.append(renderQuota(account.quota, 'five_hour')); weekly.append(renderQuota(account.quota, 'weekly'));
@@ -1910,8 +1991,9 @@
     heading.append(element('h2', '', '账号详情'));
     const close = element('button', 'text-button', '×'); close.type = 'button'; close.setAttribute('aria-label', '关闭账号详情');
     close.onclick = () => { selectedAccountID = ''; renderAccounts(); }; heading.append(close); rows.push(heading);
-    const displayedState = presentation?.accountView(account) || accountStatus(account);
-    const identity = element('div', 'detail-section'); identity.append(element('h3', 'account-detail-name', account.id), element('p', 'account-secondary', maskedAccount(account.id)), badge(displayedState.label, displayedState.kind));
+    const displayedState = presentation?.accountView(account, Date.now()) || accountStatus(account);
+    const detailBadge = badge(displayedState.label, displayedState.kind); detailBadge.dataset.accountStateId = account.id;
+    const identity = element('div', 'detail-section'); identity.append(element('h3', 'account-detail-name', account.id), element('p', 'account-secondary', maskedAccount(account.id)), detailBadge);
     const state = statusOperations.get(account.id), enabled = typeof state?.disabled === 'boolean' ? !state.disabled : account.status !== 'disabled';
     const switchRow = element('div', 'summary-row'), toggle = element('button', 'account-status-switch');
     toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', String(enabled)); toggle.setAttribute('aria-label', 'CPA 账号状态：' + account.id);
@@ -1944,14 +2026,26 @@
   }
   function renderAccountTabs() {
     const data = overviewData?.dashboard, current = $('accounts-filter')?.value || 'all';
-    const counts = {all: data?.total, available: data?.capacity, usable: data?.capacity, quota_exhausted: data?.quota_exhausted, attention: data?.unknown_enabled, quota_unknown: data?.unknown_enabled, disabled: data?.disabled};
+    const counts = {all: data?.total, available: data?.quota_available ?? data?.capacity, usable: data?.quota_available ?? data?.capacity, quota_exhausted: data?.quota_exhausted, attention: data?.unknown_enabled, quota_unknown: data?.unknown_enabled, disabled: data?.disabled};
     for (const node of document.querySelectorAll('[data-account-count]')) setLiveText(node, counts[node.dataset.accountCount] ?? '—');
     for (const button of document.querySelectorAll('[data-account-filter]')) { const filter = {available: 'usable', attention: 'quota_unknown'}[button.dataset.accountFilter] || button.dataset.accountFilter; button.classList.toggle('active', filter === current); button.setAttribute('aria-pressed', String(filter === current)); }
   }
   function updateTimes() {
+    for (const node of document.querySelectorAll('[data-account-state-id]')) {
+      const account = accountsData.find(account => account.id === node.dataset.accountStateId), state = account && statusOperations.get(account.id);
+      if (!account || state?.phase === 'confirmed' && (state.disabled || account.status === 'disabled')) continue;
+      const value = presentation?.accountView(account, Date.now()) || accountStatus(account);
+      setLiveText(node, value.label);
+      if (node.className !== 'status-badge ' + value.kind) node.className = 'status-badge ' + value.kind;
+    }
     for (const node of document.querySelectorAll('[data-reset-at]')) setLiveText(node, resetText(node.dataset.resetAt));
     for (const node of document.querySelectorAll('[data-observed-at]')) setLiveText(node, (node.dataset.quotaSource ? node.dataset.quotaSource + ' · ' : '') + age(node.dataset.observedAt));
     for (const node of document.querySelectorAll('[data-queue-phase]')) setLiveText(node, queueText({phase: node.dataset.queuePhase, scheduled_at: node.dataset.scheduledAt, trigger: node.dataset.trigger, hold_reason: node.dataset.holdReason}));
+  }
+  function scheduleClock() {
+    clearTimeout(timeTimer);
+    if (!connected || document.hidden) return;
+    timeTimer = setTimeout(() => { updateTimes(); scheduleClock(); }, 1000);
   }
   function queueAnnotation(query, className = 'queue-time') {
     const node = element('small', className, queueText(query));
@@ -2309,11 +2403,11 @@
     if (!presentation) return;
     const value = presentation.overviewSummary(overviewData, overviewTaskData), stats = overviewData?.dashboard;
     const number = amount => amount === null ? '—' : String(amount);
-    if ($('metric-capacity')) updateChildren($('metric-capacity'), [element('span', 'metric-main-number', number(value.capacity)), element('span', 'metric-denominator', ' / ' + number(value.enabled))]);
+    if ($('metric-capacity')) updateChildren($('metric-capacity'), [element('span', 'metric-main-number', number(value.usable)), element('span', 'metric-denominator', ' / ' + number(value.enabled))]);
     setText('metric-resetting', number(value.exhausted)); setText('metric-running', number(value.running)); setText('metric-attention', number(value.attention));
-    setText('capacity-available', number(value.capacity)); setText('capacity-exhausted', number(value.exhausted)); setText('capacity-unknown', number(value.other));
-    setText('capacity-pool', stats ? '已启用 ' + number(value.enabled) + ' · 已禁用 ' + stats.disabled : '等待账号同步');
-    for (const [id, count] of [['capacity-bar-available', value.capacity], ['capacity-bar-exhausted', value.exhausted], ['capacity-bar-unknown', value.other]]) {
+    setText('capacity-available', number(value.usable)); setText('capacity-exhausted', number(value.exhausted)); setText('capacity-unknown', number(value.other));
+    setText('capacity-pool', stats ? '已确认活动窗口 ' + number(value.capacity) + ' · 已禁用 ' + stats.disabled : '等待账号同步');
+    for (const [id, count] of [['capacity-bar-available', value.usable], ['capacity-bar-exhausted', value.exhausted], ['capacity-bar-unknown', value.other]]) {
       if ($(id)) { $(id).style.width = value.enabled > 0 && count !== null ? Math.max(0, Math.min(100, count / value.enabled * 100)) + '%' : '0%'; }
     }
     const five = stats?.five_hour_exhausted, weekly = stats?.weekly_exhausted;
@@ -2461,7 +2555,7 @@
     const data = await api('/overview');
     if (current !== generation || !views.accept('overview', sequence, data)) return null;
     if (!data.capabilities?.quota_query && !data.read_only) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
-    if (previous && previous !== data.instance_id) { cursor = ''; nextCursor = ''; previousCursors = []; pageStart = 0; accountsRevision = -1; accountsViewRevision = -1; pending.clear(); resetHistory(); }
+    if (previous && previous !== data.instance_id) { cursor = ''; nextCursor = ''; previousCursors = []; pageStart = 0; accountsRevision = -1; accountsViewRevision = -1; pending.clear(); resetHistory(); void refreshCallerNames(); }
     overviewData = data;
     if (savedSettings && savedSettings.instance_id !== data.instance_id) {
       if (draftDirty()) settingsConflict = true;
@@ -2577,6 +2671,8 @@
       connected = true; connecting = false; $('login-section').hidden = true;
       if (persist && !saveLogin(context, base, remember ? key : '')) notice('已连接，但浏览器无法保存登录偏好；请允许站点存储后重新连接。', 'warning');
       setConnection('独立后台已连接 · 页面自动更新'); setText('auto-status', '数据自动更新'); setData($('auto-status'), 'state', 'online'); controls();
+      void refreshCallerNames();
+      scheduleClock();
       await refreshConfirmedStatuses();
       if (current !== generation) return;
       await accounts(true);
@@ -2650,7 +2746,7 @@
   }
 
   const schedulingNumbers = {quota_max_age_seconds: 'routing-age', session_ttl_seconds: 'routing-session', max_inflight: 'routing-cap'};
-  const cardNumbers = {poll_seconds: 'cards-poll', expiry_seconds: 'cards-expiry', force_before_seconds: 'cards-force', min_used_percent: 'cards-used'};
+  const cardNumbers = {expiry_seconds: 'cards-expiry', force_before_seconds: 'cards-force', min_used_percent: 'cards-used'};
   function routingEditable() { return connected && schedulingSaved?.instance_id === views.instance && !schedulingBusy && !schedulingLoading; }
   function syncRoutingProjectText() {
     routingProjectText = routingProjects.map(row => row.project + ' = ' + row.accounts.join(', ')).join('\n');
@@ -2767,7 +2863,7 @@
         routingProjectChanged();
       };
       const name = element('div', 'routing-account-identity'); name.append(element('strong', '', account.id), element('small', 'muted', maskedAccount(account.id)));
-      const state = presentation?.accountView(account) || accountStatus(account);
+      const state = presentation?.accountView(account, Date.now()) || accountStatus(account);
       node.append(checkbox, name, renderQuota(account.quota, 'five_hour'), renderQuota(account.quota, 'weekly'), badge(state.label, state.kind));
       return node;
     });
@@ -2866,8 +2962,8 @@
     $('cards-auto').disabled = !current || schedulingBusy || schedulingLoading || !$('cards-enabled').checked;
     const saved = current ? schedulingSaved.config : null;
     setText('routing-status', saved ? saved.enabled ? '已保存：已开启' : '已保存：未开启' : '尚未读取');
-    setText('cards-status', !saved ? '尚未读取' : saved.cards.enabled ? saved.cards.auto_consume ? '已保存：自动使用' : '已保存：仅查询' : '已保存：未开启');
-    setText('cards-dependency', !$('cards-enabled').checked && $('cards-auto').checked ? '已保存的自动使用当前不会运行。先开启详情查询；保持查询关闭并保存会同时关闭自动使用。' : '先开启详情查询，才能自动使用；关闭详情查询会同时关闭自动使用。');
+    setText('cards-status', !saved ? '尚未读取' : saved.cards.enabled ? saved.cards.auto_consume ? '已保存：自动使用' : '已保存：按需补全' : '已保存：手动 / 已有观测');
+    setText('cards-dependency', !$('cards-enabled').checked && $('cards-auto').checked ? '已保存的自动使用当前不会运行。先开启按需补全详情；保持补全关闭并保存会同时关闭自动使用。' : '先开启按需补全详情，才能自动使用；关闭补全会同时关闭自动使用。');
     const text = !connected ? (schedulingDirty ? '已断开连接，草稿保留。重新连接后再保存。' : '连接后读取设置，关闭页面不停止后台。')
       : schedulingBusy ? '正在保存全部设置…'
       : schedulingLoading ? '正在读取后台设置，草稿保留…'
@@ -2911,7 +3007,6 @@
     c.quota_max_age_seconds = number('routing-age', '额度有效时间（秒）', 5, 3600);
     c.session_ttl_seconds = number('routing-session', '会话空闲失效时间（秒）', 1, 86400);
     c.cards.enabled = $('cards-enabled').checked; c.cards.auto_consume = c.cards.enabled && $('cards-auto').checked;
-    c.cards.poll_seconds = number('cards-poll', '查询间隔（秒）', 60, 86400);
     c.cards.expiry_seconds = number('cards-expiry', '关注到期卡的时间范围（秒）', 60, 2592000);
     c.cards.force_before_seconds = number('cards-force', '最晚尝试兑换的提前量（秒）', 1, 2592000);
     c.cards.min_used_percent = number('cards-used', '兑换所需已用比例（%）', 1, 100);
@@ -3036,7 +3131,12 @@
     const details = count === 0 ? '' : account.credits?.credits == null ? '，详情尚未读取' : deadline === null ? '，到期时间未知' : '，最近到期 ' + resetDate(deadline);
     heading.append(element('strong', '', account.account_id), badge(account.credits ? count + ' 张' + details : '卡片信息未知', account.error_code ? 'attention' : 'available'));
     node.append(heading);
-    resetMetadata(node, [['数量观测', historyDate(account.summary_observed_at || account.observed_at, true)], ['详情观测', historyDate(account.details_observed_at, true)]]);
+    const query = element('button', 'button button-outline', '查询卡片数量'); query.type = 'button';
+    query.dataset.resetQueryAccount = account.account_id; query.dataset.renderKey = 'query-count';
+    query.disabled = !connected || queryBusy.has('account:' + account.account_id);
+    query.setAttribute('aria-label', '通过 CPA 用量接口查询账号 ' + account.account_id + ' 的重置卡数量');
+    query.onclick = () => submitQuery(account.account_id); node.append(query);
+    resetMetadata(node, [['数量来源', account.summary_source ? sourceText(account.summary_source) : account.credits ? '详情查询 / 历史记录' : '尚无观测'], ['数量观测', historyDate(account.summary_observed_at || account.observed_at, true)], ['详情观测', historyDate(account.details_observed_at, true)]]);
     if (account.error_code) node.append(element('p', 'reset-warning', message(account.error_code)));
     if (account.credits?.credits?.length) {
       const credits = element('details', 'reset-credit-details'); credits.append(element('summary', '', '查看卡片标识与到期时间（' + account.credits.credits.length + '）'));
@@ -3065,6 +3165,13 @@
     return node;
   }
   function renderResetCards() {
+    const runtime = resetData?.runtime;
+    if ($('reset-runtime-message')) {
+      const needed = schedulingSaved?.config?.cards?.enabled === true;
+      const text = needed && runtime && !runtime.available ? message(runtime.error_code || 'reset_transport_failed') : runtime?.transport==='codex_cli' ? '已显式配置 CLI 兼容通道；数量仍复用已有流量和额度观测。详情只按变化及到期条件读取。' : '数量优先复用已有流量和额度观测，也可手动查询。详情和兑换通过 CPA 的 HTTP 通道访问上游，无需 Codex CLI；自动使用需独立开启。';
+      setText('reset-runtime-message', text);
+      $('reset-runtime-message').className = needed && runtime && !runtime.available ? 'reset-warning' : 'field-help';
+    }
     const records = resetRecords(), pages = Math.max(1, Math.ceil(records.length / 10));
     resetPage = Math.max(1, Math.min(resetPage, pages));
     $('reset-cards-list').hidden = resetTab !== 'cards'; $('reset-attempts-list').hidden = resetTab !== 'attempts';
@@ -3158,6 +3265,7 @@
     if ($('task-history-root')) $('task-history-root').hidden = page !== 'tasks';
     recordsPanel?.setContext({connected, instanceId: views.instance || '', displayAccount});
     recordsPanel?.show(page);
+    if (page !== 'tasks') void refreshCallerNames();
     if (page === 'tasks') { renderHistory(); if (load && connected) void loadHistory(); }
   }
   function changeFilter() {
@@ -3364,12 +3472,17 @@
   for (const button of document.querySelectorAll('[data-action="batch"]')) button.addEventListener('click', () => button.id === 'header-query' ? querySelectedAccounts() : submitQuery());
   function resumeUpdates() {
     if (!connected || document.hidden) return;
+    void refreshCallerNames();
+    scheduleClock();
     void refresh(); monitor(generation);
   }
   document.addEventListener?.('visibilitychange', () => {
-    if (document.hidden) monitor(generation); else { applyHostTheme(); resumeUpdates(); }
+    if (document.hidden) { clearTimeout(timeTimer); monitor(generation); } else { applyHostTheme(); resumeUpdates(); }
   });
   context.addEventListener?.('focus', () => { applyHostTheme(); resumeUpdates(); });
+  context.addEventListener?.('storage', event => {
+    if (event.key === null || event.key === 'api-key-names:v1:' + loginAddress(context, base)) void refreshCallerNames();
+  });
   context.addEventListener?.('resize', fitHistoryDetail);
   context.addEventListener?.('scroll', fitHistoryDetail, {passive: true});
   context.addEventListener?.('pagehide', event => {

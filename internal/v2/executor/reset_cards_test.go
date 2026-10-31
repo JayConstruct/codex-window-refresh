@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -11,6 +13,51 @@ import (
 
 	"codex-window-refresh/internal/v2/store"
 )
+
+func TestResetCLIFindsUserInstallationsOutsideServicePath(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	home := t.TempDir()
+	install := func(relative string) string {
+		path := filepath.Join(home, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	install(".nvm/versions/node/v9.0.0/bin/codex")
+	latest := install(".nvm/versions/node/v22.2.0/bin/codex")
+	if path, err := resolveResetCLI("codex", home); err != nil || path != latest {
+		t.Fatal(path, err)
+	}
+	standalone := install(".local/bin/codex")
+	if path, err := resolveResetCLI("", home); err != nil || path != standalone {
+		t.Fatal(path, err)
+	}
+	if _, err := resolveResetCLI(filepath.Join(home, "missing"), home); err == nil || err.Error() != "reset_codex_unavailable" {
+		t.Fatal("explicit path silently fell back", err)
+	}
+	if err := os.Chmod(standalone, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveResetCLI(standalone, home); err == nil || err.Error() != "reset_codex_not_executable" {
+		t.Fatal(err)
+	}
+}
+
+type resetBuffer struct{ bytes.Buffer }
+
+func (*resetBuffer) Close() error { return nil }
+
+func TestResetUnsupportedProtocolHasSpecificDiagnostic(t *testing.T) {
+	rpc := resetRPC{input: &resetBuffer{}, output: bufio.NewScanner(strings.NewReader(`{"id":1,"error":{"code":-32601,"message":"method not found"}}`))}
+	var result any
+	if err := rpc.call("account/rateLimits/read", map[string]any{}, &result); err == nil || err.Error() != "reset_protocol_unsupported" {
+		t.Fatal(err)
+	}
+}
 
 type resetRuntimeHost struct {
 	fixtureHost

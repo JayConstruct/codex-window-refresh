@@ -177,7 +177,7 @@ func (s *Store) RoutingSnapshot(ctx context.Context, at time.Time) (RoutingSnaps
 		}
 		var credits policy.ResetCredits
 		stamp, _ := time.Parse(time.RFC3339Nano, observed)
-		if settings.Config.Cards.Enabled && stamp.Add(time.Duration(settings.Config.Cards.PollSeconds)*time.Second).After(at) && json.Unmarshal([]byte(cards), &credits) == nil && (q.ResetCredits == nil || q.Fields["reset_credits"].ObservedAt.Before(stamp) || q.ResetCredits.AvailableCount > 0 && q.ResetCredits.AvailableCount == credits.AvailableCount) {
+		if settings.Config.Cards.Enabled && !stamp.IsZero() && !stamp.After(at) && json.Unmarshal([]byte(cards), &credits) == nil && (q.ResetCredits == nil || q.Fields["reset_credits"].ObservedAt.Before(stamp) || q.ResetCredits.AvailableCount > 0 && q.ResetCredits.AvailableCount == credits.AvailableCount) {
 			for _, c := range credits.Credits {
 				if c.Status == "available" && c.ResetType == "codexRateLimits" && c.ExpiresAt != nil && *c.ExpiresAt > at.Unix() && *c.ExpiresAt <= at.Unix()+int64(settings.Config.Cards.ExpirySeconds) && (a.CardExpiry == 0 || *c.ExpiresAt < a.CardExpiry) {
 					a.CardExpiry = *c.ExpiresAt
@@ -259,6 +259,7 @@ type ResetView struct {
 	ObservedAt        string               `json:"observed_at"`
 	ErrorCode         string               `json:"error_code"`
 	SummaryObservedAt string               `json:"summary_observed_at,omitempty"`
+	SummarySource     string               `json:"summary_source,omitempty"`
 	DetailsObservedAt string               `json:"details_observed_at,omitempty"`
 }
 type ResetAttempt struct {
@@ -289,6 +290,9 @@ func (s *Store) ResetViews(ctx context.Context) ([]ResetView, []ResetAttempt, er
 		if raw.Valid {
 			_ = json.Unmarshal([]byte(raw.String), &v.Credits)
 		}
+		if v.Credits != nil {
+			v.SummarySource = "codex_account"
+		}
 		if v.Credits != nil && v.Credits.Credits != nil {
 			v.DetailsObservedAt = v.ObservedAt
 		}
@@ -299,9 +303,13 @@ func (s *Store) ResetViews(ctx context.Context) ([]ResetView, []ResetAttempt, er
 				summaryAt = snapshot.ObservedAt
 			}
 			if !summaryAt.IsZero() {
-				v.SummaryObservedAt = queryStamp(summaryAt)
 				detailAt, _ := time.Parse(time.RFC3339Nano, v.ObservedAt)
-				if v.Credits == nil || !summaryAt.Before(detailAt) {
+				if v.Credits == nil || !summaryAt.Before(detailAt) || v.Credits.Credits == nil && v.Credits.AvailableCount == snapshot.ResetCredits.AvailableCount {
+					v.SummaryObservedAt = queryStamp(summaryAt)
+					v.SummarySource = snapshot.Fields["reset_credits"].Source
+					if v.SummarySource == "" {
+						v.SummarySource = snapshot.Source
+					}
 					count := snapshot.ResetCredits.AvailableCount
 					if v.Credits == nil || v.Credits.AvailableCount != count {
 						v.Credits = &policy.ResetCredits{AvailableCount: count}
@@ -315,9 +323,7 @@ func (s *Store) ResetViews(ctx context.Context) ([]ResetView, []ResetAttempt, er
 				}
 			}
 		}
-		if v.Credits != nil || raw.Valid || v.ErrorCode != "" {
-			views = append(views, v)
-		}
+		views = append(views, v)
 	}
 	if err == nil {
 		err = rows.Err()
@@ -341,15 +347,100 @@ func (s *Store) ResetViews(ctx context.Context) ([]ResetView, []ResetAttempt, er
 	return views, attempts, rows.Err()
 }
 func (s *Store) NextResetAccount(ctx context.Context, at time.Time) (Account, error) {
-	var a Account
-	err := s.db.QueryRowContext(ctx, `SELECT a.id,a.auth_index,a.status,b.binding FROM accounts a JOIN account_bindings b ON b.account_id=a.id LEFT JOIN reset_cards c ON c.account_id=a.id AND c.binding=b.binding WHERE a.status IN ('available','unavailable') AND COALESCE(c.next_at,'')<=? AND (SELECT last_success_at FROM inventory_state WHERE singleton=1)>=? ORDER BY COALESCE(c.next_at,''),a.id LIMIT 1`, queryStamp(at), queryStamp(at.Add(-time.Minute))).Scan(&a.ID, &a.AuthIndex, &a.Status, &a.Binding)
-	if errors.Is(err, sql.ErrNoRows) {
-		err = ErrNotFound
+	settings, err := s.SchedulingSettings(ctx)
+	if err != nil {
+		return Account{}, err
 	}
-	return a, err
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.auth_index,a.status,b.binding,COALESCE(a.quota,''),COALESCE(c.credits,''),COALESCE(c.observed_at,''),COALESCE(c.error_code,''),COALESCE(c.next_at,'') FROM accounts a JOIN account_bindings b ON b.account_id=a.id LEFT JOIN reset_cards c ON c.account_id=a.id AND c.binding=b.binding WHERE a.status IN ('available','unavailable') AND COALESCE(c.next_at,'')<=? AND (SELECT last_success_at FROM inventory_state WHERE singleton=1)>=? AND NOT EXISTS(SELECT 1 FROM reset_attempts r WHERE r.account_id=a.id AND r.binding=b.binding AND (r.phase IN ('sending','unknown','verifying') OR r.phase='skipped' AND r.updated_at>?)) ORDER BY COALESCE(c.next_at,''),a.id LIMIT 10000`, queryStamp(at), queryStamp(at.Add(-time.Minute)), queryStamp(at.Add(-15*time.Minute)))
+	if err != nil {
+		return Account{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a Account
+		var raw, detail, observed, code, next string
+		if err = rows.Scan(&a.ID, &a.AuthIndex, &a.Status, &a.Binding, &raw, &detail, &observed, &code, &next); err != nil {
+			return Account{}, err
+		}
+		var q quota.Snapshot
+		var cards *policy.ResetCredits
+		if json.Unmarshal([]byte(raw), &q) != nil || q.Binding != a.Binding {
+			continue
+		}
+		_ = json.Unmarshal([]byte(detail), &cards)
+		stamp, _ := time.Parse(time.RFC3339Nano, observed)
+		nextAt, _ := time.Parse(time.RFC3339Nano, next)
+		if resetDetailNeeded(q, cards, stamp, code, settings.Config.Cards, at, nextAt.Add(-time.Minute)) {
+			return a, nil
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return Account{}, err
+	}
+	return Account{}, ErrNotFound
 }
-func (s *Store) RecordResetCredits(ctx context.Context, a Account, credits *policy.ResetCredits, code string, at time.Time, poll int) error {
+
+// Detail reads follow new count evidence, actionable usage changes or a known
+// expiry boundary. An unchanged account never causes a periodic detail read.
+func resetDetailNeeded(q quota.Snapshot, cards *policy.ResetCredits, observed time.Time, code string, p policy.ResetConfig, at time.Time, checked ...time.Time) bool {
+	lastCheck := observed
+	if len(checked) > 0 && checked[0].After(lastCheck) {
+		lastCheck = checked[0]
+	}
+	count := 0
+	if cards != nil {
+		count = cards.AvailableCount
+	}
+	stamp := q.Fields["reset_credits"].ObservedAt
+	if stamp.IsZero() {
+		stamp = q.ObservedAt
+	}
+	if q.ResetCredits != nil && !stamp.After(at.Add(time.Second)) && !stamp.Before(observed) {
+		count = q.ResetCredits.AvailableCount
+	}
+	if count <= 0 {
+		return false
+	}
+	if observed.IsZero() || cards == nil || code != "" {
+		return true
+	}
+	if q.ResetCredits != nil && stamp.After(observed) && count != cards.AvailableCount {
+		return true
+	}
+	if !p.AutoConsume {
+		return false
+	}
+	for _, card := range cards.Credits {
+		if card.Status != "available" || card.ResetType != "codexRateLimits" || card.ExpiresAt == nil || *card.ExpiresAt <= at.Unix() {
+			continue
+		}
+		if q.ObservedAt.After(lastCheck) && resetWorthwhile(q, card, p, at) {
+			return true
+		}
+		for _, seconds := range []int{p.ExpirySeconds, p.ForceBeforeSeconds} {
+			boundary := time.Unix(*card.ExpiresAt, 0).Add(-time.Duration(seconds) * time.Second)
+			if !at.Before(boundary) && lastCheck.Before(boundary) {
+				return true
+			}
+		}
+	}
+	return false
+}
+func (s *Store) RecordResetCredits(ctx context.Context, a Account, credits *policy.ResetCredits, code string, at time.Time, _ int, checked ...time.Time) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
+		// A service that supplies no details must not cause another read merely
+		// because the stored detail payload is null. Retain the observed count as
+		// the comparison baseline; its original timestamp remains in quota.fields.
+		if credits == nil && code == "" {
+			var quotaRaw string
+			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(quota,'') FROM accounts WHERE id=?", a.ID).Scan(&quotaRaw); err != nil {
+				return err
+			}
+			var q quota.Snapshot
+			if json.Unmarshal([]byte(quotaRaw), &q) == nil && q.Binding == a.Binding && q.ResetCredits != nil {
+				credits = &policy.ResetCredits{AvailableCount: q.ResetCredits.AvailableCount}
+			}
+		}
 		var raw any
 		if credits != nil {
 			b, err := json.Marshal(credits)
@@ -358,22 +449,10 @@ func (s *Store) RecordResetCredits(ctx context.Context, a Account, credits *poli
 			}
 			raw = string(b)
 		}
-		next := at.Add(time.Duration(poll) * time.Second)
-		if code != "" && poll > 60 {
-			next = at.Add(time.Minute)
-		}
-		if credits != nil {
-			for _, card := range credits.Credits {
-				if card.Status == "available" && card.ExpiresAt != nil && *card.ExpiresAt > at.Unix() {
-					probe := time.Unix(*card.ExpiresAt, 0).Add(-time.Minute)
-					if probe.Before(at.Add(time.Minute)) {
-						probe = at.Add(time.Minute)
-					}
-					if probe.Before(next) {
-						next = probe
-					}
-				}
-			}
+		// This timestamp is a debounce/retry boundary, not a polling schedule.
+		next := at.Add(time.Minute)
+		if len(checked) > 0 && checked[0].After(at) {
+			next = checked[0].Add(time.Minute)
 		}
 		_, err := tx.ExecContext(ctx, `INSERT INTO reset_cards SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM accounts a JOIN account_bindings b ON b.account_id=a.id WHERE a.id=? AND a.auth_index=? AND b.binding=?) ON CONFLICT(account_id) DO UPDATE SET binding=excluded.binding,credits=CASE WHEN excluded.error_code='' THEN excluded.credits WHEN reset_cards.binding=excluded.binding THEN reset_cards.credits ELSE NULL END,observed_at=CASE WHEN excluded.error_code='' THEN excluded.observed_at WHEN reset_cards.binding=excluded.binding THEN reset_cards.observed_at ELSE '' END,next_at=excluded.next_at,error_code=excluded.error_code`, a.ID, a.Binding, raw, queryStamp(at), queryStamp(next), code, a.ID, a.AuthIndex, a.Binding)
 		return err

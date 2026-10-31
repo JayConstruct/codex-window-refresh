@@ -17,7 +17,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 Codeman 使用默认用户服务 `codeman-web.service` 时，一条命令安装本版客户端、配置入口并重启 Codeman：
 
 ```sh
-curl -fSL --retry 3 https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/v0.2.0-rc.31/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh --codeman-dir "$HOME/.codeman" && systemctl --user restart codeman-web.service
+curl -fSL --retry 3 https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/v0.2.0-rc.32/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh --codeman-dir "$HOME/.codeman" && systemctl --user restart codeman-web.service
 ```
 
 使用其他启动方式时，仅运行安装器，再通过原来的管理方式重启 Codeman。
@@ -111,20 +111,22 @@ python3 scripts/cwr-codex.py --project project-a --directory /work/project-a
 
 ## 官方赠送重置卡
 
-rc.22 起，正常账号额度查询会保留上游 `/wham/usage` 中可选的 `rate_limit_reset_credits.available_count`，页面可直接显示卡片数量，不增加请求，也不要求安装 Codex CLI。缺失字段表示未知，不能推断为零。数量摘要不含卡片 ID 和到期时间；它们由独立详情查询补充。新数量与旧详情数量不一致时，不展示旧卡片列表；摘要更新不会刷新详情的观测时间。
+正常账号额度查询会保留上游 `/wham/usage` 中可选的 `rate_limit_reset_credits.available_count`，页面可直接显示卡片数量，不增加请求，也不要求安装 Codex CLI。缺失字段表示未知，不能推断为零。数量摘要不含卡片 ID 和到期时间；它们由独立详情查询补充。新数量与旧详情数量不一致时，不展示旧卡片列表；摘要更新不会刷新详情的观测时间。
 
-卡片详情查询和兑换需要可执行的 Codex CLI，且必须支持官方文档中的 `account/rateLimits/read`、`rateLimitResetCredit/consume` 和外部 ChatGPT token 登录。可通过后台参数 `--codex-binary /absolute/path/to/codex` 指定。旧版、不支持该协议或未安装时展示诊断，不调用网页内部端点。
+卡片详情查询和兑换默认使用 CPA 的通用 `host.http.do` 通道，无需安装 Codex CLI。只允许访问上游两个固定接口：`GET /backend-api/wham/rate-limit-reset-credits` 读取详情，`POST /backend-api/wham/rate-limit-reset-credits/consume` 兑换指定卡片。使用绑定账号的 OAuth 凭据及上游账号 ID，凭据与原始响应不落盘，不调用模型；请求前后复核账号绑定。账号显式代理/direct 优先，其次为 `--reset-proxy`，均未配置时通过 CPA HTTP 继承宿主全局代理。每次请求持有独立操作句柄，取消会传递至宿主，不跨宿主实例重放。
 
-每次账号操作使用独立临时 CODEX_HOME、内存凭据存储和 stdio RPC，凭据仅在内存及匿名管道传输，不作为命令参数、日志或数据库内容。适配器不开模型会话。账号显式代理/direct 设置会被继承；账号没有代理覆盖时，重置卡适配器使用 `--reset-proxy`，未指定则继承后台进程代理环境。它使用 Codex 进程网络栈，**不会自动读取 CPA 全局代理**；需要代理的部署应为该后台单独配置。既有额度查询仍通过原有 CPA HTTP 桥继承宿主全局代理。
+仅显式设置 `--codex-binary /absolute/path/to/codex` 时使用 CLI 兼容通道；安装器会保存该参数。CLI 需要支持 `account/rateLimits/read`、`rateLimitResetCredit/consume` 及外部 ChatGPT token 登录，使用临时 CODEX_HOME、内存凭据和 stdio RPC。此通道沿用 Codex 进程网络栈及代理环境，不能继承 CPA 全局代理。HTTP 兑换遇到超时或回执不明时不会自动切换 CLI 重发。“刷新记录”只读取本地记录与通道配置，不查询或兑换上游卡片。
 
-面板分别开启“后台查询重置卡详情”和“到期前自动使用”。默认每账号十五分钟查询一次，接近已知到期时间时提前补读；所有卡片请求串行执行，大账号池实际轮询周期还受账号数和响应耗时影响。服务缺少到期时间或仅返回卡片数量时，保留未知状态，不猜测日期、不自动兑换。
+卡片数量优先复用已有额度查询，以及真实用户 WebSocket 额度事件中实际报告的重置卡计数；HTTP 响应只有窗口额度头时不能推算卡片数量，缺失字段保持未知。页面为每个账号提供“查询卡片数量”按钮，复用 CPA 原有额度查询队列，单账号立即执行，无需 Codex CLI，不开启自动详情或兑换，不发送模型请求。
+
+已取消每十五分钟轮询卡片详情。可选的“有卡片时自动补全详情”只在已观测到正数卡片、数量变化或上次详情失败需重试时补读；数量不变不会反复查询。开启自动使用后，新的可兑换用量观测或已知卡片的关注/最晚尝试到期边界会触发必要核实。补读串行并按账号至少间隔一分钟，避免连续事件造成请求堆积。服务仅返回数量或未提供详情时不按分钟反复索要相同详情；缺少到期时间保留未知，不猜测日期、不自动兑换。旧 poll_seconds 字段只为配置兼容保留，不再控制固定轮询。
 
 默认关注一天内到期的卡，优先最早到期的一张；五小时或周窗口已用达到 80% 时可以兑换，最后三十分钟内则只要存在有用的已使用窗口就尝试。自然重置距离不足五分钟的窗口不作为兑换理由。执行前先查询额度、核实账号绑定、检查配置和其他后台发送占用。不能重置的窗口由官方返回 `nothingToReset`，不会创建模型请求来人为消耗额度。
 
-兑换前持久保存操作 ID，并作为 `idempotencyKey`；超时、响应丢失、重启后复用同一 ID 和同一张卡。明确返回 `reset` 或 `alreadyRedeemed` 后只做额度和卡片补读，不再次兑换；读到五小时和周额度均可用后，清除 CPA 对该账号的本地路由冷却并请求重新同步；已因额度耗尽而暂不可用的账号仍可核实和兑换，手动禁用始终阻止兑换。完成后显示“已兑换并查询额度”，不根据兑换回执构造新的倒计时。`noCredit`、`nothingToReset` 记录为本次未兑换。结果未知保留账号后台发送保护；关闭自动兑换后不会继续变更操作，已确认兑换的只读核实可以继续。
+兑换前持久保存操作 ID，HTTP 请求传入 `redeem_request_id` 和选定卡片的 `credit_id`（CLI 使用 `idempotencyKey`）；超时、响应丢失、重启后复用同一 ID 和同一张卡。明确返回 `reset` 或 `alreadyRedeemed` 后只做额度和卡片补读，不再次兑换；读到五小时和周额度均可用后，清除 CPA 对该账号的本地路由冷却并请求重新同步；已因额度耗尽而暂不可用的账号仍可核实和兑换，手动禁用始终阻止兑换。完成后显示“已兑换并查询额度”，不根据兑换回执构造新的倒计时。`noCredit`、`nothingToReset` 记录为本次未兑换。结果未知保留账号后台发送保护；关闭自动兑换后不会继续变更操作，已确认兑换的只读核实可以继续。
 
 管理 API：`GET/POST /v0/management/codex-window-refresh/v2/scheduling` 使用 revision 比较保存；`GET .../reset-cards` 读取卡片与最近兑换记录。它们通过 CPA 管理认证，读取设置和打开页面不会查询上游或兑换。
 
-接口依据：[CPA Scheduler](https://github.com/router-for-me/CLIProxyAPI/blob/90c447d3a8727d115aa7552ec93ce023736ed492/sdk/pluginapi/types.go#L520)、[Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)、[官方 App Server 账号协议](https://learn.chatgpt.com/docs/app-server#8-earned-rate-limit-resets-chatgpt)。本地验证使用模拟宿主和模拟协议进程，未操作真实重置卡。
+接口依据：[CPA Scheduler](https://github.com/router-for-me/CLIProxyAPI/blob/90c447d3a8727d115aa7552ec93ce023736ed492/sdk/pluginapi/types.go#L520)、[Codex 配置](https://learn.chatgpt.com/docs/config-file/config-reference)、[官方 App Server 账号协议](https://learn.chatgpt.com/docs/app-server#8-earned-rate-limit-resets-chatgpt)。本地验证使用模拟宿主、HTTP 回执和兼容协议进程，未操作真实重置卡。
 
-数量与详情接口核对：[官方客户端实现](https://github.com/openai/codex/blob/23934d31b15b1127c83535f84854e5009f7cd51d/codex-rs/backend-client/src/client/rate_limit_resets.rs)、[上游字段定义](https://github.com/openai/codex/blob/23934d31b15b1127c83535f84854e5009f7cd51d/codex-rs/backend-client/src/types.rs)。
+直接 HTTP 调用方式也可参照 [cpa-key-billing 实现](https://github.com/haowang02/cpa-plugin-key-billing/blob/main/internal/plugin/auth_quota_providers.go)。数量与详情接口核对：[官方客户端实现](https://github.com/openai/codex/blob/23934d31b15b1127c83535f84854e5009f7cd51d/codex-rs/backend-client/src/client/rate_limit_resets.rs)、[上游字段定义](https://github.com/openai/codex/blob/23934d31b15b1127c83535f84854e5009f7cd51d/codex-rs/backend-client/src/types.rs)。

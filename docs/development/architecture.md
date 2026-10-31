@@ -2,7 +2,7 @@
 
 新版网页采用浅色运行总览与侧栏布局，账号查询、全池筛选、任务历史及 CPA 同步连接实际后台。源码已接入批量随机延迟、定期及窗口到期额度查询、模型与短句池配置、手动候选生成和 Codex 模型唤醒；自动查询及自动唤醒默认关闭。模型唤醒与可编辑生成提示词自 rc.8 提供，rc.7 不包含。界面、数据口径和验证方法见 [V2 网页面板](../user/panel.md)。
 
-当前后台与客户端为 v0.2.0-rc.31，接入层为 v0.2.0-rc.28，数据库为 schema 12。已实现独立后台及 C 原生接入层，并有本地假宿主端到端测试；曾以空账号 CPA 隔离实例验证注册与管理转发，尚未完成真实账号查询或模型请求验收。当前部署步骤见 [安装指南](../user/install.md)，总体目标见 [重建设计](design.md)，接口约束见 [实施契约](contracts.md)。
+当前后台、客户端安装包及接入层为 v0.2.0-rc.32，数据库为 schema 12。已实现独立后台及 C 原生接入层，并有本地假宿主端到端测试；曾以空账号 CPA 隔离实例验证注册与管理转发，尚未完成真实账号查询或模型请求验收。当前部署步骤见 [安装指南](../user/install.md)，总体目标见 [重建设计](design.md)，接口约束见 [实施契约](contracts.md)。
 
 ## 已实现
 
@@ -162,6 +162,10 @@ curl --unix-socket /absolute/private/run/daemon.sock http://localhost/healthz
 
 后台在原事件事务中更新 `traffic_requests`、`traffic_attempts` 和连续水位，提交后 ACK。逻辑请求以接入实例和宿主 RequestID 隔离；物理执行以实例和 UsageRecord.RequestID 去重；selection ID 连接决策及执行，不能把同一 selection 下的不同执行 UUID 合成一次调用。缺少 selection 时，只在同一实例的 trace 唯一且没有歧义时关联；出现 trace 冲突时撤回该回退关联，绝不按时间猜测。调用方及会话摘要采用每数据库随机盐，原始标识不进入流量表。
 
+调用方显示名称复用 CPA 的浏览器存储 `api-key-names:v1:<apiBase>`，兼容其 `enc::v1::` 混淆格式。名称指纹为 `SHA256(JSON.stringify(['api-key-name', apiBase, apiKey]))`；浏览器读取 CPA 管理端 Key 清单，在内存计算宿主 `caller_scope`，再通过认证的 `POST /api/v2/traffic-callers`（CPA 插件管理路径同名）取得数据库内调用方摘要。该接口最多接收 64 个小写 SHA-256 摘要，返回同序调用方 ID；不接受原始 Key 或名称，不写数据库，不返回盐。名称、原始 Key 不进入插件后台、URL、流量记录或新增本地缓存，名称只在浏览器渲染时覆盖，筛选与下钻继续使用原调用方 ID。
+
+总览 `quota_available` 和 `usable` 筛选使用同一最近余额判定：完整许可/五小时/周额度观测、时间不在未来、余额为正且未到重置边界；允许未启动及未知启动状态，过期观测不直接标记账号不可用。`capacity` 继续要求五分钟内的活动窗口证据，自动唤醒及容量准备不使用展示可用数代替。到期查询状态只根据 `pending_query` 的真实阶段、暂缓原因及持久计划时间显示，每秒时钟只更新页面，不创建任务。
+
 `GET /api/v2/traffic` 及对应 CPA 管理路径支持 `kind=users|plugin|analysis`，列表和聚合支持 `search/project/caller/account/model/status/session/from/to/page/limit`，详情使用 `id`（兼容 `request_id`）。响应含 `instance_id`、`view_revision`、`coverage`、真实统计、分页和可选详情；未报告的耗时/用量是 JSON null。筛选账号和分流原因匹配请求内任何实际执行尝试。账号、项目、调用方及会话聚合各最多 32 项，每行最多 32 个账号；`aggregation_limited` 和 `facets_limited` 指明裁剪，避免超过接入层 2 MiB 响应预算。聚合汇总保持完整保留范围口径。
 
 插件调用视图目前由持久查询运行、唤醒响应、候选生成和重置卡操作派生，不能重建旧版本没有采集的网络尝试。新唤醒在授权发送的同一事务保存规则版本、绑定/额度/活动检查结论、查询证据时间及适用的容量缺口；不将后来的额度状态冒充发送时快照。查询共享运行只展示一次，并可关联多个任务。
@@ -169,3 +173,7 @@ curl --unix-socket /absolute/private/run/daemon.sock http://localhost/healthz
 请求及尝试上限为 50000/100000，达到上限保留安全活动链路并暴露流量缺口。历史维护沿用每轮 256 条的清理事务，逻辑请求按历史保留期和终态预算清理，孤立尝试一小时后可清理；无完成证据不会因保留时间被宣称成功。当前覆盖依赖宿主相应生命周期、选号和用量事件，空清单或模拟测试不代表真实业务观测已经完整。
 
 锁顺序为 scheduler lock → event ring lock；usage/lifecycle 钩子先释放 scheduler lock 再操作 event ring，持有 event ring lock 时不回调选号器。钩子不等待后台、网络或数据库，序列化超长与环缓冲溢出继续报告 loss_epoch/gap。新增假宿主端到端测试验证决策 → 执行 → 持久请求/分析 API、摘要隐私、无真实模型调用；Go 测试覆盖重放、迟到决策、同 selection 多执行、换号恢复、未知结果和保留清理。
+
+重置卡数量现在可由绑定到具体账号的原生 `codex.rate_limits` 事件采集，白名单仅保留 `rate_limit_reset_credits.available_count` / camelCase 别名，按独立字段水位合并，不刷新窗口证据。详情取消固定轮询，只有正数数量变化、可兑换用量变化或已知到期边界才触发详情核实；分钟时间戳用于去抖和错误重试。手动数量查询复用既有 `quota_query` 队列与幂等协议，不依赖 CLI；详情缺失保持未知，自动使用仍须单独授权。
+
+重置卡默认通过 CPA 的受限 `host.http.do` 查询详情并兑换，无需 CLI。接入层只额外允许固定 GET 详情及 POST consume 地址、固定请求头，以及仅含 `credit_id` 和 `redeem_request_id` 的有界兑换正文；沿用额度查询的操作句柄、取消通道及实例绑定。默认继承 CPA 全局代理，显式账号代理/direct 或 reset-proxy 通过后台 HTTP transport 执行。明确配置 codex-binary 时保留 CLI 兼容通道；兑换回执不明不会自动切换通道或生成新的幂等标识。

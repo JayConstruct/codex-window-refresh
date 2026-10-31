@@ -110,9 +110,11 @@ def render_unit(plan, locations, binary):
     user = "" if service.get("scope") == "user" else f"User={plan['user']}\nGroup={plan['gid']}\n"
     # Quote each systemd argument; safe_path has already rejected expansion and
     # control characters. Runtime/data directories are owned by the CPA user.
+    codex = plan.get("codex_binary")
+    codex_arg = f' --codex-binary "{common.safe_path(codex)}"' if codex else ""
     content = ("[Unit]\nDescription=CPA Window Refresh v2 read-only backend\nAfter=network.target\n\n"
                "[Service]\nType=simple\n" + user +
-               f'ExecStart="{binary}" --runtime-dir "{locations["runtime"]}" --data-dir "{locations["data"]}"\n'
+               f'ExecStart="{binary}" --runtime-dir "{locations["runtime"]}" --data-dir "{locations["data"]}"{codex_arg}\n'
                "Restart=on-failure\nRestartSec=3\nTimeoutStopSec=20\nUMask=0077\n"
                "NoNewPrivileges=true\n\n[Install]\nWantedBy=default.target\n")
     return content.encode()
@@ -315,6 +317,8 @@ def wait_ready(plan, locations, version, bridge_version, timeout=30):
 def install(args, plan, arch):
     locations = paths(plan)
     previous = read_record(locations, plan)
+    if previous and not plan.get("codex_binary"):
+        plan["codex_binary"] = previous.get("codex_binary")
     if previous:
         print(f"当前后台版本：{previous['version']}；目标后台版本：{args.version}。")
     require(previous is not None or args.restart, "首次切换到 v2 必须显式 --restart，安全卸载 v1 并回收旧 Go 运行时。")
@@ -416,6 +420,7 @@ def install(args, plan, arch):
             ready = wait_ready(plan, locations, args.version, bridge_version)
             hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [binary, library, locations["unit"], locations["dropin"]]}
             record = dict(backend="v2", library=str(library), bridge_sha256=bridge_hash, bridge_version=bridge_version,
+                          codex_binary=plan.get("codex_binary"),
                           config=str(plan["config"]), uid=plan["uid"], gid=plan["gid"],
                           service=plan["service"]["name"], scope=plan["service"].get("scope", "system"),
                           cleanup_pending=[str(p) for p in cleanup], hashes=hashes, **ready)
@@ -462,7 +467,7 @@ def install(args, plan, arch):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["cpa-dir", "config", "plugin-dir", "working-dir", "user", "service", "package", "checksums", "cpa-url"]:
+    for name in ["cpa-dir", "config", "plugin-dir", "working-dir", "user", "service", "package", "checksums", "cpa-url", "codex-binary"]:
         parser.add_argument("--" + name)
     parser.add_argument("--version", default="latest")
     for name in ["restart", "user-service", "dry-run"]:
@@ -481,6 +486,7 @@ def main():
     for name, value in dict(model=None, defer_model=True, management_url=None, quota_transport="host", hot_reload=False, check_model=False).items():
         setattr(args, name, value)
     plan = common.infer(args)
+    plan["codex_binary"] = str(common.safe_path(args.codex_binary)) if args.codex_binary else None
     plan["cpa_url"] = args.cpa_url
     cpa_resource_url(plan)
     locations = paths(plan)

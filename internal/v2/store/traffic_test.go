@@ -18,6 +18,39 @@ func trafficEvent(seq uint64, kind, id string, observation events.Traffic) event
 func number(v int64) *int64 { return &v }
 func httpNumber(v int) *int { return &v }
 
+func TestResolveTrafficCallersMatchesStoredIdentityWithoutWriting(t *testing.T) {
+	s, other := openTest(t), openTest(t)
+	ctx := context.Background()
+	scope := trafficHash("cli-proxy-api:caller-scope:v1", "fixture-key")
+	if _, err := s.ApplyEvents(ctx, batch(0, trafficEvent(1, "started", "r", events.Traffic{Phase: "started", Caller: scope}))); err != nil {
+		t.Fatal(err)
+	}
+	page, err := s.Traffic(ctx, TrafficFilter{})
+	if err != nil || len(page.Records) != 1 {
+		t.Fatal(page, err)
+	}
+	var before, after int
+	if err := s.db.QueryRow("SELECT total_changes()").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	callers, err := s.ResolveTrafficCallers(ctx, []string{scope, scope})
+	if err != nil || len(callers) != 2 || callers[0] != page.Records[0].Caller || callers[1] != callers[0] {
+		t.Fatal(callers, err)
+	}
+	if err := s.db.QueryRow("SELECT total_changes()").Scan(&after); err != nil || before != after {
+		t.Fatal("lookup wrote to database", before, after, err)
+	}
+	isolated, err := other.ResolveTrafficCallers(ctx, []string{scope})
+	if err != nil || isolated[0] == callers[0] {
+		t.Fatal("caller handles must stay database scoped", isolated, err)
+	}
+	for _, scopes := range [][]string{nil, {}, {"fixture-key"}, {strings.ToUpper(scope)}, {scope[:63]}, make([]string, 65)} {
+		if _, err := s.ResolveTrafficCallers(ctx, scopes); err != ErrTrafficFilter {
+			t.Fatal("invalid scope accepted", err)
+		}
+	}
+}
+
 func TestTrafficFailoverCorrelationReplayAndPrivacy(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()

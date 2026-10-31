@@ -20,6 +20,7 @@ type quotaHTTPRequest struct {
 	Method      string      `json:"method"`
 	URL         string      `json:"url"`
 	Headers     http.Header `json:"headers"`
+	Body        []byte      `json:"body,omitempty"`
 }
 
 type quotaHTTPResponse struct {
@@ -130,7 +131,11 @@ func quotaTransportError(ctx context.Context) error {
 // hostQuotaHTTP uses an operation handle so cancelling the daemon request also
 // cancels the physical request in CPA. The hostlink layer owns handle/instance
 // association; callbacks must never replay an operation on a replacement host.
-func (c *CPA) hostQuotaHTTP(ctx context.Context, headers http.Header) (response quotaHTTPResponse, resultErr error) {
+func (c *CPA) hostQuotaHTTP(ctx context.Context, headers http.Header) (quotaHTTPResponse, error) {
+	return c.hostAccountHTTP(ctx, http.MethodGet, quotaUsageURL, headers, nil)
+}
+
+func (c *CPA) hostAccountHTTP(ctx context.Context, method, endpoint string, headers http.Header, body []byte) (response quotaHTTPResponse, resultErr error) {
 	if c.Host == nil || ctx.Err() != nil {
 		return quotaHTTPResponse{}, quotaTransportError(ctx)
 	}
@@ -201,7 +206,7 @@ func (c *CPA) hostQuotaHTTP(ctx context.Context, headers http.Header) (response 
 		case <-finished:
 		}
 	}()
-	err = call(ctx, "host.http.do", quotaHTTPRequest{operation.ID, http.MethodGet, quotaUsageURL, headers}, &response)
+	err = call(ctx, "host.http.do", quotaHTTPRequest{OperationID: operation.ID, Method: method, URL: endpoint, Headers: headers, Body: body}, &response)
 	close(finished)
 	<-joined
 	if err != nil || ctx.Err() != nil || pinned && instanceHost.Instance() != instance {
@@ -213,7 +218,7 @@ func (c *CPA) hostQuotaHTTP(ctx context.Context, headers http.Header) (response 
 		clear(response.Body)
 		return quotaHTTPResponse{}, errors.New("quota_transport_failed")
 	}
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		clear(response.Body)
 		response.Body = nil
 	}

@@ -62,6 +62,27 @@ func TestUsageResetCountIsOptionalAllowlistedAndIndependentlyOrdered(t *testing.
 	}
 }
 
+func TestPassiveResetCountsAreIndependentAndCannotRefreshWindowEvidence(t *testing.T) {
+	at := time.Now().UTC()
+	initial := normalized(t, `{"rate_limit":{"allowed":true,"primary_window":{"used_percent":20,"window_minutes":300,"reset_after_seconds":3000}}}`, "cpa_wham_usage", at, at)
+	for _, raw := range []string{`{"rate_limit_reset_credits":{"available_count":2,"credentials":"never-save"}}`, `{"rateLimitResetCredits":{"availableCount":2,"credits":[{"access_token":"never-save"}]}}`} {
+		incoming := normalized(t, raw, "cpa_websocket_quota", at.Add(time.Second), at.Add(time.Second))
+		merged, changed, err := Merge(initial, incoming)
+		var q Snapshot
+		if err != nil || !changed || json.Unmarshal(merged, &q) != nil || q.ResetCredits == nil || q.ResetCredits.AvailableCount != 2 || strings.Contains(string(merged), "never-save") {
+			t.Fatal(string(merged), err)
+		}
+		if q.Fields["five_hour"].ObservedAt != at || q.Fields["reset_credits"].Source != "cpa_websocket_quota" {
+			t.Fatal("count refreshed quota windows", q.Fields)
+		}
+	}
+	for _, raw := range []string{`{"rate_limit_reset_credits":{"available_count":-1}}`, `{"rate_limit_reset_credits":{"available_count":2,"availableCount":3}}`, `{"rate_limit_reset_credits":{"available_count":2},"rateLimitResetCredits":{"availableCount":3}}`} {
+		if _, err := Normalize([]byte(raw), nil, "binding", "cpa_websocket_quota", at, at); err == nil {
+			t.Fatal("invalid count accepted", raw)
+		}
+	}
+}
+
 func normalized(t *testing.T, raw, source string, at, start time.Time) []byte {
 	t.Helper()
 	s, e := Normalize([]byte(raw), nil, "binding", source, at, start)

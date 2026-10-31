@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {trafficFixture} from './fixtures/v2-traffic.mjs';
 import {createServer} from 'node:http';
 import {spawn} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {readFile, writeFile, mkdir, mkdtemp, rm, access} from 'node:fs/promises';
 import {tmpdir, homedir} from 'node:os';
 import {join, resolve, dirname} from 'node:path';
@@ -16,6 +17,10 @@ const schedulingOnly = process.env.CWR_SCHEDULING_ONLY === '1';
 const projectsOnly = process.env.CWR_PROJECTS_ONLY === '1';
 const quotaStatusOnly = process.env.CWR_QUOTA_STATUS_ONLY === '1';
 const authOnly = process.env.CWR_AUTH_ONLY === '1';
+const callerNamesOnly = process.env.CWR_CALLER_NAMES_ONLY === '1';
+const callerKey = 'fixture-client-caller-key', hash = value => createHash('sha256').update(value).digest('hex');
+const callerScope = hash('cli-proxy-api:caller-scope:v1\0' + callerKey), callerID = 'caller-' + hash('fixture-db-salt\0caller\0' + callerScope);
+const callerLookups = [];
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], patches = [], reads = [], exceptions = [], pageErrors = [];
@@ -29,6 +34,7 @@ let modelRevision = 0, modelConflictOnce = false;
 let schedulingRevision = 0;
 let observedProjects = [];
 let resetCardsFixture = null;
+let quotaAvailableFixture;
 let schedulingConfig = {enabled:false,prefer_reset:true,quota_max_age_seconds:300,session_ttl_seconds:1800,max_inflight:2,projects:[],cards:{enabled:false,auto_consume:false,poll_seconds:900,expiry_seconds:86400,force_before_seconds:1800,min_used_percent:80}};
 let modelConfig = {default_model: '', default_prompt: '你好，请用一句简短的中文问候回复。', five_hour_model: '', five_hour_prompt: '', weekly_model: '', weekly_prompt: '', generation_prompt: '生成简短、自然、适合日常问候的中文短句，避免重复。', prompt_mode: 'fixed', phrases: []};
 const generations = new Map();
@@ -182,6 +188,11 @@ try {
           'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'"});
         response.end(await readFile(name === 'panel.js' && process.env.CWR_FIXTURE_PANEL_JS || join(root, 'internal/v2/daemon/web', filenames[name]))); return;
       }
+      if (callerNamesOnly && url.pathname === '/cpa/v0/management/api-keys') {
+        assert.equal(request.headers.authorization, 'Bearer ' + fixtureKey);
+        assert.equal(request.method, 'GET'); reads.push(url.pathname);
+        json(response, 200, {'api-keys': [callerKey]}); return;
+      }
       if (url.pathname === '/cpa/v0/management/auth-files/status') {
         if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
         assert.equal(request.method, 'PATCH', 'Auth status must never upload or overwrite credentials');
@@ -222,7 +233,17 @@ try {
       if (!url.pathname.startsWith(api)) { response.writeHead(404); response.end(); return; }
       if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
       const resource = url.pathname.slice(api.length);
-      if (resource === 'traffic' && request.method === 'GET') { json(response, 200, trafficFixture(url, identity)); return; }
+      if (resource === 'traffic' && request.method === 'GET') {
+        if (callerNamesOnly && url.searchParams.get('caller') === callerID) url.searchParams.set('caller', '调用方 A');
+        const traffic = trafficFixture(url, identity);
+        json(response, 200, callerNamesOnly ? JSON.parse(JSON.stringify(traffic).replaceAll('"调用方 A"', JSON.stringify(callerID))) : traffic); return;
+      }
+      if (callerNamesOnly && resource === 'traffic-callers') {
+        assert.equal(request.method, 'POST'); assert.equal(url.search, '');
+        let body = ''; for await (const chunk of request) body += chunk;
+        assert.deepEqual(JSON.parse(body), {scopes: [callerScope]}); callerLookups.push(body);
+        json(response, 200, {...identity(), callers: [callerID]}); return;
+      }
       if (request.method === 'POST') {
         let body = ''; for await (const chunk of request) body += chunk;
         posts.push({resource, body, headers: request.headers});
@@ -297,6 +318,10 @@ try {
           else if (account.id === data.account_id) delete account.pending_query;
         }
         jobs.set(id, job); revision++;
+        if (quotaStatusOnly && resetCardsFixture && data.account_id) {
+          const account=resetCardsFixture.accounts.find(account=>account.account_id===data.account_id);
+          if(account){account.credits={availableCount:2,credits:null};account.summary_observed_at=observed();account.summary_source='cpa_wham_usage';}
+        }
         json(response, 202, {job_id: id, instance_id: 'local-browser-fixture'}); return;
       }
       reads.push(request.url);
@@ -341,7 +366,7 @@ try {
       if (resource === 'overview') {
         json(response, 200, {...identity(), version: '0.2.0-rc.27', schema_version:12, query_timeout_seconds:15, retention:{history_seconds:604800,terminal_jobs:10000}, accounts_revision: accountsRevision, query_settings: {revision: settingsRevision, config: queryConfig}, read_only: true, query_concurrency: 8,
           capabilities: {quota_query: true, passive_quota: true, model_execution: wakeCapable, wake_settings: wakeCapable, automatic_wake: wakeCapable, inventory_sync: true, query_settings: true, automatic_quota_query: true, randomized_quota_query: true, model_settings: true, prompt_generation: true, generation_accounts: true, prompt_generation_providers: ['codex', 'antigravity'], editable_generation_prompt: true}, activity: {connected: true},
-          inventory: {status: 'ready', last_success_at: overviewObservedAt}, dashboard: {total: process.env.CWR_DESIGN_REVIEW==='1'?18:24, enabled:process.env.CWR_DESIGN_REVIEW==='1'?16:22, available: process.env.CWR_DESIGN_REVIEW==='1'?16:20, disabled: 2, unavailable: 2, capacity: process.env.CWR_DESIGN_REVIEW==='1'?12:16, unknown_quota: 4, unknown_enabled:process.env.CWR_DESIGN_REVIEW==='1'?1:2,quota_exhausted:process.env.CWR_DESIGN_REVIEW==='1'?3:2,five_hour_exhausted:process.env.CWR_DESIGN_REVIEW==='1'?2:1,weekly_exhausted:1,errors: 2,
+          inventory: {status: 'ready', last_success_at: overviewObservedAt}, dashboard: {total: process.env.CWR_DESIGN_REVIEW==='1'?18:24, enabled:process.env.CWR_DESIGN_REVIEW==='1'?16:22, available: process.env.CWR_DESIGN_REVIEW==='1'?16:20, disabled: 2, unavailable: 2, capacity: process.env.CWR_DESIGN_REVIEW==='1'?12:16, quota_available:quotaAvailableFixture, unknown_quota: 4, unknown_enabled:process.env.CWR_DESIGN_REVIEW==='1'?1:2,quota_exhausted:process.env.CWR_DESIGN_REVIEW==='1'?3:2,five_hour_exhausted:process.env.CWR_DESIGN_REVIEW==='1'?2:1,weekly_exhausted:1,errors: 2,
             tasks: {active: process.env.CWR_DESIGN_REVIEW==='1'?2:3, querying: 2}, recent_jobs: fixtureJobs, active_jobs: fixtureJobs,
             recent_events: [{kind: 'quota_query', at: overviewObservedAt, account_id: 'codex-07', phase: 'running'}, {kind: 'quota_query', at: overviewObservedAt, account_id: '', phase: 'queued'}, {kind: 'inventory', at: overviewObservedAt, phase: 'ready'}]}}); return;
       }
@@ -472,12 +497,13 @@ try {
       await waitFor(() => readCountFor('accounts') > before, 'Quota status refresh did not read account observations'); await settleRefresh();
     };
     accounts[0].quota.weekly.State = 'unknown'; accounts[0].quota.weekly.Remaining.Value = 100;
+    quotaAvailableFixture = 19;
     accounts[1].observed_at = old; accounts[1].quota.observed_at = old;
     delete accounts[2].quota.weekly;
     await reload();
     let rows = await readRows();
-    assert.equal(rows[0].status, '窗口待核实'); assert.match(rows[0].quota, /100%/); assert.doesNotMatch(rows[0].updated, /待更新/);
-    assert.equal(rows[1].status, '正常'); assert.match(rows[1].updated, /^10 分钟前$/);
+    assert.equal(rows[0].status, '可用'); assert.match(rows[0].quota, /100%/); assert.doesNotMatch(rows[0].updated, /待更新/);
+    assert.equal(rows[1].status, '可用'); assert.match(rows[1].updated, /^10 分钟前$/);
     assert.equal(rows[2].status, '额度数据不完整');
     await evaluate(`document.querySelector('.account-identity').click()`); await settleRefresh();
     assert.match(await evaluate(`document.querySelector('#account-detail .quota-status-explanation').textContent`), /窗口是否已启动尚未确认/);
@@ -491,14 +517,38 @@ try {
     accounts.splice(0, accounts.length, ...structuredClone(original));
     for (const account of accounts) { account.observed_at = old; if(account.quota) account.quota.observed_at = old; }
     await reload(); rows = await readRows();
-    assert.equal(rows.slice(0,4).every(row=>row.status==='正常'&&/^10 分钟前$/.test(row.updated)), true, 'Old observations should retain normal accounts and only display relative update time');
+    assert.equal(rows.slice(0,4).every(row=>row.status==='可用'&&/^10 分钟前$/.test(row.updated)), true, 'Old observations should retain available balances and only display relative update time');
     assert.equal(rows[4].status, '已禁用'); assert.equal(rows[5].status, '暂不可用');
     await screenshot('quota-stale-observations-desktop.png');
     accounts.splice(0, accounts.length, ...structuredClone(original)); await reload();
     assert.match((await readRows())[0].updated, /^刚刚$/);
-    assert.equal(posts.length, 0); assert.equal(patches.length, 0);
+    assert.equal(await evaluate('document.getElementById("capacity-available").textContent'), '19');
+    accounts[0].quota.five_hour.Remaining.Value = 0;
+    accounts[0].quota.five_hour.ResetAt = later(-1);
+    accounts[0].pending_query = {phase:'queued',trigger:'five_hour_expiry',scheduled_at:later(6)};
+    await reload();
+    const countdown = (await readRows())[0].status;
+    assert.match(countdown, /^\d+ 秒后查询$/);
+    await waitFor(async()=>{const next=(await readRows())[0].status;return next!==countdown&&/^\d+ 秒后查询$/.test(next)}, 'Query countdown did not tick independently');
+    await waitFor(async()=>(await readRows())[0].status==='等待查询', 'Expired countdown did not wait for actual execution');
+    assert.equal(accounts[0].quota.five_hour.Remaining.Value, 0, 'Countdown invented recovered quota');
+    await screenshot('quota-reset-query-waiting.png');
+    resetCardsFixture = {accounts:[{account_id:'codex-01',credits:null}],attempts:[],runtime:{available:false,error_code:'reset_codex_unavailable'}};
+    await evaluate('document.querySelector("[data-page=cards]").click()');
+    await waitFor(()=>evaluate('document.getElementById("reset-runtime-message").textContent.includes("无需 Codex CLI")'), 'Manual quantity lookup unnecessarily required CLI');
+    assert.equal(await evaluate('document.getElementById("cards-poll")===null'),true,'Periodic reset-card polling control survived');
+    await evaluate('document.querySelector("[data-reset-query-account=codex-01]").click()');
+    await waitFor(()=>evaluate('document.getElementById("reset-cards-list").textContent.includes("2 张")&&document.getElementById("reset-cards-list").textContent.includes("主动查询")'),'Manual CPA count lookup did not update the card record');
+    await screenshot('reset-runtime-help-desktop.png');
+    await cdp('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+    assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'), true, 'Reset CLI help overflowed on mobile');
+    await screenshot('reset-runtime-help-mobile.png');
+    assert.equal(posts.length, 1); assert.equal(posts[0].resource,'jobs');
+    assert.deepEqual(JSON.parse(posts[0].body),{kind:'quota_query',account_id:'codex-01'});
+    assert.equal(schedulingConfig.cards.enabled,false); assert.equal(schedulingConfig.cards.auto_consume,false);
+    assert.equal(patches.length, 0);
     assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
-    console.log('Quota status Chromium checks passed: fresh 100% placeholders, incomplete observations, account health separated from five-minute capacity freshness, detail explanations, refresh recovery, desktop/mobile overflow and zero writes. Screenshots: '+output);
+    console.log('Quota/card Chromium checks passed: available balances, countdown, manual CPA card count without CLI, source/time, no periodic card query control, desktop/mobile layout, one explicit quota query and no redemption/model calls. Screenshots: '+output);
   }
   async function runSchedulingChecks() {
     const writeCount = posts.length, patchCount = patches.length;
@@ -876,6 +926,54 @@ try {
   await waitFor(() => evaluate('document.getElementById("login-section")?.hidden && document.getElementById("accounts")?.rows.length === 6'), 'Dashboard did not auto-connect');
   await evaluate('document.fonts.ready.then(() => true)');
   checks: {
+  if (callerNamesOnly) {
+    const storageKey = 'api-key-names:v1:' + origin + '/cpa';
+    const fingerprint = hash(JSON.stringify(['api-key-name', origin + '/cpa', callerKey]));
+    const label = '办公室 / <img src=x onerror=alert(1)>';
+    async function saveCallerName(name) {
+      await evaluate(`(() => {
+        const storageKey=${JSON.stringify(storageKey)};
+        if (${JSON.stringify(name)} === null) localStorage.removeItem(storageKey);
+        else {
+          const bytes=new TextEncoder().encode(JSON.stringify({[${JSON.stringify(fingerprint)}]:${JSON.stringify(name)}}));
+          const mask=new TextEncoder().encode('cli-proxy-api-webui::secure-storage|'+location.host+'|'+navigator.userAgent);
+          for(let i=0;i<bytes.length;i++)bytes[i]^=mask[i%mask.length];
+          localStorage.setItem(storageKey,'enc::v1::'+btoa(Array.from(bytes,b=>String.fromCharCode(b)).join('')));
+        }
+        dispatchEvent(new StorageEvent('storage',{key:storageKey}));
+      })()`);
+    }
+    await saveCallerName(label);
+    const saved = await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`);
+    await evaluate(`document.querySelector('[data-page=history]').click();document.querySelector('[data-record-page=users]').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes(${JSON.stringify(label)})`), 'CPA name did not reach request details');
+    assert.equal(await evaluate(`document.querySelector('.rr-table tbody').textContent.includes(${JSON.stringify(label)})`), true);
+    assert.equal(await evaluate(`document.querySelector('#rr-facet-caller option[value="${callerID}"]')?.textContent`), label);
+    assert.equal(await evaluate(`document.querySelectorAll('.runtime-records img').length`), 0, 'Local label was interpreted as HTML');
+    await evaluate(`document.querySelector('[data-record-page=analysis]').click()`);
+    await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.rr-segment-button')).some(button=>button.textContent==='调用方'&&!button.disabled)`), 'Caller matrix did not load');
+    await evaluate(`Array.from(document.querySelectorAll('.rr-segment-button')).find(button=>button.textContent==='调用方').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-matrix-table')?.textContent.includes(${JSON.stringify(label)})`), 'CPA name did not reach caller analysis');
+    await evaluate(`Array.from(document.querySelectorAll('.rr-matrix-table tbody tr')).find(row=>row.querySelector('th')?.textContent===${JSON.stringify(label)}).querySelector('.rr-matrix-value').click()`);
+    await waitFor(() => evaluate(`document.querySelector('[aria-label="调用方筛选"]').value===${JSON.stringify(label)}&&!!document.querySelector('.rr-table tbody tr')`), 'Caller drilldown lost the display name');
+    await waitFor(() => networkRequests.some(request => new URL(request.url).searchParams.get('caller') === callerID), 'Caller drilldown lost the original identity');
+    assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`), saved, 'Name display modified CPA storage');
+    for (const width of [1586, 390]) {
+      await cdp('Emulation.setDeviceMetricsOverride', {width, height: width === 390 ? 844 : 992, deviceScaleFactor: 1, mobile: width === 390});
+      assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'), true, 'Caller label overflowed the page');
+      await screenshot('caller-names-' + width + '.png');
+    }
+    await saveCallerName('笔记本');
+    await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes('笔记本')`), 'Name edit did not refresh');
+    const lookups = callerLookups.length;
+    await saveCallerName(null);
+    await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes(${JSON.stringify('调用方 ' + callerID.slice(7, 15))})`), 'Deleted name did not restore caller digest');
+    assert.equal(callerLookups.length, lookups, 'Deleting names fetched client keys again');
+    assert.equal(posts.length, 0); assert.equal(patches.length, 0);
+    assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
+    console.log('Caller names Chromium checks passed: CPA obfuscated local names, HTTP, detail/list/facets/matrix, exact drilldown identity, text-only labels, desktop/mobile layout, edits/deletion and no persisted names or upstream tasks.');
+    break checks;
+  }
   if (authOnly) {
     const storageKey = 'cwr-v2-auth:' + origin + '/cpa';
     const hostAuth = await evaluate('localStorage.getItem("cli-proxy-auth")');
@@ -2098,7 +2196,7 @@ try {
   if (server) await new Promise(resolve => server.close(resolve));
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
-if (!authOnly && !autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaStatusOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
+if (!callerNamesOnly && !authOnly && !autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaStatusOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
   console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
@@ -2113,5 +2211,8 @@ if (!authOnly && !autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaS
   const authChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTH_ONLY:'1', CWR_SCREENSHOT_DIR:join(output,'auto-login')}, stdio:'inherit'});
   const authResult = await new Promise((resolve,reject)=>{authChild.once('error',reject);authChild.once('exit',(code,signal)=>resolve({code,signal}));});
   assert.equal(authResult.code,0,'Isolated auto-login Chromium fixture failed: '+JSON.stringify(authResult));
-  console.log('V2 full, automatic-refresh, project-matching, quota status and auto-login Chromium fixtures all passed.');
+  const callerChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_CALLER_NAMES_ONLY:'1', CWR_SCREENSHOT_DIR:join(output,'caller-names')}, stdio:'inherit'});
+  const callerResult = await new Promise((resolve,reject)=>{callerChild.once('error',reject);callerChild.once('exit',(code,signal)=>resolve({code,signal}));});
+  assert.equal(callerResult.code,0,'Isolated caller names Chromium fixture failed: '+JSON.stringify(callerResult));
+  console.log('V2 full, automatic-refresh, project-matching, quota status, auto-login and caller names Chromium fixtures all passed.');
 }

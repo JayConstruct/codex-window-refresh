@@ -23,7 +23,7 @@ func (s *Store) AccountPageSorted(ctx context.Context, after string, limit int, 
 	return s.accountEvidencePage(ctx, after, limit, expected, search, status, order)
 }
 
-// Evidence filters share quotaState with the capacity metric. Filtering runs
+// Evidence filters share quotaAvailable with the display availability metric. Filtering runs
 // within the same read transaction as the revision and pagination counters.
 func (s *Store) accountEvidencePage(ctx context.Context, after string, limit int, expected *uint64, search, status string, orders ...string) (AccountPage, error) {
 	page := AccountPage{Accounts: []Account{}}
@@ -63,9 +63,10 @@ func (s *Store) accountEvidencePage(ctx context.Context, after string, limit int
 		if !strings.Contains(strings.ToLower(account.ID), needle) {
 			continue
 		}
-		known, usable := quotaState([]byte(raw), at)
+		usable := quotaAvailable([]byte(raw), at)
 		match := status == "usable" && account.Status == "available" && usable
 		if status == "quota_unknown" {
+			known, _ := quotaState([]byte(raw), at)
 			match = account.Status != "disabled" && account.DisplayStatus != "quota_exhausted" && account.DisplayStatus != "quota_restricted" && (!known || account.Status != "available")
 		}
 		if status == "" || status == "all" || status == "available" && account.DisplayStatus == "available" || status == "disabled" && account.Status == "disabled" || status == "unavailable" && account.Status != "available" && account.Status != "disabled" || status == "attention" && account.DisplayStatus != "available" && account.DisplayStatus != "disabled" || status == "quota_exhausted" && account.DisplayStatus == status || status == "quota_restricted" && account.DisplayStatus == status {

@@ -473,21 +473,38 @@ static int decode_base64(Slice value,char *out,size_t cap,size_t *size) {
     *size=j;
     return 1;
 }
+static J *quota_reset_count(Slice object) {
+    const char *names[]={"available_count","availableCount"};
+    Slice values[2]={{0}};
+    if(!select_fields(object,names,values,2))return NULL;
+    int64_t count=-1;
+    for(size_t i=0;i<2;i++)if(values[i].data) {
+        J *value=decode(values[i]);
+        if(!value||json_object_get_type(value)!=3){json_object_put(value);return NULL;}
+        int64_t n=json_object_get_int64(value);json_object_put(value);
+        if(n<0||n>100000||(count>=0&&count!=n))return NULL;
+        count=n;
+    }
+    if(count<0)return NULL;
+    J *result=json_object_new_object();
+    json_object_object_add(result,"available_count",json_object_new_int64(count));
+    return result;
+}
 static J *websocket_quota(Slice payload,const char*event_type,int *is_headers) {
     char decoded[12288];
     size_t n=0;
     if(!decode_base64(payload,decoded,sizeof(decoded),&n))return NULL;
     const char*names[]= {
-        "type","headers","rate_limit","rate_limits","rateLimit"
+        "type","headers","rate_limit","rate_limits","rateLimit","rate_limit_reset_credits","rateLimitResetCredits"
     };
-    Slice values[5]= {
+    Slice values[7]= {
         {
             0
         }
     };
     if(!select_fields((Slice) {
         decoded,n
-    },names,values,5))return NULL;
+    },names,values,7))return NULL;
     J*t=decode(values[0]);
     const char*type=text(t);
     if(!type||(event_type&&event_type[0]&&strcmp(type,event_type))) {
@@ -502,8 +519,8 @@ static J *websocket_quota(Slice payload,const char*event_type,int *is_headers) {
     else if(!strcmp(type,"codex.rate_limits")) {
         result=json_object_new_object();
         int fields=0;
-        for(size_t i=2;i<5;i++)if(values[i].data) {
-            J*rate=quota_rate(values[i]);
+        for(size_t i=2;i<7;i++)if(values[i].data) {
+            J*rate=i<5?quota_rate(values[i]):quota_reset_count(values[i]);
             if(!rate) {
                 json_object_put(result);
                 result=NULL;
@@ -553,12 +570,12 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
     int before=!strcmp(method,"request.intercept_before"),selection=!strcmp(method,"request.intercept_after"),completion=!strcmp(method,"request.complete");
     int lifecycle=before||selection||completion,stream=!strcmp(method,"response.intercept_stream_chunk"),ws=!strcmp(method,"websocket.response_event");
     const char*root_names[]= {
-        "RequestID","Metadata","ResponseHeaders","ChunkIndex","Provider","AuthID","EventType","Payload","Outcome","StatusCode","TraceID","Model","StartedAt","CompletedAt"
+        "RequestID","Metadata","ResponseHeaders","ChunkIndex","Provider","AuthID","EventType","Payload","Outcome","StatusCode","TraceID","Model","StartedAt","CompletedAt","CallerScope"
     };
     const char*meta_names[]= {
         "caller_scope","selected_auth_id","source","generate","selection_id","canonical_session_id","parent_session_id"
     };
-    Slice root[14]= {
+    Slice root[15]= {
         {
             0
         }
@@ -569,7 +586,7 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
     };
     if(!payload||!size||!select_fields((Slice) {
         payload,size
-    },root_names,root,14)) {
+    },root_names,root,15)) {
         if(lifecycle)lost();
         return;
     }
@@ -586,6 +603,12 @@ void cwr_observe_hook(const char *method,const void *payload,size_t size) {
         return;
     }
     J*id=decode(root[0]),*identity=decode(meta[0]),*account=decode(meta[1]),*source=decode(meta[2]),*generate=decode(meta[3]);
+    // CallerScope is a dedicated CPA field; metadata is only a best effort
+    // mirror. Keep compatibility with hosts that supply either representation.
+    if(!text(identity)) {
+        json_object_put(identity);
+        identity=decode(root[14]);
+    }
     const char*request=text(id),*who=text(identity),*selected=text(account),*origin=text(source);
     int excluded=(origin&&!strcmp(origin,"plugin_host_model_callback"))||(generate&&json_object_get_type(generate)==1&&!json_object_get_int(generate));
     if(!request) {

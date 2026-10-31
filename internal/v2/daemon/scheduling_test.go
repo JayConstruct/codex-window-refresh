@@ -67,6 +67,14 @@ func TestResetLostResponseRecoversSameAttemptAndVerifiesWithoutModelExecution(t 
 	if err = st.SyncInventory(ctx, []store.Account{a}); err != nil {
 		t.Fatal(err)
 	}
+	seed, _ := source.Query(ctx, a)
+	var observed quota.Snapshot
+	_ = json.Unmarshal(seed, &observed)
+	observed.ResetCredits = &policy.ResetCredits{AvailableCount: 1}
+	seed, _ = json.Marshal(observed)
+	if err = st.SaveResetQuota(ctx, a, seed); err != nil {
+		t.Fatal(err)
+	}
 	config := policy.DefaultScheduling()
 	config.Cards.Enabled = true
 	config.Cards.AutoConsume = true

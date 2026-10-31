@@ -4,12 +4,67 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {createHash} = require('node:crypto');
 const CWRPresentation = require('../../../internal/v2/daemon/web/presentation.js');
 const {ViewTracker, apiBase, readPanelKey, readLogin, age, resetText, windowView, accountStatus, requestID, validateQueryDraft, configDraft, queueText} = require('../../../internal/v2/daemon/web/panel.js');
 const script = fs.readFileSync(path.resolve(__dirname, '../../../internal/v2/daemon/web/panel.js'), 'utf8');
 const view = (instance = 'a', revision = 1) => ({instance_id: instance, view_revision: revision});
 const origin = 'http://127.0.0.1:8317';
+const {callerDigest, readCallerNames, resolveCallerNames} = require('../../../internal/v2/daemon/web/panel.js');
 const location = {origin, host: '127.0.0.1:8317', pathname: '/v0/resource/plugins/codex-window-refresh/status'};
+const digest = value => createHash('sha256').update(value).digest('hex');
+const nameFingerprint = (address, key) => digest(JSON.stringify(['api-key-name', address, key]));
+
+test('caller digests match SHA-256 across UTF-8 and block boundaries on plain HTTP', () => {
+  for (const value of ['', 'abc', '客户端😀', ...[55, 56, 63, 64, 65, 4096].map(length => 'x'.repeat(length))]) assert.equal(callerDigest(value), digest(value));
+});
+
+test('CPA local names map to recorded callers using only host digests in plugin requests', async () => {
+  const address = origin + '/cpa', key = 'fixture-client-key', caller = 'caller-' + 'c'.repeat(64);
+  const name = '<script>办公室 / 测试</script>', storageKey = 'api-key-names:v1:' + address;
+  const storage = {[storageKey]: JSON.stringify({[nameFingerprint(address, key)]: name})};
+  const context = {location: {...location, pathname: '/cpa' + location.pathname}, localStorage: {getItem: name => storage[name] ?? null}};
+  const before = JSON.stringify(storage), calls = [];
+  const labels = await resolveCallerNames(context, '/cpa/v0/management/codex-window-refresh/v2', async (path, options, management) => {
+    calls.push({path, options, management});
+    if (management) return {'api-keys': [key, 'unnamed-key']};
+    assert.deepEqual(JSON.parse(options.body), {scopes: [digest('cli-proxy-api:caller-scope:v1\0' + key)]});
+    assert.equal(options.body.includes(key), false); assert.equal(options.body.includes(name), false);
+    return {callers: [caller]};
+  });
+  assert.equal(labels[caller], name); assert.equal(Object.keys(labels).length, 1);
+  assert.deepEqual(calls.map(call => call.path), ['/api-keys', '/traffic-callers']);
+  assert.equal(JSON.stringify(storage), before);
+  assert.deepEqual(readCallerNames(context, '/v0/management/codex-window-refresh/v2'), {});
+});
+
+test('CPA obfuscated names decode locally and missing or blocked storage requires no Key read', async () => {
+  const key = 'fixture-client-key', names = {[nameFingerprint(origin, key)]: '我的电脑'};
+  const bytes = new TextEncoder().encode(JSON.stringify(names));
+  const mask = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + location.host + '|fixture');
+  for (let i = 0; i < bytes.length; i++) bytes[i] ^= mask[i % mask.length];
+  const context = {location, navigator: {userAgent: 'fixture'}, TextEncoder, TextDecoder, atob, localStorage: {getItem: () => 'enc::v1::' + Buffer.from(bytes).toString('base64')}};
+  assert.deepEqual(readCallerNames(context, '/v0/management/codex-window-refresh/v2'), names);
+  for (const getItem of [() => null, () => 'broken json', () => { throw new Error('denied'); }]) {
+    context.localStorage.getItem = getItem;
+    const labels = await resolveCallerNames(context, '/v0/management/codex-window-refresh/v2', () => assert.fail('unnecessary Key read'));
+    assert.equal(Object.keys(labels).length, 0);
+  }
+});
+
+test('caller identity lookup batches digests and rejects malformed mappings', async () => {
+  const keys = Array.from({length: 65}, (_, i) => 'client-' + i);
+  const names = Object.fromEntries(keys.map(key => [nameFingerprint(origin, key), key.replace('client-', '名称 ')]));
+  const context = {location, localStorage: {getItem: () => JSON.stringify(names)}};
+  const batches = [];
+  const labels = await resolveCallerNames(context, '/v0/management/codex-window-refresh/v2', async (path, options, management) => {
+    if (management) return {'api-keys': keys};
+    const scopes = JSON.parse(options.body).scopes; batches.push(scopes.length);
+    return {callers: scopes.map(scope => 'caller-' + scope)};
+  });
+  assert.deepEqual(batches, [64, 1]); assert.equal(Object.keys(labels).length, 65);
+  await assert.rejects(resolveCallerNames(context, '/v0/management/codex-window-refresh/v2', async (path, options, management) => management ? {'api-keys': keys} : {callers: ['invalid']}), /invalid_caller_response/);
+});
 const overview = (revision = 1) => ({...view('a', revision), read_only: true, accounts_revision: revision, query_concurrency: 8,
   inventory: {status: 'ready', last_success_at: new Date().toISOString()}, capabilities: {quota_query: true, passive_quota: true},
   dashboard: {total: 24, available: 20, disabled: 2, unavailable: 2, capacity: 16, unknown_quota: 4, errors: 2, recent_jobs: [], recent_events: []}});
@@ -241,7 +296,7 @@ function panel(respond, options = {}) {
         if (selector === '[data-action="batch"]') return [get('header-query')];
         const nodes = [...new Set([...elements.values()].flatMap(walk))];
         if (selector.startsWith('.')) return nodes.filter(node => node.className === selector.slice(1));
-        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase', '[data-wake-account]': 'wakeAccount', '[data-account-status-id]': 'accountStatusId', '[data-account-alias-id]': 'accountAliasId', '[data-history-status]': 'historyStatus', '[data-history-count]': 'historyCount'}[selector];
+        const attribute = {'[data-reset-at]': 'resetAt', '[data-observed-at]': 'observedAt', '[data-queue-phase]': 'queuePhase', '[data-wake-account]': 'wakeAccount', '[data-account-status-id]': 'accountStatusId', '[data-account-alias-id]': 'accountAliasId', '[data-account-state-id]': 'accountStateId', '[data-reset-query-account]': 'resetQueryAccount', '[data-history-status]': 'historyStatus', '[data-history-count]': 'historyCount'}[selector];
         return attribute ? nodes.filter(node => Object.hasOwn(node.dataset, attribute)) : [];
       }},
     location: options.location || location, navigator: {userAgent: 'fixture', ...options.navigator}, isSecureContext: options.secure || false,
@@ -257,7 +312,7 @@ function panel(respond, options = {}) {
     },
     AbortController, URL, URLSearchParams, TextEncoder, TextDecoder, Uint8Array, atob, btoa,
     crypto: options.crypto || {randomUUID: () => 'fixture-idempotency-key'},
-    addEventListener: (name, callback) => events.set(name, callback),
+    addEventListener: (name, callback) => { const previous = events.get(name); events.set(name, previous ? event => { previous(event); callback(event); } : callback); },
     setTimeout: (fn, delay) => { timers.set(++nextTimer, {fn, delay}); return nextTimer; }, clearTimeout: id => timers.delete(id),
   });
   vm.runInContext(script, context);
@@ -3874,6 +3929,47 @@ function recordedCallbacks() {
   }}};
 }
 
+test('caller names update from CPA storage and deletion restores the anonymous label', async () => {
+  const key = 'local-client-key', caller = 'caller-' + 'a'.repeat(64), fingerprint = nameFingerprint(origin, key);
+  const storageKey = 'api-key-names:v1:' + origin, storage = {[storageKey]: JSON.stringify({[fingerprint]: '办公电脑'})};
+  let display, updates = 0;
+  const records = {callerLabel: () => '调用方 aaaaaaaa', mount(options) {
+    display = options.displayCaller;
+    return {show() {}, refresh() {}, disconnect() {}, setContext(value) { if (value.displayCaller) { display = value.displayCaller; updates++; } }};
+  }};
+  const ui = panel((url, options) => url.endsWith('/api-keys') ? [200, {'api-keys': [key]}] : url.endsWith('/traffic-callers') ? [200, {callers: [caller]}] : basic(url), {storage, records});
+  await ui.get('connect').onclick(); await flush();
+  assert.equal(display(caller), '办公电脑');
+  storage[storageKey] = JSON.stringify({[fingerprint]: '笔记本'});
+  ui.events.get('storage')({key: storageKey}); await flush();
+  assert.equal(display(caller), '笔记本');
+  const lookups = ui.calls.filter(call => call.url.endsWith('/traffic-callers')).length;
+  delete storage[storageKey]; ui.events.get('storage')({key: storageKey}); await flush();
+  assert.equal(display(caller), '调用方 aaaaaaaa');
+  assert.equal(ui.calls.filter(call => call.url.endsWith('/traffic-callers')).length, lookups);
+  assert.ok(updates >= 3);
+  assert.equal(JSON.stringify(storage).includes(key), false);
+});
+
+test('caller lookup failure and a late disconnected lookup keep anonymous caller labels', async () => {
+  const clientKey = 'caller-key', caller = 'caller-' + 'b'.repeat(64), storageKey = 'api-key-names:v1:' + origin;
+  for (const failure of [true, false]) {
+    let display, release;
+    const records = {callerLabel: () => '调用方 bbbbbbbb', mount(options) {
+      display = options.displayCaller;
+      return {show() {}, refresh() {}, disconnect() {}, setContext() {}};
+    }};
+    const ui = panel(url => {
+      if (url.endsWith('/api-keys')) return [200, {'api-keys': [clientKey]}];
+      if (url.endsWith('/traffic-callers')) return failure ? [404, {error: 'not_found'}] : new Promise(resolve => { release = () => resolve([200, {callers: [caller]}]); });
+      return basic(url);
+    }, {records, storage: {[storageKey]: JSON.stringify({[nameFingerprint(origin, clientKey)]: '私有备注'})}});
+    await ui.get('connect').onclick(); await flush();
+    if (!failure) { ui.get('disconnect').onclick(); release(); await flush(); }
+    assert.equal(display(caller), '调用方 bbbbbbbb');
+  }
+});
+
 test('a slower task open cannot replace a newer task of another type', async () => {
   for (const olderKind of ['query', 'wake']) {
     const {callbacks, records} = recordedCallbacks(); let release;
@@ -3926,8 +4022,9 @@ test('project search filters labels and identifiers without dropping hidden proj
   ui.get('routing-project-search').value = 'PROJECT-TWO'; ui.get('routing-project-search').oninput();
   assert.match(ui.get('routing-project-list').textContent, /代码审查/); assert.doesNotMatch(ui.get('routing-project-list').textContent, /商城后台/);
   assert.equal(ui.get('routing-projects').value, original); assert.equal(mutations(ui).length, 0);
-  editScheduling(ui, 'cards-poll', '1200'); await submitScheduling(ui);
-  assert.deepEqual(config.projects, projects); assert.equal(config.cards.poll_seconds, 1200);
+  editScheduling(ui, 'cards-expiry', '120000'); await submitScheduling(ui);
+  assert.deepEqual(config.projects, projects); assert.equal(config.cards.expiry_seconds, 120000);
+  assert.equal(config.cards.poll_seconds, 900, 'Legacy field must survive without controlling periodic reads');
 });
 
 test('account details include completed tasks in the exact account scope and reject a prior account response', async () => {
@@ -4035,12 +4132,59 @@ function observedQuotaAccount(id, at, five = 64, weekly = 100) {
 }
 function quotaOverview(revision, capacity, total = 2) {
   const data = overview(revision);
-  data.dashboard = {...data.dashboard, total, enabled: total, available: total, disabled: 0, unavailable: 0, capacity,
+  data.dashboard = {...data.dashboard, total, enabled: total, available: total, disabled: 0, unavailable: 0, capacity, quota_available: total,
     quota_exhausted: 0, unknown_enabled: total - capacity, unknown_quota: total - capacity, errors: 0};
   return data;
 }
 const quotaUpdateTime = row => descendants(row.children[5]).find(node => node.className === 'observed-age');
 const quotaPercentages = row => descendants(row).filter(node => node.className === 'quota-percent').map(node => node.textContent);
+
+test('reset query badge counts down each second locally and stops its timer on disconnect', async () => {
+  const at = Date.now(), account = observedQuotaAccount('waiting-reset', at - 10000, 0, 75);
+  account.quota.five_hour.ResetAt = new Date(at - 1000).toISOString();
+  account.pending_query = {phase:'queued',trigger:'five_hour_expiry',scheduled_at:new Date(at+3000).toISOString()};
+  const ui = panel(url => url.endsWith('/overview') ? [200, {...quotaOverview(1, 0, 1),dashboard:{...quotaOverview(1,0,1).dashboard,quota_available:0}}] : url.includes('/task-history?') ? [200, historyPage()] : [200, accountPage(1, [account])], {presentation:CWRPresentation});
+  let current = at;
+  ui.clock.Date = class extends Date { static now() { return current; } };
+  await ui.get('connect').onclick();
+  assert.equal(ui.get('accounts').children[0].children[4].textContent, '3 秒后查询');
+  const reads = ui.calls.length;
+  current += 1000; await ui.tick(1000);
+  assert.equal(ui.get('accounts').children[0].children[4].textContent, '2 秒后查询');
+  current += 2000; await ui.tick(1000);
+  assert.equal(ui.get('accounts').children[0].children[4].textContent, '等待查询');
+  assert.equal(ui.calls.length, reads, 'Countdown dispatched a network request');
+  assert.equal(account.quota.five_hour.Remaining.Value, 0);
+  ui.get('disconnect').onclick();
+  assert.equal([...ui.timers.values()].some(timer=>timer.delay===1000), false);
+});
+
+test('reset runtime diagnostics explain the server-side CLI dependency', async () => {
+  const ui = panel(url => url.endsWith('/reset-cards') ? [200,{instance_id:'a',accounts:[],attempts:[],runtime:{available:false,error_code:'reset_codex_unavailable'}}] : basic(url));
+  await ui.get('connect').onclick();
+  ui.nav.find(node=>node.dataset.page==='cards').listeners.get('click')(); await flush();
+  assert.match(ui.get('reset-runtime-message').textContent, /数量优先复用已有流量/);
+  assert.match(ui.get('reset-runtime-message').textContent, /无需 Codex CLI/);
+  assert.equal(mutations(ui).length, 0);
+});
+
+test('manual card count lookup uses the existing CPA quota job with details and automatic redemption off', async () => {
+  let count = null;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/reset-cards')) return [200,{instance_id:'a',accounts:[{account_id:'codex-01',credits:count===null?null:{availableCount:count,credits:null}}],attempts:[],runtime:{available:false,error_code:'reset_codex_unavailable'}}];
+    if (url.endsWith('/jobs') && options.method==='POST') { count=2; return [202,{...view(),job_id:'manual-card-count'}]; }
+    if (url.includes('/jobs?job_id=')) return [200,{...view(),job_id:'manual-card-count',phase:'completed',items:[]}];
+    return basic(url);
+  });
+  await ui.get('connect').onclick();
+  ui.nav.find(node=>node.dataset.page==='cards').listeners.get('click')(); await flush();
+  const button=descendants(ui.get('reset-cards-list')).find(node=>node.dataset.resetQueryAccount==='codex-01');
+  assert.ok(button); assert.equal(button.disabled,false);
+  await button.onclick(); await flush();
+  assert.deepEqual(mutations(ui).map(call=>JSON.parse(call.body)),[{kind:'quota_query',account_id:'codex-01'}]);
+  assert.match(ui.get('reset-cards-list').textContent,/2 张/);
+  assert.equal(ui.get('cards-enabled').checked,false); assert.equal(ui.get('cards-auto').checked,false);
+});
 const openQuotaDetail = async (ui, index = 0) => {
   descendants(ui.get('accounts').children[index]).find(node => node.className === 'account-identity').onclick();
   await flush();
@@ -4060,7 +4204,7 @@ test('fresh 100-percent unknown windows keep their percentages and explain windo
   await ui.get('connect').onclick();
   for (const [index, expected] of [[0, ['100%', '100%']], [1, ['54%', '100%']]]) {
     const row = ui.get('accounts').children[index];
-    assert.equal(row.children[4].textContent, '窗口待核实');
+    assert.equal(row.children[4].textContent, '可用');
     assert.doesNotMatch(row.children[4].textContent + row.children[4].title, /过期|已超过/);
     assert.deepEqual(quotaPercentages(row), expected); assert.equal(row.children[5].textContent, quotaUpdateTime(row).textContent);
     const explanation = await openQuotaDetail(ui, index);
@@ -4068,7 +4212,7 @@ test('fresh 100-percent unknown windows keep their percentages and explain windo
     assert.match(explanation.textContent, /查询额度也不会启动窗口/);
     assert.match(explanation.textContent, index === 0 ? /五小时额度/ : /周额度/);
   }
-  assert.equal(ui.get('metric-capacity').textContent, '0 / 2');
+  assert.equal(ui.get('metric-capacity').textContent, '2 / 2');
   assert.equal(mutations(ui).length, 0);
 });
 
@@ -4091,7 +4235,7 @@ test('older quota evidence keeps only relative update time while its reason rema
   revision++; await ui.get('refresh').onclick();
   for (const [index, expected] of [[0, ['88%', '100%']], [1, ['100%', '93%']]]) {
     const row = ui.get('accounts').children[index];
-    assert.equal(row.children[4].textContent, '正常');
+    assert.equal(row.children[4].textContent, '可用');
     assert.ok(descendants(row.children[4]).some(node => node.className === 'status-badge available'));
     assert.doesNotMatch(row.children[4].textContent, /过期|待核实/);
     assert.deepEqual(quotaPercentages(row), expected);
@@ -4103,7 +4247,7 @@ test('older quota evidence keeps only relative update time while its reason rema
     assert.match(explanation.textContent, /不表示账号不可用/);
     if (index === 0) assert.match(explanation.textContent, /周额度的观测/);
   }
-  assert.equal(ui.get('metric-capacity').textContent, '0 / 2');
+  assert.equal(ui.get('metric-capacity').textContent, '2 / 2');
   assert.equal(mutations(ui).length, 0);
 });
 
@@ -4129,13 +4273,13 @@ test('a completed quota query refreshes the displayed observation time without e
       return [200, accountPage(revision, [account])];
     }, {presentation: CWRPresentation});
     await ui.get('connect').onclick();
-    assert.equal(ui.get('accounts').children[0].children[4].textContent, '正常');
+    assert.equal(ui.get('accounts').children[0].children[4].textContent, '可用');
     assert.match(ui.get('accounts').children[0].children[5].textContent, /10 分钟前/);
     await openQuotaDetail(ui);
     await accountQuery(ui).onclick();
     const row = ui.get('accounts').children[0];
     assert.ok(polled > 0); assert.equal(row.children[5].textContent, '刚刚');
-    assert.equal(row.children[4].textContent, windowState === 'active' ? '可用' : windowState === 'unknown' ? '窗口待核实' : '正常');
+    assert.equal(row.children[4].textContent, '可用');
     assert.deepEqual(quotaPercentages(row), ['100%', '100%']);
     assert.equal(descendants(row.children[5]).find(node => node.className === 'observed-age').dataset.observedAt, account.observed_at);
     if (windowState !== 'weekly_stale') assert.doesNotMatch(row.children[4].title, /已超过 5 分钟/);
@@ -4150,6 +4294,6 @@ test('a completed quota query refreshes the displayed observation time without e
     assert.equal(posts.length, 1); assert.ok(posts[0].url.endsWith('/jobs'));
     assert.deepEqual(JSON.parse(posts[0].body), {kind: 'quota_query', account_id: account.id});
     assert.equal(ui.calls.some(call => /\/(wake-jobs|prompt-generations)(?:\?|$)/.test(call.url)), false);
-    assert.equal(ui.get('metric-capacity').textContent, (windowState === 'active' ? '1' : '0') + ' / 1');
+    assert.equal(ui.get('metric-capacity').textContent, '1 / 1');
   }
 });

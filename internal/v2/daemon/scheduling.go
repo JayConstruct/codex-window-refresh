@@ -46,7 +46,7 @@ func resetCode(err error) string {
 		return ""
 	}
 	switch err.Error() {
-	case "reset_codex_unavailable", "reset_runtime_unavailable", "reset_protocol_invalid", "reset_transport_failed", "reset_account_rpc_failed", "reset_verification_incomplete", "account_binding_changed", "account_disabled", "quota_proxy_invalid":
+	case "reset_codex_unavailable", "reset_codex_not_executable", "reset_protocol_unsupported", "reset_runtime_unavailable", "reset_protocol_invalid", "reset_transport_failed", "reset_account_rpc_failed", "reset_verification_incomplete", "account_binding_changed", "account_disabled", "quota_proxy_invalid", "reset_authentication_failed", "reset_permission_denied", "reset_rate_limited", "reset_upstream_failed", "reset_response_too_large", "bridge_unavailable":
 		return err.Error()
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -95,8 +95,14 @@ func (s *Service) resetStep(ctx context.Context, source resetSource) error {
 	if err != nil {
 		return err
 	}
+	if runtime, ok := source.(interface{ ResetTransport() (string, error) }); ok {
+		if _, err := runtime.ResetTransport(); err != nil {
+			return err
+		}
+	}
 	credits, probeErr := source.ReadResetCredits(ctx, a)
-	if err = s.Store.RecordResetCredits(ctx, a, credits, resetCode(probeErr), time.Now().UTC(), p.PollSeconds); err != nil {
+	readAt := time.Now().UTC()
+	if err = s.Store.RecordResetCredits(ctx, a, credits, resetCode(probeErr), readAt, p.PollSeconds); err != nil {
 		return err
 	}
 	if probeErr != nil {
@@ -111,6 +117,11 @@ func (s *Service) resetStep(ctx context.Context, source resetSource) error {
 		return err
 	}
 	if err = s.Store.SaveResetQuota(ctx, a, raw); err != nil {
+		return err
+	}
+	// Advance the check watermark after our own quota read without changing the
+	// actual detail observation time or hiding a newer passive count.
+	if err = s.Store.RecordResetCredits(ctx, a, credits, "", readAt, p.PollSeconds, time.Now().UTC()); err != nil {
 		return err
 	}
 	var selected *policy.ResetCredit
@@ -257,5 +268,10 @@ func (s *Service) resetCards(w http.ResponseWriter, r *http.Request) {
 		apiError(w, 503, "storage_unavailable")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"instance_id": s.instance, "accounts": cards, "attempts": attempts})
+	runtime := map[string]any{"available": false, "error_code": "reset_runtime_unavailable"}
+	if source, ok := s.source.(interface{ ResetTransport() (string, error) }); ok {
+		transport, err := source.ResetTransport()
+		runtime = map[string]any{"available": err == nil, "transport": transport, "error_code": resetCode(err)}
+	}
+	writeJSON(w, 200, map[string]any{"instance_id": s.instance, "accounts": cards, "attempts": attempts, "runtime": runtime})
 }
