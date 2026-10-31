@@ -797,10 +797,6 @@
     persistDisplayPreference(); closeAliasDialog(); applyDisplayPrivacy(document.documentElement); renderAccounts(); renderPreferences();
   }
   function statusBusy() { return [...statusOperations.values()].some(state => ['reading', 'checking', 'saving', 'verifying'].includes(state.phase)); }
-  function accountStatusBlocksWake(id) {
-    const state = statusOperations.get(id);
-    return !!state && (state.phase === 'unknown' || ['reading', 'checking', 'saving', 'verifying'].includes(state.phase) || state.phase === 'confirmed' && state.disabled);
-  }
   async function toggleAccountStatus(id) {
     if (!connected || statusBusy()) return;
     const account = accountsData.find(item => item.id === id);
@@ -831,6 +827,17 @@
     state.phase = 'confirmed'; state.disabled = identity.disabled;
     state.message = '已通过 CPA 只读目录核实：当前' + (identity.disabled ? '已禁用；未发送模型，未知任务防重保持不变。' : '已启用；正常业务及已授权自动任务可能恢复额度消耗。') + '此结果不保证外部后续修改。';
     views.barrier(); feedback('account-status-state-message', state.message, 'success');
+    if (overviewData?.capabilities?.inventory_sync === true) {
+      try {
+        await api('/sync', {method: 'POST'});
+        if (current === generation) { views.barrier(); void refresh(); }
+      } catch (error) {
+        if (current === generation) {
+          if (error.code === 'unauthorized') report(error);
+          else notice('CPA 开关已核实，后台同步通知暂未成功；后台会自动检查最新状态。', 'warning');
+        }
+      }
+    }
     return true;
   }
   async function updateAccountStatus(id, state) {
@@ -1325,7 +1332,7 @@
   async function submitManualWake(verify = false, quickAccount = '') {
     if (!connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading) return;
     if (verify && wakeTask?.job_id) return readWakeJob();
-    const consent = quickAccount ? quickAccount === quickWakeAccount && !accountStatusBlocksWake(quickAccount) && !quickWakeLoading && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount && account.status === 'available') : $('wake-manual-consent').checked;
+    const consent = quickAccount ? quickAccount === quickWakeAccount && !quickWakeLoading && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount) : $('wake-manual-consent').checked;
     if (wakeUnknown || (verify ? !wakeUnconfirmed || !wakeIntent : wakeUnconfirmed || wakeActive() || !consent)) return;
     if (!verify) {
       const account = quickAccount || resolveDisplayAccount($('wake-account').value);
@@ -1352,15 +1359,18 @@
   function renderQuickWake() {
     const blocked = quickWakeBlocked();
     for (const button of document.querySelectorAll('[data-wake-account]')) {
-      const disabled = blocked || !!quickWakeAccount || button.dataset.accountStatus !== 'available' || accountStatusBlocksWake(button.dataset.wakeAccount);
-      if (button.disabled !== disabled) button.disabled = disabled;
+      setAttribute(button, 'aria-busy', blocked || !!quickWakeAccount);
     }
   }
   function closeQuickWake() {
     quickWakeSequence++; quickWakeAccount = ''; quickWakeLoading = false; renderQuickWake();
   }
   async function startQuickWake(id) {
-    if (quickWakeBlocked() || quickWakeAccount || accountStatusBlocksWake(id) || !accountsData.some(account => account.id === id && account.status === 'available')) return;
+    if (!connected) { notice('请先连接 CPA 管理接口。', 'warning'); return; }
+    if (!wakeExecutionSupported()) { notice(message('wake_unavailable'), 'warning'); return; }
+    if (wakeUnknown || wakeUnconfirmed) { notice('上次唤醒结果尚未确认，请在唤醒页核实原任务。', 'warning'); return; }
+    if (quickWakeBlocked() || quickWakeAccount) { notice('已有唤醒任务正在核查或执行，请等待结果。'); return; }
+    if (!accountsData.some(account => account.id === id)) return;
     const current = generation, sequence = ++quickWakeSequence;
     quickWakeAccount = id; quickWakeLoading = true; renderQuickWake();
     try {
@@ -1902,7 +1912,8 @@
       const wakeButton = element('button', 'account-query account-wake', '立即唤醒'); wakeButton.type = 'button';
       wakeButton.dataset.wakeAccount = account.id; wakeButton.dataset.accountStatus = account.status;
       wakeButton.dataset.renderKey = 'wake'; button.dataset.renderKey = 'query';
-      wakeButton.disabled = quickWakeBlocked() || !!quickWakeAccount || account.status !== 'available' || accountStatusBlocksWake(account.id);
+      wakeButton.setAttribute('aria-busy', String(quickWakeBlocked() || !!quickWakeAccount));
+      wakeButton.title = '后台先检查最新额度与窗口；窗口未开启且符合条件时唤醒，已有窗口则跳过。';
       wakeButton.setAttribute('aria-label', '立即唤醒账号 ' + account.id); wakeButton.onclick = () => startQuickWake(account.id);
       const enabled = typeof state?.disabled === 'boolean' ? !state.disabled : state?.before ? !state.before.disabled : account.status !== 'disabled';
       const statusButton = element('button', 'account-status-switch');
@@ -1918,8 +1929,8 @@
       const menu = element('details', 'account-menu'), more = element('summary', 'account-more', '…'), menuItems = element('div', 'account-menu-items');
       more.setAttribute('aria-label', '账号更多操作：' + account.id);
       const detailButton = element('button', 'text-button', '查看账号详情'); detailButton.type = 'button'; detailButton.onclick = () => openAccountDetail(account.id);
-      menuItems.append(detailButton, wakeButton, statusButton, aliasButton); menu.append(more, menuItems);
-      buttons.append(button, menu); action.append(buttons);
+      menuItems.append(detailButton, aliasButton); menu.append(more, menuItems);
+      buttons.append(statusButton, button, wakeButton, menu); action.append(buttons);
       if (['queued', 'running'].includes(account.pending_query?.phase)) action.append(queueAnnotation(account.pending_query, 'query-pending'));
       row.append(selection, name, five, weekly, status, observed, action); rows.push(row);
     }
@@ -2003,7 +2014,7 @@
     switchRow.append(element('span', 'muted', 'CPA 账号状态'), toggle); identity.append(switchRow); rows.push(identity);
     const actions = element('div', 'account-detail-actions');
     const query = element('button', 'button button-primary', '查询额度'); query.type = 'button'; query.disabled = !connected || queryBusy.has('account:' + account.id); query.onclick = () => submitQuery(account.id);
-    const wake = element('button', 'button button-outline', '立即唤醒'); wake.type = 'button'; wake.disabled = quickWakeBlocked() || !!quickWakeAccount || account.status !== 'available' || accountStatusBlocksWake(account.id); wake.onclick = () => startQuickWake(account.id);
+    const wake = element('button', 'button button-outline', '立即唤醒'); wake.type = 'button'; wake.dataset.wakeAccount = account.id; wake.setAttribute('aria-busy', String(quickWakeBlocked() || !!quickWakeAccount)); wake.onclick = () => startQuickWake(account.id);
     actions.append(query, wake); rows.push(actions);
     const quota = element('section', 'detail-section detail-quota'); quota.append(element('h3', '', '额度概况'));
     for (const [key, label] of [['five_hour', '五小时剩余'], ['weekly', '周额度剩余']]) { const row = element('div', 'detail-quota-row'); row.append(element('strong', '', label), renderQuota(account.quota, key)); quota.append(row); }
@@ -2368,7 +2379,7 @@
     setText('metric-errors-detail', stats?.errors || data?.last_error ? '查看诊断详情' : stats ? '当前无已报告异常' : '等待后台数据');
     setText('last-updated', data?.inventory?.last_success_at ? age(data.inventory.last_success_at) + '同步 CPA' : '尚未同步 CPA');
     if (data) {
-      setText('inventory', ready ? '账号状态每 ' + (data.inventory.refresh_interval_seconds || 30) + ' 秒同步 CPA；页面关闭后继续。额度耗尽由最近额度观测核实，查询仍按已保存规则执行。' : 'CPA 账号同步尚未就绪；后台会自动重试，保留已保存结果。');
+      setText('inventory', ready ? (data.inventory.status_refresh_interval_seconds ? '开关操作后立即通知同步，每 ' + data.inventory.status_refresh_interval_seconds + ' 秒检查 CPA 状态变化，每 ' + (data.inventory.refresh_interval_seconds || 30) + ' 秒完整核实身份；' : '账号状态每 ' + (data.inventory.refresh_interval_seconds || 30) + ' 秒同步 CPA；') + '页面关闭后继续。额度查询按已保存规则执行。' : 'CPA 账号同步尚未就绪；后台会自动重试，保留已保存结果。');
       const automatic = data.capabilities?.automatic_quota_query === true, randomized = data.capabilities?.randomized_quota_query === true;
       setText('feature-note', (automatic ? '查询开关即改即存。' : '自动查询尚未接入。') + (automaticWakeSupported() ? '自动唤醒开关直接保存；开启前须确认模型额度消耗。详细规则在唤醒页独立保存。' : '当前后台尚未提供自动模型唤醒。'));
       setText('account-query-note', randomized ? '单账号立即查询 · 批量按账号随机延迟，后台持久排队' : '单账号立即查询 · 批量查询由后台执行');
@@ -2494,7 +2505,8 @@
     const rows = [
       ['后台版本', data?.version || '尚未连接'], ['接入层版本', data?.bridge_version || '—'],
       ['数据库版本', data?.schema_version ? 'schema ' + data.schema_version : '—'],
-      ['账号同步间隔', inventory?.refresh_interval_seconds ? inventory.refresh_interval_seconds + ' 秒' : '—'],
+      ['账号状态检查', inventory?.status_refresh_interval_seconds ? inventory.status_refresh_interval_seconds + ' 秒 · 开关操作即时通知' : '—'],
+      ['完整身份校验', inventory?.refresh_interval_seconds ? inventory.refresh_interval_seconds + ' 秒' : '—'],
       ['额度查询并发', data?.query_concurrency ? String(data.query_concurrency) : '—'],
       ['单账号查询超时', data?.query_timeout_seconds ? data.query_timeout_seconds + ' 秒' : '—'],
       ['任务保留', data?.retention ? data.retention.history_seconds / 86400 + ' 天 · 最多 ' + data.retention.terminal_jobs + ' 项' : '—']

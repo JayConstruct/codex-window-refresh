@@ -798,7 +798,7 @@ try {
     await settleRefresh();
     await evaluate('(() => {document.querySelector("[data-account-alias-id=codex-01]").click();document.getElementById("account-alias-value").value="自动刷新主账号";document.getElementById("account-alias-save").click();const mode=document.getElementById("display-mode");mode.value="alias";mode.dispatchEvent(new Event("change"))})()');
     await naturalPolls();
-    await evaluate('document.querySelector("[data-account-status-id=codex-01]").closest("details").open=true;document.querySelector("[data-account-status-id=codex-01]").focus()');
+    await evaluate('document.querySelector("[data-account-status-id=codex-01]").focus()');
     await startMutationProbe(['accounts', 'tasks', 'recent-events', 'diagnostics-content']);
     await naturalPolls(2);
     const overviewBudget = await endMutationProbe('same-state overview + alias, two native polls');
@@ -1087,12 +1087,13 @@ try {
   if (projectsOnly) { await runProjectMatchingChecks(); break checks; }
   if (schedulingOnly) { await runSchedulingChecks(); break checks; }
   if (autorefreshOnly) {
-    await evaluate('document.querySelector("[data-account-status-id=codex-01]").closest("details").open=true;document.querySelector("[data-account-status-id=codex-01]").click()');
+    await evaluate('document.querySelector("[data-account-status-id=codex-01]").click()');
     await waitFor(() => evaluate('document.querySelector("[data-account-status-id=codex-01]").dataset.state==="confirmed"'), 'Explicit fixture-only setup PATCH did not reach confirmed');
     assert.equal(patches.length, 1, 'Fixture setup must PATCH exactly once after explicit confirmation');
+    await waitFor(() => posts.length === 1 && posts[0].resource === 'sync', 'Fixture setup must notify the backend after CPA confirmation');
     await assertForegroundPollingCadence();
     await runAutorefreshChecks();
-    assert.equal(posts.length, 0, 'Read-only Chromium suite submitted plugin/model work');
+    assert.equal(posts.length, 1, 'Read-only Chromium suite submitted work after the fixture setup sync');
     assert.equal(patches.length, 1, 'Read-only Chromium suite added an unconfirmed CPA PATCH');
     await evaluate('document.getElementById("disconnect").click()');
     await settleRefresh();
@@ -1546,10 +1547,10 @@ try {
   await evaluate('document.getElementById("wake-account").value="codex-01";document.getElementById("wake-account").dispatchEvent(new Event("input"));document.getElementById("wake-manual-consent").click()');
   await evaluate('document.querySelector("[data-page=overview]").click()');
   modelReadGate = gate();
-  await evaluate('document.querySelector("#accounts .account-menu").open=true;document.querySelector("#accounts .account-wake").click()');
+  await evaluate('document.querySelector("#accounts .account-wake").click()');
   await waitFor(() => modelReadGate.started, 'Immediate wake did not verify the saved model');
-  assert.equal(await evaluate('document.querySelector("#accounts .account-wake").disabled'), true, 'Model verification did not lock duplicate wake clicks');
-  await evaluate('document.querySelector("#accounts .account-menu").open=true;document.querySelector("#accounts .account-wake").click()');
+  assert.equal(await evaluate('document.querySelector("#accounts .account-wake").disabled'), false, 'Wake button should stay clickable during verification');
+  await evaluate('document.querySelector("#accounts .account-wake").click()');
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 0, 'Wake bypassed saved model verification');
   assert.equal(await evaluate('!!document.querySelector("dialog[open]")'), false, 'Immediate wake opened a confirmation modal');
   modelReadGate.release(); modelReadGate = undefined;
@@ -1909,7 +1910,7 @@ try {
         assert.ok(account[action].height >= 28 && account[action].height <= 40, 'Account action became stretched or too small (' + action + '): ' + detail);
       }
       assert.ok(Math.abs(account.query.top - account.more.top) <= 2, 'Query and menu no longer share their action row: ' + detail);
-      assert.ok(account.status.top >= account.wake.bottom, 'CPA status switch overlaps the wake action inside its menu: ' + detail);
+      assert.ok(Math.abs(account.status.top - account.wake.top) <= 3, 'CPA status and wake should be visible together in the action row: ' + detail);
       if (account.row.height > 140) await screenshot('account-action-row-too-tall-' + index + '.png');
       assert.ok(account.row.height <= 140, 'Account row became excessively tall: ' + detail);
     }
@@ -1926,7 +1927,7 @@ try {
     return layout;
   }
   async function clickStatus(id = 'codex-01') {
-    await evaluate(`{const button=document.querySelector(${JSON.stringify(statusSelector(id))});button.closest("details").open=true;button.click()}`);
+    await evaluate(`document.querySelector(${JSON.stringify(statusSelector(id))}).click()`);
     assert.equal(await evaluate('!!document.querySelector("dialog[open]")'), false, 'CPA switch opened a confirmation modal');
   }
   async function verifyStatus() {
@@ -1940,7 +1941,7 @@ try {
   await evaluate('document.querySelector("[data-page=overview]").click()');
   await waitFor(() => evaluate(`!!document.querySelector(${JSON.stringify(statusSelector('codex-01'))})`), 'Overview switch missing');
   await assertAccountActionLayout();
-  const writesBeforeCPAStatus = posts.length;
+  const writesBeforeCPAStatus = posts.filter(post => post.resource !== 'sync').length;
   authPatchGate = gate();
   await clickStatus();
   await waitFor(() => authPatchGate.started, 'Direct switch did not PATCH CPA status');
@@ -1952,7 +1953,8 @@ try {
   await waitFor(async () => (await statusState()).phase === 'confirmed' && (await statusState()).checked === 'false', 'Disable was not GET-verified');
   assert.ok(reads.filter(path => path.endsWith('/auth-files')).length > beforeStatusCommitReads);
   assert.equal(await evaluate('document.querySelector("#accounts .status-badge").textContent'), '已禁用');
-  assert.equal(posts.length, writesBeforeCPAStatus);
+  assert.equal(posts.filter(post => post.resource !== 'sync').length, writesBeforeCPAStatus);
+  await waitFor(() => posts.some(post => post.resource === 'sync'), 'Confirmed CPA switch did not request immediate backend sync');
   assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
   for (const outcome of ['disconnect', 'persist-hook-failed']) {
     authPatchGate = gate(outcome);
@@ -2002,7 +2004,8 @@ try {
     assert.equal(patches.length, count, 'Unsafe identity permitted PATCH: ' + label);
     authFilesOverride = undefined;
   }
-  assert.equal(posts.length, writesBeforeCPAStatus);
+  assert.equal(posts.filter(post => post.resource !== 'sync').length, writesBeforeCPAStatus);
+  const writesAfterCPAStatus = posts.length;
   console.log('Direct CPA switch regression passed: exact file binding, GET verification, duplicate lock, uncertain results, identity rejection and no confirmation modals.');
   const skipIDs = ['fixture-skipped-current', 'fixture-skipped-legacy'];
   for (const [index, jobID] of skipIDs.entries()) wakeJobs.set(jobID, {job_id: jobID, account_id: 'codex-01', phase: 'skipped', reason: 'manual',
@@ -2043,7 +2046,7 @@ try {
     if (code === 'wake_account_unavailable') assert.doesNotMatch(explanation, /账号凭据绑定已变化|账号绑定已变更/, 'Old generic wake failure incorrectly asserted a binding change');
     if (code === 'wake_host_unavailable') assert.doesNotMatch(explanation, /CPA.*(?:连接断开|未连接)/, 'Unavailable account incorrectly asserted host disconnection');
   }
-  assert.equal(posts.length, writesBeforeCPAStatus, 'Inspecting skips or wake failures submitted work');
+  assert.equal(posts.length, writesAfterCPAStatus, 'Inspecting skips or wake failures submitted work');
   await clickWhenEnabled('history-detail-close');
   await historyFilter('history-search', '', 'input');
   async function displayMode(mode) {
@@ -2179,7 +2182,8 @@ try {
   assert.equal(patches.length, 5, 'Unexpected auth-file status PATCH count');
   assert.equal(patches.every(patch => patch.path === '/cpa/v0/management/auth-files/status' && patch.body.name === 'real+primary.codex.json' && patch.body.auth_index === 'fixture-index-0'), true, 'Status PATCH escaped the exact auth file binding');
   assert.equal(posts.filter(post => post.resource === 'scheduling').length, 1, 'Unexpected scheduling writes');
-  assert.equal(posts.length, 21, 'Unexpected total API write count');
+  assert.equal(posts.filter(post => post.resource !== 'sync').length, 20, 'Unexpected non-sync API write count');
+  assert.equal(posts.filter(post => post.resource === 'sync').length, 6, 'Expected manual sync and five CPA confirmation notifications');
   assert.equal(posts.every(post => ['settings', 'jobs', 'sync', 'model-settings', 'prompt-generations', 'wake-settings', 'wake-jobs', 'scheduling'].includes(post.resource)), true, 'Unexpected API write');
   assert.equal(reads.filter(path => path.endsWith('/generation-accounts')).length, 2, 'Navigation or polling unexpectedly refreshed generation accounts');
   console.log('V2 browser checks passed: desktop/mobile layout, settings/draft isolation/conflicts, query queue/finish-time contracts, filtering/paging/authentication, generation consent, direct wake without a modal, exactly one wake POST, five direct filename/index-bound CPA PATCHes with GET verification and unknown protection, global alias/mask preferences scoped to CPA base with stable request IDs and polling focus, precise wake explanations, informational legacy/current skips, persisted task history and real trigger menus, bidirectional summary/detail revision ordering, permanent unknown warning outside long scrollable responses, readonly verification without POST, clipboard fallback, mobile detail focus/scroll, unavailable-history recovery, fixture-only page traffic and screenshots.');
@@ -2205,7 +2209,7 @@ try {
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
 if (!callerNamesOnly && !authOnly && !autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaStatusOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
-  console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
+  console.log('Original V2 fixture verified 20 non-sync POSTs, six sync notifications and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
   assert.equal(result.code, 0, 'Isolated automatic-refresh Chromium fixture failed: ' + JSON.stringify(result));

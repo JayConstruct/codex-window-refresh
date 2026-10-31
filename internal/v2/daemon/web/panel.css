@@ -230,7 +230,7 @@ body[data-page="history"] .sub-navigation button { min-height:40px; padding-bott
 .accounts-table th:nth-child(3),.accounts-table th:nth-child(4) { width:22%; }
 .accounts-table th:nth-child(5) { width:13%; }
 .accounts-table th:nth-child(6) { width:11%; }
-.accounts-table th:last-child { width:100px; }
+.accounts-table th:last-child { width:330px; }
 .account-row:hover { background:color-mix(in srgb,var(--bg-primary) 60%,transparent); }
 .account-row[data-selected="true"],.account-row.selected { background:var(--bg-primary); box-shadow:inset 3px 0 var(--text-primary); }
 .account-name { min-width:130px; }
@@ -269,6 +269,7 @@ body[data-page="history"] .sub-navigation button { min-height:40px; padding-bott
 .account-query:hover:not(:disabled) { background:var(--bg-tertiary); }
 .account-query:disabled { opacity:.45; }
 .account-buttons { display:flex; align-items:center; gap:8px; white-space:nowrap; }
+.account-buttons>.account-status-switch { min-width:120px; flex-shrink:0; }
 .accounts-table .query-pending { display:none; }
 .account-wake { color:var(--text-primary); }
 .account-footer { display:flex; align-items:center; justify-content:space-between; gap:14px; min-height:35px; padding:5px 0 0; color:var(--text-secondary); font-size:12px; }

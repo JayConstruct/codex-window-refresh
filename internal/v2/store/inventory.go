@@ -13,6 +13,9 @@ import (
 
 const InventoryRefreshInterval = 30 * time.Second
 
+// Check the credential-free directory more frequently than full binding reads.
+const InventoryStatusRefreshInterval = 2 * time.Second
+
 // Full inventory verification advances one shared heartbeat. Individual account
 // rows only change when their identity or status changes; a query observation
 // must still be newer than both its account row and that shared verification.
@@ -102,10 +105,11 @@ func (s *Store) SyncInventory(ctx context.Context, accounts []Account) error {
 }
 
 type InventoryStatus struct {
-	Status                 string `json:"status"`
-	ErrorCode              string `json:"error_code,omitempty"`
-	LastSuccessAt          string `json:"last_success_at,omitempty"`
-	RefreshIntervalSeconds int    `json:"refresh_interval_seconds"`
+	Status                       string `json:"status"`
+	ErrorCode                    string `json:"error_code,omitempty"`
+	LastSuccessAt                string `json:"last_success_at,omitempty"`
+	RefreshIntervalSeconds       int    `json:"refresh_interval_seconds"`
+	StatusRefreshIntervalSeconds int    `json:"status_refresh_interval_seconds"`
 }
 
 func (s *Store) InventoryFailed(ctx context.Context) error {

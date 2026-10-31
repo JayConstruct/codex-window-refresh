@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `codex-window-refresh`。当前主线为 **V2：C 原生接入层 + 独立 Go 后台 + SQLite**。
 
-当前后台及客户端安装包为 **v0.2.0-rc.33**，原生接入层保持 **v0.2.0-rc.32**，数据库保持 **schema 12**。rc.33 将“剩余 100% 且上游返回完整 18000 秒”的五小时窗口明确显示为“窗口未启动”，几分钟后查看也不转为倒计时。rc.32 提供调用方识别与浏览器本地 API key 名称、可用状态、到期查询倒计时，以及无需 CLI 的重置卡 HTTP 通道。Codex 调度台包含总览、账号、自动化、项目调度、运行记录及设置；升级要求见 [发布说明](docs/releases/v0.2.0-rc.33.md)。
+当前后台及客户端安装包为 **v0.2.0-rc.34**，原生接入层保持 **v0.2.0-rc.32**，数据库保持 **schema 12**。rc.34 在总览与账号操作栏直接显示 CPA 开关和唤醒按钮，唤醒保持可点击并由后台核查窗口后决定发送或跳过；开关操作立即通知同步，后台每 2 秒轻量检查状态变化、每 30 秒完整校验身份。插件模型请求增加来源与操作标记。Codex 调度台包含总览、账号、自动化、项目调度、运行记录及设置；升级要求见 [发布说明](docs/releases/v0.2.0-rc.34.md)。
 
 ## 安装与更新
 
@@ -10,10 +10,10 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `c
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.33 --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.34 --restart
 ```
 
-已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；从 rc.32 升级到 rc.33 时，安装器确认接入层文件完全一致后可仅更新并重启后台；从 rc.31 或更早版本升级须显式 `--restart`，同时更新接入层并重启 CPA。完成后强制刷新网页。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。
+已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；从 rc.32 或 rc.33 升级到 rc.34 时，安装器确认接入层文件完全一致后可仅更新并重启后台；从 rc.31 或更早版本升级须显式 `--restart`，同时更新接入层并重启 CPA。完成后强制刷新网页。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。
 
 完整参数、用户服务、离线安装与失败恢复见 [V2 安装指南](docs/user/install.md)。下载与 SHA-256 校验文件见 [Releases](https://github.com/JayConstruct/codex-window-refresh/releases)。
 

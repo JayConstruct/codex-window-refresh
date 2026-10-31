@@ -562,7 +562,7 @@ test('overview wake waits for the saved model, locks duplicate clicks and submit
   await ui.get('connect').onclick(); ui.get('wake-account').value = 'unrelated manual draft';
   const wake = () => accountWake(ui);
   const pending = wake().onclick(); await flush();
-  assert.equal(wake().disabled, true); await wake().onclick(); assert.equal(posted, undefined);
+  assert.equal(wake().disabled, false); await wake().onclick(); assert.equal(posted, undefined);
   assert.equal(ui.get('quick-wake-dialog').open, undefined);
   release(); await pending;
   assert.ok(posted); assert.equal(posted.body, JSON.stringify({account_id: 'codex-01'})); assert.ok(posted.headers['Idempotency-Key']);
@@ -570,16 +570,29 @@ test('overview wake waits for the saved model, locks duplicate clicks and submit
   assert.equal(ui.get('page-title').textContent, '账号池概览'); assert.equal(ui.get('wake-account').value, 'unrelated manual draft');
   assert.equal(ui.get('quick-wake-dialog').open, undefined);
 });
-test('immediate wake rejects missing models, failed model reads and disabled accounts without opening a dialog', async () => {
+test('immediate wake rejects missing models and failed model reads without opening a dialog', async () => {
   for (const response of [[200, modelSettings(1, modelConfig({default_model: ''}))], [503, {error: 'backend_unavailable'}]]) {
     const ui = panel(url => url.endsWith('/model-settings') ? response : wakeResponse(url));
     await ui.get('connect').onclick(); const wake = () => accountWake(ui);
     await wake().onclick(); assert.equal(wake().disabled, false); assert.match(ui.get('wake-manual-message').textContent, /已保存模型/);
     assert.equal(ui.get('quick-wake-dialog').open, undefined); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
   }
-  const ui = panel(url => url.includes('/accounts?') ? [200, accountPage(20, [{id: 'disabled', status: 'disabled'}])] : wakeResponse(url));
-  await ui.get('connect').onclick(); const wake = accountWake(ui);
-  assert.equal(wake.disabled, true); await wake.onclick(); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+test('wake stays visible and clickable for every status and lets the backend check the current account', async () => {
+  for (const status of ['available', 'disabled', 'unavailable', 'binding_unavailable']) {
+    let posted;
+    const ui = panel((url, options) => {
+      if (url.includes('/accounts?')) return [200, accountPage(20, [{id: 'check-account', status}])];
+      if (url.endsWith('/model-settings')) return [200, modelSettings(1, modelConfig({default_model: 'saved-model'}))];
+      if (url.endsWith('/wake-jobs') && options.method === 'POST') { posted = options; return [422, {error: 'wake_account_disabled'}]; }
+      return wakeResponse(url);
+    });
+    await ui.get('connect').onclick(); const wake = accountWake(ui);
+    assert.equal(wake.disabled, false); assert.equal(wake.parentNode.className, 'account-buttons');
+    assert.equal(statusSwitch(ui, 'check-account').parentNode.className, 'account-buttons');
+    await wake.onclick(); assert.deepEqual(JSON.parse(posted.body), {account_id: 'check-account'});
+    assert.equal(accountWake(ui).disabled, false);
+  }
 });
 test('wake response records remain readable and expanded after polling without exposing HTML or resending', async () => {
   const response = {recorded_at: '2026-10-18T12:00:00Z', stage: 'read', http_status: 429, event: 'response.failed', status: 'failed', upstream_error_code: 'rate_limit_exceeded', error_message: '<img src=x onerror=alert(1)>', response_text: 'Partial safe reply', bytes: 100, completed: false, truncated: true};
@@ -595,7 +608,7 @@ test('wake response records remain readable and expanded after polling without e
   assert.equal(ui.get('wake-history').children[0].children.find(node => node.dataset.renderKey === 'wake-response'), details);
   assert.equal(details.open, true); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
 });
-test('quick wake lost acknowledgement locks every account button and never submits a replacement', async () => {
+test('quick wake lost acknowledgement keeps buttons clickable and never submits a replacement', async () => {
   let writes = 0;
   const ui = panel((url, options) => {
     if (url.endsWith('/wake-jobs') && options.method === 'POST') { writes++; throw new Error('fixture disconnected'); }
@@ -605,11 +618,11 @@ test('quick wake lost acknowledgement locks every account button and never submi
   await ui.get('connect').onclick();
   const wakeButton = () => accountWake(ui);
   await wakeButton().onclick();
-  assert.equal(writes, 1); assert.equal(wakeButton().disabled, true);
+  assert.equal(writes, 1); assert.equal(wakeButton().disabled, false);
   assert.match(ui.get('wake-manual-message').textContent, /尚未确认/);
   await wakeButton().onclick();
   assert.equal(ui.get('quick-wake-dialog').open, undefined);
-  await ui.tick(5000); assert.equal(writes, 1); assert.equal(wakeButton().disabled, true);
+  await ui.tick(5000); assert.equal(writes, 1); assert.equal(wakeButton().disabled, false);
 });
 
 test('task diagnostics classify safe error codes without echoing arbitrary upstream failures', () => {
@@ -3017,6 +3030,27 @@ test('CPA account switches directly PATCH the unique filename/binding and confir
   await statusSwitch(ui).onclick(); assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'true');
   assert.equal(ui.get('accounts').children[0].children[4].textContent, '正常');
   assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 2); assert.equal(ui.calls.some(call => call.method === 'POST'), false);
+});
+
+test('CPA verified switches request immediate sync without replaying PATCH when the notification fails', async () => {
+  for (const syncStatus of [202, 503]) {
+    let file = statusFile();
+    const ui = panel((url, options) => {
+      if (url.endsWith('/overview')) { const data = overview(); data.capabilities.inventory_sync = true; return [200, data]; }
+      if (isAuthFilesList(url)) return [200, {files: [file]}];
+      if (url.endsWith('/auth-files/status')) { file = {...file, disabled: true}; return [200, {status: 'ok'}]; }
+      if (url.endsWith('/sync')) return [syncStatus, syncStatus === 202 ? {status: 'queued'} : {error: 'inventory_sync_unavailable'}];
+      return basic(url);
+    });
+    await ui.get('connect').onclick(); await statusSwitch(ui).onclick(); await flush();
+    assert.equal(statusSwitch(ui).dataset.state, 'confirmed');
+    assert.equal(statusSwitch(ui).getAttribute('aria-checked'), 'false');
+    assert.equal(ui.calls.filter(call => call.method === 'PATCH').length, 1);
+    const writes = ui.calls.filter(call => call.method === 'POST');
+    assert.equal(writes.length, 1); assert.match(writes[0].url, /\/sync$/);
+    const syncIndex = ui.calls.indexOf(writes[0]);
+    assert.ok(isAuthFilesList(ui.calls[syncIndex - 1].url), 'sync must follow readonly CPA verification');
+  }
 });
 
 test('CPA direct writes lock from the first read through verification and ignore repeated clicks', async () => {

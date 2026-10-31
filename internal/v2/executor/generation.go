@@ -119,7 +119,7 @@ func (c *CPA) GenerateCandidatesWithPrompt(ctx context.Context, account store.Ac
 		Serial:        true,
 		EntryProtocol: "openai-response", ExitProtocol: exitProtocol, Model: model,
 		Stream: true, Body: body, ForcedProvider: provider, AuthID: account.ID,
-		Headers: map[string][]string{"Content-Type": {"application/json"}}, Query: map[string][]string{},
+		Headers: pluginModelHeaders("prompt_generation"), Query: map[string][]string{},
 	}
 	unknown := func() ([]string, error) { return nil, errors.New("generation_delivery_unknown") }
 	var opened generationOpened

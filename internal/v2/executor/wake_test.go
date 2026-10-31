@@ -119,6 +119,9 @@ func TestWakePinsCodexWithExactUserPromptAndDiscardsOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := host.request
+	if request.Headers["X-CPA-Plugin-ID"][0] != "codex-window-refresh" || request.Headers["X-CPA-Plugin-Action"][0] != "wake" {
+		t.Fatal("wake missing plugin origin", request.Headers)
+	}
 	if request.AuthID != account.ID || request.ForcedProvider != "codex" || request.EntryProtocol != "openai-response" || request.ExitProtocol != "codex" || request.Model != "gpt-fixture" || !request.Stream || host.executes != 1 || host.closes != 1 || host.reads != 1 || !host.closeContextOK {
 		t.Fatalf("unsafe request=%+v model=%d read=%d close=%d", request, host.executes, host.reads, host.closes)
 	}

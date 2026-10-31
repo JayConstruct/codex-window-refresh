@@ -52,7 +52,7 @@ func TestRequestedInventorySyncWakesBackgroundLoopAndPreservesIdentityProof(t *t
 	defer st.Close()
 	link := &requestedLink{published: make(chan []store.Account, 4)}
 	inventory := &requestedInventory{}
-	consumer := &Consumer{Store: st, Link: link, Inventory: inventory, lastInventory: time.Now(), inventoryInstance: "bridge"}
+	consumer := &Consumer{Store: st, Link: link, Inventory: inventory, lastInventory: time.Now(), inventoryInstance: "bridge", lastStatusCheck: time.Now()}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); consumer.inventoryLoop(ctx) }()
@@ -151,7 +151,7 @@ func TestBackgroundStatusSyncUpdatesAndRestoresDisabledAccountsWithoutAPage(t *t
 	}
 	<-link.published
 	inventory.disabled.Store(true)
-	consumer.lastInventory = time.Now().Add(-store.InventoryRefreshInterval - time.Second)
+	consumer.lastStatusCheck = time.Now().Add(-store.InventoryStatusRefreshInterval - time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); consumer.inventoryLoop(ctx) }()
@@ -173,9 +173,40 @@ func TestBackgroundStatusSyncUpdatesAndRestoresDisabledAccountsWithoutAPage(t *t
 			t.Fatal(page, err)
 		}
 		view, err := storage.Overview(context.Background())
-		if err != nil || view.Inventory.RefreshIntervalSeconds != 30 || view.Inventory.Status != "ready" {
+		if err != nil || view.Inventory.RefreshIntervalSeconds != 30 || view.Inventory.StatusRefreshIntervalSeconds != 2 || view.Inventory.Status != "ready" {
 			t.Fatal(view, err)
 		}
+	}
+}
+
+func TestLightweightStatusChecksOnlyResolveBindingsWhenDirectoryChanges(t *testing.T) {
+	storage, err := store.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	link := &requestedLink{published: make(chan []store.Account, 4)}
+	inventory := &requestedInventory{}
+	consumer := &Consumer{Store: storage, Link: link, Inventory: inventory}
+	ctx := context.Background()
+	if err := consumer.syncInventory(ctx, "bridge"); err != nil {
+		t.Fatal(err)
+	}
+	<-link.published
+	for range 3 {
+		if err := consumer.checkInventory(ctx, "bridge", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if inventory.accountCalls.Load() != 4 || inventory.identityCalls.Load() != 1 || len(link.published) != 0 {
+		t.Fatal("unchanged directory reread credentials or republished bindings")
+	}
+	// A periodic full check still refreshes credential bindings and heartbeat.
+	if err := consumer.syncInventory(ctx, "bridge"); err != nil {
+		t.Fatal(err)
+	}
+	if inventory.identityCalls.Load() != 2 || len(link.published) != 1 {
+		t.Fatal("full check skipped identity proof")
 	}
 }
 

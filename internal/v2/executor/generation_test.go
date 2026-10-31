@@ -127,6 +127,9 @@ func TestGenerationPinsAccountAndRequest(t *testing.T) {
 		t.Fatalf("values=%v err=%v", values, err)
 	}
 	request := host.request
+	if request.Headers["X-CPA-Plugin-ID"][0] != "codex-window-refresh" || request.Headers["X-CPA-Plugin-Action"][0] != "prompt_generation" {
+		t.Fatal("candidate generation missing plugin origin", request.Headers)
+	}
 	if host.executes != 1 || host.reads != 1 || host.closes != 1 || !host.closeContextOK || request.AuthID != account.ID || request.ForcedProvider != "codex" || request.EntryProtocol != "openai-response" || request.ExitProtocol != "codex" || !request.Stream || request.Model != "gpt-fixture" {
 		t.Fatalf("unsafe request=%+v execute=%d read=%d close=%d", request, host.executes, host.reads, host.closes)
 	}

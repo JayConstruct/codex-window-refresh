@@ -25,6 +25,8 @@ type Consumer struct {
 	}
 	lastInventory     time.Time
 	inventoryInstance string
+	lastStatusCheck   time.Time
+	inventoryStatuses map[string]inventoryStatus
 	syncOnce          sync.Once
 	syncRequests      chan struct{}
 }
@@ -135,14 +137,16 @@ func (c *Consumer) inventoryLoop(ctx context.Context) {
 		if err == nil && !hello.PassiveQuota {
 			err = &protocolError{}
 		}
-		if err == nil && (requested || hello.Instance != c.inventoryInstance || time.Since(c.lastInventory) >= store.InventoryRefreshInterval) {
-			err = c.syncInventory(refresh, hello.Instance)
+		force := requested || hello.Instance != c.inventoryInstance || time.Since(c.lastInventory) >= store.InventoryRefreshInterval
+		if err == nil && (force || time.Since(c.lastStatusCheck) >= store.InventoryStatusRefreshInterval) {
+			err = c.checkInventory(refresh, hello.Instance, force)
 			if err == nil {
 				requested = false
 			}
 		}
 		cancel()
 		if err != nil {
+			requested = true
 			mark, stop := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 			_ = c.Store.InventoryFailed(mark)
 			stop()
@@ -165,9 +169,27 @@ func (c *Consumer) inventoryLoop(ctx context.Context) {
 }
 
 func (c *Consumer) syncInventory(ctx context.Context, instance string) error {
+	return c.checkInventory(ctx, instance, true)
+}
+
+type inventoryStatus struct{ AuthIndex, Status string }
+
+func (c *Consumer) checkInventory(ctx context.Context, instance string, force bool) error {
 	accounts, err := c.Inventory.Accounts(ctx)
 	if err != nil {
 		return err
+	}
+	statuses := make(map[string]inventoryStatus, len(accounts))
+	changed := len(accounts) != len(c.inventoryStatuses)
+	for _, account := range accounts {
+		status := inventoryStatus{account.AuthIndex, account.Status}
+		statuses[account.ID] = status
+		previous, exists := c.inventoryStatuses[account.ID]
+		changed = changed || !exists || previous != status
+	}
+	if !force && !changed {
+		c.lastStatusCheck = time.Now()
+		return nil
 	}
 	jobs := make(chan int)
 	var workers sync.WaitGroup
@@ -218,5 +240,6 @@ func (c *Consumer) syncInventory(ctx context.Context, instance string) error {
 		return err
 	}
 	c.inventoryInstance, c.lastInventory = instance, time.Now()
+	c.lastStatusCheck, c.inventoryStatuses = c.lastInventory, statuses
 	return nil
 }

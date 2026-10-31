@@ -92,7 +92,7 @@ func (c *CPA) executeWake(ctx context.Context, account store.Account, model, pro
 		Serial:        true,
 		EntryProtocol: "openai-response", ExitProtocol: "codex", Model: model,
 		Stream: true, Body: body, ForcedProvider: "codex", AuthID: account.ID,
-		Headers: map[string][]string{"Content-Type": {"application/json"}}, Query: map[string][]string{},
+		Headers: pluginModelHeaders("wake"), Query: map[string][]string{},
 	}
 	unknown := func() error { return errors.New("wake_delivery_unknown") }
 	if !c.WakeAvailable() {
