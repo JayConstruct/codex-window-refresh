@@ -1772,11 +1772,16 @@
       const state = statusOperations.get(account.id);
       const status = element('td'), value = state?.phase === 'confirmed' && state.disabled ? {label: '已禁用', kind: 'disabled'} : state?.phase === 'confirmed' && !state.disabled && account.status === 'disabled' ? {label: 'CPA 已启用 · 等待同步', kind: 'unavailable'} : presentation?.accountView(account) || accountStatus(account);
       status.append(badge(value.label, value.kind));
-      status.title = (account.status_observed_at ? 'CPA 状态：' + age(account.status_observed_at) + '同步。' : '') + (value.kind === 'attention' ? '额度状态来自最近一次额度观测；重置或恢复需重新核实，不以本地倒计时自动恢复正常。' : '后台定时同步 CPA 账号状态。');
+      status.title = (account.status_observed_at ? 'CPA 状态：' + age(account.status_observed_at) + '同步。' : '') + (value.description || (value.kind === 'attention' ? '额度状态来自最近一次额度观测；重置或恢复需重新核实，不以本地倒计时自动恢复正常。' : '后台定时同步 CPA 账号状态。'));
       const five = element('td'), weekly = element('td'), observed = element('td'), action = element('td');
       five.append(renderQuota(account.quota, 'five_hour')); weekly.append(renderQuota(account.quota, 'weekly'));
       const observedAge = element('span', 'observed-age', age(account.observed_at)); observedAge.dataset.observedAt = account.observed_at || '';
       observed.append(observedAge, element('small', 'observed-source', account.observed_at ? sourceText(account.quota?.source) : '等待首次查询'));
+      const observation = presentation?.quotaAssessment(account);
+      if (observation?.reason === 'stale' || observation?.reason === 'future') {
+        const hint = element('small', 'observed-warning', observation.reason === 'stale' ? '额度待更新' : '观测时间待核实');
+        hint.title = observation.fields.join('、') + (observation.reason === 'stale' ? '的观测已超过 5 分钟' : '的观测时间晚于当前页面时间'); observed.append(hint);
+      }
       const accountKey = 'account:' + account.id;
       const button = element('button', 'account-query', queryBusy.has(accountKey) ? '提交中…' : unresolved.has(accountKey) ? '核实查询' : '查询');
       button.type = 'button'; button.disabled = !connected || queryBusy.has(accountKey);
@@ -1875,7 +1880,8 @@
     heading.append(element('h2', '', '账号详情'));
     const close = element('button', 'text-button', '×'); close.type = 'button'; close.setAttribute('aria-label', '关闭账号详情');
     close.onclick = () => { selectedAccountID = ''; renderAccounts(); }; heading.append(close); rows.push(heading);
-    const identity = element('div', 'detail-section'); identity.append(element('h3', 'account-detail-name', account.id), element('p', 'account-secondary', maskedAccount(account.id)), badge((presentation?.accountView(account) || accountStatus(account)).label, (presentation?.accountView(account) || accountStatus(account)).kind));
+    const displayedState = presentation?.accountView(account) || accountStatus(account);
+    const identity = element('div', 'detail-section'); identity.append(element('h3', 'account-detail-name', account.id), element('p', 'account-secondary', maskedAccount(account.id)), badge(displayedState.label, displayedState.kind));
     const state = statusOperations.get(account.id), enabled = typeof state?.disabled === 'boolean' ? !state.disabled : account.status !== 'disabled';
     const switchRow = element('div', 'summary-row'), toggle = element('button', 'account-status-switch');
     toggle.type = 'button'; toggle.setAttribute('role', 'switch'); toggle.setAttribute('aria-checked', String(enabled)); toggle.setAttribute('aria-label', 'CPA 账号状态：' + account.id);
@@ -1889,6 +1895,7 @@
     const quota = element('section', 'detail-section detail-quota'); quota.append(element('h3', '', '额度概况'));
     for (const [key, label] of [['five_hour', '五小时剩余'], ['weekly', '周额度剩余']]) { const row = element('div', 'detail-quota-row'); row.append(element('strong', '', label), renderQuota(account.quota, key)); quota.append(row); }
     quota.append(element('p', 'field-help', '观测来源：' + sourceText(account.quota?.source) + ' · 数据更新：' + age(account.observed_at))); rows.push(quota);
+    if (displayedState.description) quota.append(element('p', 'field-help quota-status-explanation', displayedState.description));
     const cards = resetData?.accounts?.find(item => item.account_id === account.id || item.id === account.id), cardSection = element('section', 'detail-section');
     cardSection.append(element('h3', '', '重置卡'), element('p', '', cards ? '可用 ' + (cards.available_count ?? cards.summary?.available_count ?? cards.credits?.availableCount ?? '未知') + ' 张' : '尚无已观测卡片详情'));
     const cardLink = element('button', 'text-button', '查看详情 →'); cardLink.type = 'button'; cardLink.onclick = () => navigate('cards'); cardSection.append(cardLink); rows.push(cardSection);

@@ -262,6 +262,7 @@ body[data-page="history"] .sub-navigation button { min-height:40px; padding-bott
 .quota-reset,.quota-source,.observed-source { display:block; margin-top:3px; color:var(--text-secondary); font-size:11px; line-height:1.45; }
 .observed-source { display:none; }
 .observed-age { color:var(--text-secondary); font-size:12px; white-space:nowrap; }
+.observed-warning { display:block; margin-top:3px; color:var(--warning-text); font-size:11px; line-height:1.45; }
 .quota-amount { color:var(--text-secondary); font-size:12px; }
 .account-query { display:inline-flex; align-items:center; justify-content:center; min-height:32px; padding:5px 12px; border:1px solid var(--border-color); border-radius:10px; background:var(--bg-primary); color:var(--text-primary); font-size:12px; font-weight:550; white-space:nowrap; }
 .account-query:hover:not(:disabled) { background:var(--bg-tertiary); }

@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const CWRPresentation = require('../../../internal/v2/daemon/web/presentation.js');
 const {ViewTracker, apiBase, readPanelKey, age, resetText, windowView, accountStatus, requestID, validateQueryDraft, configDraft, queueText} = require('../../../internal/v2/daemon/web/panel.js');
 const script = fs.readFileSync(path.resolve(__dirname, '../../../internal/v2/daemon/web/panel.js'), 'utf8');
 const view = (instance = 'a', revision = 1) => ({instance_id: instance, view_revision: revision});
@@ -150,7 +151,7 @@ function panel(respond, options = {}) {
       this.dataset = new Proxy({}, {set: (target, name, value) => {
         this.datasetWrites.push({name, value: String(value)}); target[name] = String(value); return true;
       }});
-      this.attributes = new Map(); this.attributeWrites = []; this.listeners = new Map(); this._text = ''; this.parentNode = null;
+      this.attributes = new Map(); this.attributeWrites = []; this.listeners = new Map(); this._text = ''; this.parentNode = null; this.style = {};
       this.textWrites = 0; this.replaceChildrenCalls = 0;
       this.classList = {toggle() {}, contains: name => String(this.className || '').split(/\s+/).includes(name)};
     }
@@ -244,7 +245,7 @@ function panel(respond, options = {}) {
         return attribute ? nodes.filter(node => Object.hasOwn(node.dataset, attribute)) : [];
       }},
     location: options.location || location, navigator: {userAgent: 'fixture', ...options.navigator}, isSecureContext: options.secure || false,
-    CWRRecords: options.records,
+    CWRRecords: options.records, CWRPresentation: options.presentation,
     matchMedia: query => ({get matches() { return query === '(prefers-color-scheme: dark)' ? !!options.systemDark : !!options.mobile && query === '(max-width: 1100px)'; }, addEventListener: (name, callback) => mediaEvents.set(query, callback)}),
     localStorage: {getItem: name => { if (options.storageReadBlocked) throw new Error('storage unavailable'); return storage[name] ?? null; }, setItem: (name, value) => { if (options.storageBlocked) throw new Error('storage unavailable'); storage[name] = value; }},
     fetch: async (url, settings) => {
@@ -3920,4 +3921,131 @@ test('the records header refresh reads the active records page without resetting
   const previous = historyReads(); await ui.get('refresh').onclick(); await flush();
   assert.ok(historyReads() > previous); assert.equal(refreshes, 1);
   assert.equal(mutations(ui).length, 0);
+});
+
+function observedQuotaAccount(id, at, five = 64, weekly = 100) {
+  const observed = new Date(at).toISOString();
+  return {id, status: 'available', observed_at: observed, quota: {permission: 'allowed', source: 'cpa_wham_usage', observed_at: observed,
+    five_hour: {State: 'active', ConfirmedAt: observed, ResetAt: new Date(at + 3600000).toISOString(), Remaining: {Value: five, Unit: 'percent'}},
+    weekly: {State: 'active', ConfirmedAt: observed, ResetAt: new Date(at + 86400000).toISOString(), Remaining: {Value: weekly, Unit: 'percent'}}}};
+}
+function quotaOverview(revision, capacity, total = 2) {
+  const data = overview(revision);
+  data.dashboard = {...data.dashboard, total, enabled: total, available: total, disabled: 0, unavailable: 0, capacity,
+    quota_exhausted: 0, unknown_enabled: total - capacity, unknown_quota: total - capacity, errors: 0};
+  return data;
+}
+const quotaWarnings = row => descendants(row.children[5]).filter(node => node.className === 'observed-warning');
+const quotaPercentages = row => descendants(row).filter(node => node.className === 'quota-percent').map(node => node.textContent);
+const openQuotaDetail = async (ui, index = 0) => {
+  descendants(ui.get('accounts').children[index]).find(node => node.className === 'account-identity').onclick();
+  await flush();
+  return descendants(ui.get('account-detail')).find(node => node.className === 'field-help quota-status-explanation');
+};
+
+test('fresh 100-percent unknown windows keep their percentages and explain window verification without stale account labels', async () => {
+  const at = Date.now() - 1000;
+  const accounts = [observedQuotaAccount('fresh-five-hour', at, 100, 100), observedQuotaAccount('fresh-weekly', at, 54, 100)];
+  accounts[0].quota.five_hour.State = 'unknown'; accounts[1].quota.weekly.State = 'unknown';
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) return [200, quotaOverview(1, 0)];
+    if (url.includes('/task-history?')) return [200, historyPage()];
+    if (url.endsWith('/reset-cards')) return [200, {instance_id: 'a', accounts: [], attempts: []}];
+    return [200, accountPage(1, accounts)];
+  }, {presentation: CWRPresentation});
+  await ui.get('connect').onclick();
+  for (const [index, expected] of [[0, ['100%', '100%']], [1, ['54%', '100%']]]) {
+    const row = ui.get('accounts').children[index];
+    assert.equal(row.children[4].textContent, '窗口待核实');
+    assert.doesNotMatch(row.children[4].textContent + row.children[4].title, /过期|已超过/);
+    assert.deepEqual(quotaPercentages(row), expected); assert.equal(quotaWarnings(row).length, 0);
+    const explanation = await openQuotaDetail(ui, index);
+    assert.match(explanation.textContent, /额度数据已更新/); assert.match(explanation.textContent, /100%/);
+    assert.match(explanation.textContent, /查询额度也不会启动窗口/);
+    assert.match(explanation.textContent, index === 0 ? /五小时额度/ : /周额度/);
+  }
+  assert.equal(ui.get('metric-capacity').textContent, '0 / 2');
+  assert.equal(mutations(ui).length, 0);
+});
+
+test('older quota evidence moves its warning to the update column while normal accounts and percentages remain visible', async () => {
+  const at = Date.now() - 1000, old = new Date(at - 600000).toISOString();
+  let revision = 1, accounts = [observedQuotaAccount('old-weekly-only', at, 88, 100), observedQuotaAccount('old-all-fields', at, 100, 93)];
+  const ui = panel(url => {
+    if (url.endsWith('/overview')) return [200, quotaOverview(revision, revision === 1 ? 2 : 0)];
+    if (url.includes('/task-history?')) return [200, historyPage()];
+    if (url.endsWith('/reset-cards')) return [200, {instance_id: 'a', accounts: [], attempts: []}];
+    return [200, accountPage(revision, accounts)];
+  }, {presentation: CWRPresentation});
+  await ui.get('connect').onclick();
+  assert.equal(ui.get('metric-capacity').textContent, '2 / 2');
+  for (const row of ui.get('accounts').children) assert.equal(row.children[4].textContent, '可用');
+  accounts = structuredClone(accounts);
+  // A recent top-level timestamp must not make the older weekly field fresh.
+  accounts[0].quota.fields = {weekly: {observed_at: old, source: 'cpa_wham_usage'}};
+  accounts[1].observed_at = old; accounts[1].quota.observed_at = old;
+  revision++; await ui.get('refresh').onclick();
+  for (const [index, expected] of [[0, ['88%', '100%']], [1, ['100%', '93%']]]) {
+    const row = ui.get('accounts').children[index], warnings = quotaWarnings(row);
+    assert.equal(row.children[4].textContent, '正常');
+    assert.ok(descendants(row.children[4]).some(node => node.className === 'status-badge available'));
+    assert.doesNotMatch(row.children[4].textContent, /过期|待核实/);
+    assert.deepEqual(quotaPercentages(row), expected);
+    assert.equal(warnings.length, 1); assert.equal(warnings[0].textContent, '额度待更新');
+    assert.match(warnings[0].title, /周额度.*超过 5 分钟/);
+    const explanation = await openQuotaDetail(ui, index);
+    assert.match(explanation.textContent, /CPA 账号状态正常/); assert.match(explanation.textContent, /显示的是上次观测额度/);
+    assert.match(explanation.textContent, /不表示账号不可用/);
+    if (index === 0) assert.match(explanation.textContent, /周额度的观测/);
+  }
+  assert.equal(ui.get('metric-capacity').textContent, '0 / 2');
+  assert.equal(mutations(ui).length, 0);
+});
+
+test('a completed quota query refreshes stale hints and distinguishes a fresh unknown window without resending or calling models', async () => {
+  for (const windowState of ['active', 'unknown', 'weekly_stale']) {
+    let revision = 1, polled = 0;
+    let account = observedQuotaAccount('query-refresh-account', Date.now() - 600000, 100, 100);
+    const ui = panel((url, request) => {
+      if (url.endsWith('/jobs') && request.method === 'POST') {
+        account = observedQuotaAccount(account.id, Date.now() - 1000, 100, 100);
+        account.quota.five_hour.State = windowState === 'unknown' ? 'unknown' : 'active';
+        if (windowState === 'weekly_stale') account.quota.fields = {weekly: {observed_at: new Date(Date.now() - 600000).toISOString(), source: 'cpa_wham_usage'}};
+        revision++;
+        return [202, {instance_id: 'a', job_id: 'completed-quota-query'}];
+      }
+      if (url.includes('/jobs?')) {
+        polled++;
+        return [200, {...view('a', revision), job_id: 'completed-quota-query', account_id: account.id, trigger: 'manual_single', phase: 'completed', items: [{account_id: account.id, phase: 'completed'}]}];
+      }
+      if (url.endsWith('/overview')) return [200, quotaOverview(revision, revision > 1 && windowState === 'active' ? 1 : 0, 1)];
+      if (url.includes('/task-history?')) return [200, historyPage()];
+      if (url.endsWith('/reset-cards')) return [200, {instance_id: 'a', accounts: [], attempts: []}];
+      return [200, accountPage(revision, [account])];
+    }, {presentation: CWRPresentation});
+    await ui.get('connect').onclick();
+    assert.equal(ui.get('accounts').children[0].children[4].textContent, '正常');
+    assert.equal(quotaWarnings(ui.get('accounts').children[0])[0].textContent, '额度待更新');
+    await openQuotaDetail(ui);
+    await accountQuery(ui).onclick();
+    const row = ui.get('accounts').children[0];
+    assert.ok(polled > 0); assert.equal(quotaWarnings(row).length, windowState === 'weekly_stale' ? 1 : 0);
+    assert.equal(row.children[4].textContent, windowState === 'active' ? '可用' : windowState === 'unknown' ? '窗口待核实' : '正常');
+    assert.deepEqual(quotaPercentages(row), ['100%', '100%']);
+    assert.equal(descendants(row.children[5]).find(node => node.className === 'observed-age').dataset.observedAt, account.observed_at);
+    if (windowState !== 'weekly_stale') assert.doesNotMatch(row.children[4].title, /已超过 5 分钟/);
+    const explanation = descendants(ui.get('account-detail')).find(node => node.className === 'field-help quota-status-explanation');
+    if (windowState === 'unknown') assert.match(explanation.textContent, /额度数据已更新.*窗口是否已启动尚未确认/);
+    else if (windowState === 'weekly_stale') {
+      assert.match(explanation.textContent, /周额度的观测已超过 5 分钟/);
+      assert.doesNotMatch(explanation.textContent, /五小时额度的观测/);
+      assert.match(quotaWarnings(row)[0].title, /周额度的观测/);
+    } else assert.equal(explanation, undefined);
+    await ui.tick(5000); await flush();
+    const posts = mutations(ui);
+    assert.equal(posts.length, 1); assert.ok(posts[0].url.endsWith('/jobs'));
+    assert.deepEqual(JSON.parse(posts[0].body), {kind: 'quota_query', account_id: account.id});
+    assert.equal(ui.calls.some(call => /\/(wake-jobs|prompt-generations)(?:\?|$)/.test(call.url)), false);
+    assert.equal(ui.get('metric-capacity').textContent, (windowState === 'active' ? '1' : '0') + ' / 1');
+  }
 });

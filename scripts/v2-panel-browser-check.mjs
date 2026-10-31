@@ -14,6 +14,7 @@ const fixtureKey = 'local-v2-browser-fixture';
 const autorefreshOnly = process.env.CWR_AUTOREFRESH_ONLY === '1';
 const schedulingOnly = process.env.CWR_SCHEDULING_ONLY === '1';
 const projectsOnly = process.env.CWR_PROJECTS_ONLY === '1';
+const quotaStatusOnly = process.env.CWR_QUOTA_STATUS_ONLY === '1';
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
 const posts = [], patches = [], reads = [], exceptions = [], pageErrors = [];
@@ -461,6 +462,43 @@ try {
     const capture = await cdp('Page.captureScreenshot', {format: 'png', captureBeyondViewport: false});
     await writeFile(join(output, name), Buffer.from(capture.data, 'base64'));
   }
+  async function runQuotaStatusChecks() {
+    const original = structuredClone(accounts), old = later(-600);
+    const readRows = () => evaluate(`Array.from(document.querySelectorAll('#accounts tr'),row=>({status:row.cells[4].textContent,updated:row.cells[5].textContent,quota:row.cells[2].textContent+row.cells[3].textContent}))`);
+    const reload = async () => {
+      revision++; accountsRevision++;
+      const before = readCountFor('accounts'); await evaluate(`document.getElementById('refresh').click()`);
+      await waitFor(() => readCountFor('accounts') > before, 'Quota status refresh did not read account observations'); await settleRefresh();
+    };
+    accounts[0].quota.weekly.State = 'unknown'; accounts[0].quota.weekly.Remaining.Value = 100;
+    accounts[1].observed_at = old; accounts[1].quota.observed_at = old;
+    delete accounts[2].quota.weekly;
+    await reload();
+    let rows = await readRows();
+    assert.equal(rows[0].status, '窗口待核实'); assert.match(rows[0].quota, /100%/); assert.doesNotMatch(rows[0].updated, /待更新/);
+    assert.equal(rows[1].status, '正常'); assert.match(rows[1].updated, /额度待更新/);
+    assert.equal(rows[2].status, '额度数据不完整');
+    await evaluate(`document.querySelector('.account-identity').click()`); await settleRefresh();
+    assert.match(await evaluate(`document.querySelector('#account-detail .quota-status-explanation').textContent`), /窗口是否已启动尚未确认/);
+    assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`), true);
+    await screenshot('quota-window-unconfirmed-desktop.png');
+    await cdp('Emulation.setDeviceMetricsOverride', {width:390,height:844,deviceScaleFactor:1,mobile:false});
+    assert.equal(await evaluate(`document.documentElement.scrollWidth<=innerWidth`), true);
+    await screenshot('quota-window-unconfirmed-mobile.png');
+    await evaluate(`document.querySelector('[aria-label="关闭账号详情"]').click();document.querySelector('[data-page="overview"]').click()`);
+    await cdp('Emulation.setDeviceMetricsOverride', {width:1586,height:992,deviceScaleFactor:1,mobile:false});
+    accounts.splice(0, accounts.length, ...structuredClone(original));
+    for (const account of accounts) { account.observed_at = old; if(account.quota) account.quota.observed_at = old; }
+    await reload(); rows = await readRows();
+    assert.equal(rows.slice(0,4).every(row=>row.status==='正常'&&row.updated.includes('额度待更新')), true, 'Evidence expiry changed healthy CPA accounts into unavailable accounts');
+    assert.equal(rows[4].status, '已禁用'); assert.equal(rows[5].status, '暂不可用');
+    await screenshot('quota-stale-observations-desktop.png');
+    accounts.splice(0, accounts.length, ...structuredClone(original)); await reload();
+    assert.doesNotMatch((await readRows())[0].updated, /额度待更新/);
+    assert.equal(posts.length, 0); assert.equal(patches.length, 0);
+    assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
+    console.log('Quota status Chromium checks passed: fresh 100% placeholders, incomplete observations, account health separated from five-minute capacity freshness, detail explanations, refresh recovery, desktop/mobile overflow and zero writes. Screenshots: '+output);
+  }
   async function runSchedulingChecks() {
     const writeCount = posts.length, patchCount = patches.length;
     await evaluate('document.querySelector("[data-page=scheduling]").click()');
@@ -889,6 +927,7 @@ try {
     console.log('DESIGN_REVIEW '+JSON.stringify({pages:layouts.length,exceptions,pageErrors,output}));
     break checks;
   }
+  if (quotaStatusOnly) { await runQuotaStatusChecks(); break checks; }
   if (projectsOnly) { await runProjectMatchingChecks(); break checks; }
   if (schedulingOnly) { await runSchedulingChecks(); break checks; }
   if (autorefreshOnly) {
@@ -2009,7 +2048,7 @@ try {
   if (server) await new Promise(resolve => server.close(resolve));
   await rm(temporary, {recursive: true, force: true, maxRetries: 5, retryDelay: 200});
 }
-if (!autorefreshOnly && !schedulingOnly && !projectsOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
+if (!autorefreshOnly && !schedulingOnly && !projectsOnly && !quotaStatusOnly && process.env.CWR_DESIGN_REVIEW !== '1') {
   console.log('Original V2 fixture verified 21 POSTs including sticky settings and five direct CPA PATCHes; starting isolated automatic-refresh fixture after browser cleanup.');
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_AUTOREFRESH_ONLY: '1'}, stdio: 'inherit'});
   const result = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({code, signal})); });
@@ -2018,5 +2057,8 @@ if (!autorefreshOnly && !schedulingOnly && !projectsOnly && process.env.CWR_DESI
   const projectChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_PROJECTS_ONLY: '1', CWR_AUTOREFRESH_ONLY: '0', CWR_SCHEDULING_ONLY: '0', CWR_SCREENSHOT_DIR: join(output, 'project-matching')}, stdio: 'inherit'});
   const projectResult = await new Promise((resolve, reject) => { projectChild.once('error', reject); projectChild.once('exit', (code, signal) => resolve({code, signal})); });
   assert.equal(projectResult.code, 0, 'Isolated project-matching Chromium fixture failed: ' + JSON.stringify(projectResult));
-  console.log('V2 full, automatic-refresh and project-matching Chromium fixtures all passed.');
+  const quotaChild = spawn(process.execPath, [fileURLToPath(import.meta.url)], {env: {...process.env, CWR_QUOTA_STATUS_ONLY:'1', CWR_AUTOREFRESH_ONLY:'0', CWR_PROJECTS_ONLY:'0', CWR_SCREENSHOT_DIR:join(output,'quota-status')}, stdio:'inherit'});
+  const quotaResult = await new Promise((resolve,reject)=>{quotaChild.once('error',reject);quotaChild.once('exit',(code,signal)=>resolve({code,signal}));});
+  assert.equal(quotaResult.code,0,'Isolated quota status Chromium fixture failed: '+JSON.stringify(quotaResult));
+  console.log('V2 full, automatic-refresh, project-matching and quota status Chromium fixtures all passed.');
 }
