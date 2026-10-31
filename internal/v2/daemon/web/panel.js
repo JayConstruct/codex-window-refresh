@@ -236,7 +236,8 @@
     const observedAt = quota?.fields?.[name]?.observed_at || window?.ConfirmedAt || quota?.observed_at;
     const seconds = Number.isSafeInteger(window?.ResetAfterSeconds) ? window.ResetAfterSeconds : Math.floor(timestamp(window?.ResetAt) / 1000) - Math.floor(timestamp(window?.ConfirmedAt || observedAt) / 1000);
     const fullWindow = seconds === {five_hour: 18000, weekly: 604800}[name];
-    return {percent, amount: percent === null && remaining?.Unit !== 'percent' && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + ' ' + (remaining.Unit || '') : '', reset: fullWindow ? '' : resetText(window?.ResetAt, now), source: sourceText(source), observedAt};
+    const unstarted = name === 'five_hour' && percent === 100 && !['active', 'expired'].includes(window?.State) && (window?.State === 'inactive' || fullWindow);
+    return {percent, amount: percent === null && remaining?.Unit !== 'percent' && typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value + ' ' + (remaining.Unit || '') : '', reset: unstarted ? '窗口未启动' : fullWindow ? '' : resetText(window?.ResetAt, now), source: sourceText(source), observedAt};
   }
   function accountStatus(account) {
     if (account.status === 'disabled') return {label: '手动禁用', kind: 'disabled'};
@@ -1860,7 +1861,7 @@
       cell.title = view.source + ' · ' + age(view.observedAt);
       if (view.reset) {
         const reset = element('small', 'quota-reset', view.reset);
-        reset.dataset.resetAt = quota[name].ResetAt || '';
+        if (view.reset !== '窗口未启动') reset.dataset.resetAt = quota[name].ResetAt || '';
         cell.append(reset);
       }
       source.dataset.observedAt = view.observedAt || ''; source.dataset.quotaSource = view.source;

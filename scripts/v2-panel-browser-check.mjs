@@ -514,6 +514,14 @@ try {
     await screenshot('quota-window-unconfirmed-mobile.png');
     await evaluate(`document.querySelector('[aria-label="关闭账号详情"]').click();document.querySelector('[data-page="overview"]').click()`);
     await cdp('Emulation.setDeviceMetricsOverride', {width:1586,height:992,deviceScaleFactor:1,mobile:false});
+    const unstartedObserved = later(-120);
+    Object.assign(accounts[0].quota.five_hour, {State:'unknown', ResetAfterSeconds:18000, ConfirmedAt:unstartedObserved, ResetAt:new Date(Date.parse(unstartedObserved)+18000000).toISOString(), Remaining:{Value:100,Unit:'percent'}});
+    await reload();
+    assert.equal((await readRows())[0].status, '窗口未启动');
+    assert.equal(await evaluate(`document.querySelector('#accounts tr .quota-reset').textContent`), '窗口未启动');
+    await new Promise(resolve => setTimeout(resolve,1100));
+    assert.equal(await evaluate(`document.querySelector('#accounts tr .quota-reset').textContent`), '窗口未启动', 'Local timer replaced unstarted state with a countdown');
+    await screenshot('quota-full-window-unstarted-desktop.png');
     accounts.splice(0, accounts.length, ...structuredClone(original));
     for (const account of accounts) { account.observed_at = old; if(account.quota) account.quota.observed_at = old; }
     await reload(); rows = await readRows();

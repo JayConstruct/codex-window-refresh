@@ -17,7 +17,7 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 Codeman 使用默认用户服务 `codeman-web.service` 时，一条命令安装本版客户端、配置入口并重启 Codeman：
 
 ```sh
-curl -fSL --retry 3 https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/v0.2.0-rc.32/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh --codeman-dir "$HOME/.codeman" && systemctl --user restart codeman-web.service
+curl -fSL --retry 3 https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/v0.2.0-rc.33/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh --codeman-dir "$HOME/.codeman" && systemctl --user restart codeman-web.service
 ```
 
 使用其他启动方式时，仅运行安装器，再通过原来的管理方式重启 Codeman。

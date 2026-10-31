@@ -3,6 +3,17 @@
   const finiteCount = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
   const stamp = value => typeof value === 'string' && !value.startsWith('0001-') ? Date.parse(value) : NaN;
 
+  function fiveHourUnstarted(quota) {
+    const window = quota?.five_hour;
+    if (window?.Remaining?.Unit !== 'percent' || window.Remaining.Value !== 100 || window.State === 'active' || window.State === 'expired') return false;
+    if (window.State === 'inactive') return true;
+    // Compare with the original observation, never the current browser time.
+    // An explicit upstream countdown takes precedence over rounded timestamps.
+    if (Object.hasOwn(window, 'ResetAfterSeconds') && window.ResetAfterSeconds != null) return window.ResetAfterSeconds === 18000;
+    const observed = stamp(window.ConfirmedAt || quota.fields?.five_hour?.observed_at || quota.observed_at);
+    return Math.floor(stamp(window.ResetAt) / 1000) - Math.floor(observed / 1000) === 18000;
+  }
+
   function quotaAssessment(account, now = Date.now()) {
     const quota = account?.quota;
     const names = {permission: '许可状态', five_hour: '五小时额度', weekly: '周额度'};
@@ -77,7 +88,10 @@
     if (account.display_status === 'quota_restricted' || account.quota?.permission === 'blocked') return {label: '额度受限', kind: 'attention'};
     const evidence = quotaAssessment(account, now), fields = evidence.fields.join('、');
     if (evidence.usable) return {label: '可用', kind: 'available'};
-    if (quotaAvailable(account, now)) return {label: '可用', kind: 'available', description: evidence.reason === 'stale' ? 'CPA 账号状态正常；' + fields + '的观测已超过 5 分钟，显示的是上次观测额度，不表示账号不可用。活动窗口统计仍使用新鲜证据。' : '额度数据已更新，最近观测有可用额度；' + fields + '窗口是否已启动尚未确认。100% 剩余额度本身不能证明窗口已启动，查询额度也不会启动窗口。'};
+    if (quotaAvailable(account, now)) {
+      if (fiveHourUnstarted(account.quota)) return {label: '窗口未启动', kind: 'available', description: '最近观测五小时额度剩余 100%，上游返回完整的 18000 秒，表示五小时窗口未启动。查询额度不会启动窗口；该账号有可用余额，但不计入已启动的活动窗口容量。' + (evidence.reason === 'stale' ? '显示的是上次观测结果。' : '')};
+      return {label: '可用', kind: 'available', description: evidence.reason === 'stale' ? 'CPA 账号状态正常；' + fields + '的观测已超过 5 分钟，显示的是上次观测额度，不表示账号不可用。活动窗口统计仍使用新鲜证据。' : '额度数据已更新，最近观测有可用额度；' + fields + '窗口是否已启动尚未确认。100% 剩余额度本身不能证明窗口已启动，查询额度也不会启动窗口。'};
+    }
     if (evidence.reason === 'stale') return {label: '正常', kind: 'available', description: 'CPA 账号状态正常；' + fields + '的观测已超过 5 分钟，显示的是上次观测额度。观测时效只影响已核实窗口统计，不表示账号不可用；最近查询可能只更新了其他字段。'};
     if (evidence.reason === 'unconfirmed') return {label: '窗口待核实', kind: 'unavailable', description: '额度数据已更新，但' + fields + '窗口是否已启动尚未确认。100% 剩余额度本身不能证明窗口已启动，查询额度也不会启动窗口。'};
     if (evidence.reason === 'reset_due') return {label: '窗口待核实', kind: 'unavailable', description: fields + '已到重置时间，等待新的窗口证据；不按本地倒计时自动判定恢复。'};
@@ -120,7 +134,7 @@
     return result;
   }
 
-  const api = {quotaEvidence, quotaAssessment, quotaAvailable, pendingQueryView, accountView, overviewSummary, matchingProjects, sortAccounts};
+  const api = {fiveHourUnstarted, quotaEvidence, quotaAssessment, quotaAvailable, pendingQueryView, accountView, overviewSummary, matchingProjects, sortAccounts};
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   if (typeof globalThis !== 'undefined') globalThis.CWRPresentation = api;
 })();

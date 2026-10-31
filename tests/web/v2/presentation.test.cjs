@@ -2,6 +2,46 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {quotaEvidence, quotaAssessment, accountView, overviewSummary} = require('../../../internal/v2/daemon/web/presentation.js');
+const {fiveHourUnstarted} = require('../../../internal/v2/daemon/web/presentation.js');
+
+test('a full reported five-hour countdown identifies an unstarted window after minutes on the page', () => {
+  const at = Date.parse('2026-10-31T00:00:00.750Z'), account = observedAccount(at);
+  account.quota.five_hour = {State: 'unknown', ConfirmedAt: new Date(at).toISOString(), ResetAt: new Date(at + 17999000).toISOString(), ResetAfterSeconds: 18000, Remaining: {Value: 100, Unit: 'percent'}};
+  const before = JSON.stringify(account);
+  for (const elapsed of [0, 120000, 299999]) {
+    const state = accountView(account, at + elapsed);
+    assert.equal(state.label, '窗口未启动');
+    assert.equal(state.kind, 'available');
+    assert.match(state.description, /不计入已启动的活动窗口容量/);
+    assert.equal(quotaEvidence(account, at + elapsed).usable, false);
+  }
+  assert.equal(JSON.stringify(account), before);
+  delete account.quota.five_hour.ResetAfterSeconds;
+  account.quota.five_hour.ResetAt = new Date(Math.floor(at / 1000) * 1000 + 18000000).toISOString();
+  assert.equal(fiveHourUnstarted(account.quota), true);
+  account.quota.weekly.State = 'unknown'; account.quota.weekly.Remaining.Value = 100;
+  assert.equal(accountView(account, at).label, '窗口未启动');
+  account.quota.weekly.Remaining.Value = 0;
+  assert.equal(accountView(account, at).label, '周额度耗尽');
+  account.status = 'disabled';
+  assert.equal(accountView(account, at).label, '已禁用');
+});
+
+test('a shortened countdown and a five-hour total duration do not imply an unstarted window', () => {
+  const at = Date.parse('2026-10-31T00:00:00Z'), account = observedAccount(at);
+  const window = account.quota.five_hour;
+  window.State = 'unknown'; window.Remaining.Value = 100;
+  window.ResetAt = new Date(at + 18000000).toISOString(); window.ResetAfterSeconds = 17999;
+  assert.equal(fiveHourUnstarted(account.quota), false);
+  window.ResetAfterSeconds = 18001;
+  assert.equal(fiveHourUnstarted(account.quota), false);
+  window.ResetAfterSeconds = 18000; window.Remaining.Value = 99;
+  assert.equal(fiveHourUnstarted(account.quota), false);
+  window.Remaining.Value = 100; window.State = 'active';
+  assert.equal(fiveHourUnstarted(account.quota), false);
+  delete window.ResetAfterSeconds; window.State = 'unknown'; window.ResetAt = new Date(at + 3600000).toISOString();
+  assert.equal(fiveHourUnstarted(account.quota), false);
+});
 
 test('reset query status counts down without restoring quota and respects disabled accounts', () => {
   const at = Date.parse('2026-10-31T00:00:00Z'), account = observedAccount(at - 3600000);

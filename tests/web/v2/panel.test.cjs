@@ -153,16 +153,16 @@ test('account badges distinguish depletion, restrictions and host state without 
   assert.equal(accountStatus({status: 'available', quota: {five_hour: {Remaining: {Value: '0', Unit: 'percent'}}}}).label, '正常');
   assert.equal(accountStatus({status: 'unexpected'}).label, '状态未知');
 });
-test('full five-hour and weekly placeholders never start a display countdown as time passes', () => {
+test('full five-hour placeholders stay unstarted and never start a display countdown as time passes', () => {
   const observed = Date.parse('2026-10-17T12:00:00.750Z');
   for (const [name, seconds] of [['five_hour', 18000], ['weekly', 604800]]) {
     const window = {ResetAt: new Date(observed + seconds * 1000).toISOString(), ConfirmedAt: new Date(observed).toISOString(), ResetAfterSeconds: seconds, Remaining: {Value: 100, Unit: 'percent'}};
     for (const elapsed of [0, 1000, 60000, seconds * 1000 + 1000]) {
-      assert.equal(windowView({[name]: window}, name, observed + elapsed).reset, '');
+      assert.equal(windowView({[name]: window}, name, observed + elapsed).reset, name === 'five_hour' ? '窗口未启动' : '');
     }
     delete window.ResetAfterSeconds;
     window.ResetAt = new Date(Math.floor(observed / 1000) * 1000 + seconds * 1000).toISOString();
-    assert.equal(windowView({[name]: window}, name, observed + 60000).reset, '');
+    assert.equal(windowView({[name]: window}, name, observed + 60000).reset, name === 'five_hour' ? '窗口未启动' : '');
   }
 });
 test('non-full countdowns remain visible independently of percentage, state and window length', () => {
@@ -4138,6 +4138,26 @@ function quotaOverview(revision, capacity, total = 2) {
 }
 const quotaUpdateTime = row => descendants(row.children[5]).find(node => node.className === 'observed-age');
 const quotaPercentages = row => descendants(row).filter(node => node.className === 'quota-percent').map(node => node.textContent);
+
+test('a recently queried full five-hour window stays unstarted across local clock updates', async () => {
+  const at = Date.now(), observed = at - 120000;
+  const account = observedQuotaAccount('unstarted', observed, 100, 80);
+  Object.assign(account.quota.five_hour, {State: 'unknown', ResetAfterSeconds: 18000, ResetAt: new Date(observed + 18000000).toISOString()});
+  const ui = panel(url => url.endsWith('/overview') ? [200, quotaOverview(1, 0, 1)] : url.includes('/task-history?') ? [200, historyPage()] : [200, accountPage(1, [account])], {presentation: CWRPresentation});
+  let current = at;
+  ui.clock.Date = class extends Date { static now() { return current; } };
+  await ui.get('connect').onclick();
+  const row = ui.get('accounts').children[0];
+  assert.equal(row.children[4].textContent, '窗口未启动');
+  assert.match(row.children[2].textContent, /100%窗口未启动/);
+  const reads = ui.calls.length;
+  current += 60000; await ui.tick(1000);
+  assert.equal(row.children[4].textContent, '窗口未启动');
+  assert.match(row.children[2].textContent, /窗口未启动/);
+  assert.equal(descendants(row.children[2]).some(node => Object.hasOwn(node.dataset, 'resetAt')), false);
+  assert.equal(ui.calls.length, reads);
+  assert.equal(mutations(ui).length, 0);
+});
 
 test('reset query badge counts down each second locally and stops its timer on disconnect', async () => {
   const at = Date.now(), account = observedQuotaAccount('waiting-reset', at - 10000, 0, 75);
