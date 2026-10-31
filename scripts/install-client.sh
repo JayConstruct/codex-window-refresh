@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLIENT_VERSION=v0.2.0-rc.34
+CLIENT_VERSION=v0.2.0-rc.35
 CLIENT_SHA256=10de067c5c6983a00f60b347017a8a7b7c757bee8a1dd60c2ebefc836149c512
 version=$CLIENT_VERSION
 bin_dir=${HOME:-}/.local/bin

@@ -129,9 +129,10 @@ type TrafficFacets struct {
 }
 type TrafficCoverage struct {
 	ActivitySummary
-	UnlinkedAttempts int `json:"unlinked_attempts"`
-	RequestLimit     int `json:"request_limit"`
-	AttemptLimit     int `json:"attempt_limit"`
+	UnlinkedAttempts     int `json:"unlinked_attempts"`
+	UnclassifiedRequests int `json:"unclassified_requests"`
+	RequestLimit         int `json:"request_limit"`
+	AttemptLimit         int `json:"attempt_limit"`
 }
 
 type TrafficPage struct {
@@ -310,6 +311,12 @@ func applyTraffic(ctx context.Context, tx *sql.Tx, instance string, e events.Eve
 		requestID = trafficHash(instance, "request", e.RequestID)
 		r, err := loadTrafficRequest(ctx, tx, requestID)
 		if errors.Is(err, sql.ErrNoRows) {
+			// CPA also completes local model-catalog reads. A terminal event
+			// without request or selection evidence cannot establish a model
+			// request. Existing requests still accept empty completions below.
+			if t.Phase == "completed" && t.Caller == "" && t.Model == "" && t.AccountID == "" && t.SelectionID == "" && t.Project == "" && t.Session == "" {
+				return nil
+			}
 			var count int
 			if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM traffic_requests").Scan(&count); err != nil {
 				return err
@@ -626,6 +633,9 @@ func (s *Store) Traffic(ctx context.Context, f TrafficFilter) (TrafficPage, erro
 	if f.Kind == "plugin" {
 		records, err = pluginTraffic(ctx, tx)
 	} else {
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM traffic_requests r WHERE NOT ("+userTrafficEvidenceSQL+")").Scan(&p.Coverage.UnclassifiedRequests); err != nil {
+			return p, err
+		}
 		records, err = readUserTraffic(ctx, tx)
 	}
 	if err != nil {
@@ -813,8 +823,14 @@ func (s *Store) Traffic(ctx context.Context, f TrafficFilter) (TrafficPage, erro
 	return p, tx.Commit()
 }
 
+// Old daemons persisted catalog completions as empty requests. Keep those rows
+// intact, but require request metadata or an exactly linked selection/execution
+// before including them in user history, details, facets, or analysis.
+const userTrafficEvidenceSQL = `r.model!='' OR r.caller!='' OR r.project!='' OR r.session!='' OR r.account_id!=''
+ OR EXISTS(SELECT 1 FROM traffic_attempts a WHERE a.request_id=r.id)`
+
 func readUserTraffic(ctx context.Context, tx *sql.Tx) ([]TrafficRecord, error) {
-	rows, err := tx.QueryContext(ctx, "SELECT r.id,r.data,COALESCE(p.name,'') FROM traffic_requests r LEFT JOIN routing_projects p ON p.project=r.project ORDER BY r.created_at DESC,r.id DESC LIMIT 50000")
+	rows, err := tx.QueryContext(ctx, "SELECT r.id,r.data,COALESCE(p.name,'') FROM traffic_requests r LEFT JOIN routing_projects p ON p.project=r.project WHERE ("+userTrafficEvidenceSQL+") ORDER BY r.created_at DESC,r.id DESC LIMIT 50000")
 	if err != nil {
 		return nil, err
 	}

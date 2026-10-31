@@ -18,6 +18,84 @@ func trafficEvent(seq uint64, kind, id string, observation events.Traffic) event
 func number(v int64) *int64 { return &v }
 func httpNumber(v int) *int { return &v }
 
+func TestTrafficCatalogCompletionDoesNotInventModelRequests(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	// CPA emits these completions for model catalog reads without running a model.
+	observed := batch(0,
+		trafficEvent(1, "completed", "models-list", events.Traffic{Phase: "completed", TraceID: "catalog-trace", Status: "succeeded", HTTPStatus: httpNumber(200)}),
+		trafficEvent(2, "completed", "model-detail", events.Traffic{Phase: "completed", Status: "failed", HTTPStatus: httpNumber(404)}),
+	)
+	if through, err := s.ApplyEvents(ctx, observed); err != nil || through != 2 {
+		t.Fatal(through, err)
+	}
+	p, err := s.Traffic(ctx, TrafficFilter{})
+	if err != nil || p.Total != 0 || p.Summary.Requests != 0 {
+		t.Fatal("catalog reads counted as model requests", p, err)
+	}
+	var count int
+	if err := s.db.QueryRow("SELECT count(*) FROM traffic_requests").Scan(&count); err != nil || count != 0 {
+		t.Fatal("empty completions consumed request history capacity", count, err)
+	}
+	// An empty completion must still finish a previously observed user request.
+	// A model request seen only at completion remains valid without a caller.
+	observed = batch(2,
+		trafficEvent(3, "started", "business", events.Traffic{Phase: "started", Caller: "scope"}),
+		trafficEvent(4, "completed", "business", events.Traffic{Phase: "completed", Status: "succeeded"}),
+		trafficEvent(5, "completed", "late-model", events.Traffic{Phase: "completed", Model: "fixture-model", Status: "failed"}),
+		trafficEvent(6, "account_selected", "selected", events.Traffic{Phase: "selected", AccountID: "a", SelectionID: "selection"}),
+		trafficEvent(7, "completed", "selected", events.Traffic{Phase: "completed", Status: "succeeded"}),
+	)
+	if _, err := s.ApplyEvents(ctx, observed); err != nil {
+		t.Fatal(err)
+	}
+	p, err = s.Traffic(ctx, TrafficFilter{Kind: "analysis"})
+	if err != nil || p.Total != 3 || p.Summary.Attempts != 0 {
+		t.Fatal("valid requests without usage or caller were lost", p, err)
+	}
+	for _, r := range p.Records {
+		if (r.RequestID == "business" || r.RequestID == "selected") && r.Status != "completed" {
+			t.Fatal("empty completion did not finish known request", r)
+		}
+	}
+}
+
+func TestTrafficLegacyEmptyCompletionsStayOutsideUserHistory(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	stamp := now()
+	for _, id := range []string{"legacy-catalog", "legacy-execution", "legacy-selection"} {
+		r := TrafficRecord{ID: trafficHash("bridge-a", "request", id), RequestID: id, Status: "completed", CreatedAt: stamp, UpdatedAt: stamp, Reason: "unknown"}
+		if _, err := s.db.Exec(`INSERT INTO traffic_requests(id,bridge_instance,request_id,trace_id,status,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?,?)`, r.ID, "bridge-a", id, "trace-"+id, r.Status, stamp, stamp, mustTrafficJSON(r)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"legacy-execution", "legacy-selection"} {
+		a := TrafficAttempt{ID: "attempt-" + id, Executed: id == "legacy-execution", Status: "completed", Reason: "unknown"}
+		if _, err := s.db.Exec(`INSERT INTO traffic_attempts(id,bridge_instance,request_id,executed,created_at,updated_at,data) VALUES(?,?,?,?,?,?,?)`, a.ID, "bridge-a", trafficHash("bridge-a", "request", id), a.Executed, stamp, stamp, mustTrafficJSON(a)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, kind := range []string{"users", "analysis"} {
+		p, err := s.Traffic(ctx, TrafficFilter{Kind: kind})
+		if err != nil || p.Total != 2 || p.Summary.Attempts != 1 || p.Coverage.UnclassifiedRequests != 1 {
+			t.Fatal("legacy blank completion inflated user statistics or execution evidence was lost", p, err)
+		}
+		for _, r := range p.Records {
+			if r.RequestID == "legacy-catalog" {
+				t.Fatal("legacy catalog completion still shown as a model request")
+			}
+		}
+	}
+	if _, err := s.Traffic(ctx, TrafficFilter{ID: "legacy-catalog"}); err != ErrNotFound {
+		t.Fatal("excluded completion remains accessible as a user request", err)
+	}
+	var count int
+	if err := s.db.QueryRow("SELECT count(*) FROM traffic_requests").Scan(&count); err != nil || count != 3 {
+		t.Fatal("history reads deleted stored evidence", count, err)
+	}
+}
+
 func TestResolveTrafficCallersMatchesStoredIdentityWithoutWriting(t *testing.T) {
 	s, other := openTest(t), openTest(t)
 	ctx := context.Background()

@@ -1214,6 +1214,34 @@ class NativeBridge(unittest.TestCase):
                       'Headers': {'Authorization': ['Bearer NEVER-CAPTURE-KEY']}})
         self.assertEqual(self.rpc('bridge.events.pull', {'after': 0}, instance)['result']['latest_sequence'], len(variants))
 
+    def test_catalog_completions_do_not_become_user_model_requests(self):
+        # CPA's WriteModelListResponse emits only a completion, with no model,
+        # metadata, selection, or usage. The trace and HTTP success are real,
+        # but do not establish an upstream model execution.
+        for request_id, outcome, status in [('catalog-list', 'succeeded', 200),
+                                             ('catalog-detail', 'failed', 404)]:
+            self.call('request.complete', {'RequestID': request_id, 'TraceID': request_id + '-trace',
+                      'Model': '', 'Metadata': None, 'Outcome': outcome, 'StatusCode': status})
+        self.call('request.intercept_before', {'RequestID': 'real-user', 'CallerScope': 'fixture-caller'})
+        self.call('request.complete', {'RequestID': 'real-user', 'Metadata': None, 'Outcome': 'succeeded'})
+        self.call('request.complete', {'RequestID': 'model-without-caller', 'Model': 'fixture-model',
+                  'Metadata': None, 'Outcome': 'failed', 'StatusCode': 503})
+        self.start_daemon()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, page = self.management('traffic', query={'kind': ['users']})
+            if status == 200 and page.get('coverage', {}).get('sequence', 0) >= 5:
+                break
+            time.sleep(.025)
+        self.assertEqual(status, 200, page)
+        self.assertEqual(page['summary'], {'requests': 2, 'attempts': 0, 'recovered': 0, 'unknown': 0})
+        self.assertEqual({r['request_id']: r['status'] for r in page['records']},
+                         {'real-user': 'completed', 'model-without-caller': 'failed'})
+        status, analysis = self.management('traffic', query={'kind': ['analysis']})
+        self.assertEqual(status, 200, analysis)
+        self.assertEqual(analysis['summary'], page['summary'])
+        self.assertEqual(self.models, 0)
+
     def test_explicit_caller_reaches_records_lookup_filters_and_analysis(self):
         scope = hashlib.sha256(b'cli-proxy-api:caller-scope:v1\x00fixture-caller').hexdigest()
         # No scheduler decision carries a caller here. Later hooks deliberately

@@ -257,6 +257,7 @@
       else if (data?.aggregation_limited) { text='仅展示调用最多的部分维度，请缩小筛选范围查看完整分配。'; tone='warning'; }
       else if (coverage?.unlinked_attempts>0) { text='存在 '+formatNumber(coverage.unlinked_attempts)+' 次尚未关联的上游用量，未纳入用户请求分流统计。'; tone='warning'; }
       else if (coverage&&['gap','disconnected','unavailable','partial'].includes(coverage.status)) { text='当前观测存在缺口，记录和统计仅代表已采集范围。'; tone='warning'; }
+      if (connected&&!error&&page!=='plugin'&&coverage?.unclassified_requests>0) { text+=(text?' ':'')+'保留范围内另有 '+formatNumber(coverage.unclassified_requests)+' 条缺少业务请求证据的历史记录，未计入用户请求，无法确认是模型调用。'; tone='warning'; }
       feedback.hidden=!text; feedback.className='rr-feedback'+(tone?' rr-'+tone:''); feedback.textContent=text;
       refreshButton.disabled=!connected; refreshButton.setAttribute('aria-busy',String(loading));
     }
