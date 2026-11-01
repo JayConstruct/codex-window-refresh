@@ -61,6 +61,7 @@ func TestDifferentWakeAccountsShareBoundedBudgetAndOnlyBlockThemselves(t *testin
 	}
 	at = at.Add(time.Second)
 	wakeStoreActivity(t, st, at, 1)
+	var sendingID string
 	for i := 0; i < ModelConcurrency; i++ {
 		job, err := st.PrepareWake(ctx, at)
 		if err != nil {
@@ -69,6 +70,7 @@ func TestDifferentWakeAccountsShareBoundedBudgetAndOnlyBlockThemselves(t *testin
 		if _, err = st.AuthorizeWake(ctx, job.ID, at); err != nil {
 			t.Fatal(err)
 		}
+		sendingID = job.ID
 		if _, _, err = st.CreateWake(ctx, "duplicate-"+job.ID, WakeRequest{AccountID: job.AccountID}); !errors.Is(err, ErrBusy) {
 			t.Fatal("same account was accepted twice", err)
 		}
@@ -76,8 +78,7 @@ func TestDifferentWakeAccountsShareBoundedBudgetAndOnlyBlockThemselves(t *testin
 	if _, err := st.PrepareWake(ctx, at); !errors.Is(err, ErrNotFound) {
 		t.Fatal("physical budget exceeded", err)
 	}
-	jobs := wakeStoreJobs(t, st)
-	if err := st.FinishWake(ctx, jobs[0].ID, "unknown", "wake_outcome_unknown", at); err != nil {
+	if err := st.FinishWake(ctx, sendingID, "unknown", "wake_outcome_unknown", at); err != nil {
 		t.Fatal(err)
 	}
 	wakeStoreActivity(t, st, at.Add(time.Second), 1)
