@@ -2,8 +2,11 @@ package executor
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
+	"time"
 
+	"codex-window-refresh/internal/v2/quota"
 	"codex-window-refresh/internal/v2/store"
 )
 
@@ -11,6 +14,31 @@ type wakeRecorder struct {
 	response *store.WakeResponse
 	prompt   string
 	text     string
+	binding  string
+	started  time.Time
+}
+
+func (recorder *wakeRecorder) quota(raw []byte, headers http.Header, source string) {
+	if recorder.binding == "" || recorder.started.IsZero() {
+		return
+	}
+	// Only provider fields are normalized; raw response headers are never saved.
+	snapshot, err := quota.Normalize(raw, headers, recorder.binding, source, time.Now().UTC(), recorder.started)
+	if err != nil {
+		return
+	}
+	var old []byte
+	if recorder.response.Quota != nil {
+		old, _ = json.Marshal(recorder.response.Quota)
+	}
+	incoming, _ := json.Marshal(snapshot)
+	merged, changed, err := quota.Merge(old, incoming)
+	if err == nil && changed {
+		var result quota.Snapshot
+		if json.Unmarshal(merged, &result) == nil {
+			recorder.response.Quota = &result
+		}
+	}
 }
 
 func (recorder *wakeRecorder) capture(raw json.RawMessage) {
@@ -30,6 +58,10 @@ func (recorder *wakeRecorder) capture(raw json.RawMessage) {
 		} `json:"response"`
 	}
 	if json.Unmarshal(raw, &event) != nil {
+		return
+	}
+	if event.Type == "codex.rate_limits" {
+		recorder.quota(raw, nil, "cpa_websocket_quota")
 		return
 	}
 	if event.Type != "" {

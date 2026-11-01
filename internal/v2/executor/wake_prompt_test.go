@@ -35,7 +35,7 @@ func TestWakeCodingInstructionsKeepSavedUserPromptsAndNoClientImpersonation(t *t
 			if body.Instructions != wakeInstructions || body.ToolChoice != "none" || len(body.Input) != 1 || body.Input[0].Role != "user" || len(body.Input[0].Content) != 1 || body.Input[0].Content[0].Type != "input_text" || body.Input[0].Content[0].Text != prompt {
 				t.Fatal("coding instructions changed the saved prompt or allowed tools")
 			}
-			if !reflect.DeepEqual(host.request.Headers, map[string][]string{"Content-Type": {"application/json"}, "X-CPA-Plugin-ID": {"codex-window-refresh"}, "X-CPA-Plugin-Action": {"wake"}}) || len(host.request.Query) != 0 || host.executes != 1 || host.closes != 1 || !host.request.Serial {
+			if !reflect.DeepEqual(host.request.Headers, map[string][]string{"Content-Type": {"application/json"}, "X-CPA-Plugin-ID": {"codex-window-refresh"}, "X-CPA-Plugin-Action": {"wake"}}) || len(host.request.Query) != 0 || host.executes != 1 || host.closes != 1 || host.request.Serial {
 				t.Fatal("wake added client identity, session parameters, retries, or changed stream ownership")
 			}
 		})

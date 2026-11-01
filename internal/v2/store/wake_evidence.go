@@ -14,6 +14,20 @@ import (
 
 const wakeQuotaMaxAge = 30 * time.Second
 
+// Wake streams and candidate generation share this bounded physical budget.
+const ModelConcurrency = 4
+
+// A bound five-hour observation alone can prove activation. Missing permission
+// or weekly fields must not erase the independent window evidence.
+func wakeWindowVerified(snapshot quota.Snapshot, binding, gate string, at time.Time) bool {
+	if snapshot.Binding != binding || snapshot.FiveHour == nil || snapshot.FiveHour.State != core.WindowActive || !snapshot.FiveHour.ResetAt.After(at) {
+		return false
+	}
+	stamp := wakeFieldStamp(snapshot, "five_hour")
+	boundary, _ := time.Parse(time.RFC3339Nano, gate)
+	return !stamp.ObservedAt.IsZero() && !stamp.ObservedAt.After(at) && at.Sub(stamp.ObservedAt) <= wakeQuotaMaxAge && !stamp.ReadStartedAt.IsZero() && !stamp.ReadStartedAt.After(stamp.ObservedAt) && !stamp.ReadStartedAt.Before(boundary)
+}
+
 type wakeBaseline struct{ Binding, FiveHour, Weekly, Boot string }
 
 func readWakeBaseline(ctx context.Context, tx *sql.Tx, account Account) (wakeBaseline, error) {
@@ -214,7 +228,7 @@ func wakeModelBusy(ctx context.Context, tx *sql.Tx, job WakeJob) (string, error)
 	if account > 0 {
 		return "account_busy", nil
 	}
-	if physical > 0 {
+	if physical >= ModelConcurrency {
 		return "model_busy", nil
 	}
 	return "", nil

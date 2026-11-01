@@ -80,9 +80,9 @@
     if (url.origin !== location.origin || !url.pathname.endsWith(API)) throw Object.assign(new Error('invalid_endpoint'), {code: 'invalid_endpoint'});
     return url.pathname;
   }
-  function storedValue(context, name) {
+  function storedValue(context, name, rawValue) {
     try {
-      let raw = context.localStorage.getItem(name);
+      let raw = rawValue === undefined ? context.localStorage.getItem(name) : rawValue;
       if (raw === null) return null;
       if (raw.startsWith('enc::v1::')) {
         const bytes = Uint8Array.from(context.atob(raw.slice(9)), character => character.charCodeAt(0));
@@ -156,24 +156,56 @@
     if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return {};
     return Object.fromEntries(Object.entries(saved).slice(0, 10000).filter(([id, label]) => /^[a-f0-9]{64}$/.test(id) && typeof label === 'string' && label.trim() && label.length <= 256 && !/[\p{Cc}]/u.test(label)).map(([id, label]) => [id, label.trim()]));
   }
-  async function resolveCallerNames(context, base, request) {
-    const names = readCallerNames(context, base), labels = Object.create(null);
-    if (!Object.keys(names).length) return labels;
+  function maskedAPIKey(value) {
+    const characters = Array.from(typeof value === 'string' ? value.trim() : '');
+    return characters.length > 12 ? characters.slice(0, 4).join('') + '••••••••' + characters.slice(-4).join('') : '••••••••';
+  }
+  async function resolveCallerKeys(context, base, request, namedOnly = false) {
+    const names = readCallerNames(context, base), identities = Object.create(null);
+    if (namedOnly && !Object.keys(names).length) return identities;
     const data = await request('/api-keys', {}, true), keys = data?.['api-keys'];
-    if (!Array.isArray(keys) || keys.length > 10000 || keys.some(key => typeof key !== 'string' || key.length > 4096)) return labels;
-    const address = loginAddress(context, base), entries = new Map();
+    if (!Array.isArray(keys) || keys.length > 10000 || keys.some(key => typeof key !== 'string' || key.length > 4096 || /[\p{Cc}]/u.test(key))) throw new Error('invalid_caller_keys');
+    const address = loginAddress(context, base), entries = new Map(), ambiguous = new Set();
     for (const key of keys) {
-      const label = names[callerDigest(JSON.stringify(['api-key-name', address, key]))];
-      if (label && key.trim()) entries.set(callerDigest('cli-proxy-api:caller-scope:v1\0' + key.trim()), label);
+      if (!key.trim()) continue;
+      const fingerprint = callerDigest(JSON.stringify(['api-key-name', address, key]));
+      const name = names[fingerprint] || '';
+      if (namedOnly && !name) continue;
+      const scope = callerDigest('cli-proxy-api:caller-scope:v1\0' + key.trim());
+      if (entries.has(scope) && entries.get(scope).fingerprint !== fingerprint) ambiguous.add(scope);
+      entries.set(scope, {name, maskedKey: maskedAPIKey(key), fingerprint});
     }
-    const scopes = [...entries.keys()];
+    const scopes = [...entries.keys()].filter(scope => !ambiguous.has(scope));
     for (let start = 0; start < scopes.length; start += 64) {
       const batch = scopes.slice(start, start + 64);
       const response = await request('/traffic-callers', {method: 'POST', body: JSON.stringify({scopes: batch})});
       if (!Array.isArray(response?.callers) || response.callers.length !== batch.length || response.callers.some(id => typeof id !== 'string' || !/^caller-[a-f0-9]{64}$/.test(id))) throw new Error('invalid_caller_response');
-      response.callers.forEach((id, index) => { labels[id] = entries.get(batch[index]); });
+      response.callers.forEach((id, index) => { if (Object.hasOwn(identities, id)) throw new Error('invalid_caller_response'); identities[id] = entries.get(batch[index]); });
     }
-    return labels;
+    return identities;
+  }
+  async function resolveCallerNames(context, base, request) {
+    const identities = await resolveCallerKeys(context, base, request, true);
+    return Object.fromEntries(Object.entries(identities).map(([id, identity]) => [id, identity.name]));
+  }
+  function saveCallerName(context, base, fingerprint, value, expectedName) {
+    const name = typeof value === 'string' ? value.trim() : '';
+    if (!/^[a-f0-9]{64}$/.test(fingerprint) || typeof value !== 'string' || name.length > 256 || /[\p{Cc}]/u.test(name)) throw new Error('invalid_caller_name');
+    const storageKey = 'api-key-names:v1:' + loginAddress(context, base);
+    // Re-read the shared map immediately before writing, preserving other tabs'
+    // unrelated changes and rejecting a concurrent edit to this same name.
+    const previous = context.localStorage.getItem(storageKey), saved = previous === null ? {} : storedValue(context, storageKey, previous);
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error('caller_name_storage_invalid');
+    const current = saved[fingerprint];
+    const currentName = typeof current === 'string' && current.length <= 256 && !/[\p{Cc}]/u.test(current) ? current.trim() : '';
+    if (currentName !== expectedName) throw new Error('caller_name_conflict');
+    const next = {...saved};
+    if (name) next[fingerprint] = name; else delete next[fingerprint];
+    const bytes = new context.TextEncoder().encode(JSON.stringify(next));
+    const mask = new context.TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + context.location.host + '|' + context.navigator.userAgent);
+    for (let index = 0; index < bytes.length; index++) bytes[index] ^= mask[index % mask.length];
+    context.localStorage.setItem(storageKey, 'enc::v1::' + context.btoa(Array.from(bytes, byte => String.fromCharCode(byte)).join('')));
+    return name;
   }
   function readLogin(context, base) {
     const address = loginAddress(context, base);
@@ -619,7 +651,7 @@
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {resolveModelAccount, codexPromptPreset});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {createToastCenter});
   if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {taskDiagnostic, resolveStatusAccount, sameStatusIdentity, independentAuthFile, maskedAccount, readDisplayPreference, skippedReason});
-  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {callerDigest, readCallerNames, resolveCallerNames});
+  if (typeof module !== 'undefined' && module.exports) Object.assign(module.exports, {callerDigest, readCallerNames, resolveCallerNames, resolveCallerKeys, maskedAPIKey, saveCallerName});
   if (typeof document === 'undefined') return;
 
   const context = globalThis, $ = id => document.getElementById(id);
@@ -652,8 +684,8 @@
   let generationIntent = null, generationTask = null, generationSubmitting = false, generationReading = false, generationUnconfirmed = false, generationUnknown = false;
   let generationCatalog = null, generationCatalogLoading = false, generationCatalogError = '', generationCatalogSequence = 0, generationAccountIdentity = null;
   let savedWakeSettings = null, wakeBase = null, wakeLoading = false, wakePolling = false, wakeSaving = false, wakeConflict = false, wakeNeedsVerification = false, wakeSavingEnabled = null;
-  let wakeIntent = null, wakeTask = null, wakeSubmitting = false, wakeReading = false, wakeUnconfirmed = false, wakeUnknown = false, wakeJobsLoading = false, wakeJobs = [];
-  let quickWakeAccount = '', quickWakeLoading = false, quickWakeSequence = 0;
+  const wakeStates = new Map(), wakeReads = new Set();
+  let manualWake = newWakeState(''), wakeJobsLoading = false, wakeJobs = [], quickModelRead = null;
   let schedulingSaved = null, schedulingDirty = false, schedulingBusy = false, schedulingLoading = false, schedulingConflict = false, schedulingNeedsVerification = false;
   let schedulingRead = 0, schedulingPending = null, schedulingError = '', schedulingNotice = '';
   let routingProjects = [], routingProjectSerial = 0, routingSelectedProject = null, routingProjectText = '', routingEditSequence = 0, routingImportSequence = 0;
@@ -675,12 +707,13 @@
   const errorLimits = new Map();
   const presentation = context.CWRPresentation;
   let selectedAccountID = '', recordsPage = 'users', overviewTaskData = null, overviewTaskLoading = false;
-  let callerNames = Object.create(null), callerNamesRead = 0, callerNamesSignature = '';
+  let callerNames = Object.create(null), callerKeys = Object.create(null), callerNamesRead = 0, callerNamesSignature = '';
+  let callerNameEditing = null, callerNameOpener = null, callerNameSaving = false;
   let selectedBatchBusy = false;
   let taskOpenSequence = 0, navigationEpoch = 0, accountTaskSequence = 0, selectedAccountTasks = null, selectedAccountTasksError = false;
   const selectedAccounts = new Set();
   const recordsPanel = context.CWRRecords?.mount({root: $('runtime-records-root'), request: (path, options) => api(path, options),
-    displayAccount, displayCaller, hideRefresh: true, onTask: (id, kind) => openRecordedTask(id, kind), onViewAccount: id => openAccountDetail(id),
+    displayAccount, displayCaller, callerKeyInfo, onRenameCaller: openCallerNameDialog, hideRefresh: true, onTask: (id, kind) => openRecordedTask(id, kind), onViewAccount: id => openAccountDetail(id),
     onNavigate: page => { recordsPage = page; for (const button of document.querySelectorAll('[data-record-page]')) { const selected = button.dataset.recordPage === page; button.classList.toggle('active', selected); button.setAttribute('aria-selected', String(selected)); } }});
   const setText = (id, text) => { if ($(id)) setLiveText($(id), text); };
   function setLiveText(node, text) {
@@ -703,21 +736,87 @@
   function displayCaller(id) {
     return callerNames[id] || context.CWRRecords?.callerLabel?.(id) || '调用方未知';
   }
-  async function refreshCallerNames() {
-    if (!connected) return;
+  function callerKeyInfo(id) {
+    const identity = callerKeys[id];
+    return identity ? {name: identity.name, maskedKey: identity.maskedKey} : null;
+  }
+  function applyCallerNames() {
+    const names = readCallerNames(context, base);
+    callerNames = Object.create(null);
+    for (const [id, identity] of Object.entries(callerKeys)) {
+      identity.name = names[identity.fingerprint] || '';
+      if (identity.name) callerNames[id] = identity.name;
+    }
+    recordsPanel?.setContext({displayCaller, callerKeyInfo});
+  }
+  async function refreshCallerNames(force = false) {
+    if (!connected || !recordsPanel) return false;
     const signature = JSON.stringify([views.instance, readCallerNames(context, base)]);
-    if (signature === callerNamesSignature) return;
+    if (!force && signature === callerNamesSignature) return true;
+    if (!force && callerNamesSignature && JSON.parse(callerNamesSignature)[0] === views.instance && Object.keys(callerKeys).length) {
+      callerNamesSignature = signature;
+      applyCallerNames();
+      return true;
+    }
     callerNamesSignature = signature;
     const sequence = ++callerNamesRead, current = generation, instance = views.instance;
-    callerNames = Object.create(null);
-    recordsPanel?.setContext({displayCaller});
+    callerNames = Object.create(null); callerKeys = Object.create(null);
+    recordsPanel?.setContext({displayCaller, callerKeyInfo});
     try {
-      const labels = await resolveCallerNames(context, base, api);
-      if (sequence !== callerNamesRead || current !== generation || instance !== views.instance || !connected) return;
-      callerNames = labels;
-      recordsPanel?.setContext({displayCaller});
+      const identities = await resolveCallerKeys(context, base, api);
+      if (sequence !== callerNamesRead || current !== generation || instance !== views.instance || !connected) return false;
+      callerKeys = identities;
+      applyCallerNames();
+      return true;
     } catch {
       if (sequence === callerNamesRead) callerNamesSignature = '';
+      return false;
+    }
+  }
+  function closeCallerNameDialog() {
+    const opener = callerNameOpener;
+    callerNameEditing = null; callerNameOpener = null;
+    if ($('caller-name-dialog').open) $('caller-name-dialog').close();
+    $('caller-name-dialog').hidden = true;
+    if (opener && document.documentElement.contains(opener)) opener.focus();
+  }
+  function openCallerNameDialog(id, opener) {
+    const identity = callerKeys[id];
+    if (!connected || !identity || callerNameSaving) return;
+    callerNameEditing = {id, fingerprint: identity.fingerprint, expectedName: identity.name, instance: views.instance};
+    callerNameOpener = opener || document.activeElement;
+    setText('caller-name-key', identity.maskedKey); setText('caller-name-message', '');
+    $('caller-name-value').value = identity.name;
+    $('caller-name-value').disabled = false; $('caller-name-save').disabled = false;
+    $('caller-name-dialog').hidden = false; $('caller-name-dialog').showModal();
+    $('caller-name-value').focus();
+  }
+  async function saveCallerNameDialog() {
+    if (!callerNameEditing || callerNameSaving || !connected) return;
+    const editing = callerNameEditing, current = generation, value = $('caller-name-value').value;
+    if (value.trim().length > 256 || /[\p{Cc}]/u.test(value)) { setText('caller-name-message', '名称最多 256 个字符，不含换行或控制字符。'); return; }
+    callerNameSaving = editing; $('caller-name-value').disabled = true; $('caller-name-save').disabled = true;
+    try {
+      const loaded = await refreshCallerNames(true);
+      if (current !== generation || editing !== callerNameEditing || !connected) return;
+      const identity = callerKeys[editing.id];
+      if (!loaded) throw new Error('caller_keys_unavailable');
+      if (editing.instance !== views.instance || !identity || identity.fingerprint !== editing.fingerprint) throw new Error('caller_key_changed');
+      saveCallerName(context, base, editing.fingerprint, value, editing.expectedName);
+      await refreshCallerNames();
+      closeCallerNameDialog();
+      notice(value.trim() ? 'API Key 名称已保存，并与此浏览器的 CPA 管理中心同步。' : 'API Key 名称已清除，打码 Key 仍可查看。', 'success');
+    } catch (error) {
+      if (current === generation && editing === callerNameEditing) setText('caller-name-message', {
+        caller_name_conflict: '名称已在其他页面修改，请取消后重新打开编辑。',
+        caller_keys_unavailable: '暂时无法读取 CPA Key 清单，请稍后再保存。',
+        caller_key_changed: 'CPA 实例或 Key 已变化，请取消后重新核实。',
+        caller_name_storage_invalid: 'CPA 名称存储无法读取，未覆盖原有数据。',
+        invalid_caller_name: '名称最多 256 个字符，不含换行或控制字符。'
+      }[error.message] || '浏览器无法保存名称，请检查本地存储权限。');
+    } finally {
+      if (callerNameSaving === editing) callerNameSaving = false;
+      if (current === generation) { $('caller-name-value').disabled = false; $('caller-name-save').disabled = false; }
     }
   }
   function displayText(value) {
@@ -1247,13 +1346,26 @@
       else feedback('wake-settings-message', text, 'error');
     } finally { if (current === generation) { wakeSaving = false; wakeSavingEnabled = null; renderWakeSettings(); } }
   }
-  function wakeActive() { return wakeTask && !['completed', 'skipped', 'failed', 'unknown', 'cancelled'].includes(wakeTask.phase); }
+  function newWakeState(account) { return {account, intent: null, task: null, submitting: false, reading: false, unconfirmed: false, unknown: false, loading: false}; }
+  function wakeState(account) {
+    if (!wakeStates.has(account)) {
+      const state = newWakeState(account), known = wakeJobs.find(job => job.account_id === account && !['completed', 'skipped', 'failed', 'cancelled'].includes(job.phase));
+      if (known) { state.task = known; state.unknown = known.phase === 'unknown'; }
+      wakeStates.set(account, state);
+    }
+    return wakeStates.get(account);
+  }
+  function wakeActive(state = manualWake) { return state.task && !['completed', 'skipped', 'failed', 'unknown', 'cancelled'].includes(state.task.phase); }
+  function wakeAccountBlocked(account) {
+    const state = wakeStates.get(account);
+    return !!(state && (state.loading || state.submitting || state.unconfirmed || state.unknown || wakeActive(state))) || wakeJobs.some(job => job.account_id === account && job.job_id !== state?.task?.job_id && !['completed', 'skipped', 'failed', 'cancelled'].includes(job.phase));
+  }
   function wakeHoldText(reason) {
     if (Object.hasOwn(codes, reason) && /^wake_(account_|host_|inventory_|binding_)/.test(reason)) return message(reason);
     return {quota_pending: '等待额度查询', quota_unknown: '额度证据未知，暂不发送', quota_blocked: '额度受限', active_window: '已有活动窗口，防止重复唤醒', weekly_reset_conflict: '周重置状态冲突', activity_unknown: '业务活动证据未知', account_busy: '账号有其他执行任务', capacity_satisfied: '目标容量已满足', outside_allowed_hours: '尚未进入允许时段', model_busy: '模型执行资源繁忙', model_missing: '尚未保存可用唤醒模型', verification_pending: '等待结果核实'}[reason] || (reason ? '后台暂缓执行，请查看诊断' : '');
   }
   function renderWakeHistory() {
-    const merged = new Map(wakeJobs.map(job => [job.job_id, job])); if (wakeTask) merged.set(wakeTask.job_id, wakeTask);
+    const merged = new Map(wakeJobs.map(job => [job.job_id, job])); for (const state of wakeStates.values()) if (state.task) merged.set(state.task.job_id, state.task);
     const jobs = [...merged.values()].sort((first, second) => (timestamp(second.created_at) || 0) - (timestamp(first.created_at) || 0));
     const items = jobs.slice(0, 20).map(job => {
       const item = element('article', 'task-item'), heading = element('div', 'task-heading');
@@ -1273,13 +1385,13 @@
     updateChildren($('wake-history'), items.length ? items : [element('p', 'muted', wakeExecutionSupported() ? '暂无唤醒任务；读取页面不会创建任务。' : '当前后台尚未接入模型唤醒。')]);
   }
   function renderManualWake() {
-    const supported = wakeExecutionSupported(), locked = !connected || !supported || wakeSubmitting || wakeActive() || wakeUnconfirmed || wakeUnknown;
-    $('wake-manual-fields').disabled = locked;
-    $('wake-manual-submit').disabled = locked || wakeReading || !$('wake-manual-consent').checked;
-    $('wake-manual-verify').hidden = !wakeUnconfirmed && !wakeUnknown;
-    $('wake-manual-verify').disabled = !connected || !supported || wakeSubmitting || wakeReading || wakeUnknown && !wakeTask?.job_id;
+    const supported = wakeExecutionSupported(), locked = !connected || !supported || manualWake.submitting || wakeActive() || manualWake.unconfirmed || manualWake.unknown;
+    $('wake-manual-fields').disabled = !connected || !supported || manualWake.submitting;
+    $('wake-manual-submit').disabled = locked || manualWake.reading || !$('wake-manual-consent').checked;
+    $('wake-manual-verify').hidden = !manualWake.unconfirmed && !manualWake.unknown;
+    $('wake-manual-verify').disabled = !connected || !supported || manualWake.submitting || manualWake.reading || manualWake.unknown && !manualWake.task?.job_id;
     $('wake-history-refresh').disabled = !connected || !supported || wakeJobsLoading;
-    setText('wake-manual-status', !connected ? '等待连接' : !supported ? '尚未接入' : wakeSubmitting ? '提交中' : wakeUnconfirmed ? '需要核实' : wakeUnknown ? '结果未知' : wakePhases[wakeTask?.phase] || '按需唤醒');
+    setText('wake-manual-status', !connected ? '等待连接' : !supported ? '尚未接入' : manualWake.submitting ? '提交中' : manualWake.unconfirmed ? '需要核实' : manualWake.unknown ? '结果未知' : wakePhases[manualWake.task?.phase] || '按需唤醒');
     if (!supported) setText('wake-manual-message', '当前后台未提供真实模型唤醒能力，不会提交模型请求。');
     renderWakeHistory();
     renderQuickWake();
@@ -1291,29 +1403,33 @@
     if (data.response && (['completed', 'truncated', 'close_failed'].some(name => data.response[name] !== undefined && typeof data.response[name] !== 'boolean') || ['http_status', 'bytes'].some(name => data.response[name] !== undefined && (!Number.isSafeInteger(data.response[name]) || data.response[name] < 0 || data.response[name] > (name === 'bytes' ? 1048576 : 599))))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
     if (!historyString(data.job_id, 256, true) || ['account_id', 'reason', 'error_code', 'hold_reason'].some(name => !historyString(data[name])) || ['scheduled_at', 'created_at', 'updated_at', 'started_at', 'finished_at'].some(name => !historyString(data[name], 64))) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
   }
-  function acceptWakeTask(data) {
+  function acceptWakeTask(data, state = manualWake) {
     validateWakeJob(data);
     if (data.instance_id !== views.instance) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
-    if (wakeTask?.job_id === data.job_id && wakeTask.instance_id === data.instance_id && Number.isSafeInteger(wakeTask.view_revision) && Number.isSafeInteger(data.view_revision) && data.view_revision < wakeTask.view_revision) return;
-    wakeTask = data; wakeUnconfirmed = false; wakeUnknown = data.phase === 'unknown';
-    if (['completed', 'skipped', 'failed', 'cancelled'].includes(data.phase)) $('wake-manual-consent').checked = false;
-    feedback('wake-manual-message', wakeUnknown ? '唤醒结果未知，可能已消耗额度。不会重发；只能核实已有任务。' : data.phase === 'completed' ? '唤醒任务已完成；请以后台核实的额度和窗口状态为准。' : data.phase === 'skipped' ? '正常跳过此次唤醒：' + skippedReason(data) : data.phase === 'failed' ? '唤醒失败：' + message(data.error_code) : data.phase === 'cancelled' ? '唤醒任务已取消，未开始的工作不会继续发送。' : '任务已接受：' + wakePhases[data.phase] + '。页面只读取进度，不会再次提交模型请求。', wakeUnknown ? 'warning' : data.phase === 'failed' ? 'error' : data.phase === 'completed' ? 'success' : 'info');
+    if (state.task?.job_id === data.job_id && state.task.instance_id === data.instance_id && Number.isSafeInteger(state.task.view_revision) && Number.isSafeInteger(data.view_revision) && data.view_revision < state.task.view_revision) return;
+    state.task = data; state.unconfirmed = false; state.unknown = data.phase === 'unknown';
+    if (state === manualWake && ['completed', 'skipped', 'failed', 'cancelled'].includes(data.phase)) $('wake-manual-consent').checked = false;
+    wakeJobs = [data, ...wakeJobs.filter(job => job.job_id !== data.job_id)].slice(0, 20);
+    if (state !== manualWake) return;
+    feedback('wake-manual-message', state.unknown ? '唤醒结果未知，可能已消耗额度。不会重发；只能核实已有任务。' : data.phase === 'completed' ? '唤醒任务已完成；请以后台核实的额度和窗口状态为准。' : data.phase === 'skipped' ? '正常跳过此次唤醒：' + skippedReason(data) : data.phase === 'failed' ? '唤醒失败：' + message(data.error_code) : data.phase === 'cancelled' ? '唤醒任务已取消，未开始的工作不会继续发送。' : '任务已接受：' + wakePhases[data.phase] + '。页面只读取进度，不会再次提交模型请求。', state.unknown ? 'warning' : data.phase === 'failed' ? 'error' : data.phase === 'completed' ? 'success' : 'info');
   }
-  async function readWakeJob(id = wakeTask?.job_id) {
-    if (!connected || !wakeExecutionSupported() || !id || wakeReading || wakeSubmitting) return;
-    const current = generation, sequence = views.begin('wake-job:' + id); wakeReading = true; renderManualWake();
+  async function readWakeJob(id = manualWake.task?.job_id) {
+    if (!connected || !wakeExecutionSupported() || !id || wakeReads.has(id)) return;
+    const state = [...wakeStates.values()].find(state => state.task?.job_id === id);
+    const current = generation, sequence = views.begin('wake-job:' + id);
+    wakeReads.add(id); if (state) state.reading = true; renderManualWake();
     try {
       const data = await api('/wake-jobs?job_id=' + encodeURIComponent(id));
       if (current !== generation || !views.accept('wake-job:' + id, sequence, data)) return;
       validateWakeJob(data, id);
       wakeJobs = [data, ...wakeJobs.filter(job => job.job_id !== id)].slice(0, 20);
-      if (wakeTask?.job_id === id) acceptWakeTask(data);
+      if (state) acceptWakeTask(data, state);
       else if (data.phase === 'unknown') feedback('wake-history-message', '该任务结果未知，可能已消耗额度。读取不会重发模型请求。', 'warning');
     } catch (error) {
       if (current !== generation) return;
-      if (wakeTask?.job_id === id && [404, 410].includes(error.status)) { wakeUnknown = true; wakeTask = {...wakeTask, phase: 'unknown'}; feedback('wake-manual-message', '无法核实原唤醒任务，可能已消耗额度。禁止重发或新建替代请求。', 'warning'); }
+      if (state && [404, 410].includes(error.status)) { state.unknown = true; state.task = {...state.task, phase: 'unknown'}; if (state === manualWake) feedback('wake-manual-message', '无法核实原唤醒任务，可能已消耗额度。禁止重发或新建替代请求。', 'warning'); }
       else feedback('wake-history-message', '读取唤醒任务失败：' + message(error.code) + '；只重试读取，不重发模型请求。', 'error');
-    } finally { if (current === generation) { wakeReading = false; renderManualWake(); } }
+    } finally { wakeReads.delete(id); if (current === generation) { if (state) state.reading = false; renderManualWake(); } }
   }
   async function loadWakeJobs(explicit = false) {
     if (!connected || !wakeExecutionSupported() || wakeJobsLoading) return;
@@ -1323,65 +1439,72 @@
       if (current !== generation || !views.accept('wake-jobs', sequence, data)) return;
       if (!Array.isArray(data.jobs) || data.jobs.length > 20) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
       const ids = new Set(); for (const job of data.jobs) { validateWakeJob(job); if (ids.has(job.job_id)) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'}); ids.add(job.job_id); }
-      wakeJobs = data.jobs;
-      const own = wakeJobs.find(job => job.job_id === wakeTask?.job_id); if (own) acceptWakeTask({...own, instance_id: data.instance_id, view_revision: data.view_revision});
+      wakeJobs = data.jobs.map(job => ({...job, instance_id: data.instance_id, view_revision: data.view_revision}));
+      for (const state of wakeStates.values()) { const own = wakeJobs.find(job => job.job_id === state.task?.job_id); if (own) acceptWakeTask({...own, instance_id: data.instance_id, view_revision: data.view_revision}, state); }
       if (explicit) feedback('wake-history-message', '显示最近 ' + data.jobs.length + ' 条持久任务。刷新只读取状态，不发送模型请求。', 'success');
     } catch (error) { if (current === generation) feedback('wake-history-message', '读取唤醒历史失败：' + message(error.code), 'error'); }
     finally { if (current === generation) { wakeJobsLoading = false; renderManualWake(); } }
   }
   async function submitManualWake(verify = false, quickAccount = '') {
-    if (!connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading) return;
-    if (verify && wakeTask?.job_id) return readWakeJob();
-    const consent = quickAccount ? quickAccount === quickWakeAccount && !quickWakeLoading && savedModelSettings?.instance_id === views.instance && !!savedModelSettings.config.default_model && !modelNeedsVerification && accountsData.some(account => account.id === quickAccount) : $('wake-manual-consent').checked;
-    if (wakeUnknown || (verify ? !wakeUnconfirmed || !wakeIntent : wakeUnconfirmed || wakeActive() || !consent)) return;
+    if (!connected || !wakeExecutionSupported()) return;
+    const account = verify ? manualWake.account : quickAccount || resolveDisplayAccount($('wake-account').value);
+    if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account)) { feedback('wake-manual-message', '请输入完整有效的 Codex 账号 ID，并确认可能消耗模型额度。', 'error'); return; }
+    if (!verify && !quickAccount && manualWake.account !== account) return;
+    const state = wakeState(account);
+    if (verify && state.task?.job_id) return readWakeJob(state.task.job_id);
+    if (state.submitting || state.reading || state.unknown || (verify ? !state.unconfirmed || !state.intent : state.unconfirmed || wakeActive(state) || wakeAccountBlocked(account))) return;
     if (!verify) {
-      const account = quickAccount || resolveDisplayAccount($('wake-account').value);
-      if (!account || new TextEncoder().encode(account).length > 256 || /[\p{Cc}]/u.test(account)) { feedback('wake-manual-message', '请输入完整有效的 Codex 账号 ID，并确认可能消耗模型额度。', 'error'); return; }
-      try { wakeIntent = {key: requestID(context.crypto), instance: views.instance, body: JSON.stringify({account_id: account})}; }
+      if (quickAccount ? savedModelSettings?.instance_id !== views.instance || !savedModelSettings.config.default_model || modelNeedsVerification : !$('wake-manual-consent').checked) return;
+      try { state.intent = {key: requestID(context.crypto), instance: views.instance, body: JSON.stringify({account_id: account})}; }
       catch (error) { feedback('wake-manual-message', message(error.code), 'error'); return; }
-      wakeTask = null;
+      state.task = null;
     }
-    if (wakeIntent.instance !== views.instance) { wakeUnknown = true; feedback('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。', 'warning'); renderManualWake(); return; }
-    const current = generation; wakeSubmitting = true; renderManualWake();
+    manualWake = state;
+    if (state.intent.instance !== views.instance) { state.unknown = true; feedback('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。', 'warning'); renderManualWake(); return; }
+    const current = generation; state.submitting = true; renderManualWake();
     feedback('wake-manual-message', verify ? '使用原标识与原账号核实同一唤醒任务，不创建替代请求…' : '正在提交手动唤醒，后台将先查询额度并检查安全条件…');
     try {
-      const data = await api('/wake-jobs', {method: 'POST', headers: {'Idempotency-Key': wakeIntent.key}, body: wakeIntent.body});
+      const data = await api('/wake-jobs', {method: 'POST', headers: {'Idempotency-Key': state.intent.key}, body: state.intent.body});
       if (current !== generation) return;
-      acceptWakeTask({...data, phase: data.phase || 'queued', account_id: data.account_id || JSON.parse(wakeIntent.body).account_id, reason: data.reason || 'manual'});
+      if (data.account_id && data.account_id !== account) throw Object.assign(new Error('invalid_response'), {code: 'invalid_response'});
+      acceptWakeTask({...data, phase: data.phase || 'queued', account_id: data.account_id || account, reason: data.reason || 'manual'}, state);
       views.barrier();
     } catch (error) {
       if (current !== generation) return;
-      if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed', 'idempotency_conflict'].includes(error.code) || error.status >= 500 && error.code !== 'wake_unavailable') { wakeUnconfirmed = true; feedback('wake-manual-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请显式核实同一任务，保留原标识与原账号。', 'warning'); }
-      else { wakeUnconfirmed = false; $('wake-manual-consent').checked = false; feedback('wake-manual-message', '唤醒请求未接受：' + message(error.code), 'error'); }
-    } finally { if (current === generation) { wakeSubmitting = false; renderManualWake(); } }
+      if (verify || ['network', 'timeout', 'invalid_response', 'write_unconfirmed', 'idempotency_conflict'].includes(error.code) || error.status >= 500 && error.code !== 'wake_unavailable') { state.unconfirmed = true; if (state === manualWake) feedback('wake-manual-message', '提交结果尚未确认，可能已消耗额度。不会自动重试；请显式核实同一任务，保留原标识与原账号。', 'warning'); }
+      else { state.unconfirmed = false; $('wake-manual-consent').checked = false; if (state === manualWake) feedback('wake-manual-message', '唤醒请求未接受：' + message(error.code), 'error'); }
+    } finally { if (current === generation) { state.submitting = false; renderManualWake(); monitor(current); } }
   }
-  function quickWakeBlocked() { return !connected || !wakeExecutionSupported() || wakeSubmitting || wakeReading || wakeActive() || wakeUnconfirmed || wakeUnknown; }
+  function quickWakeBlocked(account) { return !connected || !wakeExecutionSupported() || wakeAccountBlocked(account); }
   function renderQuickWake() {
-    const blocked = quickWakeBlocked();
-    for (const button of document.querySelectorAll('[data-wake-account]')) {
-      setAttribute(button, 'aria-busy', blocked || !!quickWakeAccount);
-    }
+    for (const button of document.querySelectorAll('[data-wake-account]')) setAttribute(button, 'aria-busy', quickWakeBlocked(button.dataset.wakeAccount));
   }
   function closeQuickWake() {
-    quickWakeSequence++; quickWakeAccount = ''; quickWakeLoading = false; renderQuickWake();
+    quickModelRead = null;
+    for (const state of wakeStates.values()) { state.loading = false; if (state.submitting) state.unconfirmed = true; state.submitting = false; state.reading = false; }
+    renderQuickWake();
   }
   async function startQuickWake(id) {
     if (!connected) { notice('请先连接 CPA 管理接口。', 'warning'); return; }
     if (!wakeExecutionSupported()) { notice(message('wake_unavailable'), 'warning'); return; }
-    if (wakeUnknown || wakeUnconfirmed) { notice('上次唤醒结果尚未确认，请在唤醒页核实原任务。', 'warning'); return; }
-    if (quickWakeBlocked() || quickWakeAccount) { notice('已有唤醒任务正在核查或执行，请等待结果。'); return; }
+    const state = wakeState(id);
+    if (quickWakeBlocked(id)) {
+      manualWake = state;
+      notice(state.unknown || state.unconfirmed ? '该账号上次唤醒结果尚未确认，请在唤醒页核实原任务。' : '该账号已有唤醒任务正在核查或执行，请等待结果。', 'warning');
+      renderManualWake(); return;
+    }
     if (!accountsData.some(account => account.id === id)) return;
-    const current = generation, sequence = ++quickWakeSequence;
-    quickWakeAccount = id; quickWakeLoading = true; renderQuickWake();
+    const current = generation; state.loading = true; renderQuickWake();
     try {
-      const loaded = await reloadModelSettings();
-      if (current !== generation || sequence !== quickWakeSequence || quickWakeAccount !== id) return;
-      quickWakeLoading = false;
+      if (!quickModelRead) quickModelRead = reloadModelSettings().finally(() => { quickModelRead = null; });
+      const loaded = await quickModelRead;
+      if (current !== generation) return;
+      state.loading = false;
       if (!loaded || !savedModelSettings?.config?.default_model || savedModelSettings.instance_id !== views.instance || modelNeedsVerification) {
         feedback('wake-manual-message', '未能核实已保存模型，请先在“模型与提示词”保存实际可用的默认模型后重试。', 'error'); return;
       }
       await submitManualWake(false, id);
-    } finally { if (current === generation && sequence === quickWakeSequence) closeQuickWake(); }
+    } finally { if (current === generation) { state.loading = false; renderQuickWake(); } }
   }
   function modelSupported() { return overviewData?.capabilities?.model_settings === true; }
   function editableGenerationPrompt() { return overviewData?.capabilities?.editable_generation_prompt === true; }
@@ -1777,7 +1900,8 @@
   }
   function stop() {
     clearTimeout(timeTimer);
-    callerNamesRead++; callerNamesSignature = ''; callerNames = Object.create(null);
+    callerNamesRead++; callerNamesSignature = ''; callerNames = Object.create(null); callerKeys = Object.create(null);
+    closeCallerNameDialog(); callerNameSaving = false;
     recordsPanel?.disconnect(); overviewTaskLoading = false; overviewTaskData = null;
     selectedAccounts.clear(); selectedBatchBusy = false;
     taskOpenSequence++; accountTaskSequence++; selectedAccountTasks = null; selectedAccountTasksError = false;
@@ -1801,13 +1925,13 @@
     if (generationSubmitting && generationIntent) generationUnconfirmed = true;
     generationSubmitting = false; generationReading = false;
     if (wakeSaving) { wakeConflict = true; wakeNeedsVerification = true; }
-    if (wakeSubmitting && wakeIntent) wakeUnconfirmed = true;
+    if (manualWake.submitting && manualWake.intent) manualWake.unconfirmed = true;
     if (schedulingBusy) { schedulingNeedsVerification = true; schedulingDirty = true; }
     schedulingRead++; resetRead++; schedulingBusy = false; schedulingLoading = false;
     routingAccountsSequence++; routingAccountsLoading = false; routingAccountsBlocking = false; routingAccounts = null; routingKnownAccounts.clear(); clearTimeout(routingAccountTimer);
     routingObserved = []; routingObservedPage = 1;
     wakeConsentRequested = false;
-    wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; wakeSubmitting = false; wakeReading = false; wakeJobsLoading = false;
+    wakeLoading = false; wakePolling = false; wakeSaving = false; wakeSavingEnabled = null; manualWake.submitting = false; manualWake.reading = false; wakeJobsLoading = false;
     $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false; $('wake-manual-consent').checked = false;
     generationCatalogSequence++; generationCatalog = null; generationCatalogLoading = false; generationCatalogError = '';
     clearModelCatalog('wake'); clearModelCatalog('generation');
@@ -1912,7 +2036,7 @@
       const wakeButton = element('button', 'account-query account-wake', '立即唤醒'); wakeButton.type = 'button';
       wakeButton.dataset.wakeAccount = account.id; wakeButton.dataset.accountStatus = account.status;
       wakeButton.dataset.renderKey = 'wake'; button.dataset.renderKey = 'query';
-      wakeButton.setAttribute('aria-busy', String(quickWakeBlocked() || !!quickWakeAccount));
+      wakeButton.setAttribute('aria-busy', String(quickWakeBlocked(account.id)));
       wakeButton.title = '后台先检查最新额度与窗口；窗口未开启且符合条件时唤醒，已有窗口则跳过。';
       wakeButton.setAttribute('aria-label', '立即唤醒账号 ' + account.id); wakeButton.onclick = () => startQuickWake(account.id);
       const enabled = typeof state?.disabled === 'boolean' ? !state.disabled : state?.before ? !state.before.disabled : account.status !== 'disabled';
@@ -2014,7 +2138,7 @@
     switchRow.append(element('span', 'muted', 'CPA 账号状态'), toggle); identity.append(switchRow); rows.push(identity);
     const actions = element('div', 'account-detail-actions');
     const query = element('button', 'button button-primary', '查询额度'); query.type = 'button'; query.disabled = !connected || queryBusy.has('account:' + account.id); query.onclick = () => submitQuery(account.id);
-    const wake = element('button', 'button button-outline', '立即唤醒'); wake.type = 'button'; wake.dataset.wakeAccount = account.id; wake.setAttribute('aria-busy', String(quickWakeBlocked() || !!quickWakeAccount)); wake.onclick = () => startQuickWake(account.id);
+    const wake = element('button', 'button button-outline', '立即唤醒'); wake.type = 'button'; wake.dataset.wakeAccount = account.id; wake.setAttribute('aria-busy', String(quickWakeBlocked(account.id))); wake.onclick = () => startQuickWake(account.id);
     actions.append(query, wake); rows.push(actions);
     const quota = element('section', 'detail-section detail-quota'); quota.append(element('h3', '', '额度概况'));
     for (const [key, label] of [['five_hour', '五小时剩余'], ['weekly', '周额度剩余']]) { const row = element('div', 'detail-quota-row'); row.append(element('strong', '', label), renderQuota(account.quota, key)); quota.append(row); }
@@ -2587,8 +2711,9 @@
       else { savedWakeSettings = null; wakeBase = null; }
       $('wake-settings-consent').checked = false; $('wake-overview-consent').checked = false;
     }
-    if (wakeIntent && wakeIntent.instance !== data.instance_id && !wakeTask?.job_id && wakeUnconfirmed) {
-      wakeUnknown = true; feedback('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。', 'warning');
+    for (const state of wakeStates.values()) if (state.intent && state.intent.instance !== data.instance_id && !state.task?.job_id && state.unconfirmed) state.unknown = true;
+    if (manualWake.intent && manualWake.intent.instance !== data.instance_id && !manualWake.task?.job_id && manualWake.unconfirmed) {
+      manualWake.unknown = true; feedback('wake-manual-message', '后台实例已更换，原唤醒可能已消耗额度。禁止向新实例重发请求。', 'warning');
     }
     if (data.query_settings && settingsSupported()) applySettings({...data.query_settings, instance_id: data.instance_id, view_revision: data.view_revision});
     renderOverview(); return data;
@@ -2643,7 +2768,7 @@
         }
         if (wakeSettingsSupported()) read(() => reloadWakeSettings());
         if (activePage === 'wake') { read(() => loadWakeJobs()); if (!savedModelSettings) read(() => reloadModelSettings()); }
-        if (wakeActive()) read(() => readWakeJob());
+        for (const state of wakeStates.values()) if (state.task?.job_id && (wakeActive(state) || state.unknown)) read(() => readWakeJob(state.task.job_id));
         if (activePage === 'models') { ensureGenerationAccounts(); read(() => reloadModelSettings()); read(() => pollGeneration()); }
         await Promise.all(reads);
         if (current !== generation) return;
@@ -2666,7 +2791,7 @@
   function monitor(current) {
     clearTimeout(pollTimer);
     if (current !== generation || !connected || refreshing) return;
-    const active = recentJobs().some(job => !['completed', 'failed', 'cancelled'].includes(job.phase));
+    const active = [...wakeStates.values()].some(state => wakeActive(state)) || recentJobs().some(job => !['completed', 'failed', 'cancelled'].includes(job.phase));
     pollTimer = setTimeout(async () => {
       if (current !== generation || !connected) return;
       await refresh();
@@ -3278,7 +3403,7 @@
     if ($('task-history-root')) $('task-history-root').hidden = page !== 'tasks';
     recordsPanel?.setContext({connected, instanceId: views.instance || '', displayAccount});
     recordsPanel?.show(page);
-    if (page !== 'tasks') void refreshCallerNames();
+    if (page !== 'tasks') void refreshCallerNames(true);
     if (page === 'tasks') { renderHistory(); if (load && connected) void loadHistory(); }
   }
   function changeFilter() {
@@ -3310,6 +3435,9 @@
   $('account-alias-form').onsubmit = event => { event.preventDefault(); saveAlias(); };
   $('account-alias-cancel').onclick = closeAliasDialog;
   $('account-alias-dialog').addEventListener('cancel', event => { event.preventDefault(); closeAliasDialog(); });
+  $('caller-name-form').onsubmit = event => { event.preventDefault(); return saveCallerNameDialog(); };
+  $('caller-name-cancel').onclick = closeCallerNameDialog;
+  $('caller-name-dialog').addEventListener('cancel', event => { event.preventDefault(); closeCallerNameDialog(); });
   for (const button of document.querySelectorAll('[data-page]')) {
     if (!Object.hasOwn(pages, button.dataset.page)) continue;
     button.setAttribute('title', pages[button.dataset.page][0]); button.setAttribute('aria-label', pages[button.dataset.page][0]);
@@ -3325,7 +3453,7 @@
   };
   $('refresh').onclick = () => {
     if (activePage !== 'history') return refresh(true);
-    if (recordsPage !== 'tasks') return recordsPanel?.refresh();
+    if (recordsPage !== 'tasks') return Promise.all([recordsPanel?.refresh(), refreshCallerNames(true)]);
     void loadHistory(); if (historySelected && !historyDetailLoading) void readHistoryDetail();
   }; $('sync').onclick = syncInventory;
   if ($('routing-project-search')) $('routing-project-search').oninput = renderRoutingProjects;
@@ -3451,8 +3579,8 @@
   });
   $('wake-manual-form').onsubmit = event => { event.preventDefault(); return submitManualWake(); };
   $('wake-manual-verify').onclick = () => submitManualWake(true);
-  $('wake-manual-consent').onchange = renderManualWake;
-  $('wake-account').oninput = () => { if (!$('wake-manual-fields').disabled) { $('wake-manual-consent').checked = false; renderManualWake(); } };
+  $('wake-manual-consent').onchange = () => { manualWake = wakeState(resolveDisplayAccount($('wake-account').value)); renderManualWake(); };
+  $('wake-account').oninput = () => { if (!$('wake-manual-fields').disabled) { $('wake-manual-consent').checked = false; manualWake = wakeState(resolveDisplayAccount($('wake-account').value)); renderManualWake(); } };
   $('wake-history-refresh').onclick = () => loadWakeJobs(true);
   $('history-refresh').onclick = () => { void loadHistory(); if (historySelected && !historyDetailLoading) void readHistoryDetail(); };
   $('history-search').oninput = () => changeHistoryFilter();
@@ -3485,7 +3613,7 @@
   for (const button of document.querySelectorAll('[data-action="batch"]')) button.addEventListener('click', () => button.id === 'header-query' ? querySelectedAccounts() : submitQuery());
   function resumeUpdates() {
     if (!connected || document.hidden) return;
-    void refreshCallerNames();
+    void refreshCallerNames(true);
     scheduleClock();
     void refresh(); monitor(generation);
   }

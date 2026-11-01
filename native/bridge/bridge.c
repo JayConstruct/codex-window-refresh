@@ -63,7 +63,8 @@ static unsigned negotiated_schema;
 static pthread_cond_t streams_changed=PTHREAD_COND_INITIALIZER;
 static struct {
     char id[257];
-    int used,reading,closing,closed;
+    char account[257];
+    int used,reading,closing,closed,serial;
     time_t touched,retry_at;
 } streams[HOST_CALLS];
 static struct {
@@ -476,9 +477,9 @@ static J *rpc(J*req) {
     int stopped=stopping;
     int busy=host_active>=HOST_CALLS;
     int slot=-1;
-    if(!stopped&&!busy&&execute&&json_object_get_int(field(payload,"model_serial"))) {
+    if(!stopped&&!busy&&execute) {
         for(int index=0;index<HOST_CALLS;index++) {
-            if(streams[index].used) {
+            if(streams[index].used&&(json_object_get_int(field(payload,"model_serial"))||streams[index].serial||!strcmp(streams[index].account,string(field(payload,"auth_id"))))) {
                 pthread_mutex_unlock(&queue_mu);
                 return error("model_budget_busy");
             }
@@ -495,7 +496,11 @@ static J *rpc(J*req) {
             pthread_mutex_unlock(&queue_mu);
             return error(execute?"bridge_busy":"model_stream_unavailable");
         }
-        if(execute)streams[slot].used=1;
+        if(execute) {
+            streams[slot].used=1;
+            streams[slot].serial=json_object_get_int(field(payload,"model_serial"));
+            strcpy(streams[slot].account,string(field(payload,"auth_id")));
+        }
         if(read_stream)streams[slot].reading=1;
         if(close_stream)streams[slot].closing=1;
     }

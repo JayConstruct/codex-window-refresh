@@ -89,7 +89,6 @@ func (c *CPA) executeWake(ctx context.Context, account store.Account, model, pro
 	body := buffer.Bytes()
 	defer clear(body)
 	request := generationRequest{
-		Serial:        true,
 		EntryProtocol: "openai-response", ExitProtocol: "codex", Model: model,
 		Stream: true, Body: body, ForcedProvider: "codex", AuthID: account.ID,
 		Headers: pluginModelHeaders("wake"), Query: map[string][]string{},
@@ -103,6 +102,7 @@ func (c *CPA) executeWake(ctx context.Context, account store.Account, model, pro
 	}
 	var opened generationOpened
 	response.Stage = "open"
+	started := time.Now().UTC()
 	err := c.Host.Call(ctx, "host.model.execute_stream", request, &opened)
 	response.HTTPStatus = opened.StatusCode
 	if opened.StreamID == "" && err != nil && err.Error() == "model_budget_busy" {
@@ -143,7 +143,8 @@ func (c *CPA) executeWake(ctx context.Context, account store.Account, model, pro
 			resultErr = unknown()
 		}
 	}()
-	recorder := wakeRecorder{response: response, prompt: prompt}
+	recorder := wakeRecorder{response: response, prompt: prompt, binding: account.Binding, started: started}
+	recorder.quota(nil, opened.Headers, "cpa_response_headers")
 	defer recorder.finish()
 	if err != nil {
 		return unknown()

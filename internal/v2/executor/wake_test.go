@@ -22,7 +22,7 @@ func TestWakeKnownUnsentNativeBudgetDoesNotBecomeDeliveryUnknown(t *testing.T) {
 	cpa, host, account := wakeFixture()
 	host.opened = generationOpened{}
 	host.executeErr = errors.New("model_budget_busy")
-	if err := cpa.ExecuteWake(context.Background(), account, "fixture-model", "hello"); err == nil || err.Error() != "wake_model_busy" || host.executes != 1 || host.closes != 0 || !host.request.Serial {
+	if err := cpa.ExecuteWake(context.Background(), account, "fixture-model", "hello"); err == nil || err.Error() != "wake_model_busy" || host.executes != 1 || host.closes != 0 || host.request.Serial {
 		t.Fatal("native pre-send budget refusal was not distinguished", err)
 	}
 }

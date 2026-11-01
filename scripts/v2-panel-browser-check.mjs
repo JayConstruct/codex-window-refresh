@@ -19,6 +19,7 @@ const quotaStatusOnly = process.env.CWR_QUOTA_STATUS_ONLY === '1';
 const authOnly = process.env.CWR_AUTH_ONLY === '1';
 const callerNamesOnly = process.env.CWR_CALLER_NAMES_ONLY === '1';
 const callerKey = 'fixture-client-caller-key', hash = value => createHash('sha256').update(value).digest('hex');
+let callerKeyPresent = true;
 const callerScope = hash('cli-proxy-api:caller-scope:v1\0' + callerKey), callerID = 'caller-' + hash('fixture-db-salt\0caller\0' + callerScope);
 const callerLookups = [];
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
@@ -191,7 +192,7 @@ try {
       if (callerNamesOnly && url.pathname === '/cpa/v0/management/api-keys') {
         assert.equal(request.headers.authorization, 'Bearer ' + fixtureKey);
         assert.equal(request.method, 'GET'); reads.push(url.pathname);
-        json(response, 200, {'api-keys': [callerKey]}); return;
+        json(response, 200, {'api-keys': callerKeyPresent ? [callerKey] : []}); return;
       }
       if (url.pathname === '/cpa/v0/management/auth-files/status') {
         if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
@@ -956,6 +957,10 @@ try {
     await evaluate(`document.querySelector('[data-page=history]').click();document.querySelector('[data-record-page=users]').click()`);
     await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes(${JSON.stringify(label)})`), 'CPA name did not reach request details');
     assert.equal(await evaluate(`document.querySelector('.rr-table tbody').textContent.includes(${JSON.stringify(label)})`), true);
+    const maskedKey = 'fixt••••••••-key';
+    assert.equal(await evaluate(`document.querySelector('.rr-table tbody').textContent.includes(${JSON.stringify(maskedKey)})`), true);
+    assert.equal(await evaluate(`document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), true);
+    assert.equal(await evaluate(`document.querySelector('.runtime-records').innerHTML.includes(${JSON.stringify(callerKey)})`), false, 'Unmasked client key reached the DOM');
     assert.equal(await evaluate(`document.querySelector('#rr-facet-caller option[value="${callerID}"]')?.textContent`), label);
     assert.equal(await evaluate(`document.querySelectorAll('.runtime-records img').length`), 0, 'Local label was interpreted as HTML');
     await evaluate(`document.querySelector('[data-record-page=analysis]').click()`);
@@ -971,15 +976,42 @@ try {
       assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'), true, 'Caller label overflowed the page');
       await screenshot('caller-names-' + width + '.png');
     }
+    const editedLabel = '开发笔记本 <b>工作用</b>';
+    await evaluate(`document.querySelector('.rr-rename-caller').click()`);
+    await waitFor(() => evaluate(`document.getElementById('caller-name-dialog').open`), 'Caller name dialog did not open');
+    assert.equal(await evaluate(`document.getElementById('caller-name-key').textContent`), maskedKey);
+    assert.equal(await evaluate(`document.getElementById('caller-name-value').value`), label);
+    await screenshot('caller-name-editor-mobile.png');
+    await evaluate(`document.getElementById('caller-name-value').value=${JSON.stringify(editedLabel)};document.getElementById('caller-name-save').click()`);
+    await waitFor(() => evaluate(`!document.getElementById('caller-name-dialog').open&&document.querySelector('.rr-metadata').textContent.includes(${JSON.stringify(editedLabel)})`), 'Caller edit did not update the shared CPA name');
+    assert.equal(await evaluate(`document.querySelector('.rr-table tbody').textContent.includes(${JSON.stringify(editedLabel)})`), true);
+    assert.equal(await evaluate(`document.querySelectorAll('.runtime-records b').length`), 0, 'Edited label was interpreted as HTML');
+    const persistedEdit = await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`);
+    assert.match(persistedEdit, /^enc::v1::/);
+    assert.equal(persistedEdit.includes(callerKey), false);
+    await evaluate(`document.querySelector('.rr-rename-caller').click();document.getElementById('caller-name-value').value='未保存草稿'`);
+    await saveCallerName('另一页面修改');
+    await evaluate(`document.getElementById('caller-name-save').click()`);
+    await waitFor(() => evaluate(`document.getElementById('caller-name-message').textContent.includes('其他页面修改')`), 'Concurrent CPA name edit was silently overwritten');
+    assert.equal(await evaluate(`document.getElementById('caller-name-value').value`), '未保存草稿');
+    await evaluate(`document.getElementById('caller-name-cancel').click()`);
     await saveCallerName('笔记本');
     await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes('笔记本')`), 'Name edit did not refresh');
     const lookups = callerLookups.length;
     await saveCallerName(null);
     await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes(${JSON.stringify('调用方 ' + callerID.slice(7, 15))})`), 'Deleted name did not restore caller digest');
     assert.equal(callerLookups.length, lookups, 'Deleting names fetched client keys again');
+    assert.equal(await evaluate(`document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), true, 'Unnamed key disappeared');
+    await evaluate(`document.querySelector('.rr-rename-caller').click();document.getElementById('caller-name-value').value='临时名称';document.getElementById('caller-name-save').click()`);
+    await waitFor(() => evaluate(`!document.getElementById('caller-name-dialog').open&&document.querySelector('.rr-metadata').textContent.includes('临时名称')`), 'Unnamed key could not be named');
+    await evaluate(`document.querySelector('.rr-rename-caller').click();document.getElementById('caller-name-value').value='';document.getElementById('caller-name-save').click()`);
+    await waitFor(() => evaluate(`!document.getElementById('caller-name-dialog').open&&document.querySelector('.rr-metadata').textContent.includes(${JSON.stringify('调用方 ' + callerID.slice(7, 15))})`), 'Clearing name did not restore the caller label');
+    callerKeyPresent = false;
+    await evaluate(`document.getElementById('refresh').click()`);
+    await waitFor(() => evaluate(`!document.querySelector('.rr-rename-caller')&&!document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), 'Deleted CPA key remained editable');
     assert.equal(posts.length, 0); assert.equal(patches.length, 0);
     assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
-    console.log('Caller names Chromium checks passed: CPA obfuscated local names, HTTP, detail/list/facets/matrix, exact drilldown identity, text-only labels, desktop/mobile layout, edits/deletion and no persisted names or upstream tasks.');
+    console.log('Caller key Chromium checks passed: masked keys, CPA shared names, edit/clear/conflict/deletion, list/detail/facets/matrix, exact drilldown identity, text-only labels, desktop/mobile layout and no key-list writes or upstream tasks.');
     break checks;
   }
   if (authOnly) {
@@ -1562,7 +1594,7 @@ try {
   assert.deepEqual(JSON.parse(posts.find(post => post.resource === 'wake-jobs').body), {account_id: 'codex-01'});
   assert.equal(await evaluate('!document.querySelector("dialog[open]") && !document.querySelector("[data-view=overview]").hidden'), true, 'Quick wake changed the overview page');
   await evaluate('document.querySelector("[data-page=wake]").click()');
-  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
+  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), false);
   await clickWhenEnabled('wake-history-refresh'); await clickWhenEnabled('wake-manual-verify');
   assert.equal(posts.filter(post => post.resource === 'wake-jobs').length, 1, 'Unknown wake verification resent the model action');
   assert.match(await evaluate('document.getElementById("wake-history").textContent'), /禁止重发/);
@@ -1588,7 +1620,8 @@ try {
     await screenshot('model-settings-' + width + '.png');
     await evaluate('document.querySelector("[data-page=wake]").click()');
     assert.equal(await evaluate('document.documentElement.scrollWidth <= document.documentElement.clientWidth'), true, 'Wake editor overflow at ' + width);
-    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true, 'Wake navigation unlocked an unknown model action');
+    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), false, 'Unknown account blocked selection of another account');
+    assert.equal(await evaluate('document.getElementById("wake-manual-submit").disabled'), true, 'Unknown account allowed another model send');
     await screenshot('wake-' + width + '.png');
     await evaluate('document.querySelector("[data-page=scheduling]").click()');
     await waitFor(() => evaluate('!document.getElementById("scheduling-fields").disabled'), 'Scheduling page did not load');
@@ -1955,7 +1988,7 @@ try {
   assert.equal(await evaluate('document.querySelector("#accounts .status-badge").textContent'), '已禁用');
   assert.equal(posts.filter(post => post.resource !== 'sync').length, writesBeforeCPAStatus);
   await waitFor(() => posts.some(post => post.resource === 'sync'), 'Confirmed CPA switch did not request immediate backend sync');
-  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
+  assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), false);
   for (const outcome of ['disconnect', 'persist-hook-failed']) {
     authPatchGate = gate(outcome);
     const count = patches.length;
@@ -1970,7 +2003,7 @@ try {
     assert.equal((await statusState()).phase, 'unknown', 'Polling cleared an unknown result');
     assert.equal(patches.length, count + 1, 'Unknown PATCH retried automatically');
     await verifyStatus();
-    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), true);
+    assert.equal(await evaluate('document.getElementById("wake-manual-fields").disabled'), false);
   }
   authPatchGate = gate(); await clickStatus();
   await waitFor(() => authPatchGate.started, 'Identity-race PATCH missing');

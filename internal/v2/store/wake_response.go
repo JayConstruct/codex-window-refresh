@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+
+	"codex-window-refresh/internal/v2/quota"
 )
 
 type WakeResponse struct {
@@ -24,6 +26,8 @@ type WakeResponse struct {
 	Truncated         bool   `json:"truncated"`
 	Completed         bool   `json:"completed"`
 	CloseFailed       bool   `json:"close_failed"`
+	// Internal normalized evidence, never raw headers or account bindings in API responses.
+	Quota *quota.Snapshot `json:"-"`
 }
 
 var wakeSecretPatterns = []*regexp.Regexp{

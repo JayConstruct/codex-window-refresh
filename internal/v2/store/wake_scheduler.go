@@ -257,7 +257,7 @@ func enqueueWakeRead(ctx context.Context, tx *sql.Tx, job *WakeJob, at time.Time
 		return false, err
 	}
 	var id string
-	err = tx.QueryRowContext(ctx, `SELECT i.job_id FROM job_items i JOIN query_schedule q ON q.job_id=i.job_id AND q.account_id=i.account_id LEFT JOIN query_runs r ON r.id=i.run_id WHERE i.account_id=? AND q.binding=? AND q.auth_index=? AND (i.phase='queued' OR (i.phase='running' AND r.started_at>=?)) ORDER BY q.scheduled_at LIMIT 1`, job.AccountID, job.Account.Binding, job.Account.AuthIndex, job.QueryGate).Scan(&id)
+	err = tx.QueryRowContext(ctx, `SELECT i.job_id FROM job_items i JOIN query_schedule q ON q.job_id=i.job_id AND q.account_id=i.account_id LEFT JOIN query_runs r ON r.id=i.run_id WHERE i.account_id=? AND q.binding=? AND q.auth_index=? AND (i.phase='queued' OR (i.phase='running' AND r.started_at>=?)) AND (?!='manual' OR q.scheduled_at<=?) ORDER BY q.scheduled_at LIMIT 1`, job.AccountID, job.Account.Binding, job.Account.AuthIndex, job.QueryGate, job.Reason, queryStamp(at)).Scan(&id)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
@@ -279,6 +279,9 @@ func enqueueWakeRead(ctx context.Context, tx *sql.Tx, job *WakeJob, at time.Time
 			return false, err
 		}
 		plan := QueryPlan{Trigger: "wake_preflight", Min: settings.Config.Delay.Min, Max: settings.Config.Delay.Max}
+		if job.Reason == "manual" {
+			plan.Min, plan.Max = 0, 0
+		}
 		if job.Phase == "verifying" || job.Phase == "unknown" {
 			plan.Trigger = "wake_verification"
 		}
@@ -329,7 +332,7 @@ func verifyWakes(ctx context.Context, tx *sql.Tx, at time.Time) error {
 		}
 		var snapshot quota.Snapshot
 		_ = json.Unmarshal(account.Quota, &snapshot)
-		if wakeFresh(snapshot, account.Binding, job.QueryGate, at) && snapshot.FiveHour.State == core.WindowActive && snapshot.FiveHour.ResetAt.After(at) {
+		if wakeWindowVerified(snapshot, account.Binding, job.QueryGate, at) {
 			if err = updateWake(ctx, tx, job, "completed", "window_verified", "", at); err != nil {
 				return err
 			}

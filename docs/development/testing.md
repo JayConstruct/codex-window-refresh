@@ -21,7 +21,7 @@
 
 `CWR_AUTH_ONLY=1 make v2-panel-browser-check` 单独检查自动登录：CPA 凭据复用、桌面及移动端勾选项、手动登录是否记住、刷新恢复、主动断开和认证失效后的退出，以及 CPA 登录存储保持不变。
 
-`CWR_CALLER_NAMES_ONLY=1 make v2-panel-browser-check` 单独检查调用方名称：CPA 混淆存储读取、请求详情/列表/筛选/分流矩阵、原始摘要下钻、名称修改和删除回退、桌面与手机布局；仅使用本地模拟 CPA 与 Key，不请求上游。
+`CWR_CALLER_NAMES_ONLY=1 make v2-panel-browser-check` 单独检查调用方 Key 与名称：打码值、CPA 混淆存储读取及共用格式保存、请求详情/列表/筛选/分流矩阵、原始摘要下钻、名称编辑/清除、并发修改冲突、删除 Key 后撤销改名、桌面与手机布局；仅使用本地模拟 CPA 与 Key，不请求上游。
 
 `test_codeman_client.py` 验证 Codeman 注册表接入、原配置及参数保留、重复配置、私有备份与失败不覆盖。本机安装了 Codeman 时还会使用其实际注册表和命令渲染器，在临时目录中运行假 Codex，验证项目头、模型、推理强度、恢复会话及退出码；可用 `CWR_TEST_CODEMAN_APP` 指定 Codeman 应用目录，不修改真实注册表或启动真实模型请求。
 

@@ -158,6 +158,7 @@
     let selectedOpener = null, copyFallbackValue = '';
     let data = null, selected = null, selectedRevision = -1, detail = null, detailRevision = -1, detailError = '', error = '', loading = false;
     let callerDisplay = options.displayCaller || callerLabel;
+    let callerInfo = options.callerKeyInfo || (() => null);
     let accountDisplay = options.displayAccount || (value => value || '—'), analysisMetric = 'attempts', matrixGroup = 'project';
     let knownFacets = {projects: new Map(), callers: new Map(), accounts: new Map(), models: new Map()};
     const filtersByPage = Object.fromEntries(['users', 'plugin', 'analysis'].map(key => [key, {search: '', project: '', caller: '', account: '', model: '', status: '', session: '', range: 'today', page: 1, limit: key==='plugin'?6:7}]));
@@ -171,6 +172,7 @@
     function empty(title, description = '') { const node = el('div', 'rr-empty'); node.append(icon('request'), el('strong', '', title)); if (description) node.append(el('p', '', description)); return node; }
     function badge(record, label) { const view = record?.kind ? pluginStatus(record) : recordStatus(record); return el('span', 'rr-badge rr-' + view.tone, label || view.label); }
     function displayCaller(id) { return safeText(callerDisplay(id)) || callerLabel(id); }
+    function maskedCallerKey(id) { return safeText(callerInfo(id)?.maskedKey); }
     function account(id) { return id ? String(accountDisplay(id) || id) : '—'; }
     function date(value, full = false) { const at = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(at) ? new Intl.DateTimeFormat('zh-CN', full ? {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false} : {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}).format(at) : '—'; }
     function pair(label, value) { const row = el('div', 'rr-pair'); row.append(el('dt', '', label), el('dd', '', value)); return row; }
@@ -271,7 +273,8 @@
         row.append(textCell(account(record.account_id),record.model||'')); row.append(textCell(triggerName(record.trigger)));
       } else {
         row.append(textCell(projectLabel(record),record.session?(record.parent_session?'子会话 ':'会话 ')+clippedID(record.session):'会话未知'));
-        row.append(textCell(displayCaller(record.caller),record.model||'模型未记录'));
+        const user = textCell(displayCaller(record.caller), maskedCallerKey(record.caller));
+        user.append(el('small', 'rr-secondary', record.model || '模型未记录')); row.append(user);
         row.append(textCell(account(record.account_id)));
         row.append(textCell(reasonName(record.reason),record.reason==='host_selected'?'原因未提供':'',record.reason==='failover'?'rr-warning':''));
       }
@@ -285,7 +288,17 @@
       listHelp.textContent=plugin?'展示已保留的插件操作汇总；同一操作可能包含多次调用，不代表完整网络日志。':'按请求分组，展开详情查看每次上游尝试；缺失原因不作推测。';
     }
     function addMetadata(record, plugin) {
-      const metadata=el('dl','rr-metadata'); const entries=plugin?[['账号',account(record.account_id)],['模型',record.model||'—'],['触发原因',triggerName(record.trigger)],['创建时间',date(record.created_at,true)],['当前阶段',record.stage||'未记录'],['任务 ID',clippedID(record.task_id)]]:[['项目',projectLabel(record)],['模型',record.model||'未记录'],['调用方',record.caller?displayCaller(record.caller):'未知'],['最终账号',account(record.account_id)],['会话',clippedID(record.session)],['总耗时',duration(record.latency_ms)]];for(const [label,value]of entries)metadata.append(pair(label,value));return metadata;
+      const metadata=el('dl','rr-metadata'); const entries=plugin?[['账号',account(record.account_id)],['模型',record.model||'—'],['触发原因',triggerName(record.trigger)],['创建时间',date(record.created_at,true)],['当前阶段',record.stage||'未记录'],['任务 ID',clippedID(record.task_id)]]:[['项目',projectLabel(record)],['模型',record.model||'未记录'],['调用方',record.caller?displayCaller(record.caller):'未知'],['最终账号',account(record.account_id)],['会话',clippedID(record.session)],['总耗时',duration(record.latency_ms)]];for(const [label,value]of entries)metadata.append(pair(label,value));
+      if (!plugin) {
+        const masked = maskedCallerKey(record.caller), row = pair('API Key', masked || '无法匹配当前 CPA Key');
+        row.classList.add('rr-key-metadata');
+        if (masked && typeof options.onRenameCaller === 'function') {
+          const edit = button('修改名称', function () { options.onRenameCaller(record.caller, this); }, 'rr-button rr-rename-caller');
+          edit.disabled = !connected; row.lastChild.append(edit);
+        }
+        metadata.append(row);
+      }
+      return metadata;
     }
     function renderAttempts(record) {
       if(!Array.isArray(record.attempts))return [el('p','rr-note','尚未记录到逐次上游尝试。')];
@@ -346,7 +359,7 @@ nodes.push(section('为什么发送',[reason,el('p','rr-note',snapshot.recorded_
     }
     function show(next) {if(!['users','plugin','analysis','tasks'].includes(next))next='users';if(page!==next){copyFallbackValue='';listController?.abort();detailController?.abort();gate.reset(gate.instance);data=null;selected=null;detail=null;detailRevision=-1;selectedRevision=-1;error='';detailError='';loading=false;listPending=null;detailPending=null;clearTimeout(timer);}page=next;root.dataset.recordPage=page;updateFilterControls();render();if(connected&&page!=='tasks')void refresh();}
     function disconnect() {copyFallbackValue='';connected=false;listController?.abort();detailController?.abort();gate.reset(gate.instance);clearTimeout(timer);listPending=null;detailPending=null;loading=false;render();}
-    function setContext(value={}) {if(typeof value.displayCaller==='function'){callerDisplay=value.displayCaller;if(data)rememberFacets(data);if(document.activeElement!==fields.caller.input)fields.caller.input.value=readFilters().caller?displayCaller(readFilters().caller):'';}if(typeof value.displayAccount==='function')accountDisplay=value.displayAccount;const instance=typeof value.instanceId==='string'&&value.instanceId?value.instanceId:gate.instance;if(instance!==gate.instance){copyFallbackValue='';listController?.abort();detailController?.abort();gate.reset(instance);data=null;selected=null;detail=null;detailError='';listPending=null;detailPending=null;knownFacets={projects:new Map(),callers:new Map(),accounts:new Map(),models:new Map()};}const prior=connected;if(typeof value.connected==='boolean')connected=value.connected;if(!connected&&prior)disconnect();else{render();if(connected&&!prior&&page!=='tasks')void refresh();}}
+    function setContext(value={}) {if(typeof value.callerKeyInfo==='function')callerInfo=value.callerKeyInfo;if(typeof value.displayCaller==='function'){callerDisplay=value.displayCaller;if(data)rememberFacets(data);if(document.activeElement!==fields.caller.input)fields.caller.input.value=readFilters().caller?displayCaller(readFilters().caller):'';}if(typeof value.displayAccount==='function')accountDisplay=value.displayAccount;const instance=typeof value.instanceId==='string'&&value.instanceId?value.instanceId:gate.instance;if(instance!==gate.instance){copyFallbackValue='';listController?.abort();detailController?.abort();gate.reset(instance);data=null;selected=null;detail=null;detailError='';listPending=null;detailPending=null;knownFacets={projects:new Map(),callers:new Map(),accounts:new Map(),models:new Map()};}const prior=connected;if(typeof value.connected==='boolean')connected=value.connected;if(!connected&&prior)disconnect();else{render();if(connected&&!prior&&page!=='tasks')void refresh();}}
     function destroy(){disposed=true;connected=false;listController?.abort();detailController?.abort();gate.reset();clearTimeout(timer);for(const remove of listeners)remove();root.replaceChildren();root.classList.remove('runtime-records');}
     updateFilterControls();render();return {show,refresh,disconnect,setContext,destroy};
   }

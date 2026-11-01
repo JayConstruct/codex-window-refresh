@@ -119,8 +119,10 @@ func (s *Service) Run(ctx context.Context) {
 	go func() { defer workers.Done(); s.generate(ctx) }()
 	workers.Add(1)
 	go func() { defer workers.Done(); s.scheduleWakes(ctx) }()
-	workers.Add(1)
-	go func() { defer workers.Done(); s.executeWakes(ctx) }()
+	for i := 0; i < store.ModelConcurrency; i++ {
+		workers.Add(1)
+		go func() { defer workers.Done(); s.executeWakes(ctx) }()
+	}
 	for i := 0; i < s.options.QueryConcurrency; i++ {
 		workers.Add(1)
 		go func() { defer workers.Done(); s.worker(ctx, i) }()

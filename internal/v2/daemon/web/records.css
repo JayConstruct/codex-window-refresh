@@ -3,6 +3,9 @@
 .runtime-records button { cursor: pointer; }
 .runtime-records button:disabled { cursor: default; opacity: .5; }
 .runtime-records [hidden] { display: none !important; }
+.runtime-records .rr-key-metadata { grid-column: 1 / -1; }
+.runtime-records .rr-key-metadata dd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; overflow-wrap: anywhere; }
+.runtime-records .rr-rename-caller { padding: 4px 8px; font-size: 12px; flex-shrink: 0; }
 .runtime-records .rr-icon { width: 18px; height: 18px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .runtime-records .rr-filters { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .runtime-records .rr-search { position: relative; display: flex; flex: 1.5 1 300px; align-items: center; min-width: 200px; }

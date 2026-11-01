@@ -255,10 +255,23 @@ func (st *Store) FinishWakeWithResponse(ctx context.Context, id, phase, code str
 	return st.write(ctx, func(tx *sql.Tx) error {
 		var result sql.Result
 		var err error
+		if response != nil && response.Quota != nil && (phase == "verifying" || phase == "unknown") {
+			verified, mergeErr := mergeWakeResponseQuota(ctx, tx, id, *response.Quota, at)
+			if mergeErr != nil {
+				return mergeErr
+			}
+			if verified {
+				phase, code = "completed", "window_verified"
+			}
+		}
 		if phase == "queued" {
 			result, err = tx.ExecContext(ctx, "UPDATE wake_jobs SET phase='queued',error_code='',hold_reason='model_busy',next_check_at=?,query_gate='',model='',prompt='',hold_until='',updated_at=? WHERE id=? AND phase='sending'", queryStamp(at.Add(time.Second)), queryStamp(at), id)
 		} else {
-			result, err = tx.ExecContext(ctx, "UPDATE wake_jobs SET phase=?,error_code=?,hold_reason=?,query_job_id='',query_gate=?,scheduled_at=?,updated_at=? WHERE id=? AND phase='sending'", phase, code, "verification_pending", queryStamp(at), queryStamp(at), queryStamp(at), id)
+			hold := "verification_pending"
+			if phase == "completed" {
+				hold = ""
+			}
+			result, err = tx.ExecContext(ctx, "UPDATE wake_jobs SET phase=?,error_code=?,hold_reason=?,query_job_id='',query_gate=?,scheduled_at=?,updated_at=? WHERE id=? AND phase='sending'", phase, code, hold, queryStamp(at), queryStamp(at), queryStamp(at), id)
 		}
 		if err != nil || response == nil {
 			return err

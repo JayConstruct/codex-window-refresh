@@ -152,7 +152,7 @@ func (st *Store) ClaimAt(ctx context.Context, at time.Time) (Run, error) {
  AND (COALESCE(p.automatic,0)=0 OR (?=1 AND
  ((p.trigger='periodic' AND ?=1) OR (p.trigger='five_hour_expiry' AND ?=1) OR (p.trigger='weekly_expiry' AND ?=1) OR (p.trigger='initial_sync' AND ?=1))))
  AND NOT EXISTS(SELECT 1 FROM query_runs r WHERE r.account_id=i.account_id AND r.phase='running')
- ORDER BY CASE WHEN COALESCE(p.trigger,'manual_single')='manual_single' THEN 0 ELSE 1 END,COALESCE(q.scheduled_at,j.created_at),j.created_at,i.account_id LIMIT 1`, queryStamp(at), settings.Config.Allowed(at), settings.Config.Automatic, settings.Config.FiveHour, settings.Config.Weekly, settings.Config.Enabled("initial_sync")).Scan(&run.Account.ID, &run.Account.AuthIndex, &run.Account.Status, &run.Account.Binding)
+ ORDER BY CASE WHEN COALESCE(p.trigger,'manual_single') IN ('manual_single','wake_preflight','wake_verification') THEN 0 ELSE 1 END,COALESCE(q.scheduled_at,j.created_at),j.created_at,i.account_id LIMIT 1`, queryStamp(at), settings.Config.Allowed(at), settings.Config.Automatic, settings.Config.FiveHour, settings.Config.Weekly, settings.Config.Enabled("initial_sync")).Scan(&run.Account.ID, &run.Account.AuthIndex, &run.Account.Status, &run.Account.Binding)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}

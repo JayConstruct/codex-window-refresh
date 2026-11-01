@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +34,9 @@ type generationRequest struct {
 }
 
 type generationOpened struct {
-	StatusCode int    `json:"status_code"`
-	StreamID   string `json:"stream_id"`
+	StatusCode int         `json:"status_code"`
+	StreamID   string      `json:"stream_id"`
+	Headers    http.Header `json:"headers"`
 }
 
 type generationRead struct {
@@ -116,7 +118,6 @@ func (c *CPA) GenerateCandidatesWithPrompt(ctx context.Context, account store.Ac
 	body := buffer.Bytes()
 	defer clear(body)
 	request := generationRequest{
-		Serial:        true,
 		EntryProtocol: "openai-response", ExitProtocol: exitProtocol, Model: model,
 		Stream: true, Body: body, ForcedProvider: provider, AuthID: account.ID,
 		Headers: pluginModelHeaders("prompt_generation"), Query: map[string][]string{},

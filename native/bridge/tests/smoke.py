@@ -67,6 +67,7 @@ class NativeBridge(unittest.TestCase):
         self.model_closes = 0
         self.model_streams = {}
         self.model_requests = []
+        self.model_headers = {}
         self.model_error = False
         self.block_model_read = False
         self.block_model_close = False
@@ -985,7 +986,7 @@ class NativeBridge(unittest.TestCase):
                 self.model_requests.append(req)
                 stream_id = f'fixture-model-{self.models}'
                 self.model_streams[stream_id] = 0
-                value = {'stream_id': stream_id, 'status_code': 200, 'headers': {}}
+                value = {'stream_id': stream_id, 'status_code': 200, 'headers': self.model_headers}
             elif method == 'host.model.stream_read':
                 self.model_reads += 1
                 self.assertIn(req['stream_id'], self.model_streams)
@@ -1516,8 +1517,8 @@ class NativeBridge(unittest.TestCase):
         instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
         self.allow_models = True
         self.expected_models = 8
-        for _ in range(8):
-            self.assertTrue(self.rpc('host.model.execute_stream', self.model_request(), instance)['ok'])
+        for index in range(8):
+            self.assertTrue(self.rpc('host.model.execute_stream', dict(self.model_request(), auth_id=f'account-{index}'), instance)['ok'])
         self.assertEqual(self.rpc('host.model.execute_stream', self.model_request(), instance)['error']['code'], 'bridge_busy')
         self.assertTrue(self.rpc('host.auth.list', {}, instance)['ok'])
         self.assertTrue(self.call('plugin.quiesce', {})['ok'])
@@ -1569,6 +1570,21 @@ class NativeBridge(unittest.TestCase):
         self.assertEqual(self.models, 2)
         self.assertTrue(all('model_serial' not in request for request in self.model_requests))
         self.assertTrue(self.rpc('host.model.stream_close', {'stream_id': opened['result']['stream_id']}, instance)['ok'])
+
+    def test_parallel_model_streams_only_block_their_own_account_until_closed(self):
+        instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
+        self.allow_models = True
+        self.expected_models = 2
+        first = self.rpc('host.model.execute_stream', self.model_request(), instance)
+        self.assertTrue(first['ok'], first)
+        self.assertEqual(self.rpc('host.model.execute_stream', self.model_request(), instance)['error']['code'], 'model_budget_busy')
+        self.model_close_error = True
+        self.assertFalse(self.rpc('host.model.stream_close', {'stream_id': first['result']['stream_id']}, instance)['ok'])
+        self.assertEqual(self.rpc('host.model.execute_stream', self.model_request(), instance)['error']['code'], 'model_budget_busy')
+        second = self.rpc('host.model.execute_stream', dict(self.model_request(), auth_id='b'), instance)
+        self.assertTrue(second['ok'], second)
+        self.model_close_error = False
+        self.assertTrue(self.rpc('host.model.stream_close', {'stream_id': second['result']['stream_id']}, instance)['ok'])
 
     def test_failed_model_close_keeps_ownership_and_throttles_cleanup_without_reexecute(self):
         instance = self.rpc('bridge.hello')['result']['bridge_instance_id']
@@ -2108,6 +2124,7 @@ class NativeBridge(unittest.TestCase):
             time.sleep(.025)
         self.assertEqual(result['phase'], 'verifying', result)
         self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+
         request = self.model_requests[0]
         self.assertEqual((request['forced_provider'], request['auth_id'], request['entry_protocol'], request['exit_protocol']),
                          ('codex', 'a', 'openai-response', 'codex'))
@@ -2131,6 +2148,39 @@ class NativeBridge(unittest.TestCase):
             time.sleep(.025)
         self.assertEqual(verified['phase'], 'completed', verified)
         self.assertEqual(verified.get('error_code'), 'window_verified')
+        self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
+
+    def test_manual_wake_response_headers_update_quota_and_verify_without_extra_query(self):
+        import sqlite3
+        self.start_daemon()
+        self.wait_wake_fixture_ready()
+        self.configure_wake_fixture_model()
+        self.emit_wake_fixture_quota('response-proof-preflight', 0)
+        self.allow_models = True
+        self.expected_models = 1
+        self.model_headers = self.quota_headers('2')
+        self.model_headers.update({'X-Codex-Primary-Reset-After-Seconds': ['17000'],
+                                   'X-Codex-Secondary-Used-Percent': ['3'],
+                                   'X-Codex-Secondary-Window-Minutes': ['10080'],
+                                   'X-Codex-Secondary-Reset-After-Seconds': ['500000'],
+                                   'Authorization': ['Bearer never-return-header']})
+        status, accepted = self.management('wake-jobs', 'POST', {'account_id': 'a'}, 'response-proof')
+        self.assertEqual(status, 202, accepted)
+        deadline = time.monotonic()+5
+        while time.monotonic()<deadline:
+            status, result = self.management('wake-jobs', query={'job_id': [accepted['job_id']]})
+            if result['phase'] == 'completed':
+                break
+            time.sleep(.025)
+        self.assertEqual((status, result['phase'], result.get('error_code')), (200, 'completed', 'window_verified'), result)
+        _, page = self.management('accounts')
+        account = next(account for account in page['accounts'] if account['id'] == 'a')
+        self.assertEqual(account['quota']['five_hour']['Remaining']['Value'], 98)
+        self.assertEqual(account['quota']['weekly']['Remaining']['Value'], 97)
+        self.assertEqual(account['quota']['five_hour']['State'], 'active')
+        self.assertNotIn('never-return-header', json.dumps(result)+json.dumps(account))
+        with sqlite3.connect(self.root/'data'/'backend.sqlite') as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM jobs').fetchone()[0], 0)
         self.assertEqual((self.models, self.model_reads, self.model_closes), (1, 1, 1))
 
     def test_wake_model_error_unknown_blocks_candidate_and_new_wake_across_restart(self):

@@ -10,10 +10,51 @@ const {ViewTracker, apiBase, readPanelKey, readLogin, age, resetText, windowView
 const script = fs.readFileSync(path.resolve(__dirname, '../../../internal/v2/daemon/web/panel.js'), 'utf8');
 const view = (instance = 'a', revision = 1) => ({instance_id: instance, view_revision: revision});
 const origin = 'http://127.0.0.1:8317';
-const {callerDigest, readCallerNames, resolveCallerNames} = require('../../../internal/v2/daemon/web/panel.js');
+const {callerDigest, readCallerNames, resolveCallerNames, resolveCallerKeys, maskedAPIKey, saveCallerName} = require('../../../internal/v2/daemon/web/panel.js');
 const location = {origin, host: '127.0.0.1:8317', pathname: '/v0/resource/plugins/codex-window-refresh/status'};
 const digest = value => createHash('sha256').update(value).digest('hex');
 const nameFingerprint = (address, key) => digest(JSON.stringify(['api-key-name', address, key]));
+
+test('API key masks never expose short secrets or the hidden middle of longer keys', () => {
+  for (const value of ['', 'a', 'short-key', '123456789012']) assert.equal(maskedAPIKey(value), '••••••••');
+  assert.equal(maskedAPIKey('sk-example-private-key-1234'), 'sk-e••••••••1234');
+});
+
+test('unnamed CPA keys resolve to masked identities without persisting or posting raw keys', async () => {
+  const clientKey = 'sk-example-private-key-1234', caller = 'caller-' + 'b'.repeat(64), calls = [];
+  const context = {location, localStorage: {getItem: () => null}};
+  const identities = await resolveCallerKeys(context, '/v0/management/codex-window-refresh/v2', async (path, options, management) => {
+    calls.push({path, options});
+    if (management) return {'api-keys': [clientKey]};
+    return {callers: [caller]};
+  });
+  assert.deepEqual(identities[caller], {name: '', maskedKey: 'sk-e••••••••1234', fingerprint: nameFingerprint(origin, clientKey)});
+  assert.equal(JSON.stringify(calls).includes(clientKey), false);
+  assert.equal(JSON.stringify(identities).includes(clientKey), false);
+  await assert.rejects(resolveCallerKeys(context, '/v0/management/codex-window-refresh/v2', async () => ({'api-keys': 'invalid'})), /invalid_caller_keys/);
+});
+
+test('CPA names save in the shared storage format, preserve other names and reject conflicting or invalid writes', () => {
+  const address = origin + '/cpa', storageKey = 'api-key-names:v1:' + address;
+  const fingerprint = nameFingerprint(address, 'mock-client-one'), other = nameFingerprint(address, 'mock-client-two');
+  const storage = {[storageKey]: JSON.stringify({[fingerprint]: '原名称', [other]: '其他名称'})};
+  const context = {location, navigator: {userAgent: 'fixture'}, TextEncoder, TextDecoder, atob, btoa,
+    localStorage: {getItem: key => storage[key] ?? null, setItem: (key, value) => { storage[key] = value; }}};
+  const base = '/cpa/v0/management/codex-window-refresh/v2';
+  saveCallerName(context, base, fingerprint, ' 工作电脑 ', '原名称');
+  assert.match(storage[storageKey], /^enc::v1::/);
+  assert.deepEqual(readCallerNames(context, base), {[fingerprint]: '工作电脑', [other]: '其他名称'});
+  const saved = storage[storageKey];
+  for (const value of ['x'.repeat(257), 'bad\nname']) assert.throws(() => saveCallerName(context, base, fingerprint, value, '工作电脑'), /invalid_caller_name/);
+  assert.throws(() => saveCallerName(context, base, fingerprint, '丢失修改', '原名称'), /caller_name_conflict/);
+  assert.equal(storage[storageKey], saved);
+  saveCallerName(context, base, fingerprint, '', '工作电脑');
+  assert.deepEqual(readCallerNames(context, base), {[other]: '其他名称'});
+  storage[storageKey] = 'invalid JSON';
+  assert.throws(() => saveCallerName(context, base, fingerprint, '新名称', ''), /caller_name_storage_invalid/);
+  assert.equal(storage[storageKey], 'invalid JSON');
+  assert.equal(JSON.stringify(storage).includes('mock-client-one'), false);
+});
 
 test('caller digests match SHA-256 across UTF-8 and block boundaries on plain HTTP', () => {
   for (const value of ['', 'abc', '客户端😀', ...[55, 56, 63, 64, 65, 4096].map(length => 'x'.repeat(length))]) assert.equal(callerDigest(value), digest(value));
@@ -569,6 +610,54 @@ test('overview wake waits for the saved model, locks duplicate clicks and submit
   assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
   assert.equal(ui.get('page-title').textContent, '账号池概览'); assert.equal(ui.get('wake-account').value, 'unrelated manual draft');
   assert.equal(ui.get('quick-wake-dialog').open, undefined);
+});
+test('different accounts submit concurrently while each pending or unknown account blocks only itself', async () => {
+  let releaseModels, nextKey = 0;
+  const releases = new Map(), tasks = new Map();
+  const ui = panel((url, options) => {
+    if (url.includes('/accounts?')) return [200, accountPage(20, ['a', 'b', 'c'].map(id => ({id, status: 'available'})))];
+    if (url.endsWith('/model-settings')) return new Promise(resolve => { releaseModels = () => resolve([200, modelSettings(1, modelConfig({default_model: 'saved-model'}))]); });
+    if (url.endsWith('/wake-jobs') && options.method === 'POST') {
+      const account = JSON.parse(options.body).account_id;
+      return new Promise(resolve => releases.set(account, () => { const task = {...view('a', 30), job_id: 'wake-' + account, account_id: account, phase: account === 'a' ? 'unknown' : 'verifying'}; tasks.set(task.job_id, task); resolve([202, task]); }));
+    }
+    if (url.includes('/wake-jobs?job_id=')) return [200, tasks.get(new URL(url, origin).searchParams.get('job_id'))];
+    return wakeResponse(url);
+  }, {crypto: {randomUUID: () => 'wake-key-' + ++nextKey}});
+  await ui.get('connect').onclick();
+  const first = accountWake(ui, 0).onclick(); await flush();
+  const second = accountWake(ui, 1).onclick(); await flush();
+  await accountWake(ui, 0).onclick();
+  releaseModels(); await flush();
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 2);
+  releases.get('a')(); await first;
+  await accountWake(ui, 0).onclick();
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 2);
+  releases.get('b')(); await second;
+  await ui.tick(1500);
+  const reads = ui.calls.filter(call => call.url.includes('/wake-jobs?job_id=')).map(call => new URL(call.url, origin).searchParams.get('job_id'));
+  assert.ok(reads.includes('wake-a')); assert.ok(reads.includes('wake-b'));
+  const third = accountWake(ui, 2).onclick(); await flush(); releaseModels(); await flush(); releases.get('c')(); await third;
+  const writes = ui.calls.filter(call => call.method === 'POST');
+  assert.deepEqual(writes.map(call => JSON.parse(call.body).account_id), ['a', 'b', 'c']);
+  assert.equal(new Set(writes.map(call => call.headers['Idempotency-Key'])).size, 3);
+});
+test('manual account selection permits another account while the original acknowledgement remains unknown', async () => {
+  let keys = 0;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/wake-jobs') && options.method === 'POST') {
+      const account = JSON.parse(options.body).account_id;
+      if (account === 'codex-01') throw new Error('lost ack');
+      return [202, {...view('a', 30), job_id: 'second-account', account_id: account, phase: 'checking'}];
+    }
+    return wakeResponse(url);
+  }, {crypto: {randomUUID: () => 'manual-key-' + ++keys}});
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui);
+  configureWakeRequest(ui, 'codex-02'); await submitWake(ui);
+  configureWakeRequest(ui, 'codex-01'); await submitWake(ui);
+  assert.equal(ui.calls.filter(call => call.method === 'POST').length, 2);
+  assert.equal(ui.get('wake-manual-submit').disabled, true);
+  assert.equal(ui.get('wake-manual-verify').hidden, false);
 });
 test('immediate wake rejects missing models and failed model reads without opening a dialog', async () => {
   for (const response of [[200, modelSettings(1, modelConfig({default_model: ''}))], [503, {error: 'backend_unavailable'}]]) {
@@ -2804,7 +2893,7 @@ test('automatic wake acknowledgement lasts for the page when browser storage is 
 test('overview refuses enabling an empty rule set and settings capability alone cannot authorize execution', async () => {
   const ui = panel(url => url.endsWith('/overview') ? [200, wakeOverview('a', {model_execution: false})] : wakeResponse(url));
   await openWake(ui); assert.equal(ui.get('auto-wake').disabled, true); assert.equal(ui.get('wake-enabled').disabled, true);
-  assert.equal(ui.get('wake-manual-fields').disabled, true);
+  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-submit').disabled, true);
   edit(ui, 'wake-enabled', true); edit(ui, 'wake-five-hour', true); ui.get('wake-settings-consent').checked = true; await submitWakeSettings(ui);
   assert.equal(ui.calls.some(call => call.method === 'POST'), false);
   const empty = panel(url => wakeResponse(url)); await openWake(empty);
@@ -2853,14 +2942,14 @@ test('manual wake requires explicit spend consent, validates account and posts o
   configureWakeRequest(ui); await submitWake(ui); await submitWake(ui);
   const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 1);
   assert.deepEqual(JSON.parse(posts[0].body), {account_id: 'codex-01'}); assert.ok(posts[0].headers['Idempotency-Key']);
-  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /查询并核实/);
+  assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /查询并核实/);
 });
 test('manual wake reads each real execution phase and permits a new intent only after a known terminal result and new consent', async () => {
   let phase = 'queued';
   const ui = panel((url, options) => url.startsWith('/v0/management/codex-window-refresh/v2/wake-jobs') ? url.includes('?limit=') ? [200, {...view(), jobs: []}] : [200, {...view(), job_id: 'phase-job', account_id: 'codex-01', reason: 'manual', phase}] : wakeResponse(url));
   await openWake(ui); configureWakeRequest(ui); await submitWake(ui);
   for (phase of ['checking', 'prepared', 'sending', 'verifying']) {
-    await ui.get('wake-history').children[0].children.at(-1).onclick(); assert.equal(ui.get('wake-manual-fields').disabled, true);
+    await ui.get('wake-history').children[0].children.at(-1).onclick(); assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true);
     assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
   }
   phase = 'completed'; await ui.get('wake-history').children[0].children.at(-1).onclick();
@@ -2874,23 +2963,24 @@ test('manual wake lost acknowledgement verifies the exact original key and accou
     return wakeResponse(url);
   });
   await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.tick(5000);
-  assert.equal(posts, 1); assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-verify').hidden, false);
+  assert.equal(posts, 1); assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true); assert.equal(ui.get('wake-manual-verify').hidden, false);
   ui.get('wake-account').value = 'replacement'; await submitWake(ui); assert.equal(posts, 1);
   await ui.get('wake-manual-verify').onclick(); const writes = ui.calls.filter(call => call.method === 'POST'); assert.equal(writes.length, 2);
   assert.equal(writes[0].body, writes[1].body); assert.equal(writes[0].headers['Idempotency-Key'], writes[1].headers['Idempotency-Key']);
 });
-test('unknown manual wake never resends or releases its account fields after refresh or settings reads', async () => {
+test('unknown manual wake blocks its own submission while allowing account selection after refresh', async () => {
   const job = {...view(), job_id: 'unknown-wake', account_id: 'codex-01', reason: 'manual', phase: 'unknown', hold_reason: 'verification_pending'};
-  const ui = panel((url, options) => url.includes('/wake-jobs') ? url.includes('?limit=') ? [200, {...view(), jobs: [job]}] : [200, job] : wakeResponse(url));
+  let submitted = false;
+  const ui = panel((url, options) => { if (options.method === 'POST') submitted = true; return url.includes('/wake-jobs') ? url.includes('?limit=') ? [200, {...view(), jobs: submitted ? [job] : []}] : [200, job] : wakeResponse(url); });
   await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.get('wake-history-refresh').onclick(); await ui.get('wake-settings-reload').onclick();
-  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /禁止|不会重发/);
+  assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /禁止|不会重发/);
   await submitWake(ui); await ui.get('wake-manual-verify').onclick();
   assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1); assert.match(ui.get('wake-history').textContent, /等待结果核实|禁止重发/);
 });
 test('missing wake jobs become read-only unknown results and never create replacement work', async () => {
   const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? [202, {...view(), job_id: 'gone-wake', phase: 'queued'}] : url.includes('/wake-jobs?job_id=') ? [404, {error: 'not_found'}] : wakeResponse(url));
-  await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.tick(5000);
-  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /无法核实/);
+  await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.tick(1500);
+  assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true); assert.match(ui.get('wake-manual-message').textContent, /无法核实/);
   await submitWake(ui); await ui.get('wake-manual-verify').onclick(); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
 });
 test('wake skipped and failed results explain holds without inventing success or retrying', async () => {
@@ -2913,7 +3003,7 @@ test('manual wake uncertain storage failures and verification failures stay lock
   const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? [503, {error: 'storage_unavailable'}] : wakeResponse(url));
   await openWake(ui); configureWakeRequest(ui); await submitWake(ui); await ui.get('wake-manual-verify').onclick(); await submitWake(ui);
   const posts = ui.calls.filter(call => call.method === 'POST'); assert.equal(posts.length, 2); assert.equal(posts[0].body, posts[1].body);
-  assert.equal(ui.get('wake-manual-fields').disabled, true);
+  assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true);
 });
 test('backend restart prevents uncertain manual wake POST verification against a new instance', async () => {
   let instance = 'a';
@@ -2945,7 +3035,7 @@ test('disconnecting a pending manual wake prevents late acknowledgements from en
   const ui = panel((url, options) => url.endsWith('/wake-jobs') && options.method === 'POST' ? new Promise(resolve => { release = () => resolve([202, {...view(), job_id: 'late-wake', phase: 'prepared'}]); }) : wakeResponse(url));
   await openWake(ui); configureWakeRequest(ui); const pending = submitWake(ui); await flush(); ui.get('disconnect').onclick();
   ui.get('key').value = 'fixture-key'; await ui.get('connect').onclick(); release(); await pending;
-  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-verify').hidden, false);
+  assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true); assert.equal(ui.get('wake-manual-verify').hidden, false);
   await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
 });
 test('backend wake settings changes invalidate an earlier overview spend confirmation', async () => {
@@ -2974,17 +3064,18 @@ test('malformed wake save acknowledgements remain uncertain and cannot be blindl
   }
 });
 test('older wake history snapshots cannot roll a known unknown outcome back to an active state', async () => {
-  let jobRevision = 30, phase = 'unknown';
+  let jobRevision = 30, phase = 'unknown', submitted = false;
   const ui = panel((url, options) => {
     if (url.includes('/wake-jobs')) {
+      if (options.method === 'POST') submitted = true;
       const job = {job_id: 'monotonic-wake', account_id: 'codex-01', phase};
-      return url.includes('?limit=') ? [200, {...view('a', jobRevision), jobs: [job]}] : [200, {...view('a', jobRevision), ...job}];
+      return url.includes('?limit=') ? [200, {...view('a', jobRevision), jobs: submitted ? [job] : []}] : [200, {...view('a', jobRevision), ...job}];
     }
     return wakeResponse(url);
   });
   await openWake(ui); configureWakeRequest(ui); await submitWake(ui);
   jobRevision = 29; phase = 'queued'; await ui.get('wake-history-refresh').onclick();
-  assert.equal(ui.get('wake-manual-fields').disabled, true); assert.equal(ui.get('wake-manual-status').textContent, '结果未知');
+  assert.equal(ui.get('wake-manual-fields').disabled, false); assert.equal(ui.get('wake-manual-submit').disabled, true); assert.equal(ui.get('wake-manual-status').textContent, '结果未知');
   await submitWake(ui); assert.equal(ui.calls.filter(call => call.method === 'POST').length, 1);
 });
 
@@ -3985,6 +4076,55 @@ test('caller names update from CPA storage and deletion restores the anonymous l
   assert.equal(JSON.stringify(storage).includes(key), false);
 });
 
+test('caller key names edit the CPA shared map and clear locally without ever updating the actual key list', async () => {
+  const key = 'sk-example-private-client-5678', caller = 'caller-' + 'd'.repeat(64), storageKey = 'api-key-names:v1:' + origin;
+  const fingerprint = nameFingerprint(origin, key), storage = {};
+  const {callbacks, records} = recordedCallbacks();
+  let keyInfo;
+  records.mount = options => { Object.assign(callbacks, options); keyInfo = options.callerKeyInfo; return {show() {}, refresh() {}, disconnect() {}, setContext(value) { if (value.callerKeyInfo) keyInfo = value.callerKeyInfo; }}; };
+  const ui = panel(url => url.endsWith('/api-keys') ? [200, {'api-keys': [key]}] : url.endsWith('/traffic-callers') ? [200, {callers: [caller]}] : basic(url), {records, storage});
+  await ui.get('connect').onclick(); await flush();
+  assert.deepEqual({...keyInfo(caller)}, {name: '', maskedKey: 'sk-e••••••••5678'});
+  callbacks.onRenameCaller(caller);
+  assert.equal(ui.get('caller-name-dialog').open, true);
+  assert.equal(ui.get('caller-name-key').textContent, 'sk-e••••••••5678');
+  ui.get('caller-name-value').value = '办公室 <img src=x>';
+  await ui.get('caller-name-form').onsubmit({preventDefault() {}});
+  assert.equal(ui.get('caller-name-dialog').hidden, true);
+  assert.equal(readCallerNames(ui.clock, '/v0/management/codex-window-refresh/v2')[fingerprint], '办公室 <img src=x>');
+  assert.equal(callbacks.displayCaller(caller), '办公室 <img src=x>');
+  assert.equal(keyInfo(caller).name, '办公室 <img src=x>');
+  callbacks.onRenameCaller(caller); ui.get('caller-name-value').value = '';
+  await ui.get('caller-name-form').onsubmit({preventDefault() {}});
+  assert.equal(keyInfo(caller).name, ''); assert.equal(keyInfo(caller).maskedKey, 'sk-e••••••••5678');
+  assert.equal(readCallerNames(ui.clock, '/v0/management/codex-window-refresh/v2')[fingerprint], undefined);
+  assert.equal(ui.calls.some(call => call.url.endsWith('/api-keys') && (call.method || 'GET') !== 'GET'), false);
+  assert.equal(JSON.stringify(storage).includes(key), false);
+  assert.equal(JSON.stringify(ui.calls).includes(key), false);
+  assert.ok(storage[storageKey]);
+});
+
+test('caller name dialog retains its draft when a key is deleted or a concurrent name edit conflicts', async () => {
+  for (const scenario of ['deleted', 'conflict', 'storage-denied', 'disconnect']) {
+    const clientKey = 'sk-private-client-key-6789', caller = 'caller-' + 'e'.repeat(64), fingerprint = nameFingerprint(origin, clientKey);
+    const storageKey = 'api-key-names:v1:' + origin, storage = {[storageKey]: JSON.stringify({[fingerprint]: '原名称'})};
+    const {callbacks, records} = recordedCallbacks(); let keys = [clientKey], release;
+    const ui = panel(url => {
+      if (url.endsWith('/api-keys')) return release === false ? new Promise(resolve => { release = () => resolve([200, {'api-keys': keys}]); }) : [200, {'api-keys': keys}];
+      return url.endsWith('/traffic-callers') ? [200, {callers: [caller]}] : basic(url);
+    }, {records, storage, storageBlocked: scenario === 'storage-denied'});
+    await ui.get('connect').onclick(); await flush(); callbacks.onRenameCaller(caller); ui.get('caller-name-value').value = '待保存草稿';
+    if (scenario === 'deleted') keys = [];
+    if (scenario === 'conflict') storage[storageKey] = JSON.stringify({[fingerprint]: '其他页面修改'});
+    if (scenario === 'disconnect') release = false;
+    const pending = ui.get('caller-name-form').onsubmit({preventDefault() {}}); await flush();
+    if (scenario === 'disconnect') { ui.get('disconnect').onclick(); release(); }
+    await pending;
+    assert.equal(readCallerNames(ui.clock, '/v0/management/codex-window-refresh/v2')[fingerprint], scenario === 'conflict' ? '其他页面修改' : '原名称');
+    if (scenario !== 'disconnect') { assert.equal(ui.get('caller-name-dialog').open, true); assert.equal(ui.get('caller-name-value').value, '待保存草稿'); assert.ok(ui.get('caller-name-message').textContent); }
+  }
+});
+
 test('caller lookup failure and a late disconnected lookup keep anonymous caller labels', async () => {
   const clientKey = 'caller-key', caller = 'caller-' + 'b'.repeat(64), storageKey = 'api-key-names:v1:' + origin;
   for (const failure of [true, false]) {
@@ -4144,13 +4284,14 @@ test('account task lookup failures remain distinguishable from an observed empty
 
 test('the records header refresh reads the active records page without resetting account pagination or creating tasks', async () => {
   let refreshes = 0;
-  const ui = panel(basic, {records: {mount: () => ({setContext() {}, show() {}, disconnect() {}, refresh() { refreshes++; }})}});
+  const ui = panel(url => url.endsWith('/api-keys') ? [200, {'api-keys': []}] : basic(url), {records: {mount: () => ({setContext() {}, show() {}, disconnect() {}, refresh() { refreshes++; }})}});
   await ui.get('connect').onclick();
   ui.nav.find(node => node.dataset.page === 'history').listeners.get('click')();
   const before = ui.calls.length;
   await ui.get('refresh').onclick();
   assert.equal(ui.get('refresh-label').textContent, '刷新记录');
-  assert.equal(refreshes, 1); assert.equal(ui.calls.length, before);
+  assert.equal(refreshes, 1); assert.equal(ui.calls.length, before + 1);
+  assert.ok(ui.calls.slice(before).every(call => call.url.endsWith('/api-keys') && (call.method || 'GET') === 'GET'));
   ui.recordNav.find(node => node.dataset.recordPage === 'tasks').onclick(); await flush();
   const historyReads = () => ui.calls.filter(call => call.url.includes('/task-history?')).length;
   const previous = historyReads(); await ui.get('refresh').onclick(); await flush();

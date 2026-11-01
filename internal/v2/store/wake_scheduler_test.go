@@ -335,8 +335,8 @@ func TestWakeSharedGenerationBudgetAndPendingFairness(t *testing.T) {
 	if _, _, err = storage.CreateGeneration(ctx, "candidate", GenerationRequest{AccountID: accounts[0].ID, Model: "model", Count: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = storage.ClaimGeneration(ctx); !errors.Is(err, ErrBusy) {
-		t.Fatal("generation exceeded shared physical slot", err)
+	if _, err = storage.ClaimGeneration(ctx); err != nil {
+		t.Fatal("different account could not share the model budget", err)
 	}
 }
 

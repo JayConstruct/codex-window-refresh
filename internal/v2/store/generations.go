@@ -193,11 +193,11 @@ func (st *Store) RecoverGenerations(ctx context.Context) error {
 func (st *Store) ClaimGeneration(ctx context.Context) (Generation, error) {
 	var generation Generation
 	err := st.write(ctx, func(tx *sql.Tx) error {
-		var running int
-		if err := tx.QueryRowContext(ctx, "SELECT (SELECT count(*) FROM prompt_generations WHERE phase='running')+(SELECT count(*) FROM wake_jobs WHERE phase IN ('prepared','sending'))").Scan(&running); err != nil {
+		var running, waking int
+		if err := tx.QueryRowContext(ctx, "SELECT (SELECT count(*) FROM prompt_generations WHERE phase='running'),(SELECT count(*) FROM wake_jobs WHERE phase IN ('prepared','sending'))").Scan(&running, &waking); err != nil {
 			return err
 		}
-		if running > 0 {
+		if running > 0 || waking >= ModelConcurrency {
 			return ErrBusy
 		}
 		var err error
