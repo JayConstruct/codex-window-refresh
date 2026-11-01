@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `codex-window-refresh`。当前主线为 **V2：C 原生接入层 + 独立 Go 后台 + SQLite**。
 
-当前后台、客户端安装包和原生接入层为 **v0.2.0-rc.36**，数据库保持 **schema 12**。手动唤醒移除随机等待，支持多账号并发并按账号独立防重；优先通过模型响应中的额度证据更新并核实窗口。用户请求列表和详情显示打码 API Key，可编辑与 CPA 共用的浏览器名称。升级要求见 [发布说明](docs/releases/v0.2.0-rc.36.md)。
+当前后台与客户端安装包为 **v0.2.0-rc.37**，原生接入层保持 **v0.2.0-rc.36**，数据库保持 **schema 12**。“账号 → API Key”集中管理 Key 名称并可一键查看请求；运行记录支持可搜索 Key 筛选和简短分配说明，执行中即展示当前账号，重试换号及时更新。升级要求见 [发布说明](docs/releases/v0.2.0-rc.37.md)。
 
 ## 安装与更新
 
@@ -10,7 +10,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `c
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.36 --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.37 --restart
 ```
 
 已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；从 rc.35 或更早版本升级须显式 `--restart`，同时更新后台与接入层并重启 CPA，加载按账号保护的并发模型流。完成后强制刷新网页。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。

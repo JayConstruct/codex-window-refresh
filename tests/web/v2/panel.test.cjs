@@ -316,7 +316,7 @@ function panel(respond, options = {}) {
   }
   const recordNav = ['users', 'plugin', 'analysis', 'tasks'].map(name => { const node = new Element('button'); node.dataset.recordPage = name; return node; });
   root.append(...recordNav);
-  const nav = ['overview', 'accounts', 'query', 'wake', 'cards', 'scheduling', 'models', 'history', 'diagnostics'].map(name => { const node = new Element('button'); node.dataset.page = name; return node; });
+  const nav = ['overview', 'accounts', 'keys', 'query', 'wake', 'cards', 'scheduling', 'models', 'history', 'diagnostics'].map(name => { const node = new Element('button'); node.dataset.page = name; return node; });
   const panels = nav.map(node => { const panel = new Element(); panel.dataset.view = node.dataset.page; return panel; });
   root.append(...nav, ...panels);
   const walk = node => [node, ...node.children.flatMap(walk)];
@@ -4054,7 +4054,106 @@ function recordedCallbacks() {
   }}};
 }
 
-test('caller names update from CPA storage and deletion restores the anonymous label', async () => {
+test('API Key account tab lists unobserved keys, searches across pages and edits shared names', async () => {
+  const keys = Array.from({length: 21}, (_, index) => 'sk-private-client-' + String(index).padStart(4, '0'));
+  const storageKey = 'api-key-names:v1:' + origin;
+  const storage = {[storageKey]: JSON.stringify({[nameFingerprint(origin, keys[0])]: '已命名电脑'})};
+  const ui = panel((url, options) => {
+    if (url.endsWith('/api-keys')) return [200, {'api-keys': keys}];
+    if (url.endsWith('/traffic-callers')) return [200, {callers: JSON.parse(options.body).scopes.map(scope => 'caller-' + scope)}];
+    return basic(url);
+  }, {storage});
+  assert.equal(ui.get('caller-keys-refresh').disabled, true);
+  await ui.get('connect').onclick();
+  ui.nav.find(node => node.dataset.page === 'keys').listeners.get('click')(); await flush();
+  const list = ui.get('caller-keys-list'), buttons = () => descendants(list).filter(node => node.tagName === 'button' && node.textContent === '修改名称');
+  assert.equal(ui.get('document-body').dataset.page, 'keys');
+  assert.equal(ui.get('accounts-navigation').hidden, false);
+  assert.match(ui.get('caller-keys-count').textContent, /共 21 个 · 已命名 1 个/);
+  assert.equal(buttons().length, 20);
+  ui.get('caller-keys-next').onclick();
+  assert.equal(buttons().length, 1); assert.match(list.textContent, /0020/);
+  assert.equal(ui.get('caller-keys-next').disabled, true);
+  buttons()[0].onclick(); ui.get('caller-name-value').value = '分页电脑';
+  await ui.get('caller-name-form').onsubmit({preventDefault() {}});
+  assert.match(ui.get('caller-keys-page').textContent, /第 2 \/ 2 页/);
+  assert.equal(buttons().length, 1); assert.match(list.textContent, /分页电脑/);
+  ui.get('caller-keys-search').value = '已命名电脑'; ui.get('caller-keys-search').oninput();
+  assert.equal(buttons().length, 1); assert.match(list.textContent, /已命名电脑/);
+  ui.get('caller-keys-search').value = '0020'; ui.get('caller-keys-search').oninput();
+  assert.equal(buttons().length, 1);
+  buttons()[0].onclick();
+  assert.equal(ui.get('caller-name-value').value, '分页电脑');
+  ui.get('caller-name-value').value = '新电脑 <img src=x>';
+  await ui.get('caller-name-form').onsubmit({preventDefault() {}});
+  assert.match(list.textContent, /新电脑 <img src=x>/);
+  assert.equal(readCallerNames(ui.clock, '/v0/management/codex-window-refresh/v2')[nameFingerprint(origin, keys[20])], '新电脑 <img src=x>');
+  assert.equal(readCallerNames(ui.clock, '/v0/management/codex-window-refresh/v2')[nameFingerprint(origin, keys[0])], '已命名电脑');
+  buttons()[0].onclick(); ui.get('caller-name-value').value = '';
+  await ui.get('caller-name-form').onsubmit({preventDefault() {}});
+  assert.match(list.textContent, /未命名/);
+  assert.equal(buttons().length, 1);
+  ui.get('caller-keys-search').value = '不存在'; ui.get('caller-keys-search').oninput();
+  assert.match(list.textContent, /没有匹配/);
+  assert.equal(ui.calls.some(call => call.url.endsWith('/api-keys') && (call.method || 'GET') !== 'GET'), false);
+  for (const key of keys) {
+    assert.equal(ui.get('document-root').textContent.includes(key), false);
+    assert.equal(JSON.stringify(ui.calls).includes(key), false);
+    assert.equal(JSON.stringify(storage).includes(key), false);
+  }
+});
+
+test('API Key request shortcut selects user history with the exact caller identity', async () => {
+  const caller = 'caller-' + 'a'.repeat(64), key = 'sk-private-history-key-9876';
+  let selectedCaller = '';
+  const records = {mount() { return {show() {}, showCaller(id) { selectedCaller = id; }, refresh() {}, disconnect() {}, setContext() {}}; }};
+  const ui = panel(url => url.endsWith('/api-keys') ? [200, {'api-keys': [key]}] : url.endsWith('/traffic-callers') ? [200, {callers: [caller]}] : basic(url), {records});
+  await ui.get('connect').onclick(); await flush();
+  ui.nav.find(node => node.dataset.page === 'keys').listeners.get('click')(); await flush();
+  const view = descendants(ui.get('caller-keys-list')).find(node => node.textContent === '查看请求');
+  assert.equal(view.disabled, false); view.onclick(); await flush();
+  assert.equal(selectedCaller, caller);
+  assert.equal(ui.get('document-body').dataset.page, 'history');
+  assert.equal(ui.get('task-history-root').hidden, true);
+  assert.equal(ui.recordNav.find(node => node.dataset.recordPage === 'users').getAttribute('aria-selected'), 'true');
+  assert.equal(ui.calls.some(call => call.url.endsWith('/api-keys') && (call.method || 'GET') !== 'GET'), false);
+  assert.equal(JSON.stringify(ui.calls).includes(key), false);
+  ui.get('disconnect').onclick(); selectedCaller = ''; view.onclick();
+  assert.equal(selectedCaller, '');
+});
+
+test('API Key list retries failed reads, reloads changed inventory and clears on disconnect', async () => {
+  let keys = ['sk-client-private-key-1234'], failure = false, release;
+  const ui = panel((url, options) => {
+    if (url.endsWith('/api-keys')) {
+      if (failure) return [503, {error: 'backend_unavailable'}];
+      if (release === false) return new Promise(resolve => { release = () => resolve([200, {'api-keys': keys}]); });
+      return [200, {'api-keys': keys}];
+    }
+    if (url.endsWith('/traffic-callers')) return [200, {callers: JSON.parse(options.body).scopes.map(scope => 'caller-' + scope)}];
+    return basic(url);
+  });
+  ui.nav.find(node => node.dataset.page === 'keys').listeners.get('click')();
+  await ui.get('connect').onclick(); await flush();
+  assert.match(ui.get('caller-keys-list').textContent, /1234/);
+  failure = true; await ui.get('caller-keys-refresh').onclick();
+  assert.match(ui.get('caller-keys-message').textContent, /读取 CPA Key 清单失败/);
+  assert.equal(descendants(ui.get('caller-keys-list')).some(node => node.tagName === 'button'), false);
+  assert.equal(ui.get('caller-keys-refresh').disabled, false);
+  failure = false; keys = []; await ui.get('caller-keys-refresh').onclick();
+  assert.match(ui.get('caller-keys-list').textContent, /尚未配置/);
+  keys = ['sk-client-new-key-5678']; await ui.get('refresh').onclick();
+  assert.match(ui.get('caller-keys-list').textContent, /5678/);
+  release = false;
+  const pending = ui.get('caller-keys-refresh').onclick(); await flush();
+  ui.get('disconnect').onclick(); release(); await pending;
+  assert.equal(ui.get('caller-keys-list').textContent, '尚未连接');
+  assert.equal(ui.get('caller-keys-search').value, '');
+  assert.equal(ui.get('caller-keys-refresh').disabled, true);
+  assert.equal(ui.get('caller-keys-count').textContent, '');
+});
+
+test('caller names update from CPA storage and deletion restores the masked key', async () => {
   const key = 'local-client-key', caller = 'caller-' + 'a'.repeat(64), fingerprint = nameFingerprint(origin, key);
   const storageKey = 'api-key-names:v1:' + origin, storage = {[storageKey]: JSON.stringify({[fingerprint]: '办公电脑'})};
   let display, updates = 0;
@@ -4070,7 +4169,7 @@ test('caller names update from CPA storage and deletion restores the anonymous l
   assert.equal(display(caller), '笔记本');
   const lookups = ui.calls.filter(call => call.url.endsWith('/traffic-callers')).length;
   delete storage[storageKey]; ui.events.get('storage')({key: storageKey}); await flush();
-  assert.equal(display(caller), '调用方 aaaaaaaa');
+  assert.equal(display(caller), maskedAPIKey(key));
   assert.equal(ui.calls.filter(call => call.url.endsWith('/traffic-callers')).length, lookups);
   assert.ok(updates >= 3);
   assert.equal(JSON.stringify(storage).includes(key), false);
@@ -4097,6 +4196,7 @@ test('caller key names edit the CPA shared map and clear locally without ever up
   callbacks.onRenameCaller(caller); ui.get('caller-name-value').value = '';
   await ui.get('caller-name-form').onsubmit({preventDefault() {}});
   assert.equal(keyInfo(caller).name, ''); assert.equal(keyInfo(caller).maskedKey, 'sk-e••••••••5678');
+  assert.equal(callbacks.displayCaller(caller), 'sk-e••••••••5678');
   assert.equal(readCallerNames(ui.clock, '/v0/management/codex-window-refresh/v2')[fingerprint], undefined);
   assert.equal(ui.calls.some(call => call.url.endsWith('/api-keys') && (call.method || 'GET') !== 'GET'), false);
   assert.equal(JSON.stringify(storage).includes(key), false);
@@ -4123,6 +4223,22 @@ test('caller name dialog retains its draft when a key is deleted or a concurrent
     assert.equal(readCallerNames(ui.clock, '/v0/management/codex-window-refresh/v2')[fingerprint], scenario === 'conflict' ? '其他页面修改' : '原名称');
     if (scenario !== 'disconnect') { assert.equal(ui.get('caller-name-dialog').open, true); assert.equal(ui.get('caller-name-value').value, '待保存草稿'); assert.ok(ui.get('caller-name-message').textContent); }
   }
+});
+
+test('caller revalidation keeps a known label while pending and revokes it after a failed read', async () => {
+  const key = 'sk-private-refresh-key-3456', caller = 'caller-' + 'f'.repeat(64);
+  const {callbacks, records} = recordedCallbacks(); records.callerLabel = () => '未匹配 Key';
+  let delayed = false, release;
+  const ui = panel(url => {
+    if (url.endsWith('/api-keys')) return delayed ? new Promise(resolve => { release = () => resolve([503, {error: 'backend_unavailable'}]); }) : [200, {'api-keys': [key]}];
+    return url.endsWith('/traffic-callers') ? [200, {callers: [caller]}] : basic(url);
+  }, {records});
+  await ui.get('connect').onclick(); await flush();
+  delayed = true; const pending = ui.get('caller-keys-refresh').onclick(); await flush();
+  assert.equal(callbacks.displayCaller(caller), maskedAPIKey(key));
+  release(); await pending;
+  assert.equal(callbacks.displayCaller(caller), '未匹配 Key');
+  assert.equal(callbacks.callerKeyInfo(caller), null);
 });
 
 test('caller lookup failure and a late disconnected lookup keep anonymous caller labels', async () => {

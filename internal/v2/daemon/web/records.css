@@ -5,6 +5,7 @@
 .runtime-records [hidden] { display: none !important; }
 .runtime-records .rr-key-metadata { grid-column: 1 / -1; }
 .runtime-records .rr-key-metadata dd { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; overflow-wrap: anywhere; }
+.runtime-records .rr-key-mask { color: var(--rr-muted); font-size: inherit; }
 .runtime-records .rr-rename-caller { padding: 4px 8px; font-size: 12px; flex-shrink: 0; }
 .runtime-records .rr-icon { width: 18px; height: 18px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .runtime-records .rr-filters { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
@@ -15,6 +16,14 @@
 .runtime-records .rr-filter-input { position: relative; flex: 1 1 180px; min-width: 105px; }
 .runtime-records .rr-filter-input input { width: 100%; padding-right: 28px; }
 .runtime-records .rr-select-chevron { position: absolute; right: 12px; top: 50%; transform: translateY(-55%); color: var(--rr-muted); pointer-events: none; }
+.runtime-records .rr-caller-popup { position: absolute; z-index: 20; top: calc(100% + 5px); right: 0; width: max(100%, 300px); max-width: calc(100vw - 32px); border: 1px solid var(--rr-line); border-radius: 9px; background: var(--rr-inset); box-shadow: 0 8px 24px rgb(0 0 0 / 12%); }
+.runtime-records .rr-caller-options { max-height: 260px; overflow-y: auto; overscroll-behavior: contain; padding: 5px; }
+.runtime-records .rr-caller-option { display: grid; gap: 3px; width: 100%; min-height: 44px; padding: 9px 10px; border: 0; border-radius: 6px; color: var(--text-primary); background: transparent; text-align: left; overflow-wrap: anywhere; }
+.runtime-records .rr-caller-option:hover,.runtime-records .rr-caller-option[data-active="true"] { background: var(--rr-selected); }
+.runtime-records .rr-caller-option[aria-selected="true"] { box-shadow: inset 3px 0 var(--success-color); }
+.runtime-records .rr-caller-option strong { font-size: 13px; font-weight: 550; }
+.runtime-records .rr-caller-option code,.runtime-records .rr-caller-option small { font-size: 12px; color: var(--rr-muted); }
+.runtime-records .rr-caller-note { padding: 8px 12px; border-top: 1px solid var(--rr-line); font-size: 11px; line-height: 1.5; color: var(--rr-muted); }
 .runtime-records .rr-filters > select { flex: 0 1 170px; }
 .runtime-records .rr-filters > .rr-model-filter { flex: 1 1 210px; }
 .runtime-records .rr-more { position: relative; flex-shrink: 0; margin-left: 2px; }

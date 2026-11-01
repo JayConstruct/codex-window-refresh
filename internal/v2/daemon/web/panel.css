@@ -708,6 +708,18 @@ body[data-page="history"] .sub-navigation button { min-height:40px; padding-bott
 #history-copy-fallback input { width:100%; }
 #history-attention { color:var(--warning-text); }
 /* Local display preferences and read-only runtime diagnostics. */
+.caller-keys-card { margin-bottom:18px; }
+.caller-keys-card .card-heading { flex-wrap:wrap; gap:12px; }
+.caller-keys-card .account-heading { flex-wrap:wrap; }
+#caller-keys-search { width:100%; max-width:440px; margin-top:12px; }
+#caller-keys-message { margin-top:12px; }
+.caller-keys-list { list-style:none; padding:0; margin:12px 0 0; }
+.caller-key-row { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px 0; border-bottom:1px solid var(--border-color); }
+.caller-key-identity { display:grid; gap:5px; min-width:0; font-size:13px; overflow-wrap:anywhere; }
+.caller-key-identity>strong { font-weight:550; white-space:pre-wrap; }
+.caller-key-identity>code { font-size:12px; }
+.caller-key-actions { display:flex; flex-shrink:0; flex-wrap:wrap; justify-content:flex-end; gap:8px; }
+.caller-keys-footer { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-top:14px; font-size:12px; }
 .preferences-layout { display:grid; grid-template-columns:minmax(0,1.1fr) minmax(0,1fr); align-items:start; gap:18px; }
 .preferences-column,.diagnostic-column { display:grid; gap:16px; min-width:0; }
 .preference-row { display:flex; align-items:center; flex-wrap:wrap; gap:12px 20px; min-height:64px; padding:14px 0; border-bottom:1px solid var(--border-color); font-size:13px; }

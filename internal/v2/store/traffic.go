@@ -58,6 +58,7 @@ type TrafficRecord struct {
 	ParentSession         string           `json:"parent_session"`
 	Model                 string           `json:"model"`
 	AccountID             string           `json:"account_id"`
+	SelectionID           string           `json:"selection_id,omitempty"`
 	Reason                string           `json:"reason"`
 	Status                string           `json:"status"`
 	CreatedAt             string           `json:"created_at"`
@@ -357,6 +358,9 @@ func applyTraffic(ctx context.Context, tx *sql.Tx, instance string, e events.Eve
 		}
 		if t.AccountID != "" {
 			r.AccountID = t.AccountID
+		}
+		if t.SelectionID != "" {
+			r.SelectionID = t.SelectionID
 		}
 		if err = saveTrafficRequest(ctx, tx, instance, t.TraceID, r); err != nil {
 			return err
@@ -836,6 +840,8 @@ func readUserTraffic(ctx context.Context, tx *sql.Tx) ([]TrafficRecord, error) {
 	}
 	records := []TrafficRecord{}
 	indices := map[string]int{}
+	currentAccounts := map[string]string{}
+	currentDecisions := map[string]TrafficAttempt{}
 	for rows.Next() {
 		var id, raw, name string
 		if err = rows.Scan(&id, &raw, &name); err != nil {
@@ -849,6 +855,9 @@ func readUserTraffic(ctx context.Context, tx *sql.Tx) ([]TrafficRecord, error) {
 		}
 		r.ProjectName = name
 		r.Attempts = []TrafficAttempt{}
+		if r.Status == "running" && r.AccountID != "" {
+			currentAccounts[id] = r.AccountID
+		}
 		indices[id] = len(records)
 		records = append(records, r)
 	}
@@ -877,6 +886,11 @@ func readUserTraffic(ctx context.Context, tx *sql.Tx) ([]TrafficRecord, error) {
 		}
 		r := &records[i]
 		mergeTrafficMetadata(r, events.Traffic{Project: a.Project, Caller: a.Caller, Session: a.Session, ParentSession: a.ParentSession, Model: a.Model})
+		if currentAccounts[id] != "" && r.SelectionID != "" && a.AccountID == currentAccounts[id] && a.SelectionID == r.SelectionID {
+			if previous, ok := currentDecisions[id]; !ok || previous.Reason == "unknown" {
+				currentDecisions[id] = a
+			}
+		}
 		if !a.Executed {
 			if r.Reason == "unknown" {
 				r.Reason = a.Reason
@@ -930,7 +944,16 @@ func readUserTraffic(ctx context.Context, tx *sql.Tx) ([]TrafficRecord, error) {
 	for i := range records {
 		r := &records[i]
 		r.ProjectName = projectNames[r.Project]
-		if r.AttemptCount == 0 {
+		if account := currentAccounts[r.ID]; account != "" {
+			// The latest lifecycle selection is current while the request is
+			// running, even if a previous account has already reported usage.
+			// Selection alone still contributes no executed attempts or tokens.
+			r.AccountID = account
+			r.Reason, r.Evidence = "unknown", nil
+			if decision, ok := currentDecisions[r.ID]; ok {
+				r.Reason, r.Evidence = decision.Reason, decision.Evidence
+			}
+		} else if r.AttemptCount == 0 {
 			r.AccountID = ""
 		}
 		if r.Status != "completed" {

@@ -20,7 +20,10 @@ const authOnly = process.env.CWR_AUTH_ONLY === '1';
 const callerNamesOnly = process.env.CWR_CALLER_NAMES_ONLY === '1';
 const callerKey = 'fixture-client-caller-key', hash = value => createHash('sha256').update(value).digest('hex');
 let callerKeyPresent = true;
+let runningTrafficAccount = null;
 const callerScope = hash('cli-proxy-api:caller-scope:v1\0' + callerKey), callerID = 'caller-' + hash('fixture-db-salt\0caller\0' + callerScope);
+const unusedCallerKey = 'fixture-unused-client-4321', unusedCallerScope = hash('cli-proxy-api:caller-scope:v1\0' + unusedCallerKey);
+const unusedCallerID = 'caller-' + hash('fixture-db-salt\0caller\0' + unusedCallerScope);
 const callerLookups = [];
 const output = process.env.CWR_SCREENSHOT_DIR || join(tmpdir(), 'cwr-v2-panel-preview');
 const temporary = await mkdtemp(join(tmpdir(), 'cwr-v2-browser-'));
@@ -192,7 +195,7 @@ try {
       if (callerNamesOnly && url.pathname === '/cpa/v0/management/api-keys') {
         assert.equal(request.headers.authorization, 'Bearer ' + fixtureKey);
         assert.equal(request.method, 'GET'); reads.push(url.pathname);
-        json(response, 200, {'api-keys': callerKeyPresent ? [callerKey] : []}); return;
+        json(response, 200, {'api-keys': callerKeyPresent ? [callerKey, unusedCallerKey] : [unusedCallerKey]}); return;
       }
       if (url.pathname === '/cpa/v0/management/auth-files/status') {
         if (request.headers.authorization !== 'Bearer ' + fixtureKey || unauthorized) { json(response, 401, {error: 'unauthorized'}); return; }
@@ -237,13 +240,24 @@ try {
       if (resource === 'traffic' && request.method === 'GET') {
         if (callerNamesOnly && url.searchParams.get('caller') === callerID) url.searchParams.set('caller', '调用方 A');
         const traffic = trafficFixture(url, identity);
+        if (callerNamesOnly && runningTrafficAccount !== null && url.searchParams.get('kind') === 'users') {
+          const record = trafficFixture(new URL('?kind=users&id=request-01', url), identity).record;
+          const previous = record.attempts[0], retry = runningTrafficAccount === 'codex-07';
+          if (retry) previous.evidence = {candidate_count: 99};
+          Object.assign(record, {status: 'running', account_id: runningTrafficAccount, reason: runningTrafficAccount ? 'session_affinity' : 'unknown',
+            selection_id: 'running-selection', evidence: {candidate_count: 2}, attempts: retry ? [previous] : [], attempt_count: retry ? 1 : 0,
+            attempted: retry, recovered: false, latency_ms: null, ttft_ms: null, input_tokens: null, output_tokens: null, cached_tokens: null, reported_usage_attempts: 0});
+          Object.assign(traffic, {records: [record], total: 1, page: 1, summary: {requests: 1, attempts: record.attempt_count, recovered: 0, unknown: 0}, accounts: [], reasons: [], projects: [], callers: [], sessions: []});
+          if (url.searchParams.has('id')) traffic.record = record;
+        }
         json(response, 200, callerNamesOnly ? JSON.parse(JSON.stringify(traffic).replaceAll('"调用方 A"', JSON.stringify(callerID))) : traffic); return;
       }
       if (callerNamesOnly && resource === 'traffic-callers') {
         assert.equal(request.method, 'POST'); assert.equal(url.search, '');
         let body = ''; for await (const chunk of request) body += chunk;
-        assert.deepEqual(JSON.parse(body), {scopes: [callerScope]}); callerLookups.push(body);
-        json(response, 200, {...identity(), callers: [callerID]}); return;
+        const scopes = JSON.parse(body).scopes;
+        assert.deepEqual(scopes, callerKeyPresent ? [callerScope, unusedCallerScope] : [unusedCallerScope]); callerLookups.push(body);
+        json(response, 200, {...identity(), callers: scopes.map(scope => scope === callerScope ? callerID : unusedCallerID)}); return;
       }
       if (request.method === 'POST') {
         let body = ''; for await (const chunk of request) body += chunk;
@@ -939,12 +953,14 @@ try {
     const storageKey = 'api-key-names:v1:' + origin + '/cpa';
     const fingerprint = hash(JSON.stringify(['api-key-name', origin + '/cpa', callerKey]));
     const label = '办公室 / <img src=x onerror=alert(1)>';
-    async function saveCallerName(name) {
+    async function saveCallerName(name, otherName = '') {
       await evaluate(`(() => {
         const storageKey=${JSON.stringify(storageKey)};
         if (${JSON.stringify(name)} === null) localStorage.removeItem(storageKey);
         else {
-          const bytes=new TextEncoder().encode(JSON.stringify({[${JSON.stringify(fingerprint)}]:${JSON.stringify(name)}}));
+          const names = {[${JSON.stringify(fingerprint)}]:${JSON.stringify(name)}};
+          if (${JSON.stringify(otherName)}) names[${JSON.stringify(hash(JSON.stringify(['api-key-name', origin + '/cpa', unusedCallerKey])))}]=${JSON.stringify(otherName)};
+          const bytes=new TextEncoder().encode(JSON.stringify(names));
           const mask=new TextEncoder().encode('cli-proxy-api-webui::secure-storage|'+location.host+'|'+navigator.userAgent);
           for(let i=0;i<bytes.length;i++)bytes[i]^=mask[i%mask.length];
           localStorage.setItem(storageKey,'enc::v1::'+btoa(Array.from(bytes,b=>String.fromCharCode(b)).join('')));
@@ -956,19 +972,68 @@ try {
     const saved = await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`);
     await evaluate(`document.querySelector('[data-page=history]').click();document.querySelector('[data-record-page=users]').click()`);
     await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes(${JSON.stringify(label)})`), 'CPA name did not reach request details');
+    await waitFor(() => evaluate(`document.querySelectorAll('.rr-attempt').length===2`), 'Routing detail did not load its recorded attempts');
+    assert.equal(await evaluate(`document.querySelector('.rr-routing-reason .rr-reason-copy').textContent`), '原账号出现故障，改用这个账号。');
+    assert.equal(await evaluate(`document.querySelectorAll('.rr-routing-reason p').length`), 1, 'Routing summary included extra technical notes');
+    assert.equal(await evaluate(`document.querySelector('.rr-routing-evidence').open`), false, 'Technical routing detail should start collapsed');
+    assert.equal(await evaluate(`document.querySelector('.rr-routing-evidence').textContent.includes('HTTP 429')`), true, 'Recorded rate limit warning was lost');
+    await evaluate(`document.querySelector('.rr-routing-evidence summary').click()`);
+    assert.equal(await evaluate(`document.querySelector('.rr-routing-evidence').open`), true, 'Routing detail could not be expanded');
+    assert.equal(await evaluate(`document.querySelector('.rr-routing-evidence').textContent.includes('候选账号数')`), true, 'Recorded scheduling evidence was lost');
+    await evaluate(`document.querySelector('.rr-table tbody tr[data-rr-key="request-02"]').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-routing-reason .rr-reason-copy')?.textContent==='与父会话使用同一个账号。'&&document.querySelectorAll('.rr-attempt').length===1`), 'Parent-session reason was not simplified');
+    assert.equal(await evaluate(`document.querySelector('.rr-routing-evidence').open`), false, 'Routing detail expansion leaked into a different request');
+    assert.equal(await evaluate(`document.querySelector('.rr-routing-evidence').textContent.includes('HTTP 429')`), false, 'Rate limit warning appeared on a request without 429');
+    await evaluate(`document.querySelector('.rr-table tbody tr[data-rr-key="request-01"]').click()`);
+    await waitFor(() => evaluate(`document.querySelectorAll('.rr-attempt').length===2&&document.querySelector('.rr-routing-reason .rr-reason-copy')?.textContent==='原账号出现故障，改用这个账号。'`), 'Failover reason changed after switching requests');
     assert.equal(await evaluate(`document.querySelector('.rr-table tbody').textContent.includes(${JSON.stringify(label)})`), true);
     const maskedKey = 'fixt••••••••-key';
     assert.equal(await evaluate(`document.querySelector('.rr-table tbody').textContent.includes(${JSON.stringify(maskedKey)})`), true);
     assert.equal(await evaluate(`document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), true);
+    assert.equal(await evaluate(`document.querySelector('.rr-table thead').textContent.includes('API Key / 模型')`), true);
+    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('.rr-metadata dt')).map(node=>node.textContent).filter(text=>text==='API Key'||text==='调用方')`), ['API Key'], 'Request detail repeated its API Key identity');
+    assert.equal(await evaluate(`document.querySelector('.rr-key-metadata').textContent.split(${JSON.stringify(label)}).length`), 2, 'API Key name was duplicated or omitted in detail');
     assert.equal(await evaluate(`document.querySelector('.runtime-records').innerHTML.includes(${JSON.stringify(callerKey)})`), false, 'Unmasked client key reached the DOM');
-    assert.equal(await evaluate(`document.querySelector('#rr-facet-caller option[value="${callerID}"]')?.textContent`), label);
+    await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').focus();document.querySelector('[aria-label="API Key 筛选"]').click()`);
+    await waitFor(() => evaluate(`document.querySelector('#rr-facet-caller [data-caller-id="${callerID}"] strong')?.textContent===${JSON.stringify(label)}`), 'Named picker option did not open');
+    assert.equal(await evaluate(`document.querySelector('#rr-facet-caller [data-caller-id="${callerID}"] code')?.textContent`), maskedKey);
+    assert.equal(await evaluate(`!!document.querySelector('#rr-facet-caller [data-caller-id="${unusedCallerID}"]')`), true, 'Picker omitted configured key without history');
+    for (const width of [1586, 390]) {
+      await cdp('Emulation.setDeviceMetricsOverride', {width, height: width === 390 ? 844 : 992, deviceScaleFactor: 1, mobile: width === 390});
+      assert.equal(await evaluate(`(()=>{const box=document.querySelector('.rr-caller-popup').getBoundingClientRect();return box.left>=0&&box.right<=innerWidth;})()`), true, 'Key picker exceeded viewport width');
+      await screenshot('api-key-picker-' + width + '.png');
+    }
+    await evaluate(`(()=>{const input=document.querySelector('[aria-label="API Key 筛选"]');input.value='4321';input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));input.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true}));input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));})()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-pagination')?.textContent.includes('共 0 条记录')`), 'Keyboard selection did not filter to unused key');
+    assert.ok(networkRequests.some(request => new URL(request.url).searchParams.get('caller') === unusedCallerID), 'Picker sent a label instead of caller identity');
+    assert.equal(networkRequests.some(request => new URL(request.url).searchParams.get('caller') === '4321'), false, 'Typing a picker query issued a caller filter');
+    await evaluate(`(()=>{const input=document.querySelector('[aria-label="API Key 筛选"]');input.click();input.value=${JSON.stringify(label)};input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('#rr-facet-caller [data-caller-id="${callerID}"]').click();})()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-key-metadata')?.textContent.includes(${JSON.stringify(label)})`), 'Picker failed to restore named key');
+    await evaluate(`(()=>{const input=document.querySelector('[aria-label="API Key 筛选"]');input.click();input.value='未提交的搜索';input.dispatchEvent(new Event('input',{bubbles:true}));input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));})()`);
+    assert.equal(await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').value`), label, 'Escape did not restore the selected key');
+    assert.equal(await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').getAttribute('aria-expanded')`), 'false');
+    await saveCallerName('同名电脑', '同名电脑');
+    await evaluate(`(()=>{const input=document.querySelector('[aria-label="API Key 筛选"]');input.click();input.value='同名';input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    assert.equal(await evaluate(`document.querySelectorAll('#rr-facet-caller [role=option]').length`), 3, 'Duplicate names were merged instead of offering distinct keys');
+    assert.equal(await evaluate(`document.querySelector('#rr-facet-caller [data-caller-id="${callerID}"] code')?.textContent`), maskedKey);
+    assert.equal(await evaluate(`document.querySelector('#rr-facet-caller [data-caller-id="${unusedCallerID}"] code')?.textContent`), 'fixt••••••••4321');
+    await saveCallerName('同名电脑 2', '同名电脑');
+    assert.equal(await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').value`), '同名', 'Background name updates overwrote the picker search');
+    await evaluate(`document.querySelector('#rr-facet-caller [data-caller-id="${unusedCallerID}"]').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-pagination')?.textContent.includes('共 0 条记录')`), 'Same-name selection did not use its exact identity');
+    await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').click();document.querySelector('#rr-facet-caller [data-caller-id=""]').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-table tbody tr')?.cells.length===6`), 'Clearing the Key filter did not restore records');
+    assert.equal(await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').value`), '');
+    await saveCallerName(label);
+    await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').click();document.querySelector('#rr-facet-caller [data-caller-id="${callerID}"]').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-key-metadata')?.textContent.includes(${JSON.stringify(label)})`), 'Named identity did not restore after picker tests');
     assert.equal(await evaluate(`document.querySelectorAll('.runtime-records img').length`), 0, 'Local label was interpreted as HTML');
     await evaluate(`document.querySelector('[data-record-page=analysis]').click()`);
-    await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.rr-segment-button')).some(button=>button.textContent==='调用方'&&!button.disabled)`), 'Caller matrix did not load');
-    await evaluate(`Array.from(document.querySelectorAll('.rr-segment-button')).find(button=>button.textContent==='调用方').click()`);
+    await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.rr-segment-button')).some(button=>button.textContent==='API Key'&&!button.disabled)`), 'Caller matrix did not load');
+    await evaluate(`Array.from(document.querySelectorAll('.rr-segment-button')).find(button=>button.textContent==='API Key').click()`);
     await waitFor(() => evaluate(`document.querySelector('.rr-matrix-table')?.textContent.includes(${JSON.stringify(label)})`), 'CPA name did not reach caller analysis');
     await evaluate(`Array.from(document.querySelectorAll('.rr-matrix-table tbody tr')).find(row=>row.querySelector('th')?.textContent===${JSON.stringify(label)}).querySelector('.rr-matrix-value').click()`);
-    await waitFor(() => evaluate(`document.querySelector('[aria-label="调用方筛选"]').value===${JSON.stringify(label)}&&!!document.querySelector('.rr-table tbody tr')`), 'Caller drilldown lost the display name');
+    await waitFor(() => evaluate(`document.querySelector('[aria-label="API Key 筛选"]').value===${JSON.stringify(label)}&&!!document.querySelector('.rr-table tbody tr')`), 'Caller drilldown lost the display name');
     await waitFor(() => networkRequests.some(request => new URL(request.url).searchParams.get('caller') === callerID), 'Caller drilldown lost the original identity');
     assert.equal(await evaluate(`localStorage.getItem(${JSON.stringify(storageKey)})`), saved, 'Name display modified CPA storage');
     for (const width of [1586, 390]) {
@@ -999,19 +1064,82 @@ try {
     await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes('笔记本')`), 'Name edit did not refresh');
     const lookups = callerLookups.length;
     await saveCallerName(null);
-    await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes(${JSON.stringify('调用方 ' + callerID.slice(7, 15))})`), 'Deleted name did not restore caller digest');
+    await waitFor(() => evaluate(`document.querySelector('.rr-metadata')?.textContent.includes(${JSON.stringify(maskedKey)})`), 'Deleted name did not restore the masked key');
     assert.equal(callerLookups.length, lookups, 'Deleting names fetched client keys again');
     assert.equal(await evaluate(`document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), true, 'Unnamed key disappeared');
+    assert.equal(await evaluate(`document.querySelector('.rr-key-metadata').textContent.split(${JSON.stringify(maskedKey)}).length`), 2, 'Unnamed key was repeated in detail');
+    assert.equal(await evaluate(`Array.from(document.querySelectorAll('.rr-table tbody tr')).filter(row=>row.cells[2]?.textContent.includes(${JSON.stringify(maskedKey)})).every(row=>row.cells[2].textContent.split(${JSON.stringify(maskedKey)}).length===2)`), true, 'Unnamed key was repeated in a request row');
+    assert.equal(await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').value`), maskedKey, 'Active filter did not follow the cleared name');
+    assert.equal(await evaluate(`document.querySelector('.runtime-records').textContent.includes(${JSON.stringify(callerID.slice(7, 15))})`), false, 'Matched key still displayed its internal digest');
     await evaluate(`document.querySelector('.rr-rename-caller').click();document.getElementById('caller-name-value').value='临时名称';document.getElementById('caller-name-save').click()`);
     await waitFor(() => evaluate(`!document.getElementById('caller-name-dialog').open&&document.querySelector('.rr-metadata').textContent.includes('临时名称')`), 'Unnamed key could not be named');
     await evaluate(`document.querySelector('.rr-rename-caller').click();document.getElementById('caller-name-value').value='';document.getElementById('caller-name-save').click()`);
-    await waitFor(() => evaluate(`!document.getElementById('caller-name-dialog').open&&document.querySelector('.rr-metadata').textContent.includes(${JSON.stringify('调用方 ' + callerID.slice(7, 15))})`), 'Clearing name did not restore the caller label');
+    await waitFor(() => evaluate(`!document.getElementById('caller-name-dialog').open&&document.querySelector('.rr-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), 'Clearing name did not restore the masked key');
+    await evaluate(`document.querySelector('[data-record-page=analysis]').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-matrix-table')?.textContent.includes(${JSON.stringify(maskedKey)})`), 'Unnamed API Key matrix lost its masked label');
+    await evaluate(`document.querySelector('#primary-navigation [data-page=accounts]').click();document.querySelector('[data-page=keys]').click()`);
+    await waitFor(() => evaluate(`document.querySelectorAll('.caller-key-row').length===2`), 'API Key account tab omitted a key without request history');
+    assert.equal(await evaluate(`document.querySelector('#primary-navigation [data-page=accounts]').getAttribute('aria-current')`), 'page');
+    assert.equal(await evaluate(`document.querySelector('[data-view=keys]').hidden`), false);
+    assert.equal(await evaluate(`document.querySelector('[data-view=accounts]').hidden`), true);
+    assert.equal(await evaluate(`document.getElementById('caller-keys-count').textContent`), '共 2 个 · 已命名 0 个');
+    assert.equal(await evaluate(`document.getElementById('header-query').hidden&&document.getElementById('sync').hidden`), true);
+    assert.equal(await evaluate(`document.querySelector('[data-view=keys]').innerHTML.includes(${JSON.stringify(callerKey)})||document.querySelector('[data-view=keys]').innerHTML.includes(${JSON.stringify(unusedCallerKey)})`), false);
+    await evaluate(`document.querySelectorAll('.caller-key-requests')[0].click()`);
+    await waitFor(() => evaluate(`document.body.dataset.page==='history'&&document.querySelector('[aria-label="记录时间范围"]').value==='all'&&document.querySelector('.rr-table tbody tr')?.cells.length===6`), 'Key shortcut did not open all retained user requests');
+    const shortcutQuery = new URL(networkRequests.filter(request => { const url = new URL(request.url); return url.pathname.endsWith('/traffic') && url.searchParams.get('kind') === 'users' && !url.searchParams.has('id'); }).at(-1).url).searchParams;
+    assert.equal(shortcutQuery.get('caller'), callerID); assert.equal(shortcutQuery.get('page'), '1');
+    for (const name of ['search','project','account','model','status','session','from','to']) assert.equal(shortcutQuery.has(name), false, 'Key shortcut retained stale filter ' + name);
+    assert.equal(await evaluate(`document.querySelector('[data-record-page=users]').getAttribute('aria-selected')`), 'true');
+    await evaluate(`document.querySelector('[data-page=keys]').click()`);
+    await waitFor(() => evaluate(`document.querySelectorAll('.caller-key-requests').length===2&&!document.querySelectorAll('.caller-key-requests')[1].disabled`), 'Key tab did not restore its shortcuts');
+    await evaluate(`document.querySelectorAll('.caller-key-requests')[1].click()`);
+    await waitFor(() => evaluate(`document.body.dataset.page==='history'&&document.querySelector('.rr-pagination')?.textContent.includes('共 0 条记录')`), 'Unused Key shortcut showed another Key requests');
+    assert.equal(await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').value`), 'fixt••••••••4321');
+    await evaluate(`document.querySelector('[data-page=keys]').click()`);
+    await waitFor(() => evaluate(`document.querySelectorAll('.caller-key-rename').length===2&&!document.querySelectorAll('.caller-key-rename')[1].disabled`), 'Key tab did not restore its editors');
+    await evaluate(`document.querySelectorAll('.caller-key-rename')[1].click();document.getElementById('caller-name-value').value='尚无请求的电脑';document.getElementById('caller-name-save').click()`);
+    await waitFor(() => evaluate(`!document.getElementById('caller-name-dialog').open&&document.getElementById('caller-keys-list').textContent.includes('尚无请求的电脑')`), 'Unobserved key could not be renamed');
+    await evaluate(`document.getElementById('caller-keys-search').value='尚无请求';document.getElementById('caller-keys-search').dispatchEvent(new Event('input',{bubbles:true}))`);
+    assert.equal(await evaluate(`document.querySelectorAll('.caller-key-row').length`), 1);
+    for (const width of [1586, 390]) {
+      await cdp('Emulation.setDeviceMetricsOverride', {width, height: width === 390 ? 844 : 992, deviceScaleFactor: 1, mobile: width === 390});
+      assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'), true, 'API Key tab overflowed the page');
+      await screenshot('api-key-tab-' + width + '.png');
+    }
+    await evaluate(`document.getElementById('caller-keys-search').value='';document.getElementById('caller-keys-search').dispatchEvent(new Event('input',{bubbles:true}))`);
     callerKeyPresent = false;
+    await evaluate(`document.getElementById('caller-keys-refresh').click()`);
+    await waitFor(() => evaluate(`document.querySelectorAll('.caller-key-row').length===1&&document.getElementById('caller-keys-count').textContent==='共 1 个 · 已命名 1 个'`), 'Deleted key remained in the API Key tab');
+    await evaluate(`document.querySelector('[data-page=history]').click();document.querySelector('[data-record-page=users]').click()`);
+    await evaluate(`document.querySelector('[aria-label="API Key 筛选"]').click();document.querySelector('#rr-facet-caller [data-caller-id="${callerID}"]').click()`);
     await evaluate(`document.getElementById('refresh').click()`);
-    await waitFor(() => evaluate(`!document.querySelector('.rr-rename-caller')&&!document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), 'Deleted CPA key remained editable');
+    await waitFor(() => evaluate(`!!document.querySelector('.rr-key-metadata')&&!document.querySelector('.rr-rename-caller')&&!document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify(maskedKey)})`), 'Deleted CPA key remained editable');
+    assert.equal(await evaluate(`document.querySelector('.rr-key-metadata').textContent.includes(${JSON.stringify('未匹配 Key · ' + callerID.slice(7, 15))})`), true, 'Unmatched historical key lost its distinct fallback');
+    runningTrafficAccount = '';
+    await evaluate(`document.getElementById('refresh').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-table tbody tr')?.cells[3]?.textContent==='等待分配'&&document.querySelector('.rr-metadata')?.textContent.includes('当前账号')`), 'Running request without a selection was not shown as waiting');
+    runningTrafficAccount = 'codex-02';
+    await evaluate(`document.getElementById('refresh').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-table tbody tr')?.cells[3]?.textContent==='codex-02'&&Array.from(document.querySelectorAll('.rr-metadata .rr-pair')).some(row=>row.querySelector('dt')?.textContent==='当前账号'&&row.querySelector('dd')?.textContent==='codex-02')`), 'Running request did not show its current selected account');
+    assert.equal(await evaluate(`document.querySelector('.rr-table tbody tr').cells[5].textContent`), '执行中等待执行结果');
+    await waitFor(() => evaluate(`document.querySelector('.rr-detail').textContent.includes('已选定账号，尚无执行结果。')`), 'Running selection was presented as a finished attempt');
+    assert.equal(await evaluate(`document.querySelectorAll('.rr-attempt').length`), 0, 'Running selection invented usage attempts');
+    for (const width of [1586, 390]) {
+      await cdp('Emulation.setDeviceMetricsOverride', {width, height: width === 390 ? 844 : 992, deviceScaleFactor: 1, mobile: width === 390});
+      assert.equal(await evaluate('document.documentElement.scrollWidth<=innerWidth'), true, 'Running account overflowed the page');
+      await screenshot('running-request-account-' + width + '.png');
+    }
+    runningTrafficAccount = 'codex-07';
+    await evaluate(`document.getElementById('refresh').click()`);
+    await waitFor(() => evaluate(`document.querySelector('.rr-table tbody tr')?.cells[3]?.textContent==='codex-07'&&Array.from(document.querySelectorAll('.rr-metadata .rr-pair')).some(row=>row.querySelector('dt')?.textContent==='当前账号'&&row.querySelector('dd')?.textContent==='codex-07')`), 'Retry did not update the running account');
+    await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.rr-routing-evidence .rr-pair')).some(row=>row.querySelector('dt')?.textContent==='候选账号数'&&row.querySelector('dd')?.textContent==='2')`), 'Running request showed the previous account scheduling evidence');
+    runningTrafficAccount = null;
+    await evaluate(`document.getElementById('refresh').click()`);
+    await waitFor(() => evaluate(`Array.from(document.querySelectorAll('.rr-metadata .rr-pair')).some(row=>row.querySelector('dt')?.textContent==='最终账号'&&row.querySelector('dd')?.textContent==='codex-02')`), 'Completion did not restore the final execution account');
     assert.equal(posts.length, 0); assert.equal(patches.length, 0);
     assert.equal(exceptions.length, 0, JSON.stringify(exceptions)); assert.equal(pageErrors.length, 0, JSON.stringify(pageErrors));
-    console.log('Caller key Chromium checks passed: masked keys, CPA shared names, edit/clear/conflict/deletion, list/detail/facets/matrix, exact drilldown identity, text-only labels, desktop/mobile layout and no key-list writes or upstream tasks.');
+    console.log('Caller key Chromium checks passed: API Key account tab, exact request shortcuts, searchable picker with duplicate names and keyboard controls, masked keys, CPA shared names, edit/clear/conflict/deletion, list/detail/facets/matrix, text-only labels, desktop/mobile layout and no key-list writes or upstream tasks.');
     break checks;
   }
   if (authOnly) {

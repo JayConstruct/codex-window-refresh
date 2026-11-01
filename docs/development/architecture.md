@@ -166,6 +166,8 @@ curl --unix-socket /absolute/private/run/daemon.sock http://localhost/healthz
 
 后台在原事件事务中更新 `traffic_requests`、`traffic_attempts` 和连续水位，提交后 ACK。逻辑请求以接入实例和宿主 RequestID 隔离；物理执行以实例和 UsageRecord.RequestID 去重；selection ID 连接决策及执行，不能把同一 selection 下的不同执行 UUID 合成一次调用。缺少 selection 时，只在同一实例的 trace 唯一且没有歧义时关联；出现 trace 冲突时撤回该回退关联，绝不按时间猜测。调用方及会话摘要采用每数据库随机盐，原始标识不进入流量表。
 
+逻辑请求 JSON 同时保留最新生命周期 `selection_id`。执行中请求展示生命周期已通知的当前账号，并仅用同 selection 的决策说明当前选号原因；先前账号的迟到用量仍计入原执行，不覆盖当前账号或分流原因。选号本身不增加执行次数或用量，终态账号继续按实际执行证据展示；无需修改 SQLite schema。
+
 调用方显示名称复用 CPA 的浏览器存储 `api-key-names:v1:<apiBase>`，兼容其 `enc::v1::` 混淆格式。名称指纹为 `SHA256(JSON.stringify(['api-key-name', apiBase, apiKey]))`；浏览器读取 CPA 管理端 Key 清单，在内存计算宿主 `caller_scope`，再通过认证的 `POST /api/v2/traffic-callers`（CPA 插件管理路径同名）取得数据库内调用方摘要。该接口最多接收 64 个小写 SHA-256 摘要，返回同序调用方 ID；不接受原始 Key 或名称，不写数据库，不返回盐。名称、原始 Key 不进入插件后台、URL或流量记录。浏览器仅在内存保留调用方对应的名称指纹和打码值（长 Key 前后各 4 字符，长度不超过 12 字符时全隐藏）；列表、详情同时展示打码值，筛选与下钻继续使用原调用方 ID。详情改名在重新读取 CPA Key 清单后，校验相同指纹与编辑前名称，合并保存到 CPA 共用的名称存储，兼容并写入 `enc::v1::` 格式，不改 Key 清单，也不建立原始 Key 的额外缓存。Key 删除、断开或实例变化时清除匹配；冲突或存储失败保留编辑草稿。
 
 总览 `quota_available` 和 `usable` 筛选使用同一最近余额判定：完整许可/五小时/周额度观测、时间不在未来、余额为正且未到重置边界；允许未启动及未知启动状态，过期观测不直接标记账号不可用。`capacity` 继续要求五分钟内的活动窗口证据，自动唤醒及容量准备不使用展示可用数代替。到期查询状态只根据 `pending_query` 的真实阶段、暂缓原因及持久计划时间显示，每秒时钟只更新页面，不创建任务。

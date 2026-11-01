@@ -6,6 +6,7 @@
   const pages = {
     overview: ['账号池概览', '额度、任务与需要处理的事项'],
     accounts: ['账号管理', '查看额度、管理账号状态与执行操作'],
+    keys: ['API Key 管理', '集中查看客户端 Key，修改显示名称'],
     query: ['自动化', '规则保存后，由后台持续执行'],
     wake: ['自动化', '规则保存后，由后台持续执行'],
     cards: ['自动化', '规则保存后，由后台持续执行'],
@@ -708,12 +709,13 @@
   const presentation = context.CWRPresentation;
   let selectedAccountID = '', recordsPage = 'users', overviewTaskData = null, overviewTaskLoading = false;
   let callerNames = Object.create(null), callerKeys = Object.create(null), callerNamesRead = 0, callerNamesSignature = '';
+  let callerKeysLoading = false, callerKeysError = '', callerKeysPage = 1;
   let callerNameEditing = null, callerNameOpener = null, callerNameSaving = false;
   let selectedBatchBusy = false;
   let taskOpenSequence = 0, navigationEpoch = 0, accountTaskSequence = 0, selectedAccountTasks = null, selectedAccountTasksError = false;
   const selectedAccounts = new Set();
   const recordsPanel = context.CWRRecords?.mount({root: $('runtime-records-root'), request: (path, options) => api(path, options),
-    displayAccount, displayCaller, callerKeyInfo, onRenameCaller: openCallerNameDialog, hideRefresh: true, onTask: (id, kind) => openRecordedTask(id, kind), onViewAccount: id => openAccountDetail(id),
+    displayAccount, displayCaller, callerKeyInfo, callerIDs: () => Object.keys(callerKeys), onRenameCaller: openCallerNameDialog, hideRefresh: true, onTask: (id, kind) => openRecordedTask(id, kind), onViewAccount: id => openAccountDetail(id),
     onNavigate: page => { recordsPage = page; for (const button of document.querySelectorAll('[data-record-page]')) { const selected = button.dataset.recordPage === page; button.classList.toggle('active', selected); button.setAttribute('aria-selected', String(selected)); } }});
   const setText = (id, text) => { if ($(id)) setLiveText($(id), text); };
   function setLiveText(node, text) {
@@ -734,11 +736,42 @@
     return displayPreference.mode === 'alias' && Object.hasOwn(displayPreference.aliases, id) ? displayPreference.aliases[id] : maskedAccount(id);
   }
   function displayCaller(id) {
-    return callerNames[id] || context.CWRRecords?.callerLabel?.(id) || '调用方未知';
+    return callerNames[id] || callerKeys[id]?.maskedKey || context.CWRRecords?.callerLabel?.(id) || 'API Key 未记录';
   }
   function callerKeyInfo(id) {
     const identity = callerKeys[id];
     return identity ? {name: identity.name, maskedKey: identity.maskedKey} : null;
+  }
+  function renderCallerKeys() {
+    const root = $('caller-keys-list');
+    if (!root) return;
+    const entries = Object.entries(callerKeys), search = $('caller-keys-search').value.trim().toLocaleLowerCase();
+    const filtered = entries.filter(([, identity]) => !search || (identity.name + ' ' + identity.maskedKey).toLocaleLowerCase().includes(search));
+    const pages = Math.max(1, Math.ceil(filtered.length / 20));
+    if (!callerKeysLoading) callerKeysPage = Math.min(callerKeysPage, pages);
+    $('caller-keys-refresh').disabled = !connected || callerKeysLoading;
+    $('caller-keys-search').disabled = !connected;
+    $('caller-keys-previous').disabled = !connected || callerKeysLoading || callerKeysPage <= 1;
+    $('caller-keys-next').disabled = !connected || callerKeysLoading || callerKeysPage >= pages;
+    setText('caller-keys-count', connected && callerNamesSignature && !callerKeysLoading ? '共 ' + entries.length + ' 个 · 已命名 ' + entries.filter(([, identity]) => identity.name).length + ' 个' : '');
+    setText('caller-keys-page', connected && !callerKeysLoading && !callerKeysError && filtered.length ? '第 ' + callerKeysPage + ' / ' + pages + ' 页 · ' + filtered.length + ' 个' : '');
+    setText('caller-keys-message', !connected ? '连接 CPA 后读取全部已配置的 API Key。' : callerKeysLoading ? '正在读取 CPA Key 清单…' : callerKeysError || '名称与此浏览器、此 CPA 地址下的管理中心共用；留空可清除。');
+    const rows = filtered.slice((callerKeysPage - 1) * 20, callerKeysPage * 20).map(([id, identity]) => {
+      const row = element('li', 'caller-key-row'); row.dataset.renderKey = id;
+      const info = element('div', 'caller-key-identity');
+      info.append(element('strong', identity.name ? '' : 'muted', identity.name || '未命名'), element('code', 'muted', identity.maskedKey));
+      const edit = element('button', 'button button-outline button-small caller-key-rename', '修改名称'); edit.type = 'button';
+      edit.disabled = !connected || callerKeysLoading;
+      edit.setAttribute('aria-label', '修改名称：' + (identity.name || identity.maskedKey));
+      edit.onclick = function () { openCallerNameDialog(id, this); };
+      const view = element('button', 'button button-outline button-small caller-key-requests', '查看请求'); view.type = 'button';
+      view.disabled = !connected || callerKeysLoading || typeof recordsPanel?.showCaller !== 'function';
+      view.setAttribute('aria-label', '查看请求：' + (identity.name || identity.maskedKey));
+      view.onclick = () => { if (connected && callerKeys[id] && recordsPanel?.showCaller) { recordsPage = 'users'; navigate('history', true, id); } };
+      const actions = element('div', 'caller-key-actions'); actions.append(view, edit);
+      row.append(info, actions); return row;
+    });
+    updateChildren(root, rows.length ? rows : [element('li', 'empty-state', !connected ? '尚未连接' : callerKeysLoading ? '正在读取…' : callerKeysError ? '暂时无法显示 Key 清单，请重试。' : search ? '没有匹配的 API Key' : 'CPA 尚未配置 API Key')]);
   }
   function applyCallerNames() {
     const names = readCallerNames(context, base);
@@ -748,20 +781,24 @@
       if (identity.name) callerNames[id] = identity.name;
     }
     recordsPanel?.setContext({displayCaller, callerKeyInfo});
+    renderCallerKeys();
   }
   async function refreshCallerNames(force = false) {
-    if (!connected || !recordsPanel) return false;
+    if (!connected || (!recordsPanel && activePage !== 'keys')) return false;
     const signature = JSON.stringify([views.instance, readCallerNames(context, base)]);
-    if (!force && signature === callerNamesSignature) return true;
+    if (!force && signature === callerNamesSignature) return !callerKeysLoading;
     if (!force && callerNamesSignature && JSON.parse(callerNamesSignature)[0] === views.instance && Object.keys(callerKeys).length) {
       callerNamesSignature = signature;
       applyCallerNames();
       return true;
     }
+    const sameInstance = callerNamesSignature && JSON.parse(callerNamesSignature)[0] === views.instance;
     callerNamesSignature = signature;
     const sequence = ++callerNamesRead, current = generation, instance = views.instance;
-    callerNames = Object.create(null); callerKeys = Object.create(null);
+    if (!sameInstance) { callerNames = Object.create(null); callerKeys = Object.create(null); }
+    callerKeysLoading = true; callerKeysError = '';
     recordsPanel?.setContext({displayCaller, callerKeyInfo});
+    renderCallerKeys();
     try {
       const identities = await resolveCallerKeys(context, base, api);
       if (sequence !== callerNamesRead || current !== generation || instance !== views.instance || !connected) return false;
@@ -769,8 +806,15 @@
       applyCallerNames();
       return true;
     } catch {
-      if (sequence === callerNamesRead) callerNamesSignature = '';
+      if (sequence === callerNamesRead && current === generation) {
+        callerNamesSignature = '';
+        callerNames = Object.create(null); callerKeys = Object.create(null);
+        recordsPanel?.setContext({displayCaller, callerKeyInfo});
+        callerKeysError = '读取 CPA Key 清单失败，请点击“刷新清单”重试。';
+      }
       return false;
+    } finally {
+      if (sequence === callerNamesRead && current === generation) { callerKeysLoading = false; renderCallerKeys(); }
     }
   }
   function closeCallerNameDialog() {
@@ -1901,6 +1945,8 @@
   function stop() {
     clearTimeout(timeTimer);
     callerNamesRead++; callerNamesSignature = ''; callerNames = Object.create(null); callerKeys = Object.create(null);
+    callerKeysLoading = false; callerKeysError = ''; callerKeysPage = 1;
+    $('caller-keys-search').value = '';
     closeCallerNameDialog(); callerNameSaving = false;
     recordsPanel?.disconnect(); overviewTaskLoading = false; overviewTaskData = null;
     selectedAccounts.clear(); selectedBatchBusy = false;
@@ -1913,6 +1959,7 @@
     }
     errorLimits.clear();
     generation++; connected = false; connecting = false; key = '';
+    renderCallerKeys();
     clearTimeout(pollTimer); clearTimeout(connectRetryTimer); clearTimeout(filterTimer); clearTimeout(historyTimer);
     historySequence++; historyDetailSequence++;
     historyData = null; historySelected = null; historyJob = null; historyLoading = false; historyPolling = false; historyDetailLoading = false; historyDetailPolling = false; historyError = ''; historyDetailError = '';
@@ -2645,6 +2692,7 @@
     renderPreferences();
   }
   function renderPreferences() {
+    renderCallerKeys();
     const theme = document.documentElement.getAttribute('data-theme');
     setText('preference-current-theme', '当前：' + ({light: '暖灰', white: '纯白', dark: '深色'}[theme] || '跟随系统'));
     for (const button of document.querySelectorAll('[data-display-mode]')) { button.classList.toggle('active', button.dataset.displayMode === displayPreference.mode); button.setAttribute('aria-pressed', String(button.dataset.displayMode === displayPreference.mode)); }
@@ -2757,6 +2805,7 @@
           read(() => accounts(forceAccounts || !cursor, data.accounts_revision, !forceAccounts && !syncing));
         }
         read(pollJobs);
+        if (forceAccounts && activePage === 'keys') read(() => refreshCallerNames(true));
         if (['overview', 'accounts'].includes(activePage)) read(loadOverviewTasks);
         if (activePage === 'accounts' && selectedAccountID) read(() => loadAccountTasks());
         if (['overview', 'scheduling', 'cards'].includes(activePage)) { read(() => loadScheduling()); if (activePage === 'cards') read(() => loadResetCards()); if (activePage === 'scheduling' && !routingAccountsLoading) read(() => loadRoutingAccounts(false, true)); }
@@ -3364,17 +3413,18 @@
   $('reset-previous').onclick = () => { if (connected && resetPage > 1) { resetPage--; renderResetCards(); } };
   $('reset-next').onclick = () => { if (connected && resetPage * 10 < resetRecords().length) { resetPage++; renderResetCards(); } };
 
-  function navigate(name, loadSettings = true) {
+  function navigate(name, loadSettings = true, callerID = '') {
     if (!Object.hasOwn(pages, name)) return;
     navigationEpoch++; activePage = name;
     const automation = ['query', 'wake', 'cards', 'models'].includes(name);
     document.body.dataset.page = name;
     for (const view of document.querySelectorAll('[data-view]')) view.hidden = view.dataset.view !== name;
     for (const button of document.querySelectorAll('[data-page]')) {
-      const selected = button.dataset.primaryPage ? button.dataset.primaryPage === (automation ? 'query' : name) : button.dataset.page === name; button.classList.toggle('active', selected);
+      const selected = button.dataset.primaryPage ? button.dataset.primaryPage === (automation ? 'query' : name === 'keys' ? 'accounts' : name) : button.dataset.page === name; button.classList.toggle('active', selected);
       if (selected) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
     }
     if ($('automation-navigation')) $('automation-navigation').hidden = !automation;
+    if ($('accounts-navigation')) $('accounts-navigation').hidden = !['accounts', 'keys'].includes(name);
     if ($('records-navigation')) $('records-navigation').hidden = name !== 'history';
     if ($('scheduling-form')) $('scheduling-form').hidden = !['scheduling', 'cards'].includes(name);
     if ($('scheduling-actions')) $('scheduling-actions').hidden = !['scheduling', 'cards'].includes(name);
@@ -3393,16 +3443,17 @@
     if (name === 'query' && loadSettings && connected && settingsSupported() && (!savedSettings || savedSettings.instance_id !== views.instance)) void reloadSettings();
     if (name === 'models' && loadSettings && connected) { ensureGenerationAccounts(); void reloadModelSettings(); void pollGeneration(); }
     if (name === 'wake' && loadSettings && connected) { ensureWakeSettings(); void loadWakeJobs(); if (!savedModelSettings) void reloadModelSettings(); }
-    if (name === 'history') showRecordsPage(recordsPage, loadSettings);
+    if (name === 'history') showRecordsPage(recordsPage, loadSettings, callerID);
+    if (name === 'keys' && connected) void refreshCallerNames(true);
     renderAccountDetail(); renderRuleSummaries();
   }
-  function showRecordsPage(page, load = true) {
+  function showRecordsPage(page, load = true, callerID = '') {
     if (!['users', 'plugin', 'analysis', 'tasks'].includes(page)) return;
     recordsPage = page;
     for (const button of document.querySelectorAll('[data-record-page]')) { const selected = button.dataset.recordPage === page; button.classList.toggle('active', selected); button.setAttribute('aria-selected', String(selected)); }
     if ($('task-history-root')) $('task-history-root').hidden = page !== 'tasks';
     recordsPanel?.setContext({connected, instanceId: views.instance || '', displayAccount});
-    recordsPanel?.show(page);
+    if (callerID) recordsPanel?.showCaller(callerID); else recordsPanel?.show(page);
     if (page !== 'tasks') void refreshCallerNames(true);
     if (page === 'tasks') { renderHistory(); if (load && connected) void loadHistory(); }
   }
@@ -3438,6 +3489,10 @@
   $('caller-name-form').onsubmit = event => { event.preventDefault(); return saveCallerNameDialog(); };
   $('caller-name-cancel').onclick = closeCallerNameDialog;
   $('caller-name-dialog').addEventListener('cancel', event => { event.preventDefault(); closeCallerNameDialog(); });
+  $('caller-keys-refresh').onclick = () => refreshCallerNames(true);
+  $('caller-keys-search').oninput = () => { callerKeysPage = 1; renderCallerKeys(); };
+  $('caller-keys-previous').onclick = () => { if (connected && !callerKeysLoading && callerKeysPage > 1) { callerKeysPage--; renderCallerKeys(); } };
+  $('caller-keys-next').onclick = () => { if (connected && !callerKeysLoading) { callerKeysPage++; renderCallerKeys(); } };
   for (const button of document.querySelectorAll('[data-page]')) {
     if (!Object.hasOwn(pages, button.dataset.page)) continue;
     button.setAttribute('title', pages[button.dataset.page][0]); button.setAttribute('aria-label', pages[button.dataset.page][0]);

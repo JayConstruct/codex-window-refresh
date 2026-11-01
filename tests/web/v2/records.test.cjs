@@ -112,11 +112,33 @@ test('routing explanations use recorded decisions rather than current account qu
   const before = reasonExplanation(record);
   record.quota.remaining = 0;
   assert.equal(reasonExplanation(record), before);
-  assert.match(before, /执行当时/);
+  assert.equal(before, '继续使用当前会话的账号。');
   assert.equal(reasonName('host_selected'), '宿主选号');
   assert.match(reasonExplanation({reason: 'host_selected'}), /未提供/);
   assert.equal(reasonName('future-private-code'), '原因未提供');
-  assert.match(reasonExplanation({reason: 'unknown', quota: {remaining: 100}}), /不依据当前/);
+  assert.equal(reasonExplanation({reason: 'unknown', quota: {remaining: 100}}), '未记录账号分配原因。');
+});
+
+test('routing explanations stay short and do not turn recorded failures into quota or success claims', () => {
+  const expected = {
+    parent_affinity: '与父会话使用同一个账号。', project_preference: '这是该项目设置的首选账号。',
+    available_pool: '从当时可用的账号中选中了这个账号。', selection_reuse: '继续使用此前选中的账号。',
+    quota_load: '按当时的额度和繁忙程度，选中了这个账号。', failover: '原账号出现故障，改用这个账号。',
+    pinned: '请求或任务指定了这个账号。', scheduler_busy: '账号当时无法接单，本次未发起调用。',
+    account_unavailable: '账号当时不可用，本次未发起调用。', host_selected: '由 CPA 自动选择，未提供具体原因。',
+  };
+  for (const [reason, explanation] of Object.entries(expected)) {
+    const record = {reason, evidence: {explanation: '详细调度记录。'.repeat(40)}};
+    assert.equal(reasonExplanation(record), explanation);
+    assert.ok(explanation.length <= 30);
+  }
+  for (const status of ['completed', 'failed', 'unknown']) {
+    const record = {reason: 'failover', status, account_id: 'new', attempts: [{account_id: 'old', status: 'failed', http_status: 429}, {account_id: 'new', status}]};
+    assert.equal(reasonExplanation(record), expected.failover);
+    assert.doesNotMatch(reasonExplanation(record), /耗尽|成功|已完成|首选/);
+  }
+  assert.equal(reasonExplanation({reason: 'unknown'}, {reason: 'parent_affinity'}), expected.parent_affinity);
+  assert.equal(reasonExplanation({reason: 'future-code'}), '未记录账号分配原因。');
 });
 
 test('routing matrix derives account columns from actual aggregated attempts including earlier failover accounts', () => {

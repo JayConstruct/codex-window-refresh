@@ -196,6 +196,84 @@ func TestTrafficFailoverCorrelationReplayAndPrivacy(t *testing.T) {
 	}
 }
 
+func TestTrafficRunningRequestShowsCurrentSelectionBeforeUsage(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	apply := func(after uint64, observed ...events.Event) {
+		t.Helper()
+		if _, err := s.ApplyEvents(ctx, batch(after, observed...)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(account, reason string, attempts int) TrafficRecord {
+		t.Helper()
+		page, err := s.Traffic(ctx, TrafficFilter{Kind: "users", Account: account})
+		if err != nil || page.Total != 1 || len(page.Records) != 1 {
+			t.Fatalf("running account filter: %+v %v", page, err)
+		}
+		r := page.Records[0]
+		if r.Status != "running" || r.AccountID != account || r.Reason != reason || r.AttemptCount != attempts || page.Summary.Attempts != attempts {
+			t.Fatalf("current selection lost or counted as execution: %+v", r)
+		}
+		detail, err := s.Traffic(ctx, TrafficFilter{ID: r.ID})
+		if err != nil || detail.Record == nil || detail.Record.AccountID != account || detail.Record.Reason != reason {
+			t.Fatalf("detail lost current selection: %+v %v", detail.Record, err)
+		}
+		return r
+	}
+	apply(0,
+		trafficEvent(1, "started", "live", events.Traffic{Phase: "started", Caller: "scope"}),
+		trafficEvent(2, "traffic", "sel-a", events.Traffic{Phase: "decision", SelectionID: "sel-a", AccountID: "a", Reason: "project_preference", Caller: "scope"}),
+		trafficEvent(3, "account_selected", "live", events.Traffic{Phase: "selected", SelectionID: "sel-a", AccountID: "a"}),
+	)
+	r := read("a", "project_preference", 0)
+	if r.Attempted || r.InputTokens != nil || r.OutputTokens != nil || r.LatencyMS != nil {
+		t.Fatalf("selection manufactured execution or usage: %+v", r)
+	}
+	analysis, err := s.Traffic(ctx, TrafficFilter{Kind: "analysis"})
+	if err != nil || analysis.Summary.Attempts != 0 || len(analysis.Accounts) != 0 {
+		t.Fatalf("selected account counted as executed: %+v %v", analysis, err)
+	}
+	apply(3,
+		trafficEvent(4, "traffic", "sel-b", events.Traffic{Phase: "decision", SelectionID: "sel-b", AccountID: "b", Reason: "failover", Caller: "scope"}),
+		trafficEvent(5, "account_selected", "live", events.Traffic{Phase: "selected", SelectionID: "sel-b", AccountID: "b"}),
+		// An earlier account can report its outcome after the retry is selected.
+		trafficEvent(6, "traffic", "exec-a", events.Traffic{Phase: "usage", SelectionID: "sel-a", ExecutionID: "exec-a", AccountID: "a", Status: "failed", HTTPStatus: httpNumber(429)}),
+	)
+	read("b", "failover", 1)
+	apply(6,
+		// Reusing the same account must still use this selection's reason.
+		trafficEvent(7, "account_selected", "live", events.Traffic{Phase: "selected", SelectionID: "sel-b2", AccountID: "b"}),
+	)
+	read("b", "unknown", 1)
+	apply(7, trafficEvent(8, "traffic", "sel-b2", events.Traffic{Phase: "decision", SelectionID: "sel-b2", AccountID: "b", Reason: "session_affinity", Caller: "scope"}))
+	read("b", "session_affinity", 1)
+	apply(8,
+		trafficEvent(9, "traffic", "exec-b", events.Traffic{Phase: "usage", SelectionID: "sel-b2", ExecutionID: "exec-b", AccountID: "b", Status: "completed", InputTokens: number(120)}),
+		trafficEvent(10, "completed", "live", events.Traffic{Phase: "completed", SelectionID: "sel-b2", AccountID: "b", Status: "succeeded"}),
+	)
+	page, err := s.Traffic(ctx, TrafficFilter{ID: r.ID})
+	if err != nil || page.Record == nil || page.Record.Status != "completed" || page.Record.AccountID != "b" || page.Record.AttemptCount != 2 || !page.Record.Recovered {
+		t.Fatalf("final execution lost after live selection: %+v %v", page.Record, err)
+	}
+}
+
+func TestTrafficCompletedSelectionWithoutUsageDoesNotInventExecution(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, err := s.ApplyEvents(ctx, batch(0,
+		trafficEvent(1, "started", "selected-only", events.Traffic{Phase: "started", Caller: "scope"}),
+		trafficEvent(2, "account_selected", "selected-only", events.Traffic{Phase: "selected", SelectionID: "sel", AccountID: "a"}),
+		trafficEvent(3, "completed", "selected-only", events.Traffic{Phase: "completed", Status: "succeeded"}),
+	)); err != nil {
+		t.Fatal(err)
+	}
+	page, err := s.Traffic(ctx, TrafficFilter{})
+	if err != nil || page.Total != 1 || page.Records[0].AccountID != "" || page.Summary.Attempts != 0 || page.Records[0].Attempted {
+		t.Fatalf("completion without execution invented final account: %+v %v", page, err)
+	}
+}
+
 func TestTrafficDistinctExecutionsCanShareSelectionAndUnknownSurvivesGap(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()

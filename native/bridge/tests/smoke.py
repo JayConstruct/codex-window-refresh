@@ -438,6 +438,30 @@ class NativeBridge(unittest.TestCase):
         snapshot['accounts'][1]['reset_at']=int(time.time())+30;self.sticky_snapshot(snapshot)
         self.assertEqual(self.sticky_pick('parallel')[1]['AuthID'],'b')
 
+    def test_sticky_pending_and_running_requests_share_account_before_completion(self):
+        snapshot=self.routing_snapshot(cap=2);self.sticky_snapshot(snapshot)
+        request,choice=self.sticky_pick('running-parent')
+        self.assertEqual(choice['AuthID'],'a')
+        # A second request inherits the reservation, even before the first
+        # request has emitted its selected/started lifecycle callback.
+        second_request,second=self.sticky_pick('running-parent')
+        self.assertEqual(second['AuthID'],'a')
+        self.assertEqual(self.sticky_pick('running-parent')[1].get('RejectCode'),'scheduler_busy')
+        self.assertEqual(self.sticky_pick('child',parent='running-parent')[1].get('RejectCode'),'scheduler_busy')
+        metadata=self.sticky_started(request,choice,'running-first')
+        second_metadata=self.sticky_started(second_request,second,'running-second')
+        # Removing the pending reservation does not release active capacity.
+        self.assertEqual(self.sticky_pick('running-parent')[1].get('RejectCode'),'scheduler_busy')
+        self.sticky_completed('running-first',metadata)
+        child_request,child=self.sticky_pick('child',parent='running-parent')
+        self.assertEqual(child['AuthID'],'a')
+        child_metadata=self.sticky_started(child_request,child,'running-child')
+        self.assertEqual(self.sticky_pick('running-parent')[1].get('RejectCode'),'scheduler_busy')
+        self.sticky_completed('running-child',child_metadata)
+        # The original second request is still running throughout this check.
+        self.assertEqual(self.sticky_pick('running-parent')[1]['AuthID'],'a')
+        self.sticky_completed('running-second',second_metadata)
+
     def test_sticky_duplicate_reservation_does_not_survive_identity_replacement(self):
         snapshot=self.routing_snapshot(cap=1);self.sticky_snapshot(snapshot)
         request,choice=self.sticky_pick('main')
@@ -576,12 +600,24 @@ class NativeBridge(unittest.TestCase):
                   'Model':'fixture-model','Metadata':{'caller_scope':scope}})
         request,choice=self.sticky_pick('private-session',project='work',scope=scope)
         metadata=self.sticky_started(request,choice,'business-record')
+        self.start_daemon()
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            status,running=self.management('traffic',query={'kind':['users']})
+            if status==200 and running.get('records') and running['records'][0].get('account_id')==choice['AuthID']:break
+            time.sleep(.025)
+        self.assertEqual(status,200,running)
+        self.assertEqual(running['records'][0]['status'],'running')
+        self.assertEqual(running['records'][0]['account_id'],choice['AuthID'])
+        self.assertEqual(running['records'][0]['reason'],'project_preference')
+        self.assertEqual(running['summary']['attempts'],0)
+        self.assertFalse(running['records'][0]['attempted'])
+        self.assertIsNone(running['records'][0]['input_tokens'])
         self.call('usage.handle',{'RequestID':'business-attempt','SelectionID':metadata['selection_id'],
                   'TraceID':'trace-business','AuthID':choice['AuthID'],'Provider':'codex','Model':'fixture-model',
                   'Generate':True,'Failed':False,'Latency':2100000000,'Detail':{'InputTokens':120,'OutputTokens':30},
                   'APIKey':'NEVER-STORE-KEY','Failure':{'Body':'NEVER-STORE-BODY'}})
         self.sticky_completed('business-record',metadata)
-        self.start_daemon()
         deadline=time.monotonic()+5
         while time.monotonic()<deadline:
             status,page=self.management('traffic',query={'kind':['users']})

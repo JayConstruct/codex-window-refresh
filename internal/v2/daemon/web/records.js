@@ -11,7 +11,7 @@
   const formatNumber = value => number(value) === null ? '—' : new Intl.NumberFormat('zh-CN', {maximumFractionDigits: 2}).format(value);
   const reportedTokenTotal = record => number(record?.input_tokens) === null && number(record?.output_tokens) === null ? null : (number(record?.input_tokens) ?? 0) + (number(record?.output_tokens) ?? 0);
   const duration = value => number(value) === null ? '—' : value < 1000 ? Math.round(value) + ' 毫秒' : (value / 1000).toFixed(value < 10000 ? 1 : 0) + ' 秒';
-  const callerLabel = value => safeText(value).startsWith('caller-') ? '调用方 ' + value.slice(7, 15) : safeText(value) || '调用方未知';
+  const callerLabel = value => safeText(value).startsWith('caller-') ? '未匹配 Key · ' + value.slice(7, 15) : safeText(value) || 'API Key 未记录';
   const projectLabel = record => record?.project_name || (safeText(record?.project).startsWith('dir-') ? '项目 ' + record.project.slice(4, 12) : safeText(record?.project)) || '未标记项目';
   const clippedID = value => safeText(value).length > 20 ? value.slice(0, 10) + '…' + value.slice(-5) : safeText(value) || '—';
   const reasonName = value => own(reasonNames, value) ? reasonNames[value] : reasonNames.unknown;
@@ -103,27 +103,20 @@
   }
 
   function reasonExplanation(record, attempt = null) {
-    const source = attempt || record || {}, evidence = source.evidence || record?.evidence || {};
-    if (typeof evidence.explanation === 'string' && evidence.explanation.trim()) return evidence.explanation;
+    const source = attempt || record || {};
     switch (source.reason || record?.reason) {
-      case 'session_affinity': return '沿用执行当时已建立的会话账号绑定。';
-      case 'parent_affinity': return '依据执行当时记录的父会话绑定继承账号。';
-      case 'project_preference': return '在宿主可用候选中选择了项目首选账号。';
-      case 'available_pool': return '从宿主提供的可用账号候选中分配；没有记录其他优先因素。';
-      case 'selection_reuse': return '复用了已建立的选号结果，没有创建新的上游尝试。';
-      case 'quota_load': return '依据当时可用的额度、重置时间和占用信息择优分配。';
-      case 'failover': {
-        const attempts = Array.isArray(record?.attempts) ? record.attempts : [];
-        const previous = attempts.find(item => item.status === 'failed' && item.account_id !== record.account_id);
-        const latest = attempts.at(-1), code = count(previous?.http_status);
-        if (previous && latest) return '此前账号的尝试' + (code ? '返回 HTTP ' + code : '未成功') + '，随后按当时调度规则重新选择' + (latest.evidence?.project_preferred === true ? '项目首选组中的可用账号' : '可用账号') + '；' + (record.status === 'completed' ? '后续尝试已完成。' : '后续结果见逐次尝试。');
-        return '此前尝试未成功，调度器按当时规则重新选择账号；具体依据见逐次尝试。';
-      }
-      case 'pinned': return '请求或后台计划指定该账号，按指定身份执行。';
-      case 'scheduler_busy': return '绑定账号当时繁忙，未建立新的上游调用尝试。';
-      case 'account_unavailable': return '执行当时账号不可用，未建立新的上游调用尝试。';
-      case 'host_selected': return '账号由 CPA 宿主选择，未提供更详细的选号原因。';
-      default: return '没有记录到可核实的分流原因，不依据当前账号状态推断历史原因。';
+      case 'session_affinity': return '继续使用当前会话的账号。';
+      case 'parent_affinity': return '与父会话使用同一个账号。';
+      case 'project_preference': return '这是该项目设置的首选账号。';
+      case 'available_pool': return '从当时可用的账号中选中了这个账号。';
+      case 'selection_reuse': return '继续使用此前选中的账号。';
+      case 'quota_load': return '按当时的额度和繁忙程度，选中了这个账号。';
+      case 'failover': return '原账号出现故障，改用这个账号。';
+      case 'pinned': return '请求或任务指定了这个账号。';
+      case 'scheduler_busy': return '账号当时无法接单，本次未发起调用。';
+      case 'account_unavailable': return '账号当时不可用，本次未发起调用。';
+      case 'host_selected': return '由 CPA 自动选择，未提供具体原因。';
+      default: return '未记录账号分配原因。';
     }
   }
 
@@ -159,6 +152,8 @@
     let data = null, selected = null, selectedRevision = -1, detail = null, detailRevision = -1, detailError = '', error = '', loading = false;
     let callerDisplay = options.displayCaller || callerLabel;
     let callerInfo = options.callerKeyInfo || (() => null);
+    let callerIDs = options.callerIDs || (() => []);
+    let callerOpen = false, callerQuery = '', callerActive = -1, callerChoices = [];
     let accountDisplay = options.displayAccount || (value => value || '—'), analysisMetric = 'attempts', matrixGroup = 'project';
     let knownFacets = {projects: new Map(), callers: new Map(), accounts: new Map(), models: new Map()};
     const filtersByPage = Object.fromEntries(['users', 'plugin', 'analysis'].map(key => [key, {search: '', project: '', caller: '', account: '', model: '', status: '', session: '', range: 'today', page: 1, limit: key==='plugin'?6:7}]));
@@ -171,7 +166,7 @@
     function button(text, handler, className = 'rr-button') { const node = el('button', className, text); node.type = 'button'; node.onclick = handler; return node; }
     function empty(title, description = '') { const node = el('div', 'rr-empty'); node.append(icon('request'), el('strong', '', title)); if (description) node.append(el('p', '', description)); return node; }
     function badge(record, label) { const view = record?.kind ? pluginStatus(record) : recordStatus(record); return el('span', 'rr-badge rr-' + view.tone, label || view.label); }
-    function displayCaller(id) { return safeText(callerDisplay(id)) || callerLabel(id); }
+    function displayCaller(id) { const info = callerInfo(id); return safeText(info?.name) || safeText(info?.maskedKey) || safeText(callerDisplay(id)) || callerLabel(id); }
     function maskedCallerKey(id) { return safeText(callerInfo(id)?.maskedKey); }
     function account(id) { return id ? String(accountDisplay(id) || id) : '—'; }
     function date(value, full = false) { const at = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(at) ? new Intl.DateTimeFormat('zh-CN', full ? {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false} : {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}).format(at) : '—'; }
@@ -211,8 +206,16 @@
     const filters = el('div', 'rr-filters');
     const searchBox = el('div', 'rr-search'); searchBox.append(icon('search')); const search = el('input'); search.type = 'search'; search.placeholder = '搜索请求、会话或模型'; search.setAttribute('aria-label', '搜索运行记录'); searchBox.append(search); filters.append(searchBox);
     const fields = {};
-    for (const [name, placeholder, label] of [['project','全部项目','项目'],['caller','全部调用方','调用方'],['account','全部账号','账号']]) {
-      const wrap = el('div', 'rr-filter-input'), input = el('input'); input.type = 'text'; input.placeholder = placeholder; input.setAttribute('aria-label', label + '筛选'); input.autocomplete = 'off'; const list = el('datalist'); list.id = 'rr-facet-' + name; input.setAttribute('list', list.id); wrap.append(input, el('span', 'rr-select-chevron', '⌄'), list); filters.append(wrap); fields[name] = {input, list};
+    for (const [name, placeholder, label] of [['project','全部项目','项目筛选'],['caller','全部 API Key','API Key 筛选'],['account','全部账号','账号筛选']]) {
+      const wrap = el('div', 'rr-filter-input' + (name === 'caller' ? ' rr-caller-picker' : '')), input = el('input'); input.type = 'text'; input.placeholder = placeholder; input.setAttribute('aria-label', label); input.autocomplete = 'off';
+      const list = el(name === 'caller' ? 'div' : 'datalist'); list.id = 'rr-facet-' + name;
+      if (name === 'caller') {
+        input.setAttribute('role', 'combobox'); input.setAttribute('aria-autocomplete', 'list'); input.setAttribute('aria-expanded', 'false'); input.setAttribute('aria-controls', list.id);
+        list.className = 'rr-caller-options'; list.setAttribute('role', 'listbox'); list.setAttribute('aria-label', 'API Key 选项');
+        const popup = el('div', 'rr-caller-popup'), note = el('p', 'rr-caller-note'); popup.hidden = true; popup.append(list, note);
+        wrap.append(input, el('span', 'rr-select-chevron', '⌄'), popup); fields[name] = {input, list, popup, note};
+      } else { input.setAttribute('list', list.id); wrap.append(input, el('span', 'rr-select-chevron', '⌄'), list); fields[name] = {input, list}; }
+      filters.append(wrap);
     }
     const range = el('select'); range.setAttribute('aria-label', '记录时间范围'); for (const [value,label] of [['today','今天'],['7d','最近 7 天'],['30d','最近 30 天'],['all','全部时间']]) { const option = el('option', '', label); option.value = value; range.append(option); } filters.append(range);
     const more = el('details', 'rr-more'); more.append(el('summary', '', '更多筛选')); const moreBody = el('div', 'rr-more-body'); const model = el('input'); model.placeholder = '全部模型'; model.className='rr-model-filter'; model.setAttribute('aria-label', '模型筛选'); const status = el('select'); status.setAttribute('aria-label', '结果筛选'); for (const [value,label] of [['','全部结果'],['completed','成功'],['failed','失败'],['unknown','结果未知'],['running','执行中'],['not_sent','未发起']]) { const option = el('option','',label); option.value=value; status.append(option); } const clear = button('清除筛选', () => resetFilters()); moreBody.append(model, status, clear); more.append(moreBody); filters.append(more);
@@ -224,16 +227,58 @@
     root.append(filters, summary, feedback, workspace, analysis);
     listen(search, 'input', () => changeFilter('search', search.value, true));
     for (const [name, field] of Object.entries(fields)) listen(field.input, 'input', () => {
-      let value = field.input.value;
       if (name === 'caller') {
-        const matches = [...knownFacets.callers].filter(([id, label]) => id === value || label === value);
-        if (matches.length === 1) { value = matches[0][0]; field.input.value = displayCaller(value); }
-      }
-      changeFilter(name, value, true);
+        callerQuery = field.input.value; callerOpen = true; callerActive = -1; renderCallerChoices();
+      } else changeFilter(name, field.input.value, true);
     });
+    listen(fields.caller.input, 'focus', () => { if (connected) { callerOpen = true; callerQuery = ''; callerActive = -1; renderCallerChoices(); fields.caller.input.select(); } });
+    listen(fields.caller.input, 'click', () => { if (connected && !callerOpen) { callerOpen = true; callerQuery = ''; callerActive = -1; renderCallerChoices(); } });
+    listen(fields.caller.input, 'keydown', event => {
+      if (['ArrowDown', 'ArrowUp'].includes(event.key)) {
+        event.preventDefault(); if (!connected) return;
+        if (!callerOpen) { callerOpen = true; callerQuery = ''; }
+        renderCallerChoices(); callerActive = callerActive < 0 ? (event.key === 'ArrowDown' ? 0 : callerChoices.length - 1) : (callerActive + (event.key === 'ArrowDown' ? 1 : -1) + callerChoices.length) % callerChoices.length; renderCallerChoices();
+        fields.caller.list.children[callerActive]?.scrollIntoView({block: 'nearest'});
+      } else if (event.key === 'Enter' && callerOpen) { event.preventDefault(); if (callerActive >= 0) chooseCaller(callerChoices[callerActive]); }
+      else if (event.key === 'Escape' && callerOpen) { event.preventDefault(); closeCallerChoices(); }
+      else if (event.key === 'Tab') closeCallerChoices();
+    });
+    listen(fields.caller.list, 'mousedown', event => event.preventDefault());
+    listen(fields.caller.input.parentNode, 'focusout', event => { if (!event.currentTarget.contains(event.relatedTarget)) closeCallerChoices(); });
+    listen(document, 'pointerdown', event => { if (!fields.caller.input.parentNode.contains(event.target)) closeCallerChoices(); });
     listen(range, 'change', () => changeFilter('range', range.value)); listen(model, 'input', () => changeFilter('model', model.value, true)); listen(status, 'change', () => changeFilter('status', status.value));
 
     function readFilters() { return filtersByPage[page] || filtersByPage.users; }
+    function closeCallerChoices() {
+      callerOpen = false; callerQuery = ''; callerActive = -1;
+      fields.caller.popup.hidden = true; fields.caller.list.replaceChildren(); fields.caller.note.textContent = ''; fields.caller.input.setAttribute('aria-expanded', 'false'); fields.caller.input.removeAttribute('aria-activedescendant');
+      fields.caller.input.value = readFilters().caller ? displayCaller(readFilters().caller) : '';
+    }
+    function chooseCaller(id) { closeCallerChoices(); changeFilter('caller', id); updateFilterControls(); }
+    function renderCallerChoices() {
+      const field = fields.caller; field.input.disabled = !connected;
+      field.popup.hidden = !callerOpen || !connected || page === 'plugin' || page === 'tasks';
+      field.input.setAttribute('aria-expanded', String(!field.popup.hidden));
+      if (field.popup.hidden) { field.input.removeAttribute('aria-activedescendant'); return; }
+      const query = callerQuery.trim().toLocaleLowerCase(), selected = readFilters().caller;
+      const ids = [...new Set([...callerIDs(), ...knownFacets.callers.keys(), ...(selected ? [selected] : [])])];
+      const matches = ids.filter(id => (displayCaller(id) + ' ' + maskedCallerKey(id)).toLocaleLowerCase().includes(query));
+      callerChoices = ['', ...matches.slice(0, 100)]; callerActive = Math.min(callerActive, callerChoices.length - 1);
+      const labels = new Map();
+      for (const id of matches) { const label = displayCaller(id) + '\0' + maskedCallerKey(id); labels.set(label, (labels.get(label) || 0) + 1); }
+      const nodes = callerChoices.map((id, index) => {
+        const label = id ? displayCaller(id) : '全部 API Key', masked = id ? maskedCallerKey(id) : '';
+        const option = key(button('', () => chooseCaller(id), 'rr-caller-option'), id || 'all'); option.id = 'rr-caller-option-' + (id || 'all'); option.tabIndex = -1;
+        option.setAttribute('role', 'option'); option.setAttribute('aria-selected', String(id === (selected || ''))); option.dataset.callerId = id;
+        option.dataset.active = String(index === callerActive); option.append(el('strong', '', label));
+        if (masked && masked !== label) option.append(el('code', '', masked));
+        if (id && labels.get(label + '\0' + masked) > 1) option.append(el('small', '', '来源 ' + id.replace(/^caller-/, '').slice(0, 8)));
+        return option;
+      });
+      replace(field.list, nodes);
+      field.note.textContent = !matches.length ? '没有匹配的 API Key，可按名称或打码值搜索。' : matches.length > 100 ? '找到 ' + matches.length + ' 个，仅展示前 100 个，请继续输入缩小范围。' : '按名称或打码值搜索，选择后筛选请求。';
+      if (callerActive >= 0) field.input.setAttribute('aria-activedescendant', nodes[callerActive].id); else field.input.removeAttribute('aria-activedescendant');
+    }
     function updateFilterControls() { const value = readFilters(); search.value = value.search; for (const [name,field] of Object.entries(fields)) field.input.value = name==='caller'&&value[name]?displayCaller(value[name]):value[name]; model.value=value.model; status.value=value.status; range.value=value.range; search.placeholder = page === 'plugin' ? '搜索账号、模型或请求 ID' : '搜索请求或会话'; fields.caller.input.parentNode.hidden = page === 'plugin'; fields.project.input.parentNode.hidden = page === 'plugin'; fields.account.input.parentNode.hidden=page==='analysis'; searchBox.hidden=page==='analysis'; more.hidden=page==='analysis'; if(page==='analysis')filters.insertBefore(model,range);else moreBody.insertBefore(model,status); }
     function changeFilter(name, value, delayed = false) { if (!filtersByPage[page]) return; clearTimeout(timer); listController?.abort(); detailController?.abort(); gate.begin('detail'); detailPending=null; Object.assign(readFilters(), {[name]:value, ...name==='search'?{session:''}:{}, page:1}); gate.begin('list'); listPending = null; selected=null; detail=null; detailError=''; if (delayed) timer=setTimeout(() => refresh(true),250); else void refresh(true); }
     function resetFilters() { Object.assign(readFilters(), {search:'',project:'',caller:'',account:'',model:'',status:'',session:'',range:'today',page:1}); updateFilterControls(); selected=null; detail=null; void refresh(true); }
@@ -244,7 +289,8 @@
       for (const value of payload.facets?.accounts || []) if (typeof value === 'string') knownFacets.accounts.set(value, account(value));
       for (const value of payload.facets?.models || []) if (typeof value === 'string') knownFacets.models.set(value, value);
       for (const record of payload.records || []) { if (record.project) knownFacets.projects.set(record.project, record.project_name || record.project); if (record.caller) knownFacets.callers.set(record.caller, displayCaller(record.caller)); if (record.account_id) knownFacets.accounts.set(record.account_id, account(record.account_id)); if (record.model) knownFacets.models.set(record.model, record.model); }
-      for (const [name,field] of Object.entries(fields)) { const items=[...knownFacets[name === 'project' ? 'projects' : name === 'caller' ? 'callers' : 'accounts']].slice(0,512); replace(field.list,items.map(([id,label])=>{const option=el('option','',label);option.value=id;return key(option,id)})); }
+      for (const [name,field] of Object.entries(fields)) { if (name === 'caller') continue; const items=[...knownFacets[name === 'project' ? 'projects' : 'accounts']].slice(0,512); replace(field.list,items.map(([id,label])=>{const option=el('option','',label);option.value=id;return key(option,id)})); }
+      renderCallerChoices();
     }
     function renderSummary() {
       const stats = data?.summary, labels = page === 'plugin' ? [['requests','已观测调用'],['attempts','调用尝试'],['unknown','未确认结果']] : [['requests','用户请求'],['attempts','上游尝试'],['recovered','换号恢复'],['unknown','结果未知']];
@@ -273,25 +319,27 @@
         row.append(textCell(account(record.account_id),record.model||'')); row.append(textCell(triggerName(record.trigger)));
       } else {
         row.append(textCell(projectLabel(record),record.session?(record.parent_session?'子会话 ':'会话 ')+clippedID(record.session):'会话未知'));
-        const user = textCell(displayCaller(record.caller), maskedCallerKey(record.caller));
+        const label = displayCaller(record.caller), masked = maskedCallerKey(record.caller);
+        const user = textCell(label, masked !== label ? masked : '');
         user.append(el('small', 'rr-secondary', record.model || '模型未记录')); row.append(user);
-        row.append(textCell(account(record.account_id)));
+        row.append(textCell(record.status==='running'&&!record.account_id?'等待分配':account(record.account_id)));
         row.append(textCell(reasonName(record.reason),record.reason==='host_selected'?'原因未提供':'',record.reason==='failover'?'rr-warning':''));
       }
-      const result=el('td');result.append(badge(record));const extra=page==='plugin'?(record.http_status?'HTTP '+record.http_status:record.attempted===false?'未确认进入上游调用':''):count(record.attempt_count)!==null?record.attempt_count+' 次尝试':'';if(extra)result.append(el('small','rr-secondary',extra));row.append(result);return row;
+      const result=el('td');result.append(badge(record));const extra=page==='plugin'?(record.http_status?'HTTP '+record.http_status:record.attempted===false?'未确认进入上游调用':''):record.status==='running'&&record.attempt_count===0?(record.account_id?'等待执行结果':'等待分配账号'):count(record.attempt_count)!==null?record.attempt_count+' 次尝试':'';if(extra)result.append(el('small','rr-secondary',extra));row.append(result);return row;
     }
     function renderList() {
-      const plugin=page==='plugin', titles=plugin?['时间','调用','账号 / 模型','触发原因','结果']:['时间','项目 / 会话','调用方 / 模型','执行账号','分流原因','结果']; const header=el('tr');for(const title of titles)header.append(el('th','',title)); replace(head,[header]);
+      const plugin=page==='plugin', titles=plugin?['时间','调用','账号 / 模型','触发原因','结果']:['时间','项目 / 会话','API Key / 模型','执行账号','分流原因','结果']; const header=el('tr');for(const title of titles)header.append(el('th','',title)); replace(head,[header]);
       const records=data?.records||[]; if(records.length)replace(body,records.map(rowFor));else {const row=el('tr'),cell=el('td');cell.colSpan=titles.length;cell.append(empty(!connected?'等待连接 CPA':loading?'正在读取记录':'暂无运行记录',!connected?'连接后显示后台已采集的真实请求。':error?'读取恢复后可再次查看。':'当前筛选范围内没有已保留的记录。'));row.append(cell);replace(body,[row]);}
       const total=count(data?.total),current=count(data?.page)||readFilters().page,limit=count(data?.limit)||7,totalPages=total===null?1:Math.max(1,Math.ceil(total/limit)); const caption=el('span','',total===null?'尚未读取记录':total?'显示 '+((current-1)*limit+1)+'–'+Math.min(current*limit,total)+'，共 '+total+(plugin?' 次调用':' 个用户请求'):'共 0 条记录');
       const pages=el('div','rr-pages');for(const [label,target] of [['‹',current-1],...([...new Set([1,current-1,current,current+1,totalPages])].filter(n=>n>0&&n<=totalPages).sort((a,b)=>a-b).map(n=>[String(n),n])),['›',current+1]]) {const b=button(label,()=>{readFilters().page=target;selected=null;detail=null;void refresh(true)},'rr-page');b.disabled=!connected||target<1||target>totalPages;b.setAttribute('aria-label',label==='‹'?'上一页':label==='›'?'下一页':'第 '+label+' 页');if(target===current&&/^\d/.test(label))b.setAttribute('aria-current','page');pages.append(key(b,label+':'+target));} replace(pagination,[caption,pages]);
       listHelp.textContent=plugin?'展示已保留的插件操作汇总；同一操作可能包含多次调用，不代表完整网络日志。':'按请求分组，展开详情查看每次上游尝试；缺失原因不作推测。';
     }
     function addMetadata(record, plugin) {
-      const metadata=el('dl','rr-metadata'); const entries=plugin?[['账号',account(record.account_id)],['模型',record.model||'—'],['触发原因',triggerName(record.trigger)],['创建时间',date(record.created_at,true)],['当前阶段',record.stage||'未记录'],['任务 ID',clippedID(record.task_id)]]:[['项目',projectLabel(record)],['模型',record.model||'未记录'],['调用方',record.caller?displayCaller(record.caller):'未知'],['最终账号',account(record.account_id)],['会话',clippedID(record.session)],['总耗时',duration(record.latency_ms)]];for(const [label,value]of entries)metadata.append(pair(label,value));
+      const metadata=el('dl','rr-metadata'); const entries=plugin?[['账号',account(record.account_id)],['模型',record.model||'—'],['触发原因',triggerName(record.trigger)],['创建时间',date(record.created_at,true)],['当前阶段',record.stage||'未记录'],['任务 ID',clippedID(record.task_id)]]:[['项目',projectLabel(record)],['模型',record.model||'未记录'],[record.status==='running'?'当前账号':'最终账号',record.status==='running'&&!record.account_id?'等待分配':account(record.account_id)],['会话',clippedID(record.session)],['总耗时',duration(record.latency_ms)]];for(const [label,value]of entries)metadata.append(pair(label,value));
       if (!plugin) {
-        const masked = maskedCallerKey(record.caller), row = pair('API Key', masked || '无法匹配当前 CPA Key');
+        const label = displayCaller(record.caller), masked = maskedCallerKey(record.caller), row = pair('API Key', label);
         row.classList.add('rr-key-metadata');
+        if (masked && masked !== label) row.lastChild.append(el('code', 'rr-key-mask', masked));
         if (masked && typeof options.onRenameCaller === 'function') {
           const edit = button('修改名称', function () { options.onRenameCaller(record.caller, this); }, 'rr-button rr-rename-caller');
           edit.disabled = !connected; row.lastChild.append(edit);
@@ -302,16 +350,22 @@
     }
     function renderAttempts(record) {
       if(!Array.isArray(record.attempts))return [el('p','rr-note','尚未记录到逐次上游尝试。')];
+      if(!record.attempts.length&&record.status==='running')return [el('p','rr-note',record.account_id?'已选定账号，尚无执行结果。':'正在等待分配账号。')];
       if(!record.attempts.length)return [el('p','rr-note',recordStatus(record).label==='未发起'?'此请求未建立上游调用尝试。':'尚未收到可关联的上游尝试事件。')];
       return record.attempts.map((attempt,index)=>{const card=key(el('div','rr-attempt'),attempt.id||attempt.selection_id||'attempt:'+index),line=el('div','rr-attempt-heading');line.append(el('strong','',(attempt.executed===false?'选号记录':'尝试 '+(index+1))+' · '+account(attempt.account_id)),el('span','rr-chip',reasonName(attempt.reason)),attempt.executed===false?el('span','rr-badge','尚未确认执行'):badge(attempt));if(attempt.http_status)line.append(el('span','rr-http','HTTP '+attempt.http_status));line.append(el('span','rr-attempt-duration',duration(attempt.latency_ms)));card.append(line);if(attempt.evidence?.explanation)card.append(el('p','rr-note',attempt.evidence.explanation));return card;});
     }
     function renderEvidence(record) {
-      const attempts=record.attempts||[],attempt=attempts[attempts.length-1],evidence=attempt?.evidence||record.evidence||{},nodes=[];
+      const attempts=record.attempts||[];
+      const attempt=record.status==='running'&&record.selection_id?attempts.find(item=>item.selection_id===record.selection_id):attempts.at(-1);
+      const evidence=attempt?.evidence||record.evidence||{},nodes=[];
+      for (const explanation of new Set([record.evidence?.explanation, evidence.explanation].map(value => safeText(value).trim()).filter(Boolean))) nodes.push(el('p', 'rr-note', explanation));
       const candidates=Array.isArray(evidence.candidates)?evidence.candidates:[];
       for(const candidate of candidates.slice(0,32)){const line=el('div','rr-evidence-row');line.append(el('strong','',account(candidate.account_id||candidate.id)),el('span','',safeText(candidate.reason_text)||reasonName(candidate.reason)));nodes.push(line);}
       const labels={source:'记录来源',delivery:'调用证据',account_bound:'账号绑定一致',quota_checked:'额度已核实',activity_check_passed:'活动检查通过',capacity_missing:'当时容量缺口',recorded_at:'授权记录时间',execution:'执行方式',candidate_count:'候选账号数',snapshot_fresh:'调度快照新鲜',priority:'宿主优先级',project_preferred:'项目首选',inflight:'当时占用',max_inflight:'并发上限',quota_fresh:'额度证据新鲜',binding_match:'账号绑定一致',policy_revision:'规则版本',model_revision:'模型配置版本',capacity:'当时可用窗口',target:'目标窗口'};
       const values=el('dl','rr-evidence-fields');for(const [name,label]of Object.entries(labels))if(own(evidence,name)&&['string','number','boolean'].includes(typeof evidence[name])) values.append(pair(label,evidenceValue(name,evidence[name])));if(values.children.length)nodes.push(values);
-      if(!nodes.length)nodes.push(el('p','rr-note','未记录更详细的候选依据；不使用当前额度重建历史决策。'));return nodes;
+      if(!nodes.length)nodes.push(el('p','rr-note','没有更详细的分配记录。'));
+      if (record.http_status === 429 || attempts.some(item => item.http_status === 429)) nodes.push(el('p', 'rr-note', 'HTTP 429 表示请求受限，不能单凭此确认额度耗尽。'));
+      return nodes;
     }
     function usage(record) { const nodes=[];for(const [name,label]of [['input_tokens','输入'],['output_tokens','输出'],['cached_tokens','缓存读取']]){const item=el('span','rr-usage-item');item.append(el('span','',label),el('strong','',formatNumber(record[name])));nodes.push(item);}return nodes; }
     function renderPluginDetail(record) {
@@ -330,9 +384,19 @@ nodes.push(section('为什么发送',[reason,el('p','rr-note',snapshot.recorded_
       if(recordStatus(record).label==='结果未知'){const warning=el('div','rr-safety');warning.append(icon('info'),el('div','','执行结果未知；只读核实原记录，请勿据此重复发送。'));content.append(warning);}
       content.append(addMetadata(record,plugin));
       if(detailError)content.append(el('p','rr-inline-error',detailError));
-      if(plugin)content.append(...renderPluginDetail(record));else {content.append(section('为什么分到这个账号',[el('p','rr-reason-copy',reasonExplanation(record)),el('p','rr-note','依据为执行当时记录；HTTP 429 不直接判定为额度耗尽。')]));content.append(section('上游尝试'+(count(record.attempt_count)!==null?' '+record.attempt_count:''),renderAttempts(record)));content.append(section('查看候选账号依据',renderEvidence(record),true));const usageRow=el('div','rr-usage');usageRow.append(...usage(record));const usageSection=section('已报告用量',[usageRow,el('p','rr-note','未报告的用量显示“—”，不推算费用。')],true);usageSection.classList.add('rr-usage-section');content.append(usageSection);}
+      if (plugin) content.append(...renderPluginDetail(record));
+      else {
+        const reason = section('为什么分到这个账号', [el('p', 'rr-reason-copy', reasonExplanation(record))]);
+        reason.classList.add('rr-routing-reason'); content.append(reason);
+        content.append(section('上游尝试' + (count(record.attempt_count) !== null ? ' ' + record.attempt_count : ''), renderAttempts(record)));
+        const evidence = section('查看分配详情', renderEvidence(record), false);
+        evidence.classList.add('rr-routing-evidence'); content.append(evidence);
+        const usageRow = el('div', 'rr-usage'); usageRow.append(...usage(record));
+        const usageSection = section('已报告用量', [usageRow, el('p', 'rr-note', '未报告的用量显示“—”，不推算费用。')], true);
+        usageSection.classList.add('rr-usage-section'); content.append(usageSection);
+      }
       const actions=el('div','rr-detail-actions'),copy=button('复制请求 ID',()=>copyID(record.request_id||record.id),'rr-button');copy.prepend(icon('copy'));copy.disabled=!record.id;actions.append(copy);
-      if(plugin&&record.task_id){const task=button('查看关联任务',()=>options.onTask?.(record.task_id,record.kind),'rr-button rr-primary-button');task.disabled=typeof options.onTask!=='function';actions.append(task);}else{const same=button('查看同会话请求',()=>{const filter=sameSessionFilter(record,filtersByPage.users);if(filter){Object.assign(filtersByPage.users,filter);options.onNavigate?.('users');show('users');updateFilterControls();void refresh(true)}},'rr-button rr-primary-button');same.disabled=!sameSessionFilter(record);if(same.disabled)same.title='缺少可核实的会话或调用方标识';actions.append(same);}
+      if(plugin&&record.task_id){const task=button('查看关联任务',()=>options.onTask?.(record.task_id,record.kind),'rr-button rr-primary-button');task.disabled=typeof options.onTask!=='function';actions.append(task);}else{const same=button('查看同会话请求',()=>{const filter=sameSessionFilter(record,filtersByPage.users);if(filter){Object.assign(filtersByPage.users,filter);options.onNavigate?.('users');show('users');updateFilterControls();void refresh(true)}},'rr-button rr-primary-button');same.disabled=!sameSessionFilter(record);if(same.disabled)same.title='缺少可核实的会话或 API Key 标识';actions.append(same);}
       const fallback=el('div','rr-copy-fallback');fallback.hidden=!copyFallbackValue;const input=el('input');input.value=copyFallbackValue;input.readOnly=true;input.setAttribute('aria-label','手动复制请求 ID');fallback.append(el('label','','复制请求 ID'),input);content.append(actions,fallback);replace(detailPanel,[content]);
     }
     async function copyID(id) { if(!id||!selected)return;const selectedID=selected.id,epoch=gate.epoch;try { if(window.isSecureContext&&window.navigator?.clipboard?.writeText){await window.navigator.clipboard.writeText(id);if(epoch===gate.epoch&&selected?.id===selectedID)options.onNotice?.('已复制请求 ID');return;} }catch{}if(epoch!==gate.epoch||selected?.id!==selectedID)return;const fallback=detailPanel.querySelector('.rr-copy-fallback'),input=fallback?.querySelector('input');if(fallback&&input){copyFallbackValue=id;fallback.hidden=false;input.value=id;input.focus();input.select();} }
@@ -343,10 +407,10 @@ nodes.push(section('为什么发送',[reason,el('p','rr-note',snapshot.recorded_
       if(items.length)for(const item of items){const value=number(analysisMetric==='attempts'?item.attempts:reportedTokenTotal(item)),denominator=analysisMetric==='attempts'?(number(data?.summary?.attempts)??total):data?.aggregation_limited?0:total,share=value!==null&&denominator>0?Math.round(value/denominator*100)+'%':'';accountCard.append(barRow(account(item.account_id),value,analysisMetric==='attempts'?(number(data?.summary?.attempts)??maximum):maximum,()=>drill({account:item.account_id}),'',share,analysisMetric==='attempts'?' 次':''));}else accountCard.append(empty('暂无账号分配记录','当前筛选范围内没有已观测的上游尝试。'));
       accountCard.append(el('p','rr-note',analysisMetric==='attempts'?'当前筛选范围内，'+items.length+' 个账号有执行记录。':'仅累计已报告的输入与输出 Token；缓存读取不重复相加。已报告用量 '+items.reduce((sum,item)=>sum+(count(item.reported_usage_attempts)||0),0)+' / '+formatNumber(data?.summary?.attempts)+' 次尝试。'),el('p','rr-explanation','会话粘性、项目偏好和可用账号会影响分配占比，占比高不一定是异常。'));grid.append(accountCard);
       const reasonCard=el('section','rr-analysis-card'),reasonHeading=el('div','rr-card-heading');reasonHeading.append(el('h2','','分流原因'),el('span','rr-note','每次上游尝试记录一个主因'));reasonCard.append(reasonHeading);const reasonColumns=el('div','rr-chart-columns rr-reason-columns');reasonColumns.append(el('span','','原因'),el('span','',''),el('span','','次数'));reasonCard.append(reasonColumns);const reasons=data?.reasons||[],reasonMax=Math.max(0,...reasons.map(item=>number(item.attempts)??0));if(reasons.length)for(const item of reasons)reasonCard.append(barRow(item.reason==='host_selected'?'宿主未提供原因':reasonName(item.reason),item.attempts,reasonMax,()=>drill({search:item.reason}),item.reason==='failover'?'warning':!own(reasonNames,item.reason)||['unknown','host_selected'].includes(item.reason)?'unknown':''));else reasonCard.append(empty('暂无原因记录','未记录的原因不会依据当前状态补造。'));reasonCard.append(el('p','rr-note','次要因素在请求详情中查看。'));grid.append(reasonCard);content.push(grid);
-      const matrix=el('section','rr-analysis-card rr-matrix'),heading=el('div','rr-card-heading');heading.append(el('h2','',(matrixGroup==='project'?'项目':matrixGroup==='caller'?'调用方':'会话')+' → 账号'),el('span','rr-note','实际分流矩阵 · 点击单元格查看对应请求'));const grouping=el('div','rr-segment');for(const [value,label]of [['project','项目'],['caller','调用方'],['session','会话']]){const b=button(label,()=>{matrixGroup=value;renderAnalysis()},'rr-segment-button');b.setAttribute('aria-pressed',String(matrixGroup===value));b.disabled=value!=='project'&&!Array.isArray(value==='caller'?data?.callers:data?.sessions);if(b.disabled)b.title='当前后台未提供此维度聚合';grouping.append(b);}heading.append(grouping);matrix.append(heading);const matrixData=matrixView(data,matrixGroup);if(matrixData.rows.length&&matrixData.accounts.length){const scroll=el('div','rr-table-scroll'),table=el('table','rr-matrix-table'),thead=el('thead'),tr=el('tr');for(const title of [matrixGroup==='project'?'项目':matrixGroup==='caller'?'调用方':'会话','用户请求','上游尝试',...matrixData.accounts.map(account),'换号恢复'])tr.append(el('th','',title));thead.append(tr);table.append(thead);const tbody=el('tbody');for(const item of matrixData.rows){const row=el('tr'),label=matrixGroup==='project'?projectLabel(item):matrixGroup==='caller'?displayCaller(item.caller):clippedID(item.session);row.append(el('th','',label),el('td','',formatNumber(item.requests)),el('td','',formatNumber(item.attempts)));for(const id of matrixData.accounts){const cell=el('td'),value=item.accounts&&typeof item.accounts==='object'&&!own(item.accounts,id)?data?.aggregation_limited?null:0:count(item.accounts?.[id]),filter=matrixDrillFilter(matrixGroup,item,id),b=button(formatNumber(value),()=>{if(filter)drill(filter)},'rr-matrix-value');b.disabled=!filter;if(!filter)b.title='此维度未记录标识，无法精确筛选对应请求';if(value!==null&&matrixData.max>0)cell.style.setProperty('--rr-cell-opacity',String(.04+.3*value/matrixData.max));cell.append(b);row.append(cell);}row.append(el('td','',formatNumber(item.recovered)));tbody.append(row);}const totalRow=el('tr','rr-matrix-total');totalRow.append(el('th','',data?.aggregation_limited?'展示小计':'合计'));for(const name of ['requests','attempts'])totalRow.append(el('td','',formatNumber(matrixData.rows.every(item=>count(item[name])!==null)?matrixData.rows.reduce((sum,item)=>sum+item[name],0):null)));for(const id of matrixData.accounts)totalRow.append(el('td','',formatNumber(data?.aggregation_limited&&matrixData.rows.some(item=>!own(item.accounts,id))?null:matrixData.rows.reduce((sum,item)=>sum+(count(item.accounts?.[id])??0),0))));totalRow.append(el('td','',formatNumber(matrixData.rows.every(item=>count(item.recovered)!==null)?matrixData.rows.reduce((sum,item)=>sum+item.recovered,0):null)));tbody.append(totalRow);table.append(tbody);scroll.append(table);matrix.append(scroll);}else matrix.append(empty('暂无分流矩阵','有已观测请求后显示项目与执行账号的对应关系。'));
+      const matrix=el('section','rr-analysis-card rr-matrix'),heading=el('div','rr-card-heading');heading.append(el('h2','',(matrixGroup==='project'?'项目':matrixGroup==='caller'?'API Key':'会话')+' → 账号'),el('span','rr-note','实际分流矩阵 · 点击单元格查看对应请求'));const grouping=el('div','rr-segment');for(const [value,label]of [['project','项目'],['caller','API Key'],['session','会话']]){const b=button(label,()=>{matrixGroup=value;renderAnalysis()},'rr-segment-button');b.setAttribute('aria-pressed',String(matrixGroup===value));b.disabled=value!=='project'&&!Array.isArray(value==='caller'?data?.callers:data?.sessions);if(b.disabled)b.title='当前后台未提供此维度聚合';grouping.append(b);}heading.append(grouping);matrix.append(heading);const matrixData=matrixView(data,matrixGroup);if(matrixData.rows.length&&matrixData.accounts.length){const scroll=el('div','rr-table-scroll'),table=el('table','rr-matrix-table'),thead=el('thead'),tr=el('tr');for(const title of [matrixGroup==='project'?'项目':matrixGroup==='caller'?'API Key':'会话','用户请求','上游尝试',...matrixData.accounts.map(account),'换号恢复'])tr.append(el('th','',title));thead.append(tr);table.append(thead);const tbody=el('tbody');for(const item of matrixData.rows){const row=el('tr'),label=matrixGroup==='project'?projectLabel(item):matrixGroup==='caller'?displayCaller(item.caller):clippedID(item.session);row.append(el('th','',label),el('td','',formatNumber(item.requests)),el('td','',formatNumber(item.attempts)));for(const id of matrixData.accounts){const cell=el('td'),value=item.accounts&&typeof item.accounts==='object'&&!own(item.accounts,id)?data?.aggregation_limited?null:0:count(item.accounts?.[id]),filter=matrixDrillFilter(matrixGroup,item,id),b=button(formatNumber(value),()=>{if(filter)drill(filter)},'rr-matrix-value');b.disabled=!filter;if(!filter)b.title='此维度未记录标识，无法精确筛选对应请求';if(value!==null&&matrixData.max>0)cell.style.setProperty('--rr-cell-opacity',String(.04+.3*value/matrixData.max));cell.append(b);row.append(cell);}row.append(el('td','',formatNumber(item.recovered)));tbody.append(row);}const totalRow=el('tr','rr-matrix-total');totalRow.append(el('th','',data?.aggregation_limited?'展示小计':'合计'));for(const name of ['requests','attempts'])totalRow.append(el('td','',formatNumber(matrixData.rows.every(item=>count(item[name])!==null)?matrixData.rows.reduce((sum,item)=>sum+item[name],0):null)));for(const id of matrixData.accounts)totalRow.append(el('td','',formatNumber(data?.aggregation_limited&&matrixData.rows.some(item=>!own(item.accounts,id))?null:matrixData.rows.reduce((sum,item)=>sum+(count(item.accounts?.[id])??0),0))));totalRow.append(el('td','',formatNumber(matrixData.rows.every(item=>count(item.recovered)!==null)?matrixData.rows.reduce((sum,item)=>sum+item.recovered,0):null)));tbody.append(totalRow);table.append(tbody);scroll.append(table);matrix.append(scroll);}else matrix.append(empty('暂无分流矩阵','有已观测请求后显示项目与执行账号的对应关系。'));
       matrix.append(el('p','rr-methodology','用户请求与上游尝试分别统计；尝试包含重试，未发起的请求不计入尝试。已知结果与未知结果分别保留，不将未知计作失败。'));content.push(matrix);replace(analysis,content);
     }
-    function render() {root.hidden=page==='tasks';workspace.hidden=page==='analysis';analysis.hidden=page!=='analysis';renderSummary();renderFeedback();if(page==='analysis')renderAnalysis();else if(page!=='tasks'){renderList();renderDetail();}notify();}
+    function render() {renderCallerChoices();root.hidden=page==='tasks';workspace.hidden=page==='analysis';analysis.hidden=page!=='analysis';renderSummary();renderFeedback();if(page==='analysis')renderAnalysis();else if(page!=='tasks'){renderList();renderDetail();}notify();}
     async function select(record,opener) {selectedOpener=opener;copyFallbackValue='';selected=record;selectedRevision=data?.view_revision??-1;detail=null;detailRevision=-1;detailError='';render();void loadDetail();if(window.matchMedia?.('(max-width: 1100px)').matches){const heading=detailPanel.querySelector('h2');heading?.scrollIntoView?.({block:'start'});heading?.focus?.({preventScroll:true});} }
     function errorMessage(failure,detailFailure=false) {if(failure?.status===404)return '当前接入层尚未提供运行记录接口，请更新并重启 CPA 接入层。';if(failure?.status===401||failure?.status===403||failure?.code==='unauthorized')return '认证已失效，请重新连接。';if(failure?.message==='invalid_traffic_response')return '运行记录响应无法核实，请重新读取。';return detailFailure?'详情读取失败，保留最后已读取的记录。':'运行记录读取失败，保留最后已读取的数据。';}
     async function refresh(explicit=false) {
@@ -357,11 +421,12 @@ nodes.push(section('为什么发送',[reason,el('p','rr-note',snapshot.recorded_
       if(!connected||!selected||page==='tasks'||page==='analysis')return;const id=selected.id,currentPage=page,pendingKey=currentPage+':'+id;if(detailPending===pendingKey)return;const ticket=gate.begin('detail');detailPending=pendingKey;detailController?.abort();detailController=new AbortController();
       try{const payload=await options.request(trafficQuery(page,{},id),{signal:detailController.signal});const record=validateEnvelope(payload,currentPage,true);if(disposed||!connected||page!==currentPage||selected?.id!==id||record.id!==id||!gate.accept(ticket,payload))return;detail=record;detailRevision=payload.view_revision;detailError='';renderDetail();}catch(failure){if(ticket.epoch===gate.epoch&&selected?.id===id&&page===currentPage){detailError=errorMessage(failure,true);renderDetail();}}finally{if(detailPending===pendingKey)detailPending=null;}
     }
-    function show(next) {if(!['users','plugin','analysis','tasks'].includes(next))next='users';if(page!==next){copyFallbackValue='';listController?.abort();detailController?.abort();gate.reset(gate.instance);data=null;selected=null;detail=null;detailRevision=-1;selectedRevision=-1;error='';detailError='';loading=false;listPending=null;detailPending=null;clearTimeout(timer);}page=next;root.dataset.recordPage=page;updateFilterControls();render();if(connected&&page!=='tasks')void refresh();}
-    function disconnect() {copyFallbackValue='';connected=false;listController?.abort();detailController?.abort();gate.reset(gate.instance);clearTimeout(timer);listPending=null;detailPending=null;loading=false;render();}
-    function setContext(value={}) {if(typeof value.callerKeyInfo==='function')callerInfo=value.callerKeyInfo;if(typeof value.displayCaller==='function'){callerDisplay=value.displayCaller;if(data)rememberFacets(data);if(document.activeElement!==fields.caller.input)fields.caller.input.value=readFilters().caller?displayCaller(readFilters().caller):'';}if(typeof value.displayAccount==='function')accountDisplay=value.displayAccount;const instance=typeof value.instanceId==='string'&&value.instanceId?value.instanceId:gate.instance;if(instance!==gate.instance){copyFallbackValue='';listController?.abort();detailController?.abort();gate.reset(instance);data=null;selected=null;detail=null;detailError='';listPending=null;detailPending=null;knownFacets={projects:new Map(),callers:new Map(),accounts:new Map(),models:new Map()};}const prior=connected;if(typeof value.connected==='boolean')connected=value.connected;if(!connected&&prior)disconnect();else{render();if(connected&&!prior&&page!=='tasks')void refresh();}}
+    function show(next,reset=false) {closeCallerChoices();if(!['users','plugin','analysis','tasks'].includes(next))next='users';if(page!==next||reset){copyFallbackValue='';listController?.abort();detailController?.abort();gate.reset(gate.instance);data=null;selected=null;detail=null;detailRevision=-1;selectedRevision=-1;error='';detailError='';loading=false;listPending=null;detailPending=null;clearTimeout(timer);}page=next;root.dataset.recordPage=page;updateFilterControls();render();if(connected&&page!=='tasks')void refresh();}
+    function showCaller(id) {if(!connected||!safeText(id).trim())return false;Object.assign(filtersByPage.users,{search:'',project:'',caller:id,account:'',model:'',status:'',session:'',range:'all',page:1});options.onNavigate?.('users');show('users',true);return true;}
+    function disconnect() {closeCallerChoices();copyFallbackValue='';connected=false;listController?.abort();detailController?.abort();gate.reset(gate.instance);clearTimeout(timer);listPending=null;detailPending=null;loading=false;render();}
+    function setContext(value={}) {if(typeof value.callerIDs==='function')callerIDs=value.callerIDs;if(typeof value.callerKeyInfo==='function')callerInfo=value.callerKeyInfo;if(typeof value.displayCaller==='function'){callerDisplay=value.displayCaller;if(data)rememberFacets(data);if(!callerOpen)fields.caller.input.value=readFilters().caller?displayCaller(readFilters().caller):'';}if(typeof value.displayAccount==='function')accountDisplay=value.displayAccount;const instance=typeof value.instanceId==='string'&&value.instanceId?value.instanceId:gate.instance;if(instance!==gate.instance){copyFallbackValue='';listController?.abort();detailController?.abort();gate.reset(instance);data=null;selected=null;detail=null;detailError='';listPending=null;detailPending=null;knownFacets={projects:new Map(),callers:new Map(),accounts:new Map(),models:new Map()};}const prior=connected;if(typeof value.connected==='boolean')connected=value.connected;if(!connected&&prior)disconnect();else{render();if(connected&&!prior&&page!=='tasks')void refresh();}}
     function destroy(){disposed=true;connected=false;listController?.abort();detailController?.abort();gate.reset();clearTimeout(timer);for(const remove of listeners)remove();root.replaceChildren();root.classList.remove('runtime-records');}
-    updateFilterControls();render();return {show,refresh,disconnect,setContext,destroy};
+    updateFilterControls();render();return {show,showCaller,refresh,disconnect,setContext,destroy};
   }
 
   const exported={mount,callerLabel,projectLabel,reportedTokenTotal,recordStatus,pluginStatus,reasonName,reasonExplanation,triggerName,kindName,formatNumber,duration,localRange,trafficQuery,validateEnvelope,VersionGate,mergeRecord,matrixView,sameSessionFilter,matrixDrillFilter};
