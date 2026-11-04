@@ -12,12 +12,12 @@ rc.26 起支持客户端自动目录标识，无需维护 `projects.json`。rc.2
 curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh
 ```
 
-默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，自动为 Codeman 的 Codex 模式配置客户端启动入口。**重启 Codeman 服务后**，新建或恢复的 Codex 会话自动按工作目录携带项目标识，模型、推理强度、动画及恢复会话参数继续由 Codeman 传入。
+默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，自动为 Codeman 的 Codex 模式配置客户端启动入口。**首次配置后重启 Codeman 服务**，新建或恢复的 Codex 会话会沿用客户端模式；符合项目头添加条件时按工作目录携带项目标识，模型、推理强度、动画及恢复会话参数继续由 Codeman 传入。
 
 Codeman 使用默认用户服务 `codeman-web.service` 时，一条命令安装本版客户端、配置入口并重启 Codeman：
 
 ```sh
-curl -fSL --retry 3 https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/v0.2.0-rc.33/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh --codeman-dir "$HOME/.codeman" && systemctl --user restart codeman-web.service
+curl -fSL --retry 3 https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/v0.2.0-rc.38/scripts/install-client.sh -o /tmp/cwr-client-install.sh && bash /tmp/cwr-client-install.sh --codeman-dir "$HOME/.codeman" && systemctl --user restart codeman-web.service
 ```
 
 使用其他启动方式时，仅运行安装器，再通过原来的管理方式重启 Codeman。
@@ -26,7 +26,7 @@ Codeman 入口使用其 CLI 注册表 `~/.codeman/clis.json`，通过已安装�
 
 仍提供 `cwr-codex` 命令及兼容原路径的 `cwr-codex.py`，终端可直接使用；未加入 PATH 时可运行 `~/.local/bin/cwr-codex`。自定义安装目录使用 `--bin-dir /absolute/path`；Codeman 入口记录客户端绝对路径，不要求安装目录已在 Codeman 的 PATH 中。`--codeman-dir /path/to/.codeman` 可指定包含 `app` 的 Codeman 数据目录，`--no-codeman` 仅安装客户端。已有客户端也可执行 `cwr-codex --setup-codeman /path/to/.codeman` 单独配置。配置 Codeman 入口另需 Node.js 及支持 CLI 注册表的 Codeman；普通客户端仍只需 Python。重新下载并运行同一安装命令即可更新，下载或校验失败不会覆盖旧脚本。已有 Codex 配置和目录映射保留。离线安装可在完整解压的发行包中运行 `bash install-client.sh`，无需 curl。
 
-1. 在 Codeman 中选择项目目录，以 Codex 模式启动会话，再发送一次正常请求；终端也可进入项目目录执行 `cwr-codex`。新版脚本不读取 Codex 配置，默认使用已记住的提供商 ID，没有记忆时使用 `cliproxyapi`。若 Codex 报该提供商定义缺失或名称为空，则在会话终端按提示输入实际 ID，保存到客户端设置后自动重试；下次无需再填。
+1. 已发布 rc.27–rc.37 客户端使用已记住的提供商 ID 或默认 `cliproxyapi`，缺失时报错并交互修复。rc.38 客户端须先按[自动检测说明](#官方登录与-cpa-切换)登记 CPA 完整地址并选择 `auto`。在 Codeman 中选择项目目录，以 Codex 模式启动会话，再发送一次正常请求；终端也可进入项目目录执行 `cwr-codex`。
 2. 在面板“账号调度与重置卡”找到“客户端最近出现的项目”。客户端上报目录名和 `dir-` 开头的稳定标识；点击“匹配账号”，可填写便于辨认的项目名称，再从 CPA 账号清单选择首选账号。
 3. 开启业务账号调度并“保存并应用全部设置”。账号偏好保存在服务端，后续新会话按该项目选择账号，客户端无需重新下载文件。已有会话绑定继续沿用原账号。
 
@@ -63,11 +63,11 @@ project-b = account-3
 python3 scripts/cwr-codex.py --project project-a --directory /work/project-a
 ```
 
-通过脚本或已配置的 Codeman Codex 入口启动时，启动器为本次 Codex 进程传入 `X-CWR-Project` 请求头设置；终端直接运行原始 `codex` 时，不额外添加项目头。启动器不读取或检测 Codex 配置及 profile，普通客户端使用 Python 3.10+ 即可，无需安装 `tomli`。
+rc.38 客户端通过脚本或已配置的 Codeman Codex 入口启动时，只有生效配置匹配已登记 CPA 完整地址，才为本次 Codex 进程传入 `X-CWR-Project` 请求头设置；终端直接运行原始 `codex` 时，不额外添加项目头。普通客户端使用 Python 3.10+ 即可，无需安装 `tomli`；配置检测由 Codex 原生 `config/read` 完成。
 
-新版默认使用 `cliproxyapi`，交互输入的 ID 保存到 `$XDG_CONFIG_HOME/cwr/client.json`（未指定 XDG_CONFIG_HOME 时为 `~/.config/cwr/client.json`）。脚本只捕获当前提供商对应的 `provider name must not be empty` 启动错误；回车、Ctrl+C 或输入结束可取消，HTTP、认证或其他错误照常退出。非交互运行时不等待输入，会提示通过 `--provider` 指定 ID。客户端安装或更新保留这个记忆文件。
+已发布 rc.27–rc.37 的客户端使用已记住的 ID 或默认 `cliproxyapi`，提供商缺失时报错并交互修复。rc.38 改为自动读取生效提供商，不再猜测 ID 或等待输入；旧 `client.json` 的提供商字段仍保留，仅在显式 CPA 模式下作为匹配约束。安装或更新保留设置及模式选择。
 
-`--provider` 可单次覆盖已记住的 ID，例如 `--provider my_proxy`；成功启动不会把单次覆盖写成默认值。启动器将头部设置写入 `model_providers.<ID>.http_headers.X-CWR-Project` 启动参数，不替换 `model_provider`，不修改 Codex 配置文件或服务器调度总开关。提供商 ID 及其 CPA 地址由用户配置，启动器不自动判断或切换。Codex 的 profile 和其他命令行参数照常透传。
+rc.38 的 `--provider my_proxy` 表示要求检测出的提供商 ID 与该值相同，不改变保存值。成功匹配后，启动器将项目头、检测出的提供商和完整地址一并写入本次启动参数，防止配置文件随后变化导致项目头被重定向；不改写 Codex 配置文件或服务器调度总开关。模型、推理强度和恢复参数继续透传。
 
 这些是[当前客户端启动器](../../scripts/cwr-codex.py)的用法，旧安装器需要更新后才会配置 Codeman 入口。rc.25 安装包仍包含提供商检测逻辑。当前脚本的显式 `--project` 和原有目录映射可配合旧后台使用，自动发现需要后台和接入层至少为 rc.26。rc.27 的提供商交互修复可单独更新客户端。启动器不保存密钥、不改写请求正文，请求头仅通过本次启动参数传入。
 
@@ -80,7 +80,56 @@ python3 scripts/cwr-codex.py --project project-a --directory /work/project-a
 ]}
 ```
 
-然后在 Codeman 中使用对应目录启动 Codex，或在终端执行 `python3 /path/to/cwr-codex.py`。新版会使用已记住的提供商 ID 或默认 `cliproxyapi`。手动 `--project` 优先，其次是现有目录映射的最长路径匹配，最后自动生成目录标识；默认映射文件不存在时直接使用自动标识，不创建文件。`--map` 可指定另一份映射，显式指定的文件不存在、内容损坏或映射重复时会报错。希望已有目录改用自动标识时，移除对应映射即可。使用 `cwr-codex` 时，Codex 参数放在 `--` 后，例如 `cwr-codex -- exec "检查测试结果"`。启动目录可用原生 `-C`/`--cd` 指定，也可使用启动器的 `--directory`；项目标识按最终目录计算。终端直接执行 `codex` 可普通启动。
+然后在 Codeman 中使用对应目录启动 Codex，或在终端执行 `python3 /path/to/cwr-codex.py`。在确认 CPA 目标后，手动 `--project` 优先，其次是现有目录映射的最长路径匹配，最后自动生成目录标识；默认映射文件不存在时直接使用自动标识，不创建文件。`--map` 可指定另一份映射，显式指定的文件不存在、内容损坏或映射重复时会报错。希望已有目录改用自动标识时，移除对应映射即可。使用 `cwr-codex` 时，Codex 参数放在 `--` 后，例如 `cwr-codex -- exec "检查测试结果"`。启动目录可用原生 `-C`/`--cd` 指定，也可使用启动器的 `--directory`；项目标识按最终目录计算。终端直接执行 `codex` 可普通启动。
+
+## 官方登录与 CPA 切换
+
+rc.38 客户端增加了自动检测和显式模式选择，适用于保留 Codeman 启动入口、暂时不经过 CPA 的情况。rc.37 及更早客户端没有这些参数，需先运行上面的客户端安装命令更新到 rc.38，再使用下列命令。安装会保留客户端设置；已经保存 `official` 或 `cpa` 的用户不会被自动改为 `auto`。
+
+推荐使用自动模式，并登记允许接收项目头的完整 CPA API 地址（下面是示例，应替换为实际配置值）：
+
+```sh
+cwr-codex --trust-cpa-url http://127.0.0.1:8317/v1
+cwr-codex --set-mode auto
+cwr-codex --status
+```
+
+`auto` 不改变登录方式或请求路由。未登记任何地址时直接运行 Codex，不进行额外检测或添加项目头；已登记地址时，通过本地 `codex app-server` 的 `config/read` 读取配置层及本次 `-c` 覆盖，最多等待四秒，不创建对话或发送模型请求。只有自定义提供商的完整地址匹配登记值才加头，内置提供商均不加头。协议、主机、端口、路径均参与匹配；标准端口、主机大小写和末尾斜杠会规范化。地址不能带凭据、查询参数、片段或 URL 编码；官方 `openai.com`、`chatgpt.com`、`chat.com` 及其子域不可登记。登记表示用户确认它是 CPA，不会根据提供商名称、未知域名或服务端响应猜测。
+
+当前 Codex app-server 不接受 CLI 的 `--profile`，因此遇到显式或默认 profile、本地模型、远程服务、提供商受组织策略控制、单独指定 `model_catalog_url`、配置读取失败或地址不匹配时，`auto` 保留原生启动参数且不新增项目头。显式 `cpa` 模式在上述情况明确报错并停止，避免误以为调度已开启。使用 profile 的用户若需要项目调度，应先使用不带 profile 的已登记 CPA 配置；不会通过手动解析 TOML 猜测 profile 的生效结果。
+
+这项保护限制的是本客户端新增的项目头，不会移除用户自己在配置或参数中写入的请求头，也不控制已登记 CPA 的重定向及上游转发规则。切换为官方配置后，自动模式直接使用原生 Codex；如果希望即使原配置仍指向 CPA 也强制使用官方登录，可选择下面的 `official` 模式。
+
+```sh
+cwr-codex --set-mode official   # 保存官方模式，不启动 Codex
+cwr-codex --status              # 查看客户端模式、提供商约束及已登记地址
+cwr-codex -- login              # 如需登录，使用官方浏览器登录
+```
+
+远程或无浏览器环境可运行 `cwr-codex -- login --device-auth`。已有有效 ChatGPT 登录时可以直接从 Codeman 新建或重新启动 Codex 会话。Codeman 继续使用同一个 CWR 启动入口，模型、推理强度、动画设置和恢复参数保留。模式在每次启动时读取；已接入 CWR 的 Codeman 无需为切换模式重启服务，正在运行的 Codex 进程不会被改变。
+
+官方模式跳过目录映射及项目标识生成，不注入 `X-CWR-Project` 或创建 `model_providers.openai` 表；仅为子进程传入以下覆盖，原有 `config.toml`、profile 文件和 CPA 定义保留：
+
+```toml
+model_provider = "openai"
+forced_login_method = "chatgpt"
+openai_base_url = "https://chatgpt.com/backend-api/codex"
+chatgpt_base_url = "https://chatgpt.com/backend-api/"
+```
+
+这些值对应原生 Codex 的 ChatGPT 订阅登录及推理路径，参见[官方登录说明](https://learn.chatgpt.com/docs/auth)、[配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)及[官方推理转发路径](https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway#handle-credentials-at-the-gateway)。仅在官方子进程中移除 `OPENAI_BASE_URL`、`CHATGPT_BASE_URL`、`OPENAI_API_KEY`、`CODEX_API_KEY` 环境覆盖，代理、证书及其他环境变量保留。客户端不读取或复制登录凭据；登录仍由 Codex 管理。首次从 API Key 身份切到强制 ChatGPT 登录时，Codex 可能要求重新登录。切回 CPA 不会恢复或替换先前的登录凭据，CPA 如需重新认证仍按原来的方式处理。
+
+恢复 CPA 模式：
+
+```sh
+cwr-codex --set-mode cpa
+```
+
+这会要求原有 Codex 提供商配置匹配已登记 CPA，并在保存过提供商 ID 时检查该 ID；未登记地址会提示先使用 `--trust-cpa-url`。未保存过模式的旧设置按 `auto` 解释，不会继续无条件注入项目头。只临时改变一次可用 `cwr-codex --mode auto -- ...`、`--mode official -- ...` 或 `--mode cpa -- ...`，不会修改保存值；官方模式不接受 `--provider`。模式不检测登录凭据，也不在出错后切换路由。
+
+`--trust-cpa-url`、`--set-mode`、`--status` 与 `--setup-codeman` 均为独立管理命令，不能同时传入启动模式、提供商或原生 Codex 参数。官方模式拒绝原生参数中对提供商、登录方式、地址的冲突覆盖，以及 `--oss`、`--local-provider`、`--remote`；普通模型和 profile 参数继续透传。`exec --` 后的字面提示词保持不变。管理策略仍由 Codex 执行，客户端不会绕过组织要求。
+
+模式、提供商约束和已登记 `cpa_urls` 同存于 `$XDG_CONFIG_HOME/cwr/client.json`（默认 `~/.config/cwr/client.json`），更新时合并保留已有字段，以临时文件替换并使用 `0600` 权限。最多登记 32 个地址，总设置不超过 4096 字节。可编辑 `cpa_urls` 移除不再使用的地址。Codeman 与切换命令需以同一用户和相同 `XDG_CONFIG_HOME` 运行。设置文件损坏、模式、提供商 ID 或登记地址无效时明确报错并停止，不会静默恢复 CPA，也不会覆盖损坏文件；修复该文件后再切换模式。
 
 ## 额度分配
 

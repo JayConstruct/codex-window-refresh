@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from client_protocol_fixture import CONFIG_READER, CPA_URL
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("codeman_client", ROOT / "scripts/cwr-codex.py")
@@ -125,12 +126,15 @@ process.stdout.write(renderLaunch(entry.launch,{model:'test-model',reasoningEffo
             official = root / "official"
             official.mkdir()
             binary = official / "codex"
-            binary.write_text("#!" + sys.executable + "\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\nsys.exit(7)\n")
+            binary.write_text("#!" + sys.executable + "\n" + CONFIG_READER + "\nprint(json.dumps(sys.argv[1:]))\nsys.exit(7)\n")
             binary.chmod(0o755)
             project = root / "project"
             project.mkdir()
             environment = {**os.environ, "HOME": str(root), "XDG_CONFIG_HOME": str(root / "settings"),
                            "PATH": str(official) + os.pathsep + os.environ["PATH"]}
+            registered = subprocess.run([sys.executable, str(script), "--trust-cpa-url", CPA_URL],
+                                        env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(registered.returncode, 0, registered.stderr)
             executed = subprocess.run(["bash", "--noprofile", "--norc", "-c", command], cwd=project,
                                       env=environment, capture_output=True, text=True, timeout=10)
             self.assertEqual(executed.returncode, 7, executed.stderr)
@@ -141,3 +145,20 @@ process.stdout.write(renderLaunch(entry.launch,{model:'test-model',reasoningEffo
             self.assertIn("model_reasoning_effort=high", argv)
             self.assertEqual(argv[-2:], ["resume", "previous-session"])
             self.assertEqual(argv[argv.index("--model") + 1], "test-model")
+            registry = (root / "clis.json").read_bytes()
+            for mode in ("official", "cpa", "auto"):
+                saved = subprocess.run([sys.executable, str(script), "--set-mode", mode], cwd=project,
+                                       env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(saved.returncode, 0, saved.stderr)
+                executed = subprocess.run(["bash", "--noprofile", "--norc", "-c", command], cwd=project,
+                                          env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(executed.returncode, 7, executed.stderr)
+                argv = json.loads(executed.stdout)
+                self.assertEqual(argv[:2], ["-C", str(project)])
+                self.assertEqual(any("X-CWR-Project=" in arg for arg in argv), mode != "official")
+                self.assertEqual('model_provider="openai"' in argv, mode == "official")
+                self.assertIn("tui.animations=false", argv)
+                self.assertIn("model_reasoning_effort=high", argv)
+                self.assertEqual(argv[-2:], ["resume", "previous-session"])
+                self.assertEqual(argv[argv.index("--model") + 1], "test-model")
+                self.assertEqual((root / "clis.json").read_bytes(), registry)

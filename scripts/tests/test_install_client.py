@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -105,6 +106,24 @@ bash "$1" "${@:2}"
     def test_installer_checksum_matches_launcher(self):
         expected = hashlib.sha256((ROOT / "scripts/cwr-codex.py").read_bytes()).hexdigest()
         self.assertIn("CLIENT_SHA256=" + expected + "\n", self.installer.read_text())
+
+    def test_installed_mode_survives_client_updates(self):
+        environment = {"XDG_CONFIG_HOME": str(self.root / "settings")}
+        result = self.install("--bin-dir", str(self.destination), "--no-codeman", environment=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        command = self.destination / "cwr-codex"
+        selected = subprocess.run([str(command), "--set-mode", "official"],
+                                  env={**os.environ, **environment}, capture_output=True, text=True)
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        settings = self.root / "settings/cwr/client.json"
+        self.assertEqual(json.loads(settings.read_text()), {"mode": "official"})
+        saved = settings.read_bytes()
+        result = self.install("--bin-dir", str(self.destination), "--no-codeman", environment=environment)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(settings.read_bytes(), saved)
+        status = subprocess.run([str(command), "--status"], env={**os.environ, **environment}, capture_output=True, text=True)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("客户端模式：official", status.stdout)
 
     @unittest.skipUnless(shutil.which("node"), "Codeman setup requires Node.js")
     def test_detected_codeman_is_configured_without_changing_shell_or_codex_binary(self):

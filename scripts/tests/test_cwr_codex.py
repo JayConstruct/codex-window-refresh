@@ -1,5 +1,6 @@
 import argparse
 import importlib.util
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -7,8 +8,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
+from client_protocol_fixture import CONFIG_READER, CPA_URL
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("cwr_codex", ROOT / "scripts/cwr-codex.py")
@@ -21,10 +24,18 @@ class LauncherFixture(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.route_patch = mock.patch.object(launcher, "scheduling_route", side_effect=lambda args, *_:
+                                             (args.provider, CPA_URL))
+        self.route_patch.start()
+        self.addCleanup(self.route_patch.stop)
+
+    def prefix(self, provider="cpa"):
+        return ["codex", "-C", str(self.root), "-c", 'model_provider="' + provider + '"',
+                "-c", 'model_providers.' + provider + '.base_url="' + CPA_URL + '"']
 
     def args(self, **overrides):
         values = dict(directory=str(self.root), project="work", provider="cpa",
-                      codex="codex", arguments=[], map=str(self.root / "missing-map.json"))
+                      codex="codex", arguments=[], map=str(self.root / "missing-map.json"), mode="cpa")
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -152,7 +163,7 @@ class DirectoryRouting(LauncherFixture):
 
 
 class ExplicitLaunch(LauncherFixture):
-    def test_header_is_added_without_opening_any_codex_configuration(self):
+    def test_header_building_after_route_validation_does_not_parse_toml_files(self):
         codex_home = self.root / "codex-home"
         codex_home.mkdir()
         config = codex_home / "config.toml"
@@ -164,17 +175,18 @@ class ExplicitLaunch(LauncherFixture):
                 config.write_bytes(content)
             with self.subTest(content=content), mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
                     mock.patch.object(Path, "open", side_effect=AssertionError("launcher read configuration")):
-                self.assertEqual(launcher.command(self.args()), ["codex", "-C", str(self.root), "-c",
+                self.assertEqual(launcher.command(self.args()), [*self.prefix(), "-c",
                                  'model_providers.cpa.http_headers.X-CWR-Project="work"'])
             if content is not None:
                 self.assertEqual(config.read_bytes(), content)
 
-    def test_custom_provider_selects_header_namespace_without_switching_provider(self):
+    def test_validated_provider_and_url_are_pinned_with_the_header_namespace(self):
         command = launcher.command(self.args(provider="my_proxy"))
         self.assertIn('model_providers.my_proxy.http_headers.X-CWR-Project="work"', command)
-        self.assertFalse(any(value.startswith("model_provider=") for value in command))
+        self.assertIn('model_provider="my_proxy"', command)
+        self.assertIn('model_providers.my_proxy.base_url="' + CPA_URL + '"', command)
 
-    def test_codex_options_are_forwarded_without_provider_or_profile_detection(self):
+    def test_validated_launch_preserves_native_arguments(self):
         cases = [
             ["--profile", "other", "exec", "prompt"],
             ["--profile=missing"],
@@ -189,13 +201,13 @@ class ExplicitLaunch(LauncherFixture):
         for arguments in cases:
             with self.subTest(arguments=arguments):
                 self.assertEqual(launcher.command(self.args(arguments=["--", *arguments])),
-                                 ["codex", "-C", str(self.root), "-c",
+                                 [*self.prefix(), "-c",
                                   'model_providers.cpa.http_headers.X-CWR-Project="work"', *arguments])
 
     @unittest.skipIf(os.name == "nt", "Executable fixture uses a POSIX shebang")
     def test_script_launch_adds_header_and_direct_launch_stays_unchanged(self):
         fake = self.root / "fake-codex"
-        fake.write_text("#!" + sys.executable + "\nimport json,os,sys\nprint(json.dumps({'args':sys.argv[1:],'env':os.environ['CWR_TEST_LITERAL']}))\n", encoding="utf-8")
+        fake.write_text("#!" + sys.executable + "\n" + CONFIG_READER + "\nprint(json.dumps({'args':sys.argv[1:],'env':os.environ['CWR_TEST_LITERAL']}))\n", encoding="utf-8")
         fake.chmod(0o755)
         codex_home = self.root / "codex-home"
         codex_home.mkdir()
@@ -204,8 +216,12 @@ class ExplicitLaunch(LauncherFixture):
         profile.write_bytes(b"not TOML")
         argv = [sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--directory", str(self.root),
                 "--codex", str(fake), "--provider", "cpa", "--project", "work", "--", "exec", "literal $(no shell)"]
-        env = dict(os.environ, CODEX_HOME=str(codex_home), CWR_TEST_LITERAL="preserved")
-        expected = {"args": ["-C", str(self.root), "-c", 'model_providers.cpa.http_headers.X-CWR-Project="work"',
+        settings = self.root / "settings/cwr/client.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"cpa_urls": [CPA_URL]}))
+        env = dict(os.environ, CODEX_HOME=str(codex_home), CWR_TEST_LITERAL="preserved", XDG_CONFIG_HOME=str(settings.parent.parent),
+                   CWR_FIXTURE_CONFIG=json.dumps({"model_provider": "cpa", "model_providers": {"cpa": {"base_url": CPA_URL}}}))
+        expected = {"args": [*self.prefix()[1:], "-c", 'model_providers.cpa.http_headers.X-CWR-Project="work"',
                              "exec", "literal $(no shell)"], "env": "preserved"}
         for raw in [None, b'model_provider = "cpa"\n', b'model_provider = "other"\n', b"invalid TOML"]:
             if raw is not None:
@@ -223,138 +239,357 @@ class ExplicitLaunch(LauncherFixture):
         self.assertEqual(profile.read_bytes(), b"not TOML")
 
 
-class RememberedProvider(LauncherFixture):
+class AutomaticRouting(LauncherFixture):
     def setUp(self):
         super().setUp()
+        self.route_patch.stop()
+        self.settings = self.root / "settings/cwr/client.json"
         self.fake = self.root / "fake-codex"
-        self.attempts = self.root / "attempts.jsonl"
-        self.settings = self.root / "settings" / "cwr" / "client.json"
-        self.fake.write_text("#!" + sys.executable + '''
-import json,os,sys
-key=next(item for item in sys.argv[1:] if '.http_headers.X-CWR-Project=' in item)
-provider=key.split('.')[1]
-with open(os.environ['CWR_FIXTURE_ATTEMPTS'],'a') as stream:
-    stream.write(json.dumps({'provider':provider,'argv':sys.argv[1:]})+'\\n')
-if os.environ.get('CWR_FIXTURE_ERROR'):
-    print(os.environ['CWR_FIXTURE_ERROR'],file=sys.stderr)
-    sys.exit(1)
-if provider!=os.environ['CWR_FIXTURE_PROVIDER']:
-    print('Error: model_providers.'+provider+': provider name must not be empty\\nin `model_providers`',file=sys.stderr)
-    sys.exit(1)
-print('Codex fixture started')
-''', encoding="utf-8")
+        self.fake.write_text("#!" + sys.executable + "\n" + CONFIG_READER + "\nprint(json.dumps(sys.argv[1:]))\n")
         self.fake.chmod(0o755)
-        self.environment = dict(os.environ, XDG_CONFIG_HOME=str(self.root / "settings"),
-                                CWR_FIXTURE_ATTEMPTS=str(self.attempts), CWR_FIXTURE_PROVIDER="my_proxy")
-        self.argv = [sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--directory", str(self.root),
-                     "--project", "work", "--codex", str(self.fake)]
+        self.environment = {**os.environ, "XDG_CONFIG_HOME": str(self.settings.parent.parent)}
 
-    def launch(self, answers=None, extra=(), environment=None):
-        environment = {**self.environment, **(environment or {})}
-        if answers is None:
-            return subprocess.run([*self.argv, *extra], env=environment, stdin=subprocess.DEVNULL,
-                                  capture_output=True, text=True, timeout=10)
-        master, slave = os.openpty()
-        try:
-            with subprocess.Popen([*self.argv, *extra], env=environment, stdin=slave,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as process:
-                os.write(master, answers.encode())
-                stdout, stderr = process.communicate(timeout=10)
-                return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-        finally:
-            os.close(master)
-            os.close(slave)
+    def save(self, **settings):
+        self.settings.parent.mkdir(parents=True, exist_ok=True)
+        self.settings.write_text(json.dumps(settings))
 
-    def test_no_arguments_use_cliproxyapi_without_creating_client_settings(self):
-        result = self.launch(environment={"CWR_FIXTURE_PROVIDER": "cliproxyapi"})
+    def launch(self, *arguments, config=None, requirements=None):
+        env = dict(self.environment)
+        if config is not None:
+            env["CWR_FIXTURE_CONFIG"] = json.dumps(config)
+        if requirements is not None:
+            env["CWR_FIXTURE_REQUIREMENTS"] = json.dumps(requirements)
+        return subprocess.run([sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--directory", str(self.root),
+                               "--codex", str(self.fake), *arguments], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=10)
+
+    def test_default_without_registered_cpa_passes_through_without_probe_or_mapping(self):
+        result = self.launch("--map", "/missing-map", "--", "resume", "previous-session")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(self.attempts.read_text())["provider"], "cliproxyapi")
+        self.assertEqual(json.loads(result.stdout), ["-C", str(self.root), "resume", "previous-session"])
         self.assertFalse(self.settings.exists())
+        with mock.patch.object(launcher, "read_route", side_effect=AssertionError("unnecessary probe")):
+            self.assertIsNone(launcher.scheduling_route(self.args(mode="auto"), self.root, []))
 
-    @unittest.skipIf(os.name == "nt", "PTY input fixture requires POSIX")
-    def test_provider_startup_error_prompts_saves_and_next_launch_needs_no_arguments(self):
-        codex_config = self.root / "codex-config.toml"
-        codex_config.write_text("preserve original config", encoding="utf-8")
-        result = self.launch("bad id\nmy_proxy\n")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("请重新输入", result.stderr)
-        self.assertEqual(json.loads(self.settings.read_text()), {"provider": "my_proxy"})
+    def test_trust_registration_normalizes_exact_url_and_preserves_mode_and_provider(self):
+        self.save(mode="official", provider="old_proxy", future_setting=True)
+        for _ in range(2):
+            result = self.launch("--trust-cpa-url", "HTTP://LOCALHOST:80/v1/")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.settings.read_text()), {"mode": "official", "provider": "old_proxy",
+                         "future_setting": True, "cpa_urls": ["http://localhost/v1"]})
         self.assertEqual(self.settings.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(codex_config.read_text(), "preserve original config")
-        attempts = [json.loads(line)["provider"] for line in self.attempts.read_text().splitlines()]
-        self.assertEqual(attempts, ["cliproxyapi", "my_proxy"])
+        result = self.launch("--set-mode", "auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.settings.read_text())["mode"], "auto")
+        result = self.launch("--status")
+        self.assertIn("客户端模式：auto", result.stdout)
+        self.assertIn("http://localhost/v1", result.stdout)
+
+    def test_official_or_ambiguous_urls_cannot_be_registered_and_errors_do_not_echo_secrets(self):
+        for url in ["https://api.openai.com/v1", "https://CHATGPT.com./backend-api/codex", "https://sub.chatgpt.com/v1",
+                    "https://chat.com", "https://user:private-password@proxy.test/v1", "https://proxy.test/v1?key=private-secret",
+                    "ftp://proxy.test/v1", "https://proxy.test/v1#secret", "https://proxy.test:invalid/v1",
+                    "https://proxy.test\\@api.openai.com/v1", "https://%61pi.openai.com/v1", "https://proxy.test/v1\n"]:
+            with self.subTest(url=url):
+                result = self.launch("--trust-cpa-url", url)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("private-password", result.stderr)
+                self.assertNotIn("private-secret", result.stderr)
+                self.assertFalse(self.settings.exists())
+
+    def test_only_detected_exact_approved_custom_provider_gets_headers_and_pinned_route(self):
+        self.save(cpa_urls=[CPA_URL], provider="obsolete_name")
+        result = self.launch("--", "--model", "chosen-model", "resume", "previous-session")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = json.loads(result.stdout)
+        self.assertIn('model_provider="fixture_proxy"', argv)
+        self.assertIn('model_providers.fixture_proxy.base_url="' + CPA_URL + '"', argv)
+        self.assertEqual(sum("X-CWR-Project=" in value for value in argv), 1)
+        self.assertEqual(argv[-4:], ["--model", "chosen-model", "resume", "previous-session"])
+        self.assertNotIn("obsolete_name", result.stdout)
+
+    def test_official_targets_unapproved_ports_and_paths_and_managed_routes_get_no_headers(self):
+        self.save(cpa_urls=[CPA_URL])
+        for provider, url, requirements in [
+                ("openai", CPA_URL, None), ("fixture_proxy", "https://api.openai.com/v1", None),
+                ("fixture_proxy", "https://chatgpt.com/backend-api/codex", None),
+                ("fixture_proxy", "http://127.0.0.1:8318/v1", None), ("fixture_proxy", CPA_URL + "/other", None),
+                ("fixture_proxy", CPA_URL, {"model_provider": "managed_proxy"}),
+                ("fixture_proxy", CPA_URL, {"modelProviders": {"managed": {}}})]:
+            with self.subTest(provider=provider, url=url, requirements=requirements):
+                result = self.launch("--map", "/missing", config={"model_provider": provider,
+                                     "model_providers": {provider: {"base_url": url}}}, requirements=requirements)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
+                self.assertNotIn("X-CWR-", result.stdout)
+        result = self.launch("--provider", "mismatch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("X-CWR-", result.stdout)
+        result = self.launch(config={"model_provider": "fixture_proxy", "model_providers": {"fixture_proxy": {
+                             "base_url": CPA_URL, "model_catalog_url": "https://api.openai.com/v1/models"}}})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("X-CWR-", result.stdout)
+
+    def test_profile_remote_and_config_probe_failure_pass_through_in_auto_and_stop_in_cpa(self):
+        self.save(cpa_urls=[CPA_URL])
+        for arguments in [["--profile", "proxy"], ["-pproxy"], ["--profile=proxy"],
+                          ["--oss"], ["--remote", "ws://localhost:1234"]]:
+            with self.subTest(arguments=arguments):
+                result = self.launch("--", *arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), ["-C", str(self.root), *arguments])
+                result = self.launch("--mode", "cpa", "--", *arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+        for config in [{"model_provider": []}, {"model_provider": "missing"}, {"model_providers": []},
+                       {"profile": "unsupported"}]:
+            result = self.launch(config=config)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
+        self.fake.write_text("#!" + sys.executable + "\nimport sys,json\nif 'app-server' in sys.argv:sys.exit(1)\nprint(json.dumps(sys.argv[1:]))\n")
         result = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("提供商 ID（", result.stderr)
-        self.assertEqual(json.loads(self.attempts.read_text().splitlines()[-1])["provider"], "my_proxy")
-        self.assertFalse(list(self.settings.parent.glob(".client-*")))
+        self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
+        result = self.launch("--mode", "cpa")
+        self.assertEqual(result.returncode, 2, result.stderr)
 
-    @unittest.skipIf(os.name == "nt", "PTY input fixture requires POSIX")
-    def test_stale_remembered_provider_can_be_corrected_and_blank_cancels_without_changing_it(self):
-        self.settings.parent.mkdir(parents=True)
-        self.settings.write_text('{"provider":"old_proxy"}', encoding="utf-8")
-        original = self.settings.read_bytes()
-        result = self.launch("\n")
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(self.settings.read_bytes(), original)
-        result = self.launch("my_proxy\n")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(self.settings.read_text())["provider"], "my_proxy")
-
-    def test_noninteractive_failure_and_unrelated_codex_errors_never_prompt_or_save(self):
+    def test_cpa_requires_registration_and_legacy_settings_do_not_bypass_it(self):
+        self.save(mode="cpa", provider="cliproxyapi")
         result = self.launch()
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("--provider", result.stderr)
-        self.assertFalse(self.settings.exists())
-        for error in ["HTTP 401 authentication failed", "model_providers.other: provider name must not be empty", "model_providers.cliproxyapi_extra: provider name must not be empty"]:
-            result = self.launch(environment={"CWR_FIXTURE_ERROR": error})
-            self.assertEqual(result.returncode, 1)
-            self.assertNotIn("提供商 ID（", result.stderr)
-            self.assertFalse(self.settings.exists())
-
-    def test_explicit_provider_overrides_saved_value_only_for_this_invocation(self):
-        self.settings.parent.mkdir(parents=True)
-        self.settings.write_text('{"provider":"remembered"}', encoding="utf-8")
-        result = self.launch(extra=("--provider", "my_proxy"))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--trust-cpa-url", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.save(provider="cliproxyapi")
+        result = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(self.settings.read_text())["provider"], "remembered")
+        self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
 
-    def test_invalid_client_settings_fall_back_without_exposing_contents(self):
-        self.settings.parent.mkdir(parents=True)
-        self.settings.write_text('private-do-not-print-invalid-json', encoding="utf-8")
-        result = self.launch(environment={"CWR_FIXTURE_PROVIDER": "cliproxyapi"})
+    def test_probe_only_extracts_config_options_and_preserves_literal_prompts(self):
+        arguments = ["--model", "-pmodel-value", "-c", 'model_provider="proxy"', "exec", "--",
+                     "--profile", "literal-profile", "-c", "literal-prompt"]
+        self.assertEqual(launcher.probe_options(arguments), ["-c", 'model_provider="proxy"'])
+        self.assertEqual(launcher.probe_options(["--config=model_provider='proxy'", "--enable", "feature"]),
+                         ["--config=model_provider='proxy'", "--enable", "feature"])
+
+    def test_probe_timeout_and_invalid_protocol_responses_never_add_headers(self):
+        self.save(cpa_urls=[CPA_URL])
+        for response in ["[]", '{"id":1,"error":{"message":"private-error"}}']:
+            self.fake.write_text("#!" + sys.executable + "\nimport json,sys\nif 'app-server' in sys.argv:\n sys.stdin.readline()\n print(" + repr(response) + ",flush=True)\n sys.exit(0)\nprint(json.dumps(sys.argv[1:]))\n")
+            result = self.launch()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
+            self.assertNotIn("private-error", result.stderr)
+        self.fake.write_text("#!" + sys.executable + "\nimport json,sys,time\nif 'app-server' in sys.argv:time.sleep(30)\nprint(json.dumps(sys.argv[1:]))\n")
+        result = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("private-do-not-print", result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
 
     @unittest.skipUnless(shutil.which("codex"), "Real Codex CLI is optional")
-    def test_real_codex_accepts_existing_cliproxyapi_definition_without_creating_cpa(self):
+    def test_real_codex_config_reader_resolves_cli_overrides_and_never_modifies_source_config(self):
         home = self.root / "codex-home"
         home.mkdir()
         config = home / "config.toml"
-        original = 'model_provider="cliproxyapi"\n[model_providers.cliproxyapi]\nname="Fixture proxy"\nbase_url="http://127.0.0.1:9/v1"\nwire_api="responses"\n'
+        original = 'model_provider="openai"\n[model_providers.proxy]\nname="Fixture"\nbase_url="' + CPA_URL + '"\nwire_api="responses"\n'
+        config.write_text(original)
+        env = {**os.environ, "CODEX_HOME": str(home)}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(launcher.read_route(shutil.which("codex"), self.root, []), ("openai", None))
+            self.assertEqual(launcher.read_route(shutil.which("codex"), self.root, ["-c", 'model_provider="proxy"']), ("proxy", CPA_URL))
+            with self.assertRaises(ValueError):
+                launcher.read_route(shutil.which("codex"), self.root, ["-c", 'model_provider="proxy"', "-c", 'model_providers.proxy.base_url="https://api.openai.com/v1"'])
+        self.assertEqual(config.read_text(), original)
+        self.assertFalse((home / "auth.json").exists())
+
+    @unittest.skipUnless(shutil.which("codex"), "Real Codex CLI is optional")
+    def test_real_codex_http_requests_only_include_cwr_headers_for_registered_destination(self):
+        captured = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                captured.append({name.lower(): value for name, value in self.headers.items()})
+                body = b'{"error":{"message":"offline header capture","type":"invalid_request_error"}}'
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        except PermissionError:
+            self.skipTest("Loopback HTTP capture requires local socket access")
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            url = "http://127.0.0.1:" + str(server.server_port) + "/v1"
+            home = self.root / "http-codex-home"
+            home.mkdir()
+            config = home / "config.toml"
+            original = ('model_provider="proxy"\n[model_providers.proxy]\nname="Offline capture"\n'
+                        'base_url="' + url + '"\nwire_api="responses"\nrequest_max_retries=0\nstream_max_retries=0\n')
+            config.write_text(original)
+            environment = {**self.environment, "CODEX_HOME": str(home), "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
+            for approved, override in ((False, False), (True, False), (True, True)):
+                captured.clear()
+                self.save(cpa_urls=[url] if approved else [])
+                extra = ["-c", 'model_providers.proxy.base_url="' + url + '/other"'] if override else []
+                result = subprocess.run([sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--directory", str(self.root),
+                                         "--codex", shutil.which("codex"), "--project", "offline-fixture", "--",
+                                         "exec", *extra, "--skip-git-repo-check", "--model", "fixture-model", "offline fixture"],
+                                        env=environment, cwd=self.root, stdin=subprocess.DEVNULL, capture_output=True,
+                                        text=True, timeout=15)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(captured, "No request reached local capture server: " + result.stderr[-1500:])
+                self.assertEqual(any("x-cwr-project" in headers for headers in captured), approved and not override)
+                if approved and not override:
+                    self.assertTrue(all(headers.get("x-cwr-project") == "offline-fixture" for headers in captured))
+                self.assertTrue(all("x-cwr-project-name" not in headers for headers in captured))
+            self.assertEqual(config.read_text(), original)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2)
+
+
+class OfficialMode(LauncherFixture):
+    def setUp(self):
+        super().setUp()
+        self.settings = self.root / "settings/cwr/client.json"
+        self.fake = self.root / "fake-codex"
+        self.fake.write_text("#!" + sys.executable + "\n" + CONFIG_READER + '''
+import json,os,sys
+names=['OPENAI_BASE_URL','CHATGPT_BASE_URL','OPENAI_API_KEY','CODEX_API_KEY','HTTPS_PROXY','CODEX_CA_CERTIFICATE','CWR_FIXTURE_LITERAL']
+print(json.dumps({'argv':sys.argv[1:],'environment':{name:os.environ[name] for name in names if name in os.environ}}))
+sys.exit(int(os.environ.get('CWR_FIXTURE_EXIT','0')))
+''', encoding="utf-8")
+        self.fake.chmod(0o755)
+        self.environment = {**os.environ, "XDG_CONFIG_HOME": str(self.root / "settings"),
+                            "OPENAI_BASE_URL": "http://127.0.0.1:9/v1", "CHATGPT_BASE_URL": "http://127.0.0.1:9/",
+                            "OPENAI_API_KEY": "fixture-key", "CODEX_API_KEY": "fixture-key",
+                            "HTTPS_PROXY": "http://fixture-proxy:1234", "CODEX_CA_CERTIFICATE": "/fixture/ca.pem",
+                            "CWR_FIXTURE_LITERAL": "preserve $(literal)"}
+
+    def launch(self, *arguments, environment=None):
+        return subprocess.run([sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--directory", str(self.root),
+                               "--codex", str(self.fake), *arguments],
+                              env={**self.environment, **(environment or {})}, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=15)
+
+    def test_official_skips_project_mapping_and_codex_config_preserves_native_arguments_and_exit_code(self):
+        arguments = ["--profile", "proxy", "--model", "chosen-model", "-c", "model_reasoning_effort=high",
+                     "-c", "tui.animations=false", "resume", "previous-session"]
+        with mock.patch.object(Path, "open", side_effect=AssertionError("read configuration")), \
+                mock.patch.object(launcher, "directory_project", side_effect=AssertionError("read project")):
+            command = launcher.command(self.args(mode="official", provider=None, project="invalid project", arguments=["--", *arguments]))
+        self.assertEqual(command[:3], ["codex", "-C", str(self.root)])
+        self.assertEqual(command[-len(arguments):], arguments)
+        self.assertIn('model_provider="openai"', command)
+        self.assertIn('forced_login_method="chatgpt"', command)
+        self.assertIn('openai_base_url="https://chatgpt.com/backend-api/codex"', command)
+        self.assertIn('chatgpt_base_url="https://chatgpt.com/backend-api/"', command)
+        self.assertFalse(any("model_providers." in item or "X-CWR-Project" in item for item in command))
+        result = self.launch("--mode", "official", "--map", str(self.root / "missing.json"), "--", *arguments,
+                             environment={"CWR_FIXTURE_EXIT": "7"})
+        self.assertEqual(result.returncode, 7, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["argv"], command[1:])
+        self.assertEqual(data["environment"], {"HTTPS_PROXY": "http://fixture-proxy:1234",
+                         "CODEX_CA_CERTIFICATE": "/fixture/ca.pem", "CWR_FIXTURE_LITERAL": "preserve $(literal)"})
+        self.assertFalse(self.settings.exists())
+
+    def test_mode_is_persistent_and_switching_back_preserves_provider_and_other_settings(self):
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({"provider": "fixture_proxy", "future_setting": True, "cpa_urls": [CPA_URL]}), encoding="utf-8")
+        result = self.launch("--set-mode", "official")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('"argv"', result.stdout)
+        saved = self.settings.read_bytes()
+        self.assertEqual(json.loads(saved), {"provider": "fixture_proxy", "future_setting": True, "mode": "official", "cpa_urls": [CPA_URL]})
+        self.assertEqual(self.settings.stat().st_mode & 0o777, 0o600)
+        result = self.launch("--status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("客户端模式：official", result.stdout)
+        self.assertIn("CPA 提供商：fixture_proxy", result.stdout)
+        self.assertNotIn("future_setting", result.stdout)
+        result = self.launch("--", "login", "status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('model_provider="openai"', json.loads(result.stdout)["argv"])
+        result = self.launch("--mode", "cpa", "--", "exec", "literal $(no shell)")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertTrue(any("model_providers.fixture_proxy.http_headers.X-CWR-Project=" in item for item in data["argv"]))
+        self.assertIn("OPENAI_API_KEY", data["environment"])
+        self.assertEqual(self.settings.read_bytes(), saved)
+        result = self.launch("--set-mode", "cpa")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.settings.read_text()), {"provider": "fixture_proxy", "future_setting": True, "mode": "cpa", "cpa_urls": [CPA_URL]})
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any("model_providers.fixture_proxy.http_headers.X-CWR-Project=" in item for item in json.loads(result.stdout)["argv"]))
+        self.assertFalse(list(self.settings.parent.glob(".client-*")))
+
+    def test_settings_updates_preserve_saved_mode_and_unknown_fields(self):
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text('{"mode":"cpa","future_setting":true}', encoding="utf-8")
+        with mock.patch.dict(os.environ, self.environment):
+            launcher.save_settings(provider="repaired")
+        self.assertEqual(json.loads(self.settings.read_text()), {"mode": "cpa", "future_setting": True, "provider": "repaired"})
+
+    def test_invalid_settings_never_start_codex_or_overwrite_original(self):
+        self.settings.parent.mkdir(parents=True)
+        for content in [b'private invalid JSON', b'{"mode":"unknown"}', b'{"mode":null}',
+                        b'{"mode":"official","provider":"bad.provider"}', b'[]', b' ' * 4097]:
+            self.settings.write_bytes(content)
+            for arguments in [(), ("--set-mode", "official"), ("--status",)]:
+                with self.subTest(content=content[:80], arguments=arguments):
+                    result = self.launch(*arguments)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("无法读取客户端设置", result.stderr)
+                    self.assertNotIn("private invalid JSON", result.stderr)
+                    self.assertEqual(self.settings.read_bytes(), content)
+                    self.assertEqual(result.stdout, "")
+
+    def test_conflicting_route_flags_are_rejected_but_option_values_and_literal_prompts_are_preserved(self):
+        cases = [["-c", 'model_provider="proxy"'], ["--config=openai_base_url='http://proxy'"],
+                 ["-c=model_provider='proxy'"],
+                 ["-cchatgpt_base_url='http://proxy'"], ["-c", "forced_login_method='api'"],
+                 ["-c", '"model_provider"="proxy"'], ["-c", "model_providers.openai.base_url='http://proxy'"],
+                 ["--oss"], ["--local-provider=ollama"], ["--remote", "ws://localhost:1234"]]
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                result = self.launch("--mode", "official", "--", *arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+        arguments = ["--model", "--remote", "exec", "--", "-c", 'model_provider="prompt text"', "--oss"]
+        command = launcher.command(self.args(mode="official", arguments=["--", *arguments]))
+        self.assertEqual(command[-len(arguments):], arguments)
+        for arguments in [("--mode", "official", "--provider", "proxy"),
+                          ("--set-mode", "official", "--", "exec", "prompt"),
+                          ("--set-mode", "official", "--mode", "cpa"),
+                          ("--status", "--set-mode", "official")]:
+            with self.subTest(arguments=arguments):
+                result = self.launch(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.settings.exists())
+
+    @unittest.skipUnless(shutil.which("codex"), "Real Codex CLI is optional")
+    def test_real_codex_accepts_official_overrides_on_top_of_proxy_config_without_rewriting_it(self):
+        home = self.root / "codex-home"
+        home.mkdir()
+        config = home / "config.toml"
+        original = ('model_provider="cliproxyapi"\nforced_login_method="api"\n'
+                    'openai_base_url="http://127.0.0.1:9/v1"\nchatgpt_base_url="http://127.0.0.1:9/"\n'
+                    '[model_providers.cliproxyapi]\nname="Fixture proxy"\nbase_url="http://127.0.0.1:9/v1"\nwire_api="responses"\n')
         config.write_text(original, encoding="utf-8")
         result = subprocess.run([sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--directory", str(self.root),
-                                 "--codex", shutil.which("codex"), "--project", "work", "--", "features", "list"],
+                                 "--codex", shutil.which("codex"), "--mode", "official", "--", "features", "list"],
                                 env={**self.environment, "CODEX_HOME": str(home)}, cwd=self.root,
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(config.read_text(), original)
-
-    @unittest.skipIf(os.name == "nt", "PTY input fixture requires POSIX")
-    @unittest.skipUnless(shutil.which("codex"), "Real Codex CLI is optional")
-    def test_real_codex_provider_error_can_be_corrected_and_remembered(self):
-        home = self.root / "codex-home"
-        home.mkdir()
-        config = home / "config.toml"
-        original = 'model_provider="my_proxy"\n[model_providers.my_proxy]\nname="Fixture proxy"\nbase_url="http://127.0.0.1:9/v1"\nwire_api="responses"\n'
-        config.write_text(original, encoding="utf-8")
-        self.argv = [sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--directory", str(self.root),
-                     "--codex", shutil.which("codex"), "--project", "work", "--", "features", "list"]
-        result = self.launch("my_proxy\n", environment={"CODEX_HOME": str(home)})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("provider name must not be empty", result.stderr)
-        self.assertEqual(json.loads(self.settings.read_text()), {"provider": "my_proxy"})
-        result = self.launch(environment={"CODEX_HOME": str(home)})
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("provider name must not be empty", result.stderr)
-        self.assertEqual(config.read_text(), original)
+        self.assertFalse((home / "auth.json").exists())

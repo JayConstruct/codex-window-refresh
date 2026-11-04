@@ -176,14 +176,22 @@ class NativeBridge(unittest.TestCase):
         (repo / '.git').mkdir()
         (repo / '.git' / 'HEAD').write_text('ref: refs/heads/main\n')
         fake = self.root / 'fake-codex'
-        fake.write_text('#!' + sys.executable + '\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
+        spec = importlib.util.spec_from_file_location('client_protocol_fixture', ROOT / 'scripts/tests/client_protocol_fixture.py')
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        fake.write_text('#!' + sys.executable + '\n' + fixture.CONFIG_READER + '\nprint(json.dumps(sys.argv[1:]))\n')
         fake.chmod(0o755)
-        argv = json.loads(subprocess.check_output([sys.executable, str(ROOT / 'scripts/cwr-codex.py'),
-                          '--codex', str(fake), '--directory', str(repo)], env={**os.environ, 'HOME': str(self.root)}, text=True))
+        environment = {**os.environ, 'HOME': str(self.root), 'XDG_CONFIG_HOME': str(self.root / 'settings')}
+        command = [sys.executable, str(ROOT / 'scripts/cwr-codex.py'), '--codex', str(fake), '--directory', str(repo)]
+        unregistered = json.loads(subprocess.check_output(command, env=environment, text=True))
+        self.assertFalse(any('X-CWR-' in value for value in unregistered))
+        subprocess.check_output([sys.executable, str(ROOT / 'scripts/cwr-codex.py'),
+                                 '--trust-cpa-url', fixture.CPA_URL], env=environment, text=True)
+        argv = json.loads(subprocess.check_output(command, env=environment, text=True))
         headers = {}
         for value in argv:
-            if value.startswith('model_providers.cliproxyapi.http_headers.'):
-                key, _, encoded = value.removeprefix('model_providers.cliproxyapi.http_headers.').partition('=')
+            if value.startswith('model_providers.fixture_proxy.http_headers.'):
+                key, _, encoded = value.removeprefix('model_providers.fixture_proxy.http_headers.').partition('=')
                 headers[key] = [json.loads(encoded)]
         project = headers['X-CWR-Project'][0]
         self.assertRegex(project, '^dir-[a-f0-9]{64}$')

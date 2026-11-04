@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `codex-window-refresh`。当前主线为 **V2：C 原生接入层 + 独立 Go 后台 + SQLite**。
 
-当前后台与客户端安装包为 **v0.2.0-rc.37**，原生接入层保持 **v0.2.0-rc.36**，数据库保持 **schema 12**。“账号 → API Key”集中管理 Key 名称并可一键查看请求；运行记录支持可搜索 Key 筛选和简短分配说明，执行中即展示当前账号，重试换号及时更新。升级要求见 [发布说明](docs/releases/v0.2.0-rc.37.md)。
+当前后台与客户端安装包为 **v0.2.0-rc.38**，原生接入层保持 **v0.2.0-rc.36**，数据库保持 **schema 12**。客户端增加自动检测、官方登录与严格 CPA 模式，仅向已登记的 CPA 完整地址添加项目头，Codeman 启动入口及模型、推理强度和恢复参数保留。升级要求见 [发布说明](docs/releases/v0.2.0-rc.38.md)。
 
 ## 安装与更新
 
@@ -10,7 +10,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `c
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.37 --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.38 --restart
 ```
 
 已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；从 rc.35 或更早版本升级须显式 `--restart`，同时更新后台与接入层并重启 CPA，加载按账号保护的并发模型流。完成后强制刷新网页。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。
@@ -24,7 +24,9 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 bash /tmp/cwr-client-install.sh
 ```
 
-默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，安装器自动配置 Codeman 的 Codex 启动入口；重启 Codeman 服务后，从 Codeman 新建或恢复 Codex 会话即可自动携带项目标识，保留模型和推理强度参数。终端仍可运行 `cwr-codex`；首次请求后在服务端选择项目账号并保存。提供商启动错误时按提示输入实际 ID，客户端会记住选择。详见 [项目账号调度与重置卡](docs/user/account-scheduling.md)。
+默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，安装器自动配置 Codeman 的 Codex 启动入口；重启 Codeman 服务后，从 Codeman 新建或恢复 Codex 会话会沿用客户端设置，保留模型和推理强度参数。终端仍可运行 `cwr-codex`；请求携带项目标识后，在服务端选择项目账号并保存。详见 [项目账号调度与重置卡](docs/user/account-scheduling.md)。
+
+rc.38 客户端增加 `auto` 模式：用 `cwr-codex --trust-cpa-url URL` 登记完整 CPA API 地址，再运行 `cwr-codex --set-mode auto`；只有生效配置匹配该地址时才添加项目头，官方或不确定目标不添加。`--set-mode official` 可强制官方 ChatGPT 登录，`--set-mode cpa` 要求检测成功；`--status` 查看模式。通过上述客户端安装命令更新，已有设置保留。切换仅影响之后启动的进程，运行中的会话保持原模式。详见[官方登录与 CPA 切换](docs/user/account-scheduling.md#官方登录与-cpa-切换)。
 
 V1 用户继续使用 [V1 安装指南](docs/legacy/v1/install.md)；`scripts/install.sh` 和 `cpa-quota-upgrade.sh` 仍是 V1 入口。
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLIENT_VERSION=v0.2.0-rc.37
-CLIENT_SHA256=10de067c5c6983a00f60b347017a8a7b7c757bee8a1dd60c2ebefc836149c512
+CLIENT_VERSION=v0.2.0-rc.38
+CLIENT_SHA256=23864ec68c9f8c8f99adb1733b959f16893427aa27e078e3f8cc68e439923da0
 version=$CLIENT_VERSION
 bin_dir=${HOME:-}/.local/bin
 codeman_dir=${HOME:-}/.codeman
@@ -21,10 +21,12 @@ while [[ $# -gt 0 ]]; do
         "安装或更新本安装器配套的客户端 $CLIENT_VERSION，默认目录为 ~/.local/bin。" \
         '需要 Python 3.10+ 和 curl，支持 Linux/macOS，无需 sudo。' \
         '提供 cwr-codex 命令；检测到 ~/.codeman/app 时自动配置 Codeman 的 Codex 启动入口。' \
-        '重启 Codeman 服务后，Codex 会话自动携带项目标识；保留模型、推理强度和恢复参数。' \
+        '重启 Codeman 服务后，Codex 会话沿用客户端模式；保留模型、推理强度和恢复参数。' \
         '--codeman-dir 指定 Codeman 数据目录；--no-codeman 仅安装客户端，不配置 Codeman。' \
         '不修改原始 Codex 程序、Codex 配置、目录映射或 shell 配置。' \
-        '直接运行默认使用 cliproxyapi；提供商报错时可输入 ID 并记住，下次无需再填。' \
+        '默认 auto：仅向生效配置中已登记的 CPA 完整地址添加项目头，其他情况不添加。' \
+        'cwr-codex --trust-cpa-url URL 登记 CPA 地址；--set-mode auto 启用自动检测。' \
+        '--set-mode official 强制官方登录；--set-mode cpa 要求 CPA 检测成功；--status 查看设置。' \
         '再次下载并运行安装器即可更新；可在已解压的发行包目录中离线安装。'
       exit 0 ;;
     *) printf '未知参数：%s\n' "$1" >&2; exit 1 ;;
