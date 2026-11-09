@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 from client_protocol_fixture import CONFIG_READER, CPA_URL
+from terminal_fixture import RECORD_LAUNCH, TerminalLaunch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("codeman_client", ROOT / "scripts/cwr-codex.py")
@@ -43,13 +44,17 @@ class CodemanSetupTests(unittest.TestCase):
 
     def test_preserves_codeman_options_other_clis_and_private_backup(self):
         original = {"schemaVersion": 1, "clis": {"claude": {"enabled": False}, "codex": {
-            "enabled": True, "launch": {"params": {"custom": {"type": "bool"}}}}}}
+            "enabled": True, "launch": {"params": {"custom": {"type": "bool"}}},
+            "env": {"tmuxSetenvKeys": ["CUSTOM_KEY"], "dockerExecEnvNames": ["CUSTOM_DOCKER_KEY"]}}}}
         self.path.write_text(json.dumps(original))
         before = self.path.read_bytes()
         launcher.configure_codeman(self.root)
         saved = json.loads(self.path.read_text())
         self.assertEqual(saved["clis"]["claude"], original["clis"]["claude"])
         self.assertEqual(saved["clis"]["codex"]["enabled"], True)
+        self.assertEqual(saved["clis"]["codex"]["env"], {
+            "tmuxSetenvKeys": ["CUSTOM_KEY", "CPA_API_KEY"],
+            "dockerExecEnvNames": ["CUSTOM_DOCKER_KEY", "CPA_API_KEY"]})
         launch = saved["clis"]["codex"]["launch"]
         self.assertEqual(launch["params"]["custom"], {"type": "bool"})
         self.assertEqual(launch["variants"][0]["args"][1], {"lit": "--"})
@@ -101,6 +106,88 @@ REAL_CODEMAN = Path(os.environ.get("CWR_TEST_CODEMAN_APP", str(Path.home() / ".c
 @unittest.skipUnless(shutil.which("node") and (REAL_CODEMAN / "dist/config/cli-registry/stock.js").is_file(),
                      "Installed Codeman is optional")
 class RealCodemanLaunchTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX terminal launches")
+    def test_two_codeman_windows_choose_connections_independently(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "app").symlink_to(REAL_CODEMAN, target_is_directory=True)
+            script = root / "client bin 'quoted'" / "cwr-codex.py"
+            script.parent.mkdir()
+            shutil.copyfile(ROOT / "scripts/cwr-codex.py", script)
+            script.chmod(0o755)
+            subprocess.run([sys.executable, str(script), "--setup-codeman", str(root)], check=True, capture_output=True)
+            render = '''import {pathToFileURL} from 'node:url';
+import {readFileSync} from 'node:fs';
+const modules=process.argv[1], config=JSON.parse(readFileSync(process.argv[2],'utf8'));
+const {STOCK_CLIS}=await import(pathToFileURL(modules+'/stock.js'));
+const {resolveRegistry}=await import(pathToFileURL(modules+'/registry.js'));
+const {renderLaunch}=await import(pathToFileURL(modules+'/argv.js'));
+const warnings=[];
+const entry=resolveRegistry(STOCK_CLIS,config,warnings).entries.find(entry=>entry.id==='codex');
+if(warnings.length)throw new Error('Invalid registry');
+process.stdout.write(renderLaunch(entry.launch,{model:'test-model',reasoningEffort:'high',animations:false,resumeId:'previous-session'},{}));'''
+            command = subprocess.run(["node", "--input-type=module", "-e", render,
+                                      str(root / "app/dist/config/cli-registry"), str(root / "clis.json")],
+                                     check=True, capture_output=True, text=True).stdout
+            binary_dir = root / "bin"
+            binary_dir.mkdir()
+            binary = binary_dir / "codex"
+            binary.write_text("#!" + sys.executable + "\n" + CONFIG_READER + RECORD_LAUNCH)
+            binary.chmod(0o755)
+            settings = root / "settings/cwr/client.json"
+            settings.parent.mkdir(parents=True)
+            settings.write_text(json.dumps({"mode": "official", "cpa_urls": [CPA_URL]}))
+            before = settings.read_bytes()
+            registry = (root / "clis.json").read_bytes()
+            forwarded = json.loads(registry)["clis"]["codex"]["env"]
+            self.assertEqual(forwarded["tmuxSetenvKeys"], ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME", "CPA_API_KEY"])
+            self.assertEqual(forwarded["dockerExecEnvNames"], ["OPENAI_API_KEY", "CODEX_API_KEY", "CPA_API_KEY"])
+            environment = {**os.environ, "HOME": str(root), "XDG_CONFIG_HOME": str(root / "settings"),
+                           "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
+                           "OPENAI_API_KEY": "fixture-key", "CODEX_API_KEY": "fixture-key",
+                           "OPENAI_BASE_URL": "http://fixture.test/v1",
+                           "CPA_API_KEY": "fixture-cpa-key",
+                           "CWR_FIXTURE_HOLD": "1", "CWR_FIXTURE_CONFIG": json.dumps({
+                               "model_provider": "openai", "model_providers": {"proxy": {
+                                   "base_url": CPA_URL, "env_key": "CPA_API_KEY", "requires_openai_auth": False}}})}
+            windows = []
+            try:
+                for mode, choice in (("official", "1\n"), ("cpa", "2\n")):
+                    directory = root / ("project " + mode)
+                    directory.mkdir()
+                    record = directory / "record.json"
+                    window = TerminalLaunch(["bash", "--noprofile", "--norc", "-c", command], cwd=directory,
+                                             env={**environment, "CWR_FIXTURE_RECORD": str(record)})
+                    windows.append(window)
+                    window.until("选择连接")
+                    self.assertIn(str(directory), window.transcript())
+                    window.send(choice)
+                    window.until("FIXTURE_CODEX_STARTED")
+                    data = json.loads(record.read_text())
+                    argv = data["argv"]
+                    self.assertEqual(argv[:2], ["-C", str(directory)])
+                    self.assertEqual('model_provider="openai"' in argv, mode == "official")
+                    self.assertEqual(any("X-CWR-Project=" in arg for arg in argv), mode == "cpa")
+                    if mode == "cpa":
+                        self.assertEqual(data["environment"]["CPA_API_KEY"], "fixture-cpa-key")
+                        self.assertIn('model_providers.proxy.http_headers.X-CWR-Project="' +
+                                      launcher.directory_project(directory)[1] + '"', argv)
+                    self.assertIn("tui.animations=false", argv)
+                    self.assertIn("model_reasoning_effort=high", argv)
+                    self.assertEqual(argv[-2:], ["resume", "previous-session"])
+                    self.assertEqual(argv[argv.index("--model") + 1], "test-model")
+                self.assertTrue(all(window.process.poll() is None for window in windows))
+                self.assertEqual(settings.read_bytes(), before)
+                self.assertEqual((root / "clis.json").read_bytes(), registry)
+                self.assertNotIn("fixture-cpa-key", command)
+                self.assertNotIn(b"fixture-cpa-key", registry)
+                for window in windows:
+                    window.send("\n")
+                    self.assertEqual(window.finish(), 7, window.transcript())
+            finally:
+                for window in windows:
+                    window.close()
+
     def test_actual_registry_rendering_preserves_codex_parameters_and_routes_the_project(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

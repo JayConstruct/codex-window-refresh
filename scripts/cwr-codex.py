@@ -29,6 +29,11 @@ CODEX_VALUE_OPTIONS = {"-c", "--config", "-p", "--profile", "-m", "--model", "-s
                        "-a", "--ask-for-approval", "-i", "--image", "--remote", "--remote-auth-token-env",
                        "--local-provider", "--add-dir", "--enable", "--disable", "-o", "--output-last-message",
                        "--output-schema"}
+NONINTERACTIVE_COMMANDS = {"exec", "e", "review", "login", "logout", "mcp", "mcp-server", "plugin",
+                           "app", "app-server", "remote-control", "completion", "update", "doctor",
+                           "sandbox", "s", "debug", "apply", "a", "queue", "archive", "delete",
+                           "migrate-rollouts", "migrate-nfs-db", "unarchive", "cloud", "exec-server",
+                           "features", "help"}
 
 CODEMAN_SETUP = r"""
 import {pathToFileURL} from 'node:url';
@@ -53,6 +58,10 @@ config.clis.codex.launch ??= {};
 config.clis.codex.launch.params ??= {};
 config.clis.codex.launch.params.cwrExecutable = {type: 'enum', values: [launcher], default: launcher};
 config.clis.codex.launch.variants = variants;
+config.clis.codex.env ??= {};
+for (const key of ['tmuxSetenvKeys', 'dockerExecEnvNames']) {
+  config.clis.codex.env[key] = [...new Set([...(entry.env?.[key] ?? []), 'CPA_API_KEY'])];
+}
 const validated = [];
 resolveRegistry(STOCK_CLIS, config, validated);
 if (validated.length) throw new Error('unsupported_registry');
@@ -275,6 +284,59 @@ def launch_directory(arguments, fallback):
     return Path(directory if directory is not None else fallback).expanduser().resolve(strict=True), extra
 
 
+def interactive_session(arguments):
+    """Identify chat launches without treating option values or literal prompts as commands."""
+    index, positional = 0, False
+    while index < len(arguments):
+        value = arguments[index]
+        if value == "--":
+            break
+        if value in ("-h", "--help", "-V", "--version"):
+            return False
+        if value in CODEX_VALUE_OPTIONS:
+            index += 2
+            continue
+        if not value.startswith("-") and not positional:
+            if value in NONINTERACTIVE_COMMANDS:
+                return False
+            positional = True
+        index += 1
+    return True
+
+
+def choose_mode(default, directory):
+    """Choose for this process only; never persist a window's connection selection."""
+    choices = {"1": "official", "official": "official", "2": "cpa", "cpa": "cpa"}
+    default_key = {"official": "1", "cpa": "2"}.get(default)
+    print("\nCodex 连接选择", file=sys.stderr)
+    print("工作目录：" + str(directory), file=sys.stderr)
+    print("  1. 官方（ChatGPT 登录）\n  2. CPA", file=sys.stderr)
+    hint = "，回车选 " + default_key if default_key else ""
+    while True:
+        print("选择连接 [1/2" + hint + "，q 取消]：", end="", file=sys.stderr, flush=True)
+        # Read only this line from the terminal descriptor. A buffered readline
+        # can otherwise swallow a pasted second line meant for the child TUI.
+        line = bytearray()
+        while True:
+            chunk = os.read(sys.stdin.fileno(), 1)
+            if not chunk:
+                raise KeyboardInterrupt
+            if chunk == b"\n":
+                break
+            if len(line) < 256:
+                line.extend(chunk)
+        value = line.decode("utf-8", errors="replace").strip().lower()
+        if value in ("q", "quit", "exit"):
+            raise KeyboardInterrupt
+        if not value and default_key:
+            value = default_key
+        if value in choices:
+            mode = choices[value]
+            print("本窗口使用：" + ("官方 ChatGPT" if mode == "official" else "CPA"), file=sys.stderr)
+            return mode
+        print("请输入 1（官方）或 2（CPA），输入 q 取消。", file=sys.stderr)
+
+
 def official_arguments(arguments):
     """Reject route overrides while leaving model, profile, resume and prompt arguments intact."""
     index = 0
@@ -353,7 +415,7 @@ def probe_options(arguments):
     return options
 
 
-def read_route(codex, directory, arguments):
+def read_route(codex, directory, arguments, cpa_urls=None, required_provider=None):
     """Read layered Codex configuration with bounded stdio RPC; never start a thread or turn."""
     options = probe_options(arguments)
     process = subprocess.Popen([codex, "-C", str(directory), *options, "app-server", "--listen", "stdio://"],
@@ -407,14 +469,38 @@ def read_route(codex, directory, arguments):
         providers = config.get("model_providers") or {}
         if not valid_provider(provider) or not isinstance(providers, dict):
             raise ValueError("Codex 提供商不可用")
-        if provider in ("openai", "ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime", "gcp"):
-            return provider, None
-        definition = providers.get(provider)
-        if not isinstance(definition, dict):
-            raise ValueError("Codex 提供商定义不可用")
-        if definition.get("model_catalog_url"):
-            raise ValueError("提供商单独指定了模型目录地址，无法确认请求头仅发送给 CPA")
-        return provider, cpa_url(definition.get("base_url"))
+
+        def route(identity):
+            if identity in ("openai", "ollama", "lmstudio", "amazon-bedrock", "amazon-bedrock-runtime", "gcp"):
+                return identity, None
+            definition = providers.get(identity)
+            if not valid_provider(identity) or not isinstance(definition, dict):
+                raise ValueError("Codex 提供商定义不可用")
+            if definition.get("model_catalog_url"):
+                raise ValueError("提供商单独指定了模型目录地址，无法确认请求头仅发送给 CPA")
+            return identity, cpa_url(definition.get("base_url"))
+
+        if cpa_urls is None:
+            return route(provider)
+        candidates = []
+        for identity in dict.fromkeys((provider, *providers)):
+            if required_provider is not None and identity != required_provider:
+                continue
+            try:
+                candidate = route(identity)
+            except ValueError:
+                continue
+            if candidate[1] in cpa_urls:
+                if identity == provider:
+                    return candidate
+                candidates.append(candidate)
+        # A native route override is an explicit instruction. Do not silently
+        # select a different provider and then let a later -c undo our choice.
+        if any(re.match(r'''^(?:(?:-c|--config)=?)?\s*["']?model_provider["']?\s*=''', value) for value in options):
+            raise ValueError("CPA 模式与原生 model_provider 参数冲突，请移除冲突参数")
+        if len(candidates) != 1:
+            raise ValueError("无法唯一确定已登记 CPA 提供商，请检查配置或使用 --provider 指定")
+        return candidates[0]
     finally:
         if process.poll() is None:
             try:
@@ -433,13 +519,16 @@ def scheduling_route(args, directory, arguments):
             raise ValueError("请先用 --trust-cpa-url 登记 CPA 完整地址；未添加项目头")
         return None
     try:
-        provider, url = read_route(args.codex, directory, arguments)
+        if args.mode == "cpa":
+            provider, url = read_route(args.codex, directory, arguments, cpa_urls=urls, required_provider=args.provider)
+        else:
+            provider, url = read_route(args.codex, directory, arguments)
         if url not in urls or args.provider is not None and provider != args.provider:
             raise ValueError("生效提供商或完整地址未匹配已登记 CPA")
         return provider, url
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as error:
         if args.mode == "cpa":
-            raise ValueError("无法确认生效配置指向已登记 CPA，请检查地址、profile 和提供商；未启动 Codex") from None
+            raise ValueError("无法确认 CPA 连接：" + str(error) + "；请检查已登记地址、profile 和提供商，未启动 Codex") from None
         print("cwr-codex：无法确认目标为已登记 CPA，本次不添加项目头。", file=sys.stderr)
         return None
 
@@ -486,13 +575,13 @@ def main():
     parser.add_argument("--directory", default=os.getcwd())
     parser.add_argument("--project")
     parser.add_argument("--map", help="可选目录映射；默认读取 ~/.config/cwr/projects.json（存在时），未匹配目录自动生成标识")
-    parser.add_argument("--provider", help="要求检测到的 CPA 提供商 ID 与此值一致，不切换 Codex 配置")
+    parser.add_argument("--provider", help="指定本次 CPA 提供商 ID；必须匹配已登记地址，不改写 Codex 配置")
     parser.add_argument("--codex", default="codex")
-    parser.add_argument("--mode", choices=MODES, help="本次模式：auto 按配置与已登记地址添加项目头；cpa 要求检测成功；official 使用官方登录")
+    parser.add_argument("--mode", choices=MODES, help="直接指定本窗口模式并跳过选择：auto 检测项目头；cpa 使用 CPA；official 使用官方登录")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--setup-codeman", nargs="?", const="~/.codeman", metavar="DIRECTORY",
                         help="配置 Codeman 的 Codex 启动入口，默认 ~/.codeman；保留模型、推理强度及恢复参数")
-    action.add_argument("--set-mode", choices=MODES, help="保存默认模式后退出；Codeman 下次启动 Codex 时自动使用")
+    action.add_argument("--set-mode", choices=MODES, help="保存默认模式后退出；交互启动仍可选择，非交互启动使用该默认值")
     action.add_argument("--status", action="store_true", help="显示客户端模式及 CPA 提供商，不启动 Codex 或查询登录凭据")
     action.add_argument("--trust-cpa-url", metavar="URL", help="登记允许接收项目头的 CPA 完整 API 地址后退出；官方地址不可登记")
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
@@ -506,7 +595,7 @@ def main():
         except (ValueError, OSError, subprocess.TimeoutExpired) as error:
             parser.error(str(error))
         print("Codeman 的 Codex 入口已配置：" + str(path))
-        print("重启 Codeman 服务后，Codex 会话会使用客户端保存的模式；模型、推理强度和恢复参数保留。")
+        print("重启 Codeman 服务以加载入口和 CPA_API_KEY 转发规则；每个 Codex 交互窗口可分别选择官方或 CPA。")
         return 0
     try:
         settings = client_settings()
@@ -523,15 +612,23 @@ def main():
             save_settings(mode=args.set_mode)
             labels = {"auto": "根据配置和已登记地址检测", "official": "官方 ChatGPT 登录", "cpa": "要求 CPA 项目调度"}
             print("已保存客户端模式：" + args.set_mode + "（" + labels[args.set_mode] + "）。")
-            print("从 Codeman 下次新建或重新启动 Codex 会话时生效，正在运行的会话保持原模式。")
+            print("交互启动时仍可为每个窗口选择连接；非交互启动使用此默认值，运行中的窗口保持原连接。")
             return 0
+        explicit_mode = args.mode
         args.mode = args.mode or settings.get("mode", "auto")
         if args.status:
             print("客户端模式：" + args.mode)
+            print("交互启动：每个窗口单独选择官方或 CPA；--mode 可直接指定，非交互启动沿用默认模式。")
             print("CPA 提供商：" + settings.get("provider", "按生效配置检测") + "（保存的 ID 仅约束 CPA 模式）")
             print("已登记 CPA 地址：" + (", ".join(settings.get("cpa_urls", [])) or "无（不会添加项目头）"))
             print("客户端设置：" + str(client_settings_path()))
             return 0
+        extra = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+        directory, extra = launch_directory(extra, args.directory)
+        if not directory.is_dir():
+            raise ValueError("启动目录必须是文件夹")
+        if explicit_mode is None and sys.stdin.isatty() and sys.stderr.isatty() and interactive_session(extra):
+            args.mode = choose_mode(args.mode, directory)
         if args.mode == "official":
             if args.provider is not None:
                 raise ValueError("--provider 仅用于 CPA 模式；官方模式使用内置 openai 提供商")
@@ -541,6 +638,9 @@ def main():
         return run_codex(command(args))[0]
     except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError) as error:
         parser.error(str(error))
+    except KeyboardInterrupt:
+        print("\n已取消启动 Codex。", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

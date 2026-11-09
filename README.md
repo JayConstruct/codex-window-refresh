@@ -2,7 +2,7 @@
 
 CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `codex-window-refresh`。当前主线为 **V2：C 原生接入层 + 独立 Go 后台 + SQLite**。
 
-当前后台与客户端安装包为 **v0.2.0-rc.38**，原生接入层保持 **v0.2.0-rc.36**，数据库保持 **schema 12**。客户端增加自动检测、官方登录与严格 CPA 模式，仅向已登记的 CPA 完整地址添加项目头，Codeman 启动入口及模型、推理强度和恢复参数保留。升级要求见 [发布说明](docs/releases/v0.2.0-rc.38.md)。
+当前后台与客户端安装包为 **v0.2.0-rc.39**，原生接入层保持 **v0.2.0-rc.36**，数据库保持 **schema 12**。客户端在每次交互启动时提供官方／CPA 连接选择，支持终端及 Codeman 多窗口分别选择，保留模型、推理强度和恢复参数。升级要求见 [发布说明](docs/releases/v0.2.0-rc.39.md)。
 
 ## 安装与更新
 
@@ -10,7 +10,7 @@ CLIProxyAPI 的 Codex 账号额度查询与窗口唤醒插件，插件 ID 为 `c
 
 ```sh
 curl -fSL https://raw.githubusercontent.com/JayConstruct/codex-window-refresh/main/scripts/install-v2.sh -o /tmp/cwr-v2-install.sh
-sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.38 --restart
+sudo bash /tmp/cwr-v2-install.sh --version v0.2.0-rc.39 --restart
 ```
 
 已有 V2 后续更新可改用 `--version latest`。安装器按数值选择最新已发布的 V2，包括 rc；从 rc.35 或更早版本升级须显式 `--restart`，同时更新后台与接入层并重启 CPA，加载按账号保护的并发模型流。完成后强制刷新网页。首次切换成功后会清除本插件的 V1 策略、状态、旧版本及临时恢复副本；后续更新保留 V2 数据。升级前应另存一致备份，schema 12 不能由旧后台直接打开，回退须恢复与旧后台匹配的数据库。
@@ -24,9 +24,9 @@ curl -fSL -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/JayCons
 bash /tmp/cwr-client-install.sh
 ```
 
-默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，安装器自动配置 Codeman 的 Codex 启动入口；重启 Codeman 服务后，从 Codeman 新建或恢复 Codex 会话会沿用客户端设置，保留模型和推理强度参数。终端仍可运行 `cwr-codex`；请求携带项目标识后，在服务端选择项目账号并保存。详见 [项目账号调度与重置卡](docs/user/account-scheduling.md)。
+默认安装到 `~/.local/bin`。检测到 `~/.codeman/app` 时，安装器自动配置 Codeman 的 Codex 启动入口及 `CPA_API_KEY` 环境转发；安装或更新后重启 Codeman 服务。终端运行 `cwr-codex`，或从 Codeman 新建、恢复 Codex 窗口，均可在终端内选择 `1` 官方或 `2` CPA。不同目录的多个窗口可同时使用不同连接，选择仅影响当前进程，不改变其他窗口或全局默认值。并行使用时，CPA 配置独立提供商 Key，官方使用 ChatGPT 登录。请求携带项目标识后，在服务端选择项目账号并保存。详见 [项目账号调度与重置卡](docs/user/account-scheduling.md)。
 
-rc.38 客户端增加 `auto` 模式：用 `cwr-codex --trust-cpa-url URL` 登记完整 CPA API 地址，再运行 `cwr-codex --set-mode auto`；只有生效配置匹配该地址时才添加项目头，官方或不确定目标不添加。`--set-mode official` 可强制官方 ChatGPT 登录，`--set-mode cpa` 要求检测成功；`--status` 查看模式。通过上述客户端安装命令更新，已有设置保留。切换仅影响之后启动的进程，运行中的会话保持原模式。详见[官方登录与 CPA 切换](docs/user/account-scheduling.md#官方登录与-cpa-切换)。
+CPA 连接需已有 Codex 提供商定义，并用 `cwr-codex --trust-cpa-url URL` 登记其完整 API 地址；仅向匹配的 CPA 添加项目头。`cwr-codex --mode official` 或 `--mode cpa` 可直接指定本窗口连接并跳过菜单；`--set-mode` 保存菜单默认项及非交互启动模式，`--status` 查看设置。无终端、`exec` 等非交互命令沿用保存的默认值；`auto` 只检测项目头，不切换路由。安装更新保留已有设置。详见[官方登录与 CPA 切换](docs/user/account-scheduling.md#官方登录与-cpa-切换)。
 
 V1 用户继续使用 [V1 安装指南](docs/legacy/v1/install.md)；`scripts/install.sh` 和 `cpa-quota-upgrade.sh` 仍是 V1 入口。
 

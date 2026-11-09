@@ -25,7 +25,7 @@
 
 `test_codeman_client.py` 验证 Codeman 注册表接入、原配置及参数保留、重复配置、私有备份与失败不覆盖。本机安装了 Codeman 时还会使用其实际注册表和命令渲染器，在临时目录中运行假 Codex，验证项目头、模型、推理强度、恢复会话及退出码；可用 `CWR_TEST_CODEMAN_APP` 指定 Codeman 应用目录，不修改真实注册表或启动真实模型请求。
 
-客户端模式回归使用 `python3 -m unittest discover -s scripts/tests -p test_cwr_codex.py -v` 和 `python3 -m unittest discover -s scripts/tests -p test_codeman_client.py -v`：覆盖三种模式、地址登记与完整匹配、官方域名拒绝、配置检测失败、profile 保守处理、旧设置兼容及官方子进程环境隔离。实际 Codeman 渲染器验证同一入口切换三种模式后保留模型与恢复参数；实际 Codex CLI 在临时 `CODEX_HOME` 运行 `features list` 和配置读取 RPC。另有 HTTP 捕获测试将真实 Codex 指向本地模拟服务，确认未登记地址不带头、已登记地址携带指定项目头；模拟服务固定返回错误，不执行模型推理。无套接字权限时跳过捕获测试，须在允许本地监听的环境单独执行该项。不登录、不查询真实账号、不调用上游模型。
+客户端模式回归使用 `python3 -m unittest discover -s scripts/tests -p test_cwr_codex.py -v` 和 `python3 -m unittest discover -s scripts/tests -p test_codeman_client.py -v`：覆盖三种模式、地址登记与完整匹配、官方域名拒绝、配置检测失败、profile 保守处理、旧设置兼容及官方子进程环境隔离。真实 PTY 验证每窗口菜单、非法输入重选、默认项、取消、EOF、Ctrl+C，以及管道和粘贴输入保留；两个不同目录的进程同时运行，分别选择官方和 CPA，验证路由、环境、项目头及共享设置不被菜单改写。实际 Codeman 渲染器也验证两个并行 PTY 窗口独立选择连接，并保留模型、推理强度、动画及恢复参数；另验证全局默认官方时可选择唯一已登记 CPA，多个候选须明确指定。实际 Codex CLI 在临时 `CODEX_HOME` 运行 `features list` 和配置读取 RPC。另有 HTTP 捕获测试将真实 Codex 指向本地模拟服务，确认未登记地址不带头、已登记地址携带指定项目头；模拟服务固定返回错误，不执行模型推理。无套接字权限时跳过捕获测试，须在允许本地监听的环境单独执行该项。不登录、不查询真实账号、不调用上游模型。
 
 ## 构建与测试归属
 

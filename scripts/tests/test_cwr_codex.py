@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import threading
 import unittest
 from unittest import mock
 from client_protocol_fixture import CONFIG_READER, CPA_URL
+from terminal_fixture import RECORD_LAUNCH, TerminalLaunch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("cwr_codex", ROOT / "scripts/cwr-codex.py")
@@ -365,6 +367,34 @@ class AutomaticRouting(LauncherFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
 
+    def test_cpa_can_select_a_registered_definition_when_official_is_the_global_default(self):
+        self.save(cpa_urls=[CPA_URL])
+        config = {"model_provider": "openai", "model_providers": {"proxy": {"base_url": CPA_URL}}}
+        result = self.launch("--mode", "cpa", config=config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('model_provider="proxy"', json.loads(result.stdout))
+        self.assertTrue(any("X-CWR-Project=" in value for value in json.loads(result.stdout)))
+        result = self.launch(config=config)
+        self.assertEqual(json.loads(result.stdout), ["-C", str(self.root)])
+        result = self.launch("--mode", "cpa", "--", "-c", 'model_provider="openai"', config=config)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("冲突", result.stderr)
+
+    def test_cpa_does_not_guess_between_multiple_inactive_providers(self):
+        self.save(cpa_urls=[CPA_URL])
+        config = {"model_provider": "openai", "model_providers": {
+            "first": {"base_url": CPA_URL}, "second": {"base_url": CPA_URL}}}
+        result = self.launch("--mode", "cpa", config=config)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--provider", result.stderr)
+        result = self.launch("--mode", "cpa", "--provider", "second", config=config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('model_provider="second"', json.loads(result.stdout))
+        result = self.launch("--mode", "cpa", "--provider", "second", config=config,
+                             requirements={"model_provider": "managed"})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_probe_only_extracts_config_options_and_preserves_literal_prompts(self):
         arguments = ["--model", "-pmodel-value", "-c", 'model_provider="proxy"', "exec", "--",
                      "--profile", "literal-profile", "-c", "literal-prompt"]
@@ -395,6 +425,7 @@ class AutomaticRouting(LauncherFixture):
         env = {**os.environ, "CODEX_HOME": str(home)}
         with mock.patch.dict(os.environ, env):
             self.assertEqual(launcher.read_route(shutil.which("codex"), self.root, []), ("openai", None))
+            self.assertEqual(launcher.read_route(shutil.which("codex"), self.root, [], cpa_urls=[CPA_URL]), ("proxy", CPA_URL))
             self.assertEqual(launcher.read_route(shutil.which("codex"), self.root, ["-c", 'model_provider="proxy"']), ("proxy", CPA_URL))
             with self.assertRaises(ValueError):
                 launcher.read_route(shutil.which("codex"), self.root, ["-c", 'model_provider="proxy"', "-c", 'model_providers.proxy.base_url="https://api.openai.com/v1"'])
@@ -431,9 +462,14 @@ class AutomaticRouting(LauncherFixture):
             home.mkdir()
             config = home / "config.toml"
             original = ('model_provider="proxy"\n[model_providers.proxy]\nname="Offline capture"\n'
-                        'base_url="' + url + '"\nwire_api="responses"\nrequest_max_retries=0\nstream_max_retries=0\n')
+                        'base_url="' + url + '"\nwire_api="responses"\nenv_key="CWR_FIXTURE_CPA_KEY"\n'
+                        'requires_openai_auth=false\nrequest_max_retries=0\nstream_max_retries=0\n')
             config.write_text(original)
-            environment = {**self.environment, "CODEX_HOME": str(home), "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
+            auth = home / "auth.json"
+            auth_original = '{"OPENAI_API_KEY":"unrelated-stored-fixture-key"}'
+            auth.write_text(auth_original)
+            environment = {**self.environment, "CODEX_HOME": str(home), "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1",
+                           "CWR_FIXTURE_CPA_KEY": "independent-fixture-key"}
             for approved, override in ((False, False), (True, False), (True, True)):
                 captured.clear()
                 self.save(cpa_urls=[url] if approved else [])
@@ -449,11 +485,142 @@ class AutomaticRouting(LauncherFixture):
                 if approved and not override:
                     self.assertTrue(all(headers.get("x-cwr-project") == "offline-fixture" for headers in captured))
                 self.assertTrue(all("x-cwr-project-name" not in headers for headers in captured))
+                self.assertTrue(all(headers.get("authorization") == "Bearer independent-fixture-key" for headers in captured))
             self.assertEqual(config.read_text(), original)
+            self.assertEqual(auth.read_text(), auth_original)
         finally:
             server.shutdown()
             server.server_close()
             worker.join(timeout=2)
+
+
+@unittest.skipIf(os.name == "nt", "POSIX terminal launches")
+class WindowConnections(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.settings = self.root / "settings/cwr/client.json"
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text(json.dumps({"mode": "auto", "cpa_urls": [CPA_URL], "future": True}))
+        self.before = self.settings.read_bytes()
+        self.fake = self.root / "codex"
+        self.fake.write_text("#!" + sys.executable + "\n" + CONFIG_READER + RECORD_LAUNCH)
+        self.fake.chmod(0o755)
+        self.env = {**os.environ, "XDG_CONFIG_HOME": str(self.root / "settings"),
+                    "OPENAI_API_KEY": "fixture-key", "CODEX_API_KEY": "fixture-key",
+                    "CPA_API_KEY": "fixture-cpa-key",
+                    "OPENAI_BASE_URL": "http://fixture.test/v1", "HTTPS_PROXY": "http://fixture-proxy:1234"}
+
+    def terminal(self, name, *arguments, hold=False, extra_env=None):
+        directory = self.root / name
+        directory.mkdir(exist_ok=True)
+        record = directory / "record.json"
+        terminal = TerminalLaunch([sys.executable, str(ROOT / "scripts/cwr-codex.py"),
+                                   "--codex", str(self.fake), *arguments], cwd=directory,
+                                  env={**self.env, "CWR_FIXTURE_RECORD": str(record),
+                                       "CWR_FIXTURE_HOLD": "1" if hold else "", **(extra_env or {})})
+        self.addCleanup(terminal.close)
+        return terminal, directory, record
+
+    def test_simultaneous_windows_choose_independent_routes_and_keep_shared_settings(self):
+        arguments = ["--", "--model", "chosen-model", "-c", "model_reasoning_effort=high",
+                     "-c", "tui.animations=false", "resume", "previous-session"]
+        official, first, first_record = self.terminal("official directory", *arguments, hold=True)
+        cpa, second, second_record = self.terminal("CPA 目录", *arguments, hold=True)
+        for window, directory in ((official, first), (cpa, second)):
+            window.until("选择连接")
+            self.assertIn(str(directory), window.transcript())
+            self.assertIsNone(window.process.poll())
+        official.send("1\n")
+        official.until("FIXTURE_CODEX_STARTED")
+        cpa.send("2\n")
+        cpa.until("FIXTURE_CODEX_STARTED")
+        self.assertIsNone(official.process.poll())
+        self.assertIsNone(cpa.process.poll())
+        for window, directory, record, mode in ((official, first, first_record, "official"),
+                                                 (cpa, second, second_record, "cpa")):
+            data = json.loads(record.read_text())
+            argv = data["argv"]
+            self.assertEqual(argv[:2], ["-C", str(directory)])
+            self.assertEqual(argv[-len(arguments[1:]):], arguments[1:])
+            self.assertEqual('model_provider="openai"' in argv, mode == "official")
+            self.assertEqual(any("X-CWR-Project=" in value for value in argv), mode == "cpa")
+            self.assertEqual("OPENAI_API_KEY" in data["environment"], mode == "cpa")
+            self.assertEqual(data["environment"]["HTTPS_PROXY"], self.env["HTTPS_PROXY"])
+            window.send("\n")
+            self.assertEqual(window.finish(), 7, window.transcript())
+        self.assertEqual(self.settings.read_bytes(), self.before)
+
+    def test_invalid_selection_retries_and_native_directory_is_shown(self):
+        requested = self.root / "requested"
+        requested.mkdir()
+        terminal, _, record = self.terminal("initial", "--", "-C", str(requested), "--model", "exec")
+        terminal.until("选择连接")
+        self.assertIn(str(requested), terminal.transcript())
+        terminal.send("invalid\n\n")
+        terminal.until("请输入 1")
+        terminal.send("official\n")
+        self.assertEqual(terminal.finish(), 7, terminal.transcript())
+        self.assertEqual(json.loads(record.read_text())["argv"][-2:], ["--model", "exec"])
+
+    def test_saved_mode_is_menu_default_but_selection_does_not_change_it(self):
+        self.settings.write_text(json.dumps({"mode": "cpa", "cpa_urls": [CPA_URL]}))
+        before = self.settings.read_bytes()
+        for name, choice, expected in (("accept-default", "\n", "fixture_proxy"), ("override-default", "1\n", "openai")):
+            terminal, _, record = self.terminal(name)
+            terminal.until("回车选 2")
+            terminal.send(choice)
+            self.assertEqual(terminal.finish(), 7, terminal.transcript())
+            self.assertIn('model_provider="' + expected + '"', json.loads(record.read_text())["argv"])
+        self.assertEqual(self.settings.read_bytes(), before)
+
+    def test_cancel_eof_and_interrupt_do_not_launch_or_probe_codex(self):
+        for index, choice in enumerate(("q\n", "\x04", None)):
+            terminal, _, record = self.terminal("cancel-" + str(index))
+            terminal.until("选择连接")
+            if choice is None:
+                terminal.process.send_signal(signal.SIGINT)
+            else:
+                terminal.send(choice)
+            self.assertEqual(terminal.finish(), 130, terminal.transcript())
+            self.assertFalse(record.exists())
+            self.assertNotIn("Traceback", terminal.transcript())
+        self.assertEqual(self.settings.read_bytes(), self.before)
+
+    def test_explicit_mode_and_noninteractive_commands_skip_menu_even_with_terminal(self):
+        for index, arguments in enumerate((("--mode", "official"), ("--mode", "cpa"), ("--mode", "auto"),
+                                            ("--", "exec", "prompt"), ("--", "features", "list"),
+                                            ("--", "--help"), ("--", "login", "status"))):
+            terminal, _, _ = self.terminal("direct-" + str(index), *arguments)
+            self.assertEqual(terminal.finish(), 7, terminal.transcript())
+            self.assertNotIn("选择连接", terminal.transcript())
+
+    def test_nonterminal_stdin_is_passed_to_codex_without_being_consumed(self):
+        self.fake.write_text("#!" + sys.executable + "\n" + CONFIG_READER + "\nprint(sys.stdin.read(),end='')\n")
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/cwr-codex.py"), "--codex", str(self.fake)],
+                                cwd=self.root, env=self.env, input="pipeline input\n2\n", capture_output=True,
+                                text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "pipeline input\n2\n")
+        self.assertNotIn("选择连接", result.stderr)
+
+    def test_pasted_second_line_is_left_for_the_child_terminal(self):
+        self.fake.write_text("#!" + sys.executable + "\n" + CONFIG_READER +
+                             "\nprint('CHILD_INPUT=' + repr(sys.stdin.readline()),flush=True)\n")
+        terminal, _, _ = self.terminal("pasted-input")
+        terminal.until("选择连接")
+        terminal.send("1\nfor the child\n")
+        self.assertEqual(terminal.finish(), 0, terminal.transcript())
+        self.assertIn("CHILD_INPUT='for the child\\n'", terminal.transcript())
+
+    def test_native_command_detection_skips_option_values_and_literal_prompt_flags(self):
+        for arguments in ([], ["resume", "previous"], ["fork", "--last"], ["--model", "exec"],
+                          ["-c", "--help", "resume", "previous"], ["--", "exec", "--help"]):
+            self.assertTrue(launcher.interactive_session(arguments), arguments)
+        for arguments in (["exec", "prompt"], ["-m", "chosen-model", "review"], ["--version"],
+                          ["resume", "--help"], ["-c", "key=value", "app-server"]):
+            self.assertFalse(launcher.interactive_session(arguments), arguments)
 
 
 class OfficialMode(LauncherFixture):
